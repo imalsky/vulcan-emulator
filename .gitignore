@@ -205,3 +205,32 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Vulcan-emulator generated artifacts (data, models, logs, plots)
+data/raw/
+data/processed/
+models/
+logs/
+testing/figures/
+testing/results/
+
+# Large binary artifacts
+*.h5
+*.npy
+*.npz
+
+# macOS / Finder
+.DS_Store
+
+# Generated smoke-data artifacts
+data/**/raw/
+data/**/processed/
+data/**/dataset_manifest.json
+data/**/splits.json
+*.pt
+*.pt2
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.pickle
