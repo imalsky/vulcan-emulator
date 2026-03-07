@@ -1,0 +1,203 @@
+#!/bin/bash
+#PBS -N vulcan_emulator
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -m abe
+
+# Required in the HPC conda env used for this job:
+#   torch, numpy, scipy, h5py, tqdm
+# Required in addition when training.data_loading.mode="auto":
+#   psutil
+# Required for the current bundled VULCAN runtime:
+#   matplotlib
+# Optional VULCAN extras only if you rebuild chem_funs.py or use image utilities:
+#   sympy, Pillow
+# Current config/config.json sets training.device="cpu", so a CPU queue is sufficient.
+# Replace the queue/resource lines above with your site's CPU queue if available.
+
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+cd -P "${PROJECT_ROOT}"
+
+module purge
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+if ! command -v conda >/dev/null 2>&1; then
+  echo "ERROR: conda not found after module load."
+  exit 1
+fi
+
+CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+CONDA_ENV="${CONDA_ENV:-nn}"
+set +e
+conda activate "${CONDA_ENV}"
+rc=$?
+set -e
+if [ "${rc}" -ne 0 ]; then
+  echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
+  conda info --envs || true
+  exit 2
+fi
+
+CONFIG_PATH="${CONFIG_PATH:-config/config.json}"
+TRAIN_LOG="${TRAIN_LOG:-}"
+
+export HDF5_USE_FILE_LOCKING=FALSE
+export KMP_DUPLICATE_LIB_OK=TRUE
+export MPLBACKEND="${MPLBACKEND:-Agg}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${PROJECT_ROOT}/.mplconfig}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+mkdir -p "${MPLCONFIGDIR}"
+
+if [ "${CONFIG_PATH#/}" != "${CONFIG_PATH}" ]; then
+  echo "ERROR: CONFIG_PATH must be relative because src/main.py rejects absolute config paths."
+  exit 1
+fi
+if [ ! -f "${CONFIG_PATH}" ]; then
+  echo "ERROR: config not found: ${CONFIG_PATH}"
+  exit 1
+fi
+if [ ! -f "${PROJECT_ROOT}/src/main.py" ]; then
+  echo "ERROR: src/main.py not found under ${PROJECT_ROOT}"
+  exit 1
+fi
+
+mapfile -t CONFIG_INFO < <(python - "${CONFIG_PATH}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+project_root = Path(".").resolve()
+config_path = (project_root / sys.argv[1]).resolve()
+with config_path.open("r", encoding="utf-8") as handle:
+    config = json.load(handle)
+
+print(config_path)
+print((project_root / config["paths"]["vulcan_source_path"]).resolve())
+print((project_root / config["paths"]["logs_root"]).resolve())
+print((project_root / config["paths"]["models_root"] / config["training"]["output_folder"]).resolve())
+print(str(config["training"]["device"]).lower())
+PY
+)
+
+CONFIG_ABS="${CONFIG_INFO[0]}"
+VULCAN_SOURCE="${CONFIG_INFO[1]}"
+LOGS_ROOT="${CONFIG_INFO[2]}"
+RUN_DIR="${CONFIG_INFO[3]}"
+TRAIN_DEVICE="${CONFIG_INFO[4]}"
+export TRAIN_DEVICE
+
+if [ -z "${TRAIN_LOG}" ]; then
+  TRAIN_LOG="${LOGS_ROOT}/training_${PBS_JOBID:-manual}.log"
+fi
+
+mkdir -p "${LOGS_ROOT}" "$(dirname "${TRAIN_LOG}")"
+
+echo "PBS_JOBID: ${PBS_JOBID:-manual}"
+echo "Host: $(hostname)"
+echo "Project root: ${PROJECT_ROOT}"
+echo "Config: ${CONFIG_ABS}"
+echo "VULCAN source: ${VULCAN_SOURCE}"
+echo "Training device from config: ${TRAIN_DEVICE}"
+
+for required_path in \
+  "${VULCAN_SOURCE}" \
+  "${VULCAN_SOURCE}/vulcan.py" \
+  "${VULCAN_SOURCE}/vulcan_cfg.py" \
+  "${VULCAN_SOURCE}/chem_funs.py" \
+  "${VULCAN_SOURCE}/fastchem_vulcan"; do
+  if [ ! -e "${required_path}" ]; then
+    echo "ERROR: missing VULCAN runtime path: ${required_path}"
+    exit 1
+  fi
+done
+if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ]; then
+  echo "ERROR: missing executable FastChem binary: ${VULCAN_SOURCE}/fastchem_vulcan/fastchem"
+  exit 1
+fi
+
+if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
+  echo "Allocated nodes:"
+  sort -u "${PBS_NODEFILE}" || true
+fi
+
+if [ "${TRAIN_DEVICE}" = "cuda" ]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: training.device='cuda' but no visible NVIDIA GPU is available."
+    exit 1
+  fi
+fi
+
+if ! python - "${CONFIG_PATH}" <<'PY'
+import importlib
+import json
+import os
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+with config_path.open("r", encoding="utf-8") as handle:
+    config = json.load(handle)
+
+required = ["torch", "numpy", "scipy", "h5py", "tqdm", "matplotlib"]
+if str(config["training"]["data_loading"]["mode"]).lower() == "auto":
+    required.append("psutil")
+
+missing: list[str] = []
+for name in required:
+    try:
+        module = importlib.import_module(name)
+        version = getattr(module, "__version__", "unknown")
+        print(f"{name}=={version}")
+    except Exception as exc:  # pragma: no cover - batch preflight only
+        missing.append(f"{name}: {exc}")
+
+if missing:
+    print("Missing required Python packages for vulcan-emulator:", file=sys.stderr)
+    for item in missing:
+        print(f"  - {item}", file=sys.stderr)
+    raise SystemExit(1)
+
+import torch
+
+if os.environ.get("TRAIN_DEVICE") == "cuda" and not torch.cuda.is_available():
+    print(
+        "training.device='cuda' requested but torch.cuda.is_available() is False.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+then
+  echo "ERROR: Python runtime preflight failed."
+  exit 1
+fi
+
+echo "Execution control:"
+echo "  Comment out either command below if you want to run only one stage."
+echo "  --gen reruns VULCAN generation and rewrites data/processed."
+echo "  --train reuses existing processed data only if its provenance matches the current config."
+echo "Training log file: ${TRAIN_LOG}"
+: > "${TRAIN_LOG}"
+
+# Comment out this line if you want to skip generation.
+python -u src/main.py --gen --config "${CONFIG_PATH}"
+
+# Comment out this line if you want to skip training and only generate data.
+# Running this line alone will reuse existing processed data if it still matches the current config.
+python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+
+echo "Completed successfully."
+if [ -f "${RUN_DIR}/best.pt" ]; then
+  echo "Best checkpoint: ${RUN_DIR}/best.pt"
+fi
