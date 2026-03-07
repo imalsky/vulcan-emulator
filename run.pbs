@@ -36,7 +36,7 @@ CONDA_BASE="$(conda info --base)"
 # shellcheck disable=SC1090
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
-CONDA_ENV="${CONDA_ENV:-nn}"
+CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
 set +e
 conda activate "${CONDA_ENV}"
 rc=$?
@@ -46,6 +46,8 @@ if [ "${rc}" -ne 0 ]; then
   conda info --envs || true
   exit 2
 fi
+
+export VULCAN_EMULATOR_CONDA_ENV="${CONDA_ENV}"
 
 CONFIG_PATH="${CONFIG_PATH:-config/config.json}"
 TRAIN_LOG="${TRAIN_LOG:-}"

@@ -54,12 +54,13 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _enforce_nn_environment() -> None:
-    """Require the configured conda environment before any heavy imports or IO."""
+    """Require the expected conda environment before any heavy imports or IO."""
     env_name = os.environ.get("CONDA_DEFAULT_ENV")
-    if env_name != "nn":
+    expected_env = os.environ.get("VULCAN_EMULATOR_CONDA_ENV", "nn")
+    if env_name != expected_env:
         raise RuntimeError(
-            "This project must run inside conda env 'nn'. "
-            "Use: conda run -n nn python src/main.py ..."
+            f"This project must run inside conda env '{expected_env}'. "
+            f"Use: conda run -n {expected_env} python src/main.py ..."
         )
 
 
