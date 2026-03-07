@@ -12,13 +12,15 @@ from pathlib import Path
 
 import numpy as np
 
-# Prevent duplicate OpenMP runtime aborts before importing torch via src modules.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
+TESTING_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+if str(TESTING_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTING_DIR))
 
 from common import iter_split_shards
 from inference import VulcanPredictor, load_physical_space_model, physical_inputs_from_processed_arrays
@@ -27,7 +29,6 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "tiny_train_smoke.json"
 
 
 def _run(command: list[str]) -> None:
-    """Run one subprocess from the project root and fail on non-zero exit."""
     completed = subprocess.run(
         command,
         cwd=PROJECT_ROOT,
@@ -43,7 +44,6 @@ def _run(command: list[str]) -> None:
 
 
 def main() -> None:
-    """Execute the tiny end-to-end smoke pipeline and validate key artifacts."""
     if os.environ.get("CONDA_DEFAULT_ENV") != "nn":
         raise RuntimeError("Run this smoke script inside the 'nn' conda environment.")
 
@@ -96,7 +96,7 @@ def main() -> None:
         raise RuntimeError(f"Expected {expected_runs} raw runs, found {len(raw_runs)}.")
 
     model, normalization_metadata, data_contract = load_physical_space_model(run_dir)
-    seq, glb, _tgt = next(iter(iter_split_shards(processed_root=processed_root, split="test")))
+    seq, glb, _tgt, _dt = next(iter(iter_split_shards(processed_root=processed_root, split="test")))
     example = physical_inputs_from_processed_arrays(
         sequence_inputs=seq[0],
         global_inputs=glb[0],
@@ -108,11 +108,11 @@ def main() -> None:
         pressure_bar=example["pressure_bar"],
         temperature_k=example["temperature_k"],
         kzz_cm2_s=example["kzz_cm2_s"],
-        initial_ymix=example["initial_ymix"],
+        anchor_ymix=example["anchor_ymix"],
         gravity_cm_s2=example["gravity_cm_s2"],
         metallicity_log10=example["metallicity_log10"],
         c_to_o=example["c_to_o"],
-        time_s=example["time_s"],
+        dt_s=example["dt_s"],
     )
     if prediction.shape != (seq.shape[1], data_contract["target_dim"]):
         raise RuntimeError(

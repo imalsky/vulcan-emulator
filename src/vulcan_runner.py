@@ -1,4 +1,22 @@
-"""VULCAN subprocess execution and raw HDF5 run extraction."""
+"""VULCAN subprocess execution and raw trajectory extraction.
+
+Manages the lifecycle of individual VULCAN chemistry runs:
+
+1. **Preflight**: Validates the VULCAN source tree (vulcan.py, FastChem binary,
+   chem_funs.py species list) and runs a one-shot smoke test.
+2. **Worker isolation**: Each process gets its own copy of the VULCAN source
+   tree to avoid file conflicts during parallel execution.
+3. **Config generation**: Patches ``vulcan_cfg.py`` with sampled parameters
+   (P, T, Kzz, gravity, abundances, physics toggles) via regex replacement.
+4. **Execution**: Runs VULCAN as a subprocess with timeout enforcement.
+5. **Extraction**: Loads the ``.vul`` pickle output, converts number densities
+   to mixing ratios (``ymix = n_i / sum(n)``), deduplicates time steps, and
+   writes the validated trajectory into a standardized HDF5 layout.
+
+v1 physics coverage: thermochemistry + transport + optional condensation.
+Photochemistry, ion chemistry, and non-H2 atmospheric bases are excluded
+(see spec.md Section 9.4 for full feature coverage map).
+"""
 
 from __future__ import annotations
 
@@ -37,21 +55,35 @@ class BoundaryConditionSettings:
 
 
 @dataclass(frozen=True)
+class SpeciesSelection:
+    """Ordered species lists used for model state and supervised outputs."""
+
+    state_species: tuple[str, ...]
+    output_species: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WorkerSettings:
-    """Immutable worker settings shared across tasks."""
+    """Immutable worker/runtime settings shared across VULCAN tasks."""
 
     vulcan_source: str
     worker_root: str
     runs_root: str
-    target_species: tuple[str, ...]
+    species: SpeciesSelection
     use_transport: bool
     boundary_conditions: BoundaryConditionSettings | None
     use_condensation_optional: bool
     save_evo_frq: int
-    snapshots_per_run: int
     keep_vulcan_outputs_debug: bool
     run_timeout_seconds: int
     num_workers: int
+    runtime: float
+    dt_min: float
+    dt_max: float
+    count_max: int
+    trun_min: float
+    count_min: int
+    y_time_freq: int
 
 
 @dataclass(frozen=True)
@@ -66,12 +98,12 @@ _WORKER_CACHE: dict[str, Any] = {}
 
 
 def _load_available_species(vulcan_source: Path) -> list[str]:
-    """Parse the bundled VULCAN species list from chem_funs.py."""
+    """Parse the bundled VULCAN species list from ``chem_funs.py``."""
     chem_funs_path = vulcan_source / "chem_funs.py"
     if not chem_funs_path.is_file():
         raise VulcanRuntimeError(
             "VULCAN runtime is missing chem_funs.py, which is required to validate "
-            f"the configured target species: {chem_funs_path}"
+            f"configured species: {chem_funs_path}"
         )
 
     text = chem_funs_path.read_text(encoding="utf-8")
@@ -97,35 +129,37 @@ def _load_available_species(vulcan_source: Path) -> list[str]:
 
     if parsed is None:
         raise VulcanRuntimeError(
-            "Failed to parse VULCAN species list from chem_funs.py. "
-            f"Expected a top-level spec_list assignment in {chem_funs_path}."
+            "Failed to parse VULCAN species list from chem_funs.py. Expected a top-level "
+            f"spec_list assignment in {chem_funs_path}."
         )
 
-    try:
-        if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
-            raise TypeError("spec_list must be a list[str].")
-    except (TypeError, ValueError) as exc:
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
         raise VulcanRuntimeError(
             f"Invalid VULCAN species list in {chem_funs_path}; expected a list[str]."
-        ) from exc
-
+        )
     return parsed
 
 
-def validate_target_species_available(vulcan_source: Path, target_species: tuple[str, ...]) -> None:
-    """Fail fast when configured targets are not present in the bundled VULCAN network.
-
-    Args:
-        vulcan_source: Root directory of the bundled VULCAN source tree.
-        target_species: Ordered tuple of configured species names to validate.
-    """
-    available_species = set(_load_available_species(vulcan_source))
-    missing_species = [species for species in target_species if species not in available_species]
-    if missing_species:
+def validate_species_available(
+    vulcan_source: Path,
+    *,
+    state_species: tuple[str, ...],
+    output_species: tuple[str, ...],
+) -> None:
+    """Fail fast when configured species are not present in the VULCAN network."""
+    available = set(_load_available_species(vulcan_source))
+    missing_state = [species for species in state_species if species not in available]
+    missing_output = [species for species in output_species if species not in available]
+    if missing_state or missing_output:
+        parts: list[str] = []
+        if missing_state:
+            parts.append(f"state_species missing={missing_state}")
+        if missing_output:
+            parts.append(f"output_species missing={missing_output}")
+        joined = "; ".join(parts)
         raise VulcanRuntimeError(
-            "Configured target species are not available in the bundled VULCAN chemistry "
-            f"network: {missing_species}. Update data_spec.target_species or regenerate "
-            "VULCAN chemistry functions for a matching network."
+            "Configured species are not available in the bundled VULCAN chemistry network: "
+            f"{joined}. Update data_spec state/output species or regenerate the chemistry network."
         )
 
 
@@ -133,16 +167,7 @@ def resolve_boundary_conditions(
     config: dict[str, Any],
     vulcan_source: Path,
 ) -> BoundaryConditionSettings | None:
-    """Resolve and validate optional boundary-condition settings against the VULCAN tree.
-
-    Args:
-        config: Fully validated project configuration dictionary.
-        vulcan_source: Root directory of the VULCAN runtime tree used to validate flux files.
-
-    Returns:
-        A `BoundaryConditionSettings` instance when boundary conditions are enabled, otherwise
-        `None`.
-    """
+    """Resolve and validate optional boundary-condition settings against the VULCAN tree."""
     if not bool(config["physics_toggles"]["use_boundary_conditions"]):
         return None
 
@@ -222,15 +247,7 @@ def _run_preflight_smoke(
     use_condensation_optional: bool,
     timeout_seconds: int,
 ) -> None:
-    """Run a one-shot VULCAN smoke test inside an isolated worker copy.
-
-    Args:
-        vulcan_source: Root directory of the VULCAN runtime tree.
-        boundary_conditions: Optional resolved boundary-condition settings.
-        use_transport: Whether transport-related flags should be enabled.
-        use_condensation_optional: Whether optional condensation flags should be enabled.
-        timeout_seconds: Wall-clock timeout for the smoke run.
-    """
+    """Run a one-shot VULCAN smoke test inside an isolated worker copy."""
     preflight_spec = _build_preflight_run_spec()
 
     with tempfile.TemporaryDirectory(prefix="vulcan_preflight_") as tmpdir_name:
@@ -248,15 +265,24 @@ def _run_preflight_smoke(
             vulcan_source=str(vulcan_source),
             worker_root=str(tmpdir),
             runs_root=str(tmpdir / "runs"),
-            target_species=("H2", "He", "H2O"),
+            species=SpeciesSelection(
+                state_species=("H2", "He", "H2O"),
+                output_species=("H2", "He", "H2O"),
+            ),
             use_transport=use_transport,
             boundary_conditions=boundary_conditions,
             use_condensation_optional=use_condensation_optional,
             save_evo_frq=1,
-            snapshots_per_run=1,
             keep_vulcan_outputs_debug=False,
             run_timeout_seconds=timeout_seconds,
             num_workers=1,
+            runtime=1.0e-8,
+            dt_min=1.0e-14,
+            dt_max=1.0e-8,
+            count_max=1,
+            trun_min=0.0,
+            count_min=0,
+            y_time_freq=1,
         )
         smoke_cfg = _apply_run_config(
             baseline_cfg=baseline_cfg,
@@ -265,17 +291,7 @@ def _run_preflight_smoke(
             atm_relpath=atm_relpath,
             out_name="preflight_smoke.vul",
         )
-        smoke_overrides: dict[str, Any] = {
-            "save_evolution": False,
-            "runtime": 1.0e-8,
-            "trun_min": 0.0,
-            "count_min": 0,
-            "count_max": 1,
-            "dt_max": 1.0e-8,
-            "dt_min": 1.0e-14,
-        }
-        for key, value in smoke_overrides.items():
-            smoke_cfg = _replace_assignment(smoke_cfg, key, value)
+        smoke_cfg = _replace_assignment(smoke_cfg, "save_evolution", False)
         (worker_dir / "vulcan_cfg.py").write_text(smoke_cfg, encoding="utf-8")
 
         try:
@@ -353,14 +369,14 @@ def preflight_vulcan_source(
 
 
 def _py_literal(value: Any) -> str:
-    """Render one Python literal exactly as it should appear in `vulcan_cfg.py`."""
+    """Render one Python literal exactly as it should appear in ``vulcan_cfg.py``."""
     if isinstance(value, bool):
         return "True" if value else "False"
     return repr(value)
 
 
 def _replace_assignment(text: str, key: str, value: Any) -> str:
-    """Replace one top-level assignment in a copied `vulcan_cfg.py` file."""
+    """Replace one top-level assignment in a copied ``vulcan_cfg.py`` file."""
     pattern = re.compile(rf"^(\s*{re.escape(key)}\s*=).*$", re.MULTILINE)
     replacement = rf"\1 {_py_literal(value)}"
     replaced, count = pattern.subn(replacement, text)
@@ -425,7 +441,6 @@ def _apply_run_config(
 ) -> str:
     """Apply one sampled run configuration to the copied VULCAN config template."""
     cfg = baseline_cfg
-
     replacements: dict[str, Any] = {
         "use_photo": False,
         "use_ion": False,
@@ -439,7 +454,13 @@ def _apply_run_config(
         "output_humanread": False,
         "save_evolution": True,
         "save_evo_frq": int(settings.save_evo_frq),
-        "y_time_freq": 1,
+        "y_time_freq": int(settings.y_time_freq),
+        "runtime": float(settings.runtime),
+        "dt_min": float(settings.dt_min),
+        "dt_max": float(settings.dt_max),
+        "count_max": int(settings.count_max),
+        "trun_min": float(settings.trun_min),
+        "count_min": int(settings.count_min),
         "atm_type": "file",
         "Kzz_prof": "file",
         "atm_file": atm_relpath,
@@ -477,43 +498,34 @@ def _apply_run_config(
 
     for key, value in replacements.items():
         cfg = _replace_assignment(cfg, key, value)
-
     return cfg
 
 
-def _nearest_indices(sorted_times: np.ndarray, queries: np.ndarray) -> np.ndarray:
-    """Map query times to the nearest available saved VULCAN evolution times."""
-    idx = np.searchsorted(sorted_times, queries, side="left")
-    idx = np.clip(idx, 0, sorted_times.size - 1)
+def _deduplicate_strictly_increasing(
+    times: np.ndarray,
+    states: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the first state and subsequent strictly increasing saved times only."""
+    if times.ndim != 1 or states.ndim != 3:
+        raise VulcanRuntimeError("Invalid trajectory ranks in VULCAN output.")
+    if states.shape[0] != times.size:
+        raise VulcanRuntimeError("Trajectory time/state length mismatch in VULCAN output.")
 
-    prev_idx = np.maximum(idx - 1, 0)
-    choose_prev = np.abs(sorted_times[prev_idx] - queries) < np.abs(sorted_times[idx] - queries)
-    idx[choose_prev] = prev_idx[choose_prev]
-    return idx
+    keep_indices = [0]
+    last_time = float(times[0])
+    for idx in range(1, times.size):
+        candidate = float(times[idx])
+        if candidate > last_time:
+            keep_indices.append(idx)
+            last_time = candidate
+    keep = np.asarray(keep_indices, dtype=np.int64)
+    return times[keep], states[keep]
 
 
-def _extract_run_payload(
-    output_file: Path, run_spec: RunSpec, settings: WorkerSettings
-) -> dict[str, Any]:
-    """Extract and validate the payload needed for one raw HDF5 run.
-
-    Args:
-        output_file: Pickled `.vul` output file produced by VULCAN.
-        run_spec: Original sampled run specification used to drive the run.
-        settings: Worker/runtime settings controlling species selection and snapshot count.
-
-    Returns:
-        Dictionary containing:
-        - `pressure_bar`, `temperature_k`, `kzz_cm2_s`: shape `[nz]`, dtype `float64`
-        - `initial_ymix`: shape `[nz, target_species]`, dtype `float64`
-        - `query_time_s`: shape `[snapshots]`, dtype `float64`
-        - `target_ymix`: shape `[snapshots, nz, target_species]`, dtype `float64`
-        - `target_species`: ordered `list[str]`
-    """
-    # TRUST ASSUMPTION: .vul files are produced by our controlled VULCAN subprocess
-    # in isolated worker directories. They are never loaded from external/untrusted sources.
+def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerSettings) -> dict[str, Any]:
+    """Extract the raw full-trajectory payload required by the transition-model pipeline."""
     with output_file.open("rb") as handle:
-        data = pickle.load(handle)  # noqa: S301
+        data = pickle.load(handle)  # noqa: S301 - trusted, self-generated VULCAN artifact
 
     variable = data.get("variable")
     if not isinstance(variable, dict):
@@ -523,17 +535,23 @@ def _extract_run_payload(
     if not species:
         raise VulcanRuntimeError("Invalid .vul structure: missing species list.")
 
-    target_species = list(settings.target_species)
-    missing_species = [sp for sp in target_species if sp not in species]
-    if missing_species:
+    state_species = list(settings.species.state_species)
+    output_species = list(settings.species.output_species)
+    missing_state = [sp for sp in state_species if sp not in species]
+    missing_output = [sp for sp in output_species if sp not in species]
+    if missing_state or missing_output:
+        parts: list[str] = []
+        if missing_state:
+            parts.append(f"state_species={missing_state}")
+        if missing_output:
+            parts.append(f"output_species={missing_output}")
         raise VulcanRuntimeError(
-            f"Configured target species missing in run {run_spec.run_id}: {missing_species}"
+            f"Configured species missing in run {run_spec.run_id}: {'; '.join(parts)}"
         )
 
     y_ini = np.asarray(variable.get("y_ini"), dtype=np.float64)
     y_time = np.asarray(variable.get("y_time"), dtype=np.float64)
     t_time = np.asarray(variable.get("t_time"), dtype=np.float64)
-
     if y_ini.ndim != 2:
         raise VulcanRuntimeError("Invalid y_ini shape in .vul output.")
     if y_time.ndim != 3 or t_time.ndim != 1:
@@ -542,111 +560,99 @@ def _extract_run_payload(
         )
     if y_time.shape[0] != t_time.shape[0]:
         raise VulcanRuntimeError("Inconsistent y_time/t_time lengths in .vul output.")
+    if y_ini.shape[0] != run_spec.pressure_bar.size:
+        raise VulcanRuntimeError("y_ini vertical dimension does not match the sampled atmosphere.")
+    if y_ini.shape[1] != len(species):
+        raise VulcanRuntimeError("y_ini species dimension does not match the VULCAN species list.")
+    if y_time.shape[1:] != y_ini.shape:
+        raise VulcanRuntimeError("y_time state shape does not match y_ini shape.")
 
-    y_states = np.concatenate([y_ini[None, ...], y_time], axis=0)
+    states = np.concatenate([y_ini[None, ...], y_time], axis=0)
     times = np.concatenate([np.array([0.0], dtype=np.float64), t_time], axis=0)
-
-    row_sums = np.sum(y_states, axis=2, keepdims=True)
-    if np.any(row_sums <= 0.0):
-        raise VulcanRuntimeError("Non-positive total number density encountered in y states.")
-
-    ymix_states = y_states / row_sums
-
-    target_idx = np.array([species.index(sp) for sp in target_species], dtype=np.int64)
-    initial_ymix = np.take(ymix_states[0], target_idx, axis=1)
-
-    positive_mask = times > 0.0
-    positive_times = times[positive_mask]
-    if positive_times.size == 0:
-        raise VulcanRuntimeError("No positive evolution times available for log10 snapshots.")
-
-    n_snap = int(settings.snapshots_per_run)
-    if positive_times.size == 1:
-        query_times = np.repeat(positive_times[0], n_snap)
-    else:
-        query_times = np.logspace(
-            np.log10(float(np.min(positive_times))),
-            np.log10(float(np.max(positive_times))),
-            n_snap,
-            dtype=np.float64,
+    times, states = _deduplicate_strictly_increasing(times, states)
+    if times.size < 2:
+        raise VulcanRuntimeError(
+            "VULCAN output does not contain at least one positive saved time after deduplication."
         )
+    if float(times[0]) != 0.0:
+        raise VulcanRuntimeError("Extracted trajectory must start at t=0.")
 
-    selected_idx = _nearest_indices(times, query_times)
-    target_ymix = np.take(ymix_states[selected_idx], target_idx, axis=2)
+    row_sums = np.sum(states, axis=2, keepdims=True)
+    if np.any(~np.isfinite(row_sums)) or np.any(row_sums <= 0.0):
+        raise VulcanRuntimeError("Encountered non-positive or non-finite total number density.")
+    ymix = states / row_sums
 
-    arrays = [
+    state_indices = np.asarray([species.index(sp) for sp in state_species], dtype=np.int64)
+    output_indices = np.asarray([species.index(sp) for sp in output_species], dtype=np.int64)
+    ymix_state = np.take(ymix, state_indices, axis=2)
+    ymix_output = np.take(ymix, output_indices, axis=2)
+
+    arrays_to_check = [
         run_spec.pressure_bar,
         run_spec.temperature_k,
         run_spec.kzz_cm2_s,
-        initial_ymix,
-        query_times,
-        target_ymix,
+        times,
+        ymix_state,
+        ymix_output,
     ]
-    if any(np.any(~np.isfinite(arr)) for arr in arrays):
+    if any(np.any(~np.isfinite(array)) for array in arrays_to_check):
         raise VulcanRuntimeError("Non-finite values detected in extracted run payload.")
 
     return {
-        "pressure_bar": run_spec.pressure_bar.astype(np.float64),
-        "temperature_k": run_spec.temperature_k.astype(np.float64),
-        "kzz_cm2_s": run_spec.kzz_cm2_s.astype(np.float64),
-        "initial_ymix": initial_ymix.astype(np.float64),
-        "query_time_s": query_times.astype(np.float64),
-        "target_ymix": target_ymix.astype(np.float64),
-        "target_species": target_species,
+        "pressure_bar": np.asarray(run_spec.pressure_bar, dtype=np.float64),
+        "temperature_k": np.asarray(run_spec.temperature_k, dtype=np.float64),
+        "kzz_cm2_s": np.asarray(run_spec.kzz_cm2_s, dtype=np.float64),
+        "time_s": np.asarray(times, dtype=np.float64),
+        "ymix_state": np.asarray(ymix_state, dtype=np.float64),
+        "ymix_output": np.asarray(ymix_output, dtype=np.float64),
+        "state_species": state_species,
+        "output_species": output_species,
     }
 
 
 def _write_run_hdf5(run_path: Path, run_spec: RunSpec, payload: dict[str, Any]) -> None:
-    """Persist one extracted run payload into the raw HDF5 contract layout.
-
-    Args:
-        run_path: Destination HDF5 path for the raw run artifact.
-        run_spec: Original sampled run specification.
-        payload: Extracted payload dictionary returned by `_extract_run_payload`.
-    """
+    """Persist one extracted full trajectory into the raw HDF5 contract layout."""
     run_path.parent.mkdir(parents=True, exist_ok=True)
     str_dtype = h5py.string_dtype(encoding="utf-8")
 
     with h5py.File(run_path, "w") as handle:
         handle.attrs["run_id"] = int(run_spec.run_id)
 
-        group_inputs = handle.create_group("inputs")
-        group_inputs.create_dataset("pressure_bar", data=payload["pressure_bar"])
-        group_inputs.create_dataset("temperature_k", data=payload["temperature_k"])
-        group_inputs.create_dataset("kzz_cm2_s", data=payload["kzz_cm2_s"])
-        group_inputs.create_dataset("initial_ymix", data=payload["initial_ymix"])
-        group_inputs.create_dataset(
-            "target_species", data=np.asarray(payload["target_species"], dtype=str_dtype)
+        inputs = handle.create_group("inputs")
+        inputs.create_dataset("pressure_bar", data=payload["pressure_bar"])
+        inputs.create_dataset("temperature_k", data=payload["temperature_k"])
+        inputs.create_dataset("kzz_cm2_s", data=payload["kzz_cm2_s"])
+        inputs.create_dataset(
+            "state_species",
+            data=np.asarray(payload["state_species"], dtype=str_dtype),
+        )
+        inputs.create_dataset(
+            "output_species",
+            data=np.asarray(payload["output_species"], dtype=str_dtype),
         )
 
-        group_globals = handle.create_group("globals")
-        group_globals.create_dataset("gravity_cm_s2", data=np.float64(run_spec.gravity_cm_s2))
-        group_globals.create_dataset(
-            "metallicity_log10", data=np.float64(run_spec.metallicity_log10)
+        globals_group = handle.create_group("globals")
+        globals_group.create_dataset("gravity_cm_s2", data=np.float64(run_spec.gravity_cm_s2))
+        globals_group.create_dataset(
+            "metallicity_log10",
+            data=np.float64(run_spec.metallicity_log10),
         )
-        group_globals.create_dataset("c_to_o", data=np.float64(run_spec.c_to_o))
+        globals_group.create_dataset("c_to_o", data=np.float64(run_spec.c_to_o))
 
-        group_targets = handle.create_group("targets")
-        group_targets.create_dataset("time_s", data=payload["query_time_s"])
-        group_targets.create_dataset("ymix", data=payload["target_ymix"])
+        trajectory = handle.create_group("trajectory")
+        trajectory.create_dataset("time_s", data=payload["time_s"])
+        trajectory.create_dataset("ymix_state", data=payload["ymix_state"])
+        trajectory.create_dataset("ymix_output", data=payload["ymix_output"])
 
-        group_sampler = handle.create_group("sampler")
+        sampler = handle.create_group("sampler")
         for key, value in run_spec.tp_params.items():
-            group_sampler.create_dataset(f"tp_{key}", data=np.float64(value))
+            sampler.create_dataset(f"tp_{key}", data=np.float64(value))
         for key, value in run_spec.kzz_params.items():
-            group_sampler.create_dataset(f"kzz_{key}", data=np.float64(value))
+            sampler.create_dataset(f"kzz_{key}", data=np.float64(value))
 
 
 def _run_single(spec: RunSpec, settings: WorkerSettings) -> RunResult:
-    """Execute one sampled VULCAN run end-to-end inside one worker copy.
-
-    Args:
-        spec: One sampled run specification.
-        settings: Shared worker/runtime settings.
-
-    Returns:
-        `RunResult` containing the run id and the written raw HDF5 artifact path.
-    """
+    """Execute one sampled VULCAN run end-to-end inside one worker copy."""
     context = _ensure_worker_context(settings)
     worker_dir: Path = context["worker_dir"]
     baseline_cfg: str = context["baseline_cfg_text"]
@@ -668,10 +674,9 @@ def _run_single(spec: RunSpec, settings: WorkerSettings) -> RunResult:
     )
     (worker_dir / "vulcan_cfg.py").write_text(cfg_text, encoding="utf-8")
 
-    cmd = [sys.executable, "vulcan.py", "-n"]
     try:
         completed = subprocess.run(
-            cmd,
+            [sys.executable, "vulcan.py", "-n"],
             cwd=worker_dir,
             text=True,
             capture_output=True,
@@ -696,9 +701,7 @@ def _run_single(spec: RunSpec, settings: WorkerSettings) -> RunResult:
         raise VulcanRuntimeError(f"Expected VULCAN output file not found: {output_file}")
 
     payload = _extract_run_payload(output_file, spec, settings)
-
-    runs_root = Path(settings.runs_root)
-    run_file = runs_root / f"run_{spec.run_id:06d}.h5"
+    run_file = Path(settings.runs_root) / f"run_{spec.run_id:06d}.h5"
     _write_run_hdf5(run_file, spec, payload)
 
     if not settings.keep_vulcan_outputs_debug:
@@ -712,44 +715,35 @@ def run_vulcan_jobs(
     *,
     settings: WorkerSettings,
 ) -> list[RunResult]:
-    """Run all VULCAN jobs with fail-fast policy.
-
-    Args:
-        run_specs: Sampled run specifications to execute.
-        settings: Shared worker/runtime settings.
-
-    Returns:
-        Sorted list of `RunResult` records, one per successful run.
-
-    Any run failure aborts the full generation action.
-    """
+    """Run all VULCAN jobs with fail-fast policy."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     if not run_specs:
         raise VulcanRuntimeError("No run specs provided to VULCAN runner.")
+    if int(settings.num_workers) <= 0:
+        raise VulcanRuntimeError("settings.num_workers must be > 0.")
 
     runs_root = Path(settings.runs_root)
     runs_root.mkdir(parents=True, exist_ok=True)
 
     results: list[RunResult] = []
-    num_workers = int(settings.num_workers)
-    if num_workers <= 0:
-        raise VulcanRuntimeError("settings.num_workers must be > 0.")
-
     try:
-        if num_workers == 1:
+        if int(settings.num_workers) == 1:
             for spec in tqdm(run_specs, desc="VULCAN runs", unit="run"):
                 results.append(_run_single(spec, settings))
             return sorted(results, key=lambda item: item.run_id)
 
-        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+        with ProcessPoolExecutor(max_workers=int(settings.num_workers)) as pool:
             futures = {pool.submit(_run_single, spec, settings): spec.run_id for spec in run_specs}
             try:
                 for future in tqdm(
-                    as_completed(futures), total=len(futures), desc="VULCAN runs", unit="run"
+                    as_completed(futures),
+                    total=len(futures),
+                    desc="VULCAN runs",
+                    unit="run",
                 ):
                     results.append(future.result())
-            except Exception as exc:  # fail fast: cancel pending
+            except Exception as exc:
                 for pending in futures:
                     pending.cancel()
                 raise VulcanRuntimeError(
@@ -764,7 +758,6 @@ def _cleanup_worker_dirs(settings: WorkerSettings) -> None:
     """Remove copied worker trees unless debug retention is enabled."""
     if settings.keep_vulcan_outputs_debug:
         return
-
     _WORKER_CACHE.clear()
     worker_root = Path(settings.worker_root)
     if not worker_root.is_dir():

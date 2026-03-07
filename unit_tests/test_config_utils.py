@@ -24,7 +24,6 @@ BASE_CONFIG_PATH = PROJECT_ROOT / "config" / "tiny_train_smoke.json"
 
 
 def _load_base_config() -> dict[str, Any]:
-    """Load the shipped tiny smoke configuration used by unit tests."""
     with BASE_CONFIG_PATH.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -35,7 +34,6 @@ class ConfigUtilsTests(unittest.TestCase):
     def test_shipped_smoke_config_loads_and_resolves_precision(self) -> None:
         config = load_and_validate_config(BASE_CONFIG_PATH)
         precision = resolve_precision(config)
-
         self.assertEqual(precision.input_dtype, torch.float32)
         self.assertEqual(precision.stats_dtype, torch.float32)
         self.assertEqual(precision.model_dtype, torch.float32)
@@ -49,7 +47,6 @@ class ConfigUtilsTests(unittest.TestCase):
         config = deepcopy(_load_base_config())
         config["training"]["use_amp"] = True
         config["precision"]["amp_autocast_dtype"] = "float16"
-
         with self.assertRaisesRegex(
             ConfigValidationError,
             "training.use_amp=true requires training.device='cuda'",
@@ -59,11 +56,9 @@ class ConfigUtilsTests(unittest.TestCase):
     def test_load_and_validate_config_rejects_absolute_logs_path(self) -> None:
         config = deepcopy(_load_base_config())
         config["paths"]["logs_root"] = "/tmp/absolute_logs"
-
         with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
-
             with self.assertRaisesRegex(
                 ConfigValidationError,
                 "paths.logs_root must be relative",

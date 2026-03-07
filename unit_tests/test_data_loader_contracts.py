@@ -22,25 +22,24 @@ from data_loader import DataLoadingConfig, DataLoadingError, build_training_load
 
 
 def _write_processed_split(split_dir: Path) -> dict[str, Any]:
-    """Write a small valid processed split for loader unit tests."""
     sequence_shards = [
         np.array(
             [
-                [[1.0, 10.0, 100.0, 0.1], [2.0, 20.0, 200.0, 0.2]],
-                [[3.0, 30.0, 300.0, 0.3], [4.0, 40.0, 400.0, 0.4]],
+                [[1.0, 10.0, 100.0, 0.1, 0.2], [2.0, 20.0, 200.0, 0.2, 0.3]],
+                [[3.0, 30.0, 300.0, 0.3, 0.4], [4.0, 40.0, 400.0, 0.4, 0.5]],
             ],
             dtype=np.float32,
         ),
         np.array(
             [
-                [[5.0, 50.0, 500.0, 0.5], [6.0, 60.0, 600.0, 0.6]],
+                [[5.0, 50.0, 500.0, 0.5, 0.6], [6.0, 60.0, 600.0, 0.6, 0.7]],
             ],
             dtype=np.float32,
         ),
     ]
     global_shards = [
-        np.array([[1.0, 0.1, 0.5], [2.0, 0.2, 0.6]], dtype=np.float32),
-        np.array([[3.0, 0.3, 0.7]], dtype=np.float32),
+        np.array([[1.0, 0.1, 0.5, -1.0], [2.0, 0.2, 0.6, 0.0]], dtype=np.float32),
+        np.array([[3.0, 0.3, 0.7, 1.0]], dtype=np.float32),
     ]
     target_shards = [
         np.array(
@@ -57,48 +56,60 @@ def _write_processed_split(split_dir: Path) -> dict[str, Any]:
             dtype=np.float32,
         ),
     ]
+    dt_shards = [
+        np.array([1.0e1, 1.0e2], dtype=np.float32),
+        np.array([1.0e3], dtype=np.float32),
+    ]
 
     seq_dir = split_dir / "sequence_inputs"
     glb_dir = split_dir / "globals"
     tgt_dir = split_dir / "targets"
-    for directory in (seq_dir, glb_dir, tgt_dir):
+    dt_dir = split_dir / "dt_s"
+    for directory in (seq_dir, glb_dir, tgt_dir, dt_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    for shard_idx, (seq, glb, tgt) in enumerate(
-        zip(sequence_shards, global_shards, target_shards, strict=True)
+    for shard_idx, (seq, glb, tgt, dt) in enumerate(
+        zip(sequence_shards, global_shards, target_shards, dt_shards, strict=True)
     ):
         np.save(seq_dir / f"shard_{shard_idx:05d}.npy", seq, allow_pickle=False)
         np.save(glb_dir / f"shard_{shard_idx:05d}.npy", glb, allow_pickle=False)
         np.save(tgt_dir / f"shard_{shard_idx:05d}.npy", tgt, allow_pickle=False)
+        np.save(dt_dir / f"shard_{shard_idx:05d}.npy", dt, allow_pickle=False)
 
     metadata = {
         "split": "train",
         "num_shards": 2,
         "sequence_length": 2,
-        "input_dim": 4,
-        "global_dim": 3,
+        "input_dim": 5,
+        "global_dim": 4,
         "target_dim": 2,
+        "state_dim": 2,
         "total_samples": 3,
         "sequence_feature_order": [
             "pressure_bar",
             "temperature_k",
             "kzz_cm2_s",
-            "initial_ymix:H2",
+            "anchor_ymix:H2",
+            "anchor_ymix:He",
         ],
         "global_feature_order": [
             "gravity_cm_s2",
             "metallicity_log10",
             "c_to_o",
+            "log10_dt_s",
         ],
-        "target_species_order": ["H2", "He"],
+        "state_species_order": ["H2", "He"],
+        "output_species_order": ["H2", "He"],
+        "output_from_state_indices": [0, 1],
         "normalization_fingerprint": "a" * 64,
+        "dt_min_s": 1.0e1,
+        "dt_max_s": 1.0e3,
     }
     (split_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     return metadata
 
 
 def _loading_config(mode: str) -> DataLoadingConfig:
-    """Build a small deterministic loading policy for unit tests."""
     return DataLoadingConfig(
         mode=mode,
         max_cached_shards=2,
@@ -116,9 +127,8 @@ class DataLoaderContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ve_loader_meta_") as tmpdir_name:
             split_dir = Path(tmpdir_name) / "train"
             metadata = _write_processed_split(split_dir)
-            metadata["input_dim"] = 5
+            metadata["input_dim"] = 6
             (split_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-
             with self.assertRaisesRegex(
                 DataLoadingError,
                 "Invalid sequence feature order length",
@@ -129,7 +139,6 @@ class DataLoaderContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ve_loader_ram_") as tmpdir_name:
             split_dir = Path(tmpdir_name) / "train"
             metadata = _write_processed_split(split_dir)
-
             loader, loaded_metadata = build_training_loader(
                 split_dir=split_dir,
                 batch_size=2,
@@ -141,23 +150,23 @@ class DataLoaderContractTests(unittest.TestCase):
                 target_dtype=torch.float64,
                 loading=_loading_config("ram"),
             )
-
-            seq, glb, tgt, mask = next(iter(loader))
+            seq, glb, tgt, mask, dt = next(iter(loader))
             self.assertEqual(loaded_metadata["total_samples"], metadata["total_samples"])
-            self.assertEqual(tuple(seq.shape), (2, 2, 4))
-            self.assertEqual(tuple(glb.shape), (2, 3))
+            self.assertEqual(tuple(seq.shape), (2, 2, 5))
+            self.assertEqual(tuple(glb.shape), (2, 4))
             self.assertEqual(tuple(tgt.shape), (2, 2, 2))
             self.assertEqual(tuple(mask.shape), (2, 2))
+            self.assertEqual(tuple(dt.shape), (2,))
             self.assertEqual(seq.dtype, torch.float32)
             self.assertEqual(glb.dtype, torch.float32)
             self.assertEqual(tgt.dtype, torch.float64)
             self.assertEqual(mask.dtype, torch.bool)
+            self.assertEqual(dt.dtype, torch.float64)
 
     def test_build_training_loader_disk_emits_expected_batch_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ve_loader_disk_") as tmpdir_name:
             split_dir = Path(tmpdir_name) / "train"
             _write_processed_split(split_dir)
-
             loader, _metadata = build_training_loader(
                 split_dir=split_dir,
                 batch_size=2,
@@ -169,16 +178,15 @@ class DataLoaderContractTests(unittest.TestCase):
                 target_dtype=torch.float32,
                 loading=_loading_config("disk"),
             )
-
             total_samples = 0
-            for seq, glb, tgt, mask in loader:
+            for seq, glb, tgt, mask, dt in loader:
                 total_samples += int(seq.shape[0])
-                self.assertEqual(tuple(seq.shape[1:]), (2, 4))
-                self.assertEqual(tuple(glb.shape[1:]), (3,))
+                self.assertEqual(tuple(seq.shape[1:]), (2, 5))
+                self.assertEqual(tuple(glb.shape[1:]), (4,))
                 self.assertEqual(tuple(tgt.shape[1:]), (2, 2))
                 self.assertEqual(tuple(mask.shape[1:]), (2,))
+                self.assertEqual(tuple(dt.shape[1:]), ())
                 self.assertEqual(mask.dtype, torch.bool)
-
             self.assertEqual(total_samples, 3)
 
 

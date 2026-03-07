@@ -1,4 +1,14 @@
-"""Artifact provenance helpers for generated and processed VULCAN datasets."""
+"""Artifact provenance helpers for generated and processed VULCAN datasets.
+
+Ensures that processed training data stays in sync with its source config
+and raw VULCAN outputs via SHA-256 fingerprinting.  Before training begins,
+the fingerprint of the processed artifacts is recomputed and compared to
+the stored fingerprint; any mismatch (stale data, modified config, missing
+files) raises an error requiring ``--gen`` re-execution.
+
+This prevents subtle bugs from training on processed data that was generated
+under a different configuration or from a different set of raw runs.
+"""
 
 from __future__ import annotations
 
@@ -47,14 +57,17 @@ def _preprocess_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
     generation = config["generation"]
     relevant_generation = {
         "num_runs": generation["num_runs"],
-        "snapshots_per_run": generation["snapshots_per_run"],
         "split_ratios": generation["split_ratios"],
         "random_seed": generation["random_seed"],
         "shard_size": generation["shard_size"],
         "save_evo_frq": generation["save_evo_frq"],
+        "keep_vulcan_outputs_debug": generation["keep_vulcan_outputs_debug"],
+        "run_timeout_seconds": generation["run_timeout_seconds"],
     }
     return {
         "generation": relevant_generation,
+        "trajectory_sampling": config["trajectory_sampling"],
+        "vulcan_runtime": config["vulcan_runtime"],
         "tp_sampler": config["tp_sampler"],
         "gravity_sampler": config["gravity_sampler"],
         "kzz_sampler": config["kzz_sampler"],
@@ -120,22 +133,7 @@ def build_processed_fingerprint(
     summary_path: Path,
     split_metadata_paths: dict[str, Path],
 ) -> dict[str, Any]:
-    """Build the fingerprint that ties processed data back to raw inputs and config.
-
-    Args:
-        config: Fully validated project configuration dictionary.
-        project_root: Root directory used to relativize stored paths.
-        raw_run_files: Raw HDF5 run files that produced the processed dataset.
-        manifest_path: Dataset manifest JSON path.
-        split_path: Train/val/test split JSON path.
-        normalization_path: Normalization metadata JSON path.
-        summary_path: Processed-summary JSON path.
-        split_metadata_paths: Mapping from split name to per-split metadata JSON path.
-
-    Returns:
-        JSON-serializable fingerprint dictionary containing artifact metadata, the relevant config
-        hash, and raw-run file provenance.
-    """
+    """Build the fingerprint that ties processed data back to raw inputs and config."""
     raw_entries = []
     for path in raw_run_files:
         stat = path.stat()
@@ -153,7 +151,7 @@ def build_processed_fingerprint(
     }
 
     return {
-        "version": 1,
+        "version": 2,
         "config_sha256": stable_config_sha256(config),
         "manifest": _file_entry(manifest_path, project_root),
         "splits": _file_entry(split_path, project_root),
@@ -169,19 +167,9 @@ def compare_processed_fingerprints(
     expected: dict[str, Any],
     existing: dict[str, Any],
 ) -> tuple[bool, str]:
-    """Compare two processed-data fingerprints and explain the first mismatch.
-
-    Args:
-        expected: Freshly computed fingerprint dictionary for the current inputs/config.
-        existing: Fingerprint dictionary loaded from disk.
-
-    Returns:
-        Tuple `(matches, reason)` where `matches` is `True` on exact contract parity and `reason`
-        is the first detected mismatch message when `matches` is `False`.
-    """
+    """Compare two processed-data fingerprints and explain the first mismatch."""
     if existing.get("version") != expected["version"]:
         return False, "fingerprint version mismatch"
-
     if existing.get("config_sha256") != expected["config_sha256"]:
         return False, "preprocessing-relevant config differs from processed artifacts"
 
@@ -200,7 +188,6 @@ def compare_processed_fingerprints(
 
     if existing.get("raw_run_files") != expected["raw_run_files"]:
         return False, "raw run file list/size/mtime differs from processed fingerprint"
-
     return True, ""
 
 
@@ -209,16 +196,7 @@ def validate_processed_artifacts(
     config: dict[str, Any],
     paths: Any,
 ) -> dict[str, Any]:
-    """Validate processed artifacts and return the resolved provenance bundle.
-
-    Args:
-        config: Fully validated project configuration dictionary.
-        paths: Resolved path bundle exposing `root`, `data_root`, and `processed_root`.
-
-    Returns:
-        Dictionary containing the loaded manifest, expected fingerprint, key artifact paths, and
-        the resolved raw-run file list required by downstream training code.
-    """
+    """Validate processed artifacts and return the resolved provenance bundle."""
     generation = config["generation"]
     processed_root = paths.processed_root
     manifest_path = paths.data_root / str(generation["manifest_filename"])

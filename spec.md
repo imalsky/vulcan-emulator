@@ -109,6 +109,8 @@ All required keys must exist with exact type/range validation.
 
 - `paths`
 - `generation`
+- `trajectory_sampling`
+- `vulcan_runtime`
 - `tp_sampler`
 - `gravity_sampler`
 - `kzz_sampler`
@@ -135,9 +137,9 @@ Path rule for this section:
 #### `generation`
 - `num_runs` (default first milestone: `1000`)
 - `num_workers` (multiprocess CPU workers)
-- `snapshots_per_run` (default `128`)
-- `snapshot_spacing` (`log_time`)
-- `split_ratios` (`train=0.70`, `val=0.15`, `test=0.15`)
+- `save_evo_frq` (snapshot saving frequency; default `1`)
+- `y_time_freq` (time-output frequency; default `1`)
+- `split_ratios` (configurable; default `train=0.80`, `val=0.10`, `test=0.10`)
 - `random_seed`
 - `keep_vulcan_outputs_debug` (`false` default)
 - `failure_policy` (`fail_on_first_error`)
@@ -281,7 +283,27 @@ Future extension modes (not v1 default):
 - species-dependent effective mixing parameterizations
 - externally supplied dynamical Kzz profiles
 
-### 9.4 Generation Orchestration
+### 9.4 VULCAN Feature Coverage
+
+VULCAN exposes many physics toggles and configuration options. This section documents which are supported in v1 and which are deferred.
+
+**Fully supported in v1:**
+- **Varying Kzz profiles**: Kzz is a per-level sequence input. The data pipeline samples power-law profiles per run and passes the realized profile as a sequence feature, so the model learns Kzz sensitivity directly.
+- **Condensation**: Controlled via `physics_toggles.use_condensation_optional`. When enabled, VULCAN's `use_condense` and `use_settling` are activated for eligible runs during data generation. This is a fixed generation-time toggle, not a per-run FiLM conditioning variable.
+- **Transport**: Enabled by default (`use_transport=true`).
+- **Boundary conditions**: Optional support via `physics_toggles.use_boundary_conditions` and the `boundary_conditions` config section.
+- **Gravity, metallicity, C/O ratio**: Sampled per run and passed as global FiLM conditioning inputs.
+
+**Explicitly excluded in v1:**
+- **Photochemistry** (`use_photo`): Disabled. Would require stellar parameters (r_star, orbit_radius, sl_angle, sflux_file) and significantly expand the conditioning space.
+- **Ion chemistry** (`use_ion`): Disabled. Coupled to photochemistry.
+- **Stellar parameters**: Not applicable without photochemistry.
+- **Atmospheric base gas selection** (`atm_base`): v1 assumes H2-dominated atmospheres only.
+
+**Not per-run conditioned (generation-level only):**
+- **Condensation toggle**: Supported as a generation-level switch but not as a per-sample FiLM feature. Adding condensation as a per-run conditioning variable would require expanding `global_dim` and the normalization pipeline—deferred to v2.
+
+### 9.5 Generation Orchestration
 
 - Multiprocess CPU worker pool is default.
 - Each worker runs VULCAN subprocess jobs in isolated working directories.
@@ -387,7 +409,7 @@ Sequence inputs [batch, nz, input_dim]    Global inputs [batch, global_dim]
 
 - **Input projection**: Linear layer mapping `input_dim` to `d_model`.
 - **Positional encoding**: Standard sinusoidal encoding (Vaswani et al. 2017).
-- **FiLM conditioning**: Global features projected to per-channel scale (`gamma`) and shift (`beta`). Applied as `(1 + gamma) * x + beta`. Clamped for stability.
+- **FiLM conditioning**: All 4 global scalars (gravity, metallicity, C/O, log10_dt) are projected through a single MLP to produce per-channel scale (`gamma`) and shift (`beta`). Applied as `(1 + gamma) * x + beta`. Clamped for stability.
   - Initial FiLM on embeddings before the encoder stack.
   - Per-block FiLM after each transformer encoder layer.
 - **Transformer encoder layers**: Pre-norm architecture (`norm_first=True`), multi-head self-attention, GELU activation, `batch_first=True`.
@@ -423,10 +445,11 @@ Total: `global_dim = 4`
 ### 13.6 Hyperparameters
 
 All hyperparameters are config-defined. Current baseline from `config/config.json`:
-- `d_model = 128`, `nhead = 4`, `num_layers = 3`, `dim_feedforward = 512`
+- `d_model = 128`, `nhead = 8`, `num_layers = 4`, `dim_feedforward = 384`
 - `dropout = 0.0`, `film_clamp = 10.0`
-- `max_sequence_length = 120`
+- `max_sequence_length = 64`
 - `output_head_divisor = 2`
+- `conditioning_hidden_dim = 128`
 
 ## 14. Training And Inference Policy
 
@@ -490,6 +513,8 @@ Each scenario must raise explicit actionable errors.
 
 ### v2+
 - Add photochemistry/ion-chemistry toggles and expanded data generation.
+- Condensation as per-run FiLM conditioning (expand `global_dim`).
+- Atmospheric base gas selection beyond H2-dominated.
 - Preserve same core contracts: explicit config, fail-fast, no hidden fallback.
 
 ## 17. Locked Defaults And Assumptions
@@ -503,10 +528,10 @@ Each scenario must raise explicit actionable errors.
 7. `--gen` performs generation + normalization in one command
 8. Model family baseline: transformer encoder + FiLM
 9. Objective: time-conditioned full trajectory emulation
-10. Snapshot policy: `128` log-time snapshots per run
-11. Grid defaults: `nz=120`, `P_top=1e-8 bar`, `P_bottom=1e3 bar`
+10. Snapshot policy: `save_evo_frq=1`, `y_time_freq=1` (save every step)
+11. Grid defaults: configurable `nz` (e.g. 12 dev, 100+ production), `P_top=1e-8 bar`, `P_bottom=1e3 bar`
 12. Abundance sampling: metallicity + C/O enabled
-13. Split policy: run-level only, `70/15/15`
+13. Split policy: run-level only, configurable ratios (default `80/10/10`)
 14. Raw format: HDF5
 15. Processed format: NPY shards
 16. Target species list is required and explicit (top-20 editable config)

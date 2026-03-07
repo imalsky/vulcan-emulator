@@ -31,7 +31,6 @@ BASE_CONFIG_PATH = PROJECT_ROOT / "config" / "tiny_train_smoke.json"
 
 
 def _load_base_config() -> dict:
-    """Load the small smoke-test configuration used by contract tests."""
     with BASE_CONFIG_PATH.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -42,7 +41,6 @@ class ContractTests(unittest.TestCase):
     def test_missing_required_paths_key_is_rejected(self) -> None:
         config = _load_base_config()
         config["paths"].pop("logs_root")
-
         with tempfile.TemporaryDirectory(prefix="ve_cfg_") as tmpdir_name:
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -53,7 +51,6 @@ class ContractTests(unittest.TestCase):
         config = _load_base_config()
         config["physics_toggles"]["use_boundary_conditions"] = True
         config.pop("boundary_conditions", None)
-
         with tempfile.TemporaryDirectory(prefix="ve_cfg_") as tmpdir_name:
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -70,31 +67,16 @@ class ContractTests(unittest.TestCase):
             "bot_BC_flux_file": "atm/BC_bot_mars.txt",
             "use_fix_sp_bot": {},
         }
-
         with tempfile.TemporaryDirectory(prefix="ve_cfg_") as tmpdir_name:
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
             loaded = load_and_validate_config(config_path)
             with self.assertRaises(VulcanRuntimeError):
-                resolve_boundary_conditions(
-                    loaded,
-                    PROJECT_ROOT.parent / "VULCAN-master",
-                )
+                resolve_boundary_conditions(loaded, Path(tmpdir_name))
 
-    def test_missing_tp_distribution_bound_is_rejected(self) -> None:
+    def test_log10_dt_globals_cannot_use_log_based_normalization(self) -> None:
         config = _load_base_config()
-        config["tp_sampler"]["log10_gamma1"].pop("min")
-
-        with tempfile.TemporaryDirectory(prefix="ve_cfg_") as tmpdir_name:
-            config_path = Path(tmpdir_name) / "config.json"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaises(ConfigValidationError):
-                load_and_validate_config(config_path)
-
-    def test_log10_globals_cannot_use_log_based_normalization(self) -> None:
-        config = _load_base_config()
-        config["normalization"]["global_methods"]["log10_time_s"] = "log-standard"
-
+        config["normalization"]["global_methods"]["log10_dt_s"] = "log-standard"
         with tempfile.TemporaryDirectory(prefix="ve_cfg_") as tmpdir_name:
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -104,7 +86,6 @@ class ContractTests(unittest.TestCase):
     def test_invalid_processed_fingerprint_is_rejected(self) -> None:
         config = _load_base_config()
         config["paths"]["data_root"] = "data"
-
         with tempfile.TemporaryDirectory(prefix="ve_prov_") as tmpdir_name:
             root = Path(tmpdir_name)
             data_root = root / "data"
@@ -113,13 +94,30 @@ class ContractTests(unittest.TestCase):
             raw_run.parent.mkdir(parents=True, exist_ok=True)
             raw_run.write_bytes(b"stub")
 
+            split_meta = {
+                "split": "train",
+                "total_samples": 1,
+                "num_shards": 1,
+                "sequence_length": 2,
+                "input_dim": 5,
+                "global_dim": 4,
+                "target_dim": 2,
+                "state_dim": 2,
+                "sequence_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s", "anchor_ymix:H2", "anchor_ymix:He"],
+                "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
+                "state_species_order": ["H2", "He"],
+                "output_species_order": ["H2", "He"],
+                "output_from_state_indices": [0, 1],
+                "normalization_fingerprint": "a" * 64,
+                "dt_min_s": 1.0,
+                "dt_max_s": 10.0,
+            }
             for split_name in ("train", "val", "test"):
                 split_dir = processed_root / split_name
                 split_dir.mkdir(parents=True, exist_ok=True)
-                (split_dir / "metadata.json").write_text(
-                    json.dumps({"split": split_name, "ok": True}),
-                    encoding="utf-8",
-                )
+                meta = deepcopy(split_meta)
+                meta["split"] = split_name
+                (split_dir / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
 
             normalization_path = processed_root / "normalization_metadata.json"
             normalization_path.write_text(json.dumps({"epsilon": 1e-30}), encoding="utf-8")
@@ -132,16 +130,14 @@ class ContractTests(unittest.TestCase):
                         "num_runs": 1,
                         "run_files": ["data/raw/runs/run_000000.h5"],
                         "split": {"train": [0], "val": [], "test": []},
-                        "species": ["H2"],
+                        "state_species": ["H2", "He"],
+                        "output_species": ["H2", "He"],
                     }
                 ),
                 encoding="utf-8",
             )
             split_path = data_root / "splits.json"
-            split_path.write_text(
-                json.dumps({"train": [0], "val": [], "test": []}),
-                encoding="utf-8",
-            )
+            split_path.write_text(json.dumps({"train": [0], "val": [], "test": []}), encoding="utf-8")
 
             fingerprint = build_processed_fingerprint(
                 config=config,
@@ -157,10 +153,7 @@ class ContractTests(unittest.TestCase):
                 },
             )
             fingerprint["config_sha256"] = "0" * 64
-            (processed_root / PROCESSED_FINGERPRINT_FILENAME).write_text(
-                json.dumps(fingerprint),
-                encoding="utf-8",
-            )
+            (processed_root / PROCESSED_FINGERPRINT_FILENAME).write_text(json.dumps(fingerprint), encoding="utf-8")
 
             paths = SimpleNamespace(root=root, data_root=data_root, processed_root=processed_root)
             with self.assertRaises(RuntimeError):
@@ -168,45 +161,47 @@ class ContractTests(unittest.TestCase):
 
     def test_mismatched_species_order_is_rejected(self) -> None:
         config = _load_base_config()
-        species = list(config["data_spec"]["target_species"])
+        state_species = list(config["data_spec"]["state_species"])
+        output_species = list(config["data_spec"]["output_species"])
         expected_sequence_order = [
             "pressure_bar",
             "temperature_k",
             "kzz_cm2_s",
-            *[f"initial_ymix:{species_name}" for species_name in species],
+            *[f"anchor_ymix:{species_name}" for species_name in state_species],
         ]
         metadata = {
             "sequence_length": 16,
             "input_dim": 23,
             "global_dim": 4,
             "target_dim": 20,
+            "state_dim": 20,
             "sequence_feature_order": expected_sequence_order,
-            "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_time_s"],
-            "target_species_order": species,
-            "normalization_fingerprint": "abc123",
+            "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
+            "state_species_order": state_species,
+            "output_species_order": output_species,
+            "output_from_state_indices": list(range(20)),
+            "normalization_fingerprint": "a" * 64,
+            "dt_min_s": 1.0,
+            "dt_max_s": 10.0,
         }
         bad_train_meta = deepcopy(metadata)
-        bad_train_meta["target_species_order"] = [species[1], species[0], *species[2:]]
-
+        bad_train_meta["output_species_order"] = [output_species[1], output_species[0], *output_species[2:]]
         with self.assertRaises(TrainingError):
             validate_processed_split_contract(
                 config=config,
                 train_meta=bad_train_meta,
                 val_meta=metadata,
                 test_meta=metadata,
-                expected_norm_fingerprint="abc123",
+                expected_norm_fingerprint="a" * 64,
             )
 
     def test_optimizer_state_cast_helper_applies_requested_dtype(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
         optimizer = torch.optim.AdamW([parameter], lr=1.0e-3)
-
         loss = (parameter.square()).sum()
         loss.backward()
         optimizer.step()
-
         _cast_optimizer_state(optimizer, torch.float64)
-
         float_states = [
             value
             for state in optimizer.state.values()

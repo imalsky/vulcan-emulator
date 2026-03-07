@@ -10,14 +10,16 @@ from pathlib import Path
 
 import numpy as np
 
-# Prevent duplicate OpenMP runtime aborts before importing torch.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
+TESTING_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+if str(TESTING_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTING_DIR))
 
 from common import iter_split_shards
 from inference import (
@@ -26,7 +28,7 @@ from inference import (
     load_physical_space_model,
     physical_inputs_from_processed_arrays,
 )
-from model import VulcanTransformer
+from model import VulcanTransitionTransformer
 
 RUN_DIR = PROJECT_ROOT / "models" / "tiny_e2e_smoke"
 PROCESSED_ROOT = PROJECT_ROOT / "data" / "smoke" / "processed"
@@ -36,10 +38,10 @@ class InferenceTests(unittest.TestCase):
     """End-to-end inference tests for the standalone predictor wrapper."""
 
     def test_standalone_wrapper_exports_with_physical_inputs(self) -> None:
-        model = VulcanTransformer(
-            input_dim=5,
-            global_dim=4,
-            target_dim=2,
+        model = VulcanTransitionTransformer(
+            state_dim=2,
+            output_dim=2,
+            output_from_state_indices=[0, 1],
             d_model=8,
             nhead=2,
             num_layers=1,
@@ -48,6 +50,7 @@ class InferenceTests(unittest.TestCase):
             film_clamp=10.0,
             output_head_divisor=2,
             max_sequence_length=8,
+            conditioning_hidden_dim=8,
         ).eval()
         normalization_metadata = {
             "epsilon": 1e-30,
@@ -55,13 +58,13 @@ class InferenceTests(unittest.TestCase):
                 "pressure_bar": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
                 "temperature_k": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
                 "kzz_cm2_s": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
-                "initial_ymix": {"method": "none", "mean": [0.0, 0.0], "std": [1.0, 1.0], "min": [0.0, 0.0], "max": [1.0, 1.0]},
+                "anchor_ymix": {"method": "none", "mean": [0.0, 0.0], "std": [1.0, 1.0], "min": [0.0, 0.0], "max": [1.0, 1.0]},
             },
             "globals": {
                 "gravity_cm_s2": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
                 "metallicity_log10": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
                 "c_to_o": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
-                "log10_time_s": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
+                "log10_dt_s": {"method": "none", "mean": [0.0], "std": [1.0], "min": [0.0], "max": [1.0]},
             },
             "targets": {
                 "ymix": {"method": "none", "mean": [0.0, 0.0], "std": [1.0, 1.0], "min": [0.0, 0.0], "max": [1.0, 1.0]},
@@ -72,15 +75,18 @@ class InferenceTests(unittest.TestCase):
             "input_dim": 5,
             "global_dim": 4,
             "target_dim": 2,
+            "state_dim": 2,
             "sequence_feature_order": [
                 "pressure_bar",
                 "temperature_k",
                 "kzz_cm2_s",
-                "initial_ymix:H2",
-                "initial_ymix:He",
+                "anchor_ymix:H2",
+                "anchor_ymix:He",
             ],
-            "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_time_s"],
-            "target_species_order": ["H2", "He"],
+            "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
+            "state_species_order": ["H2", "He"],
+            "output_species_order": ["H2", "He"],
+            "output_from_state_indices": [0, 1],
             "normalization_fingerprint": "synthetic",
         }
         wrapper = PhysicalSpaceStandaloneModel(
@@ -98,7 +104,6 @@ class InferenceTests(unittest.TestCase):
             torch.tensor([0.5], dtype=torch.float32),
             torch.tensor([1.0e3], dtype=torch.float32),
         )
-
         with torch.inference_mode():
             exported = torch.export.export(wrapper, args=example_inputs, strict=True)
             reference = wrapper(*example_inputs)
@@ -110,9 +115,8 @@ class InferenceTests(unittest.TestCase):
     def test_predictor_returns_finite_physical_outputs(self) -> None:
         if not (RUN_DIR / "data_contract.json").is_file():
             self.skipTest("Run testing/smoke_pipeline.py to create the tiny_e2e_smoke artifacts first.")
-
         model, normalization_metadata, data_contract = load_physical_space_model(RUN_DIR)
-        seq, glb, _tgt = next(iter(iter_split_shards(processed_root=PROCESSED_ROOT, split="test")))
+        seq, glb, _tgt, _dt = next(iter(iter_split_shards(processed_root=PROCESSED_ROOT, split="test")))
         example = physical_inputs_from_processed_arrays(
             sequence_inputs=seq[0],
             global_inputs=glb[0],
@@ -124,13 +128,12 @@ class InferenceTests(unittest.TestCase):
             pressure_bar=example["pressure_bar"],
             temperature_k=example["temperature_k"],
             kzz_cm2_s=example["kzz_cm2_s"],
-            initial_ymix=example["initial_ymix"],
+            anchor_ymix=example["anchor_ymix"],
             gravity_cm_s2=example["gravity_cm_s2"],
             metallicity_log10=example["metallicity_log10"],
             c_to_o=example["c_to_o"],
-            time_s=example["time_s"],
+            dt_s=example["dt_s"],
         )
-
         self.assertEqual(prediction.shape, (seq.shape[1], data_contract["target_dim"]))
         self.assertTrue(np.isfinite(prediction).all())
         self.assertEqual(len(model.target_species), data_contract["target_dim"])

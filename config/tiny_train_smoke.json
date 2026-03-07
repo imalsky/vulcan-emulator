@@ -9,8 +9,6 @@
   "generation": {
     "num_runs": 8,
     "num_workers": 1,
-    "snapshots_per_run": 8,
-    "snapshot_spacing": "log_time",
     "split_ratios": {
       "train": 0.5,
       "val": 0.25,
@@ -22,10 +20,28 @@
     "run_timeout_seconds": 900,
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",
-    "shard_size": 8,
+    "shard_size": 64,
     "worker_root": "data/smoke/raw/_workers",
     "runs_root": "data/smoke/raw/runs",
     "save_evo_frq": 1
+  },
+  "trajectory_sampling": {
+    "pairs_per_run": 64,
+    "requested_dt_min_s": 1e-06,
+    "requested_dt_max_s": 1e+12,
+    "requested_dt_spacing": "log_uniform",
+    "allow_anchor_at_t0": true,
+    "min_future_saved_steps": 1,
+    "rollout_eval_points": 6
+  },
+  "vulcan_runtime": {
+    "runtime": 1e+12,
+    "dt_min": 1e-14,
+    "dt_max": 1e+10,
+    "count_max": 100000,
+    "trun_min": 0.0,
+    "count_min": 0,
+    "y_time_freq": 1
   },
   "tp_sampler": {
     "pressure_grid": {
@@ -121,43 +137,18 @@
     "use_condensation_optional": true
   },
   "data_spec": {
-    "target_species": [
-      "H2",
-      "He",
-      "H",
-      "H2O",
-      "CH4",
-      "CO",
-      "CO2",
-      "NH3",
-      "HCN",
-      "C2H2",
-      "N2",
-      "OH",
-      "O",
-      "NO",
-      "NO2",
-      "O2",
-      "H2CO",
-      "CH3OH",
-      "C2H4",
-      "C2H6"
+    "state_species": [
+      "H2", "He", "H", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "C2H2",
+      "N2", "OH", "O", "NO", "NO2", "O2", "H2CO", "CH3OH", "C2H4", "C2H6"
     ],
-    "required_input_profiles": [
-      "pressure_bar",
-      "temperature_k",
-      "kzz_cm2_s"
+    "output_species": [
+      "H2", "He", "H", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "C2H2",
+      "N2", "OH", "O", "NO", "NO2", "O2", "H2CO", "CH3OH", "C2H4", "C2H6"
     ],
-    "required_global_inputs": [
-      "gravity_cm_s2",
-      "metallicity_log10",
-      "c_to_o",
-      "log10_time_s"
-    ],
-    "required_state_inputs": [
-      "initial_ymix"
-    ],
-    "time_input_transform": "log10_time_seconds",
+    "required_input_profiles": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
+    "required_global_inputs": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
+    "required_state_inputs": ["anchor_ymix"],
+    "time_input_transform": "log10_dt_seconds",
     "strict_non_finite": true
   },
   "normalization": {
@@ -166,13 +157,13 @@
       "pressure_bar": "log-min-max",
       "temperature_k": "standard",
       "kzz_cm2_s": "log-standard",
-      "initial_ymix": "log-standard"
+      "anchor_ymix": "log-standard"
     },
     "global_methods": {
       "gravity_cm_s2": "log-standard",
       "metallicity_log10": "standard",
       "c_to_o": "standard",
-      "log10_time_s": "standard"
+      "log10_dt_s": "standard"
     },
     "target_method": "log-standard"
   },
@@ -188,7 +179,7 @@
   "training": {
     "device": "cpu",
     "gpu_preload": false,
-    "batch_size": 4,
+    "batch_size": 8,
     "epochs": 2,
     "learning_rate": 0.0005,
     "min_lr": 1e-05,
@@ -214,7 +205,8 @@
       "dropout": 0.0,
       "film_clamp": 10.0,
       "output_head_divisor": 2,
-      "max_sequence_length": 64
+      "max_sequence_length": 64,
+      "conditioning_hidden_dim": 32
     },
     "output_folder": "tiny_e2e_smoke"
   }
