@@ -1,4 +1,19 @@
-"""Sampling utilities for TP, Kzz, abundance, and run specifications."""
+"""Sampling utilities for TP, Kzz, abundance, and run specifications.
+
+Generates the physical parameter space for VULCAN training data:
+
+- **TP profiles**: Modified Line-2013 parameterization with configurable
+  opacity, gamma factors, internal/irradiation temperatures, and optional
+  convective adjustment.
+- **Kzz profiles**: Power-law family ``Kzz(p) = Kzz_1bar * p^(-beta)``
+  with configurable floor and cap.
+- **Abundances**: Metallicity (log-uniform) + C/O ratio sampling, with
+  elemental abundances derived from scaled solar values.
+- **Gravity**: Uniform or fixed surface gravity.
+
+All sampling distributions and ranges are config-driven.  Rejection sampling
+handles TP profiles that violate physical temperature bounds.
+"""
 
 from __future__ import annotations
 
@@ -66,7 +81,22 @@ def build_pressure_grid(tp_cfg: dict[str, Any]) -> np.ndarray:
 
 
 def _xi_gamma(gamma: float, tau: np.ndarray) -> np.ndarray:
-    """Evaluate the Line-style irradiation helper for one optical-depth profile."""
+    """Evaluate the Line-2013 irradiation integral for one gamma channel.
+
+    Computes xi(gamma, tau) = 2/3 + 2/(3*gamma) * [1 + (gamma*tau/2 - 1)*exp(-gamma*tau)]
+                              + 2*gamma/3 * (1 - tau^2/2) * E_2(gamma*tau)
+
+    where E_2 is the second-order exponential integral.  This describes how
+    stellar irradiation penetrates the atmosphere as a function of optical
+    depth, and is used in the two-stream temperature profile calculation.
+
+    Args:
+        gamma: Ratio of visible to thermal opacity (dimensionless).
+        tau: Thermal optical depth profile (array over pressure levels).
+
+    Returns:
+        The irradiation function xi evaluated at each optical depth.
+    """
     x = gamma * tau
     x = np.maximum(x, 1e-12)
     term1 = 2.0 / 3.0
@@ -81,7 +111,32 @@ def generate_tp_profile(
     gravity_cm_s2: float,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Generate one temperature profile from modified Line-style parameterization."""
+    """Generate one temperature profile from modified Line-2013 parameterization.
+
+    The temperature is computed from the two-stream radiative transfer solution:
+
+        T^4 = (3/4)*T_int^4*(2/3 + tau)
+              + (3/4)*T_irr^4*[(1-alpha)*xi(gamma1, tau) + alpha*xi(gamma2, tau)]
+
+    where tau is the thermal optical depth profile derived from
+    ``kappa_IR * (p/p0)^beta``, and ``xi`` is the irradiation integral.
+
+    An optional convective adjustment enforces an adiabatic lapse rate in
+    the deep atmosphere (applied probabilistically based on config).
+
+    Args:
+        pressure_bar: Log-spaced pressure grid in bar (descending, bottom-to-top).
+        tp_cfg: TP sampler configuration with distribution specs.
+        gravity_cm_s2: Surface gravity in cm/s^2.
+        rng: NumPy random generator for reproducible sampling.
+
+    Returns:
+        Tuple of (temperature_k array, parameter dict for provenance).
+
+    Raises:
+        SamplingError: If the sampled profile violates temperature bounds or
+            contains non-finite values.
+    """
     params = {
         "log10_kappa_ir": _sample_distribution(tp_cfg["log10_kappa_ir"], rng, "log10_kappa_ir"),
         "kappa_pressure_power_exponent": _sample_distribution(

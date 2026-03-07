@@ -28,7 +28,7 @@ from vulcan_runner import (
     VulcanRuntimeError,
     preflight_vulcan_source,
     resolve_boundary_conditions,
-    validate_target_species_available,
+    validate_species_available,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,9 +100,10 @@ def main() -> int:
 
         if args.gen:
             boundary_conditions = resolve_boundary_conditions(config, paths.vulcan_source)
-            validate_target_species_available(
+            validate_species_available(
                 paths.vulcan_source,
-                tuple(config["data_spec"]["target_species"]),
+                state_species=tuple(config["data_spec"]["state_species"]),
+                output_species=tuple(config["data_spec"]["output_species"]),
             )
             preflight_vulcan_source(
                 paths.vulcan_source,

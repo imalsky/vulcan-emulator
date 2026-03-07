@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
-# Prevent duplicate OpenMP runtime aborts before importing torch.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+TESTING_DIR = Path(__file__).resolve().parent
+if str(TESTING_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTING_DIR))
 import torch
 
 from common import PROJECT_ROOT, iter_split_shards, load_checkpoint
@@ -17,7 +20,6 @@ from inference import load_physical_space_model, physical_inputs_from_processed_
 
 
 def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for standalone PT2 export."""
     parser = argparse.ArgumentParser(description="Export standalone PT2 model.")
     parser.add_argument("--run-dir", type=Path, default=Path("models/trained_model"))
     parser.add_argument("--split", type=str, default="train")
@@ -27,7 +29,6 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Export one trained run to PT2 and verify round-trip parity."""
     args = _parse_args()
     run_dir = (PROJECT_ROOT / args.run_dir).resolve()
     checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=args.checkpoint)
@@ -42,12 +43,9 @@ def main() -> None:
     )
 
     try:
-        seq, glb, _tgt = next(iter(iter_split_shards(processed_root=processed_root, split=args.split)))
+        seq, glb, _tgt, _dt = next(iter(iter_split_shards(processed_root=processed_root, split=args.split)))
     except StopIteration as exc:
         raise RuntimeError(f"No shards found for split '{args.split}'.") from exc
-
-    if seq.shape[0] <= 0:
-        raise RuntimeError(f"First shard for split '{args.split}' has zero samples.")
 
     example = physical_inputs_from_processed_arrays(
         sequence_inputs=seq[:1],
@@ -59,11 +57,11 @@ def main() -> None:
         torch.as_tensor(example["pressure_bar"], dtype=torch.float32),
         torch.as_tensor(example["temperature_k"], dtype=torch.float32),
         torch.as_tensor(example["kzz_cm2_s"], dtype=torch.float32),
-        torch.as_tensor(example["initial_ymix"], dtype=torch.float32),
+        torch.as_tensor(example["anchor_ymix"], dtype=torch.float32),
         torch.as_tensor(example["gravity_cm_s2"], dtype=torch.float32),
         torch.as_tensor(example["metallicity_log10"], dtype=torch.float32),
         torch.as_tensor(example["c_to_o"], dtype=torch.float32),
-        torch.as_tensor(example["time_s"], dtype=torch.float32),
+        torch.as_tensor(example["dt_s"], dtype=torch.float32),
     )
 
     with torch.inference_mode():
@@ -78,23 +76,15 @@ def main() -> None:
     loaded_module = loaded_program.module()
     with torch.inference_mode():
         prediction = loaded_module(*example_tensors)
-        torch.testing.assert_close(reference, prediction, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(reference, prediction, rtol=1e-4, atol=1e-5)
 
-    metadata = {
+    summary = {
+        "run_dir": str(run_dir),
+        "split": args.split,
         "checkpoint": args.checkpoint,
-        "exported_model": str(output_path),
-        "split_used_for_trace": args.split,
-        "example_pressure_shape": list(example_tensors[0].shape),
-        "example_initial_ymix_shape": list(example_tensors[3].shape),
-        "example_time_shape": list(example_tensors[7].shape),
-        "target_species": list(data_contract["target_species_order"]),
+        "output": str(output_path),
     }
-    metadata_path = output_path.with_suffix(".json")
-    with metadata_path.open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
-
-    print(f"Saved standalone PT2 model: {output_path}")
-    print(f"Saved export metadata: {metadata_path}")
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

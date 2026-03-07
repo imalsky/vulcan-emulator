@@ -6,8 +6,13 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sys
 import tempfile
 from pathlib import Path
+
+TESTING_DIR = Path(__file__).resolve().parent
+if str(TESTING_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTING_DIR))
 
 from common import PROJECT_ROOT
 

@@ -7,12 +7,15 @@ import argparse
 import csv
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 
-# Prevent duplicate OpenMP runtime aborts before importing torch.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+TESTING_DIR = Path(__file__).resolve().parent
+if str(TESTING_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTING_DIR))
 import torch
 
 from common import (
@@ -27,7 +30,6 @@ from common import (
 
 
 def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for error-metric export."""
     parser = argparse.ArgumentParser(description="Compute per-species error metrics.")
     parser.add_argument("--run-dir", type=Path, default=Path("models/trained_model"))
     parser.add_argument("--split", type=str, default="test")
@@ -38,7 +40,6 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Evaluate one split in physical units and write summary artifacts."""
     args = _parse_args()
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0.")
@@ -59,7 +60,7 @@ def main() -> None:
 
     norm_meta = load_json(processed_root / "normalization_metadata.json")
     target_stats = norm_meta["targets"]["ymix"]
-    species = list(config["data_spec"]["target_species"])
+    species = list(split_meta["output_species_order"])
     n_species = len(species)
 
     abs_sum = np.zeros(n_species, dtype=np.float64)
@@ -67,7 +68,7 @@ def main() -> None:
     abs_pct_sum = np.zeros(n_species, dtype=np.float64)
     rows = 0
 
-    for seq, glb, tgt in iter_split_shards(processed_root=processed_root, split=args.split):
+    for seq, glb, tgt, _dt in iter_split_shards(processed_root=processed_root, split=args.split):
         shard_samples = int(seq.shape[0])
         for start in range(0, shard_samples, args.batch_size):
             end = min(start + args.batch_size, shard_samples)
@@ -80,7 +81,6 @@ def main() -> None:
 
             pred_phys = denormalize(pred.detach().cpu().numpy(), target_stats)
             tgt_phys = denormalize(tgt_batch, target_stats)
-
             diff = pred_phys - tgt_phys
             abs_sum += np.sum(np.abs(diff), axis=(0, 1))
             sq_sum += np.sum(diff * diff, axis=(0, 1))
