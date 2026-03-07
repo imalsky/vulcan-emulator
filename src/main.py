@@ -68,8 +68,12 @@ def _resolve_config_path(arg_path: Path) -> Path:
     """Resolve the user-provided config path relative to the project root."""
     if arg_path.is_absolute():
         raise RuntimeError("Config path must be relative.")
-    project_root = Path(__file__).resolve().parent.parent
-    return (project_root / arg_path).resolve()
+    project_root_override = os.environ.get("VULCAN_EMULATOR_PROJECT_ROOT")
+    if project_root_override:
+        project_root = Path(os.path.normpath(project_root_override))
+    else:
+        project_root = Path(__file__).resolve().parent.parent
+    return Path(os.path.normpath(str(project_root / arg_path)))
 
 
 def main() -> int:

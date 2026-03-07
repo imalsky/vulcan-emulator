@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,20 @@ class PathValidationError(ValueError):
     """Raised when a configured path violates project path rules."""
 
 
+def _project_root() -> Path:
+    """Return the runtime project root, honoring an explicit environment override."""
+    override = os.environ.get("VULCAN_EMULATOR_PROJECT_ROOT")
+    if override:
+        return Path(os.path.normpath(override))
+    return Path(__file__).resolve().parent.parent
+
+
+def _join_project_path(root: Path, value: str, field_name: str) -> Path:
+    """Join one relative config path to the project root without resolving symlinks."""
+    relative = _ensure_relative(value, field_name)
+    return Path(os.path.normpath(str(root / relative)))
+
+
 def _ensure_relative(value: str, field_name: str) -> Path:
     """Parse one configured path and reject absolute values."""
     path = Path(value)
@@ -40,7 +55,7 @@ def resolve_paths(config: dict[str, Any]) -> ProjectPaths:
     All configured paths are relative to project root. Project root is derived from
     the current file location (`src/..`) and must match config path conventions.
     """
-    root = Path(__file__).resolve().parent.parent
+    root = _project_root()
     paths_cfg = config["paths"]
 
     project_root_cfg = _ensure_relative(str(paths_cfg["project_root"]), "paths.project_root")
@@ -49,14 +64,14 @@ def resolve_paths(config: dict[str, Any]) -> ProjectPaths:
             "paths.project_root must be '.' to enforce root-relative contract."
         )
 
-    vulcan_source = (
-        root / _ensure_relative(str(paths_cfg["vulcan_source_path"]), "paths.vulcan_source_path")
-    ).resolve()
-    data_root = (root / _ensure_relative(str(paths_cfg["data_root"]), "paths.data_root")).resolve()
-    models_root = (
-        root / _ensure_relative(str(paths_cfg["models_root"]), "paths.models_root")
-    ).resolve()
-    logs_root = (root / _ensure_relative(str(paths_cfg["logs_root"]), "paths.logs_root")).resolve()
+    vulcan_source = _join_project_path(
+        root,
+        str(paths_cfg["vulcan_source_path"]),
+        "paths.vulcan_source_path",
+    )
+    data_root = _join_project_path(root, str(paths_cfg["data_root"]), "paths.data_root")
+    models_root = _join_project_path(root, str(paths_cfg["models_root"]), "paths.models_root")
+    logs_root = _join_project_path(root, str(paths_cfg["logs_root"]), "paths.logs_root")
 
     raw_root = data_root / "raw"
     processed_root = data_root / "processed"

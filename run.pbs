@@ -21,7 +21,8 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
-cd -P "${PROJECT_ROOT}"
+cd "${PROJECT_ROOT}"
+export VULCAN_EMULATOR_PROJECT_ROOT="${PROJECT_ROOT}"
 
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
@@ -77,18 +78,25 @@ fi
 
 mapfile -t CONFIG_INFO < <(python - "${CONFIG_PATH}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
-project_root = Path(".").resolve()
-config_path = (project_root / sys.argv[1]).resolve()
+project_root = Path(os.path.normpath(os.environ["VULCAN_EMULATOR_PROJECT_ROOT"]))
+config_path = Path(os.path.normpath(str(project_root / sys.argv[1])))
 with config_path.open("r", encoding="utf-8") as handle:
     config = json.load(handle)
 
 print(config_path)
-print((project_root / config["paths"]["vulcan_source_path"]).resolve())
-print((project_root / config["paths"]["logs_root"]).resolve())
-print((project_root / config["paths"]["models_root"] / config["training"]["output_folder"]).resolve())
+print(Path(os.path.normpath(str(project_root / config["paths"]["vulcan_source_path"]))))
+print(Path(os.path.normpath(str(project_root / config["paths"]["logs_root"]))))
+print(
+    Path(
+        os.path.normpath(
+            str(project_root / config["paths"]["models_root"] / config["training"]["output_folder"])
+        )
+    )
+)
 print(str(config["training"]["device"]).lower())
 PY
 )
