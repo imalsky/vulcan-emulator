@@ -22,7 +22,12 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from config_utils import ConfigValidationError, load_and_validate_config, resolve_precision
 from logging_utils import setup_logging
 from path_utils import PathValidationError, ensure_runtime_dirs, resolve_paths
-from preprocess import PreprocessError, build_worker_settings, run_generation_and_preprocess
+from preprocess import (
+    PreprocessError,
+    build_worker_settings,
+    discover_existing_raw_run_files,
+    run_generation_and_preprocess,
+)
 from trainer import TrainingError, run_training
 from vulcan_runner import (
     VulcanRuntimeError,
@@ -116,26 +121,34 @@ def main() -> int:
             json.dump(config, handle, indent=2)
 
         if args.gen:
-            boundary_conditions = resolve_boundary_conditions(config, paths.vulcan_source)
-            state_species = list(config["data_spec"]["state_species"])
-            output_species = list(config["data_spec"]["output_species"])
-            validate_species_available(
-                paths.vulcan_source,
-                state_species=tuple(state_species),
-                output_species=tuple(output_species),
-            )
-            settings = build_worker_settings(
-                config,
-                paths,
-                boundary_conditions=boundary_conditions,
-                state_species=state_species,
-                output_species=output_species,
-            )
-            preflight_vulcan_source(
-                paths.vulcan_source,
-                settings=settings,
-                timeout_seconds=int(config["generation"]["run_timeout_seconds"]),
-            )
+            existing_raw_run_files = discover_existing_raw_run_files(paths)
+            boundary_conditions = None
+            if existing_raw_run_files:
+                logger.info(
+                    "Detected %d existing raw run files; skipping VULCAN preflight and generation.",
+                    len(existing_raw_run_files),
+                )
+            else:
+                boundary_conditions = resolve_boundary_conditions(config, paths.vulcan_source)
+                state_species = list(config["data_spec"]["state_species"])
+                output_species = list(config["data_spec"]["output_species"])
+                validate_species_available(
+                    paths.vulcan_source,
+                    state_species=tuple(state_species),
+                    output_species=tuple(output_species),
+                )
+                settings = build_worker_settings(
+                    config,
+                    paths,
+                    boundary_conditions=boundary_conditions,
+                    state_species=state_species,
+                    output_species=output_species,
+                )
+                preflight_vulcan_source(
+                    paths.vulcan_source,
+                    settings=settings,
+                    timeout_seconds=int(config["generation"]["run_timeout_seconds"]),
+                )
             run_generation_and_preprocess(
                 config,
                 paths,

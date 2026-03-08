@@ -33,8 +33,10 @@ def main() -> None:
     run_dir = (PROJECT_ROOT / args.run_dir).resolve()
     checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=args.checkpoint)
     config = checkpoint["config"]
-    data_root = (PROJECT_ROOT / str(config["paths"]["data_root"])).resolve()
-    processed_root = data_root / "processed"
+    processed_root_cfg = str(
+        config["paths"].get("processed_root", str(Path(config["paths"]["data_root"]) / "processed"))
+    )
+    processed_root = (PROJECT_ROOT / processed_root_cfg).resolve()
 
     model, normalization_metadata, data_contract = load_physical_space_model(
         run_dir,

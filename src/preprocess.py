@@ -3,8 +3,8 @@
 Orchestrates the full ``--gen`` pipeline after VULCAN runs complete:
 
 1. **Run VULCAN jobs** from sampled RunSpecs (P, T, Kzz, gravity, abundances).
-2. **Split** raw run IDs into train/val/test by configurable ratios.
-3. **Sample transition pairs** (anchor/target time pairs) per run.
+2. **Sample transition pairs** (anchor/target time pairs) for every reusable raw run.
+3. **Split** usable run IDs into train/val/test by configurable ratios.
 4. **Fit normalization stats** on the *train* split only, applying the
    configured method (standard, log-standard, log-min-max, none) per variable.
 5. **Normalize and shard** all splits into fixed-size ``.npy`` files for
@@ -36,7 +36,7 @@ import torch
 from config_utils import PrecisionConfig
 from provenance import PROCESSED_FINGERPRINT_FILENAME, build_processed_fingerprint
 from sampling import build_run_specs
-from transition_sampling import TransitionPairs, sample_transition_pairs
+from transition_sampling import TransitionPairs, TransitionSamplingError, sample_transition_pairs
 from vulcan_runner import (
     BoundaryConditionSettings,
     SpeciesSelection,
@@ -136,6 +136,7 @@ class RawRunData:
 class PairSpecBundle:
     """One raw run file paired with sampled transition metadata."""
 
+    run_id: int
     run_file: Path
     pairs: TransitionPairs
 
@@ -206,21 +207,41 @@ def load_raw_run_file(
 
         found_state_species = _read_species_dataset(inputs["state_species"])
         found_output_species = _read_species_dataset(inputs["output_species"])
-        if found_state_species != state_species:
+        missing_state_species = [
+            species_name for species_name in state_species if species_name not in found_state_species
+        ]
+        if missing_state_species:
             raise PreprocessError(
-                f"State species mismatch in {path}. Expected {state_species}, found {found_state_species}"
+                f"State species missing in {path}. Requested {state_species}, found {found_state_species}, "
+                f"missing {missing_state_species}"
             )
-        if found_output_species != output_species:
+        missing_output_species = [
+            species_name for species_name in output_species if species_name not in found_output_species
+        ]
+        if missing_output_species:
             raise PreprocessError(
-                f"Output species mismatch in {path}. Expected {output_species}, found {found_output_species}"
+                f"Output species missing in {path}. Requested {output_species}, found {found_output_species}, "
+                f"missing {missing_output_species}"
             )
+        state_indices = np.asarray(
+            [found_state_species.index(species_name) for species_name in state_species],
+            dtype=np.int64,
+        )
+        output_indices = np.asarray(
+            [found_output_species.index(species_name) for species_name in output_species],
+            dtype=np.int64,
+        )
 
         pressure = np.asarray(inputs["pressure_bar"], dtype=np.float64)
         temperature = np.asarray(inputs["temperature_k"], dtype=np.float64)
         kzz = np.asarray(inputs["kzz_cm2_s"], dtype=np.float64)
         time_s = np.asarray(trajectory["time_s"], dtype=np.float64)
-        ymix_state = np.asarray(trajectory["ymix_state"], dtype=np.float64)
-        ymix_output = np.asarray(trajectory["ymix_output"], dtype=np.float64)
+        ymix_state = np.take(np.asarray(trajectory["ymix_state"], dtype=np.float64), state_indices, axis=2)
+        ymix_output = np.take(
+            np.asarray(trajectory["ymix_output"], dtype=np.float64),
+            output_indices,
+            axis=2,
+        )
         gravity = float(np.asarray(globals_group["gravity_cm_s2"]))
         metallicity_log10 = float(np.asarray(globals_group["metallicity_log10"]))
         c_to_o = float(np.asarray(globals_group["c_to_o"]))
@@ -260,6 +281,11 @@ def load_raw_run_file(
         metallicity_log10=metallicity_log10,
         c_to_o=c_to_o,
     )
+
+
+def discover_existing_raw_run_files(paths: Any) -> list[Path]:
+    """Return existing raw run files from the flat configured raw layout."""
+    return sorted(Path(paths.raw_root).glob("run_*.h5"))
 
 
 def _split_run_ids(
@@ -322,23 +348,26 @@ def _sample_pairs_for_run(
 
 def _build_pair_specs(
     *,
-    run_file_by_id: dict[int, Path],
-    split_ids: list[int],
+    run_files: list[Path],
     config: dict[str, Any],
     state_species: list[str],
     output_species: list[str],
 ) -> list[PairSpecBundle]:
-    """Sample transition pairs for every run in *split_ids* and return them as bundles."""
+    """Sample transition pairs from every usable raw run and skip unusable trajectories."""
     bundles: list[PairSpecBundle] = []
     seed = int(config["generation"]["random_seed"])
-    for run_id in split_ids:
-        raw = load_raw_run_file(
-            run_file_by_id[run_id],
-            state_species=state_species,
-            output_species=output_species,
-        )
-        pairs = _sample_pairs_for_run(raw=raw, config=config, random_seed=seed)
-        bundles.append(PairSpecBundle(run_file=run_file_by_id[run_id], pairs=pairs))
+    for run_file in run_files:
+        try:
+            raw = load_raw_run_file(
+                run_file,
+                state_species=state_species,
+                output_species=output_species,
+            )
+            pairs = _sample_pairs_for_run(raw=raw, config=config, random_seed=seed)
+        except (PreprocessError, TransitionSamplingError) as exc:
+            logger.warning("Skipping raw run %s during pair sampling: %s", run_file.name, exc)
+            continue
+        bundles.append(PairSpecBundle(run_id=raw.run_id, run_file=run_file, pairs=pairs))
     return bundles
 
 
@@ -680,7 +709,7 @@ def build_worker_settings(
     return WorkerSettings(
         vulcan_source=str(paths.vulcan_source),
         worker_root=str(Path(os.path.normpath(str(paths.root / generation["worker_root"])))),
-        runs_root=str(Path(os.path.normpath(str(paths.root / generation["runs_root"])))),
+        runs_root=str(paths.raw_root),
         species=SpeciesSelection(
             state_species=tuple(state_species),
             output_species=tuple(output_species),
@@ -725,50 +754,78 @@ def run_generation_and_preprocess(
     output_from_state_indices = [state_species.index(species) for species in output_species]
     stats_dtype = _numpy_stats_dtype(precision)
 
-    run_specs = build_run_specs(config)
-    if not run_specs:
-        raise PreprocessError("Run-spec generation returned zero runs.")
+    run_files = discover_existing_raw_run_files(paths)
+    if run_files:
+        logger.info(
+            "Found %d existing raw run files under %s; skipping VULCAN generation.",
+            len(run_files),
+            paths.raw_root,
+        )
+    else:
+        run_specs = build_run_specs(config)
+        if not run_specs:
+            raise PreprocessError("Run-spec generation returned zero runs.")
 
-    settings = build_worker_settings(
-        config,
-        paths,
-        boundary_conditions=boundary_conditions,
+        settings = build_worker_settings(
+            config,
+            paths,
+            boundary_conditions=boundary_conditions,
+            state_species=state_species,
+            output_species=output_species,
+        )
+
+        failure_policy = str(generation.get("failure_policy", "fail_on_first_error"))
+        logger.info(
+            "Running %d VULCAN jobs with %d workers...",
+            len(run_specs),
+            generation["num_workers"],
+        )
+        try:
+            results = run_vulcan_jobs(
+                run_specs,
+                settings=settings,
+                failure_policy=failure_policy,
+            )
+        except VulcanRuntimeError as exc:
+            raise PreprocessError(str(exc)) from exc
+        run_files = [Path(result.run_file) for result in results]
+
+    if not run_files:
+        raise PreprocessError("No raw run files were found or generated.")
+
+    logger.info("Sampling transition pairs from raw trajectories...")
+    all_bundles = _build_pair_specs(
+        run_files=run_files,
+        config=config,
         state_species=state_species,
         output_species=output_species,
     )
-
-    failure_policy = str(generation.get("failure_policy", "fail_on_first_error"))
-    logger.info("Running %d VULCAN jobs with %d workers...", len(run_specs), generation["num_workers"])
-    try:
-        results = run_vulcan_jobs(
-            run_specs, settings=settings, failure_policy=failure_policy,
+    if not all_bundles:
+        raise PreprocessError(
+            "No reusable raw trajectories produced valid transition pairs for the current config."
         )
-    except VulcanRuntimeError as exc:
-        raise PreprocessError(str(exc)) from exc
 
-    run_files = [Path(result.run_file) for result in results]
-    run_ids = [int(result.run_id) for result in results]
     split = _split_run_ids(
-        run_ids=run_ids,
+        run_ids=[bundle.run_id for bundle in all_bundles],
         split_ratios=generation["split_ratios"],
         seed=int(generation["random_seed"]),
     )
     split_map = {"train": split.train, "val": split.val, "test": split.test}
-    run_file_by_id = {int(result.run_id): Path(result.run_file) for result in results}
-
-    logger.info("Sampling transition pairs from raw trajectories...")
+    bundle_by_run_id = {bundle.run_id: bundle for bundle in all_bundles}
     split_bundles = {
-        split_name: _build_pair_specs(
-            run_file_by_id=run_file_by_id,
-            split_ids=split_ids,
-            config=config,
-            state_species=state_species,
-            output_species=output_species,
-        )
+        split_name: [bundle_by_run_id[run_id] for run_id in split_ids]
         for split_name, split_ids in split_map.items()
     }
+    for split_name, bundles in split_bundles.items():
+        if not bundles:
+            raise PreprocessError(
+                f"No usable raw runs remained in split '{split_name}' after pair sampling."
+            )
 
-    logger.info("Fitting normalization stats from train split (%d runs)...", len(split.train))
+    logger.info(
+        "Fitting normalization stats from train split (%d runs)...",
+        len(split_bundles["train"]),
+    )
     stats = _build_normalization_stats(
         train_bundles=split_bundles["train"],
         config=config,
@@ -801,9 +858,10 @@ def run_generation_and_preprocess(
             processed_root=processed_root,
         )
 
+    usable_run_files = sorted({bundle.run_file for bundle in all_bundles}, key=str)
     manifest = {
-        "num_runs": len(results),
-        "run_files": [str(path.relative_to(paths.root)) for path in sorted(run_files)],
+        "num_runs": len(all_bundles),
+        "run_files": [str(path.relative_to(paths.root)) for path in usable_run_files],
         "split": split_map,
         "state_species": state_species,
         "output_species": output_species,
@@ -827,7 +885,7 @@ def run_generation_and_preprocess(
     fingerprint = build_processed_fingerprint(
         config=config,
         project_root=paths.root,
-        raw_run_files=sorted(run_files),
+        raw_run_files=usable_run_files,
         manifest_path=manifest_path,
         split_path=split_path,
         normalization_path=norm_path,
@@ -842,8 +900,8 @@ def run_generation_and_preprocess(
         json.dump(fingerprint, handle, indent=2)
 
     logger.info(
-        "Generation + preprocessing complete. Raw runs: %d | train pairs: %d | val pairs: %d | test pairs: %d",
-        len(results),
+        "Generation + preprocessing complete. Raw runs used: %d | train pairs: %d | val pairs: %d | test pairs: %d",
+        len(all_bundles),
         split_metadata["train"]["total_samples"],
         split_metadata["val"]["total_samples"],
         split_metadata["test"]["total_samples"],

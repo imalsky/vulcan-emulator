@@ -90,7 +90,7 @@ class ContractTests(unittest.TestCase):
             root = Path(tmpdir_name)
             data_root = root / "data"
             processed_root = data_root / "processed"
-            raw_run = data_root / "raw" / "runs" / "run_000000.h5"
+            raw_run = data_root / "raw" / "run_000000.h5"
             raw_run.parent.mkdir(parents=True, exist_ok=True)
             raw_run.write_bytes(b"stub")
 
@@ -128,7 +128,7 @@ class ContractTests(unittest.TestCase):
                 json.dumps(
                     {
                         "num_runs": 1,
-                        "run_files": ["data/raw/runs/run_000000.h5"],
+                        "run_files": ["data/raw/run_000000.h5"],
                         "split": {"train": [0], "val": [], "test": []},
                         "state_species": ["H2", "He"],
                         "output_species": ["H2", "He"],

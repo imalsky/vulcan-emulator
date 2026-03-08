@@ -239,7 +239,6 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
             "split_filename",
             "shard_size",
             "worker_root",
-            "runs_root",
             "save_evo_frq",
             "max_trajectory_snapshots",
         },
@@ -271,12 +270,17 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
     if max_snap < 0:
         raise ConfigValidationError("generation.max_trajectory_snapshots must be >= 0 (0 = no limit).")
 
-    for path_key in ("worker_root", "runs_root", "manifest_filename", "split_filename"):
+    for path_key in ("worker_root", "manifest_filename", "split_filename"):
         value = cfg[path_key]
         if not isinstance(value, str) or not value:
             raise ConfigValidationError(f"generation.{path_key} must be a non-empty string path.")
         if Path(value).is_absolute():
             raise ConfigValidationError(f"generation.{path_key} must be relative, got: {value}")
+
+    if "runs_root" in cfg:
+        raise ConfigValidationError(
+            "generation.runs_root is no longer supported. Use paths.raw_root for flat raw data storage."
+        )
 
     ratios = cfg["split_ratios"]
     _require_keys(ratios, {"train", "val", "test"}, "generation.split_ratios")

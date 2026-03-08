@@ -3,6 +3,8 @@
     "project_root": ".",
     "vulcan_source_path": "../VULCAN-master",
     "data_root": "data/smoke",
+    "raw_root": "data/smoke/raw",
+    "processed_root": "data/smoke/processed",
     "models_root": "models",
     "logs_root": "logs/smoke"
   },
@@ -22,7 +24,6 @@
     "split_filename": "splits.json",
     "shard_size": 64,
     "worker_root": "data/smoke/raw/_workers",
-    "runs_root": "data/smoke/raw/runs",
     "save_evo_frq": 10,
     "max_trajectory_snapshots": 100
   },
