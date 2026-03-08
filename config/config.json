@@ -7,8 +7,8 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 10,
-    "num_workers": 1,
+    "num_runs": 100,
+    "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
       "val": 0.1,
