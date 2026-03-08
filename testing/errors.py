@@ -50,7 +50,10 @@ def main() -> None:
 
     checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=args.checkpoint)
     config = checkpoint["config"]
-    processed_root = (PROJECT_ROOT / str(config["paths"]["data_root"]) / "processed").resolve()
+    processed_root_cfg = str(
+        config["paths"].get("processed_root", str(Path(config["paths"]["data_root"]) / "processed"))
+    )
+    processed_root = (PROJECT_ROOT / processed_root_cfg).resolve()
     split_meta = load_split_metadata(processed_root=processed_root, split=args.split)
     model, forward_dtype = build_model_from_checkpoint(
         checkpoint=checkpoint,

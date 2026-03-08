@@ -69,6 +69,8 @@ def _config() -> dict[str, Any]:
             "project_root": ".",
             "vulcan_source_path": "../VULCAN-master",
             "data_root": "testing/_synthetic_smoke/data",
+            "raw_root": "testing/_synthetic_smoke/data/raw",
+            "processed_root": "testing/_synthetic_smoke/data/processed",
             "models_root": "testing/_synthetic_smoke/models",
             "logs_root": "testing/_synthetic_smoke/logs",
         },
@@ -84,8 +86,8 @@ def _config() -> dict[str, Any]:
             "split_filename": "splits.json",
             "shard_size": 16,
             "worker_root": "testing/_synthetic_smoke/data/raw/_workers",
-            "runs_root": "testing/_synthetic_smoke/data/raw/runs",
             "save_evo_frq": 1,
+            "max_trajectory_snapshots": 0,
         },
         "trajectory_sampling": {
             "mode": "fixed_dt_post_equilibrium",
@@ -396,7 +398,7 @@ def _prepare_artifacts() -> tuple[dict[str, Any], Any]:
     for run_id in range(4):
         run = _make_raw_run(run_id, nz=4, state_dim=len(TOP20_SPECIES), rng=rng)
         raw_runs.append(run)
-        run_file = paths.raw_root / "runs" / f"run_{run_id:06d}.h5"
+        run_file = paths.raw_root / f"run_{run_id:06d}.h5"
         _write_raw_run(run_file, run, TOP20_SPECIES)
         raw_run_files.append(run_file)
 

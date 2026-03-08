@@ -75,6 +75,25 @@ class ConfigUtilsTests(unittest.TestCase):
 
         self.assertEqual(loaded["generation"]["failure_policy"], "continue_on_error")
 
+    def test_load_and_validate_config_allows_generation_without_runs_root(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["generation"].pop("runs_root", None)
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = load_and_validate_config(config_path)
+
+        self.assertNotIn("runs_root", loaded["generation"])
+
+    def test_load_and_validate_config_rejects_deprecated_runs_root(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["generation"]["runs_root"] = "data/raw/runs"
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "generation.runs_root is no longer supported"):
+                load_and_validate_config(config_path)
+
 
 if __name__ == "__main__":
     unittest.main()

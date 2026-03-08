@@ -27,6 +27,7 @@ import os
 import random
 import re
 import shutil
+import time
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,29 @@ def _configure_cpu_threads(device: torch.device) -> None:
         torch.set_num_interop_threads(1)
     except RuntimeError:
         pass
+
+
+def _format_progress_line(
+    *,
+    epoch: int,
+    epochs: int,
+    train_mse: float,
+    val_mse: float,
+    val_mae: float,
+    lr: float,
+    epoch_seconds: float,
+    elapsed_seconds: float,
+) -> str:
+    """Render one fixed-width training-progress line for the logs directory."""
+    return (
+        f"{epoch:6d}/{epochs:<6d}"
+        f" {train_mse:15.8e}"
+        f" {val_mse:15.8e}"
+        f" {val_mae:15.8e}"
+        f" {lr:15.8e}"
+        f" {epoch_seconds:15.8e}"
+        f" {elapsed_seconds:15.8e}"
+    )
 
 
 def _build_loader(
@@ -792,18 +816,29 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
     )
 
     history_path = run_dir / "training_log.csv"
+    progress_log_path = paths.logs_root / f"training_progress_{training['output_folder']}.log"
     with history_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["epoch", "train_mse", "val_mse", "val_mae", "lr"])
+        writer.writerow(
+            ["epoch", "train_mse", "val_mse", "val_mae", "lr", "epoch_seconds", "elapsed_seconds"]
+        )
+    with progress_log_path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            f"{'epoch':>13} {'train_mse':>15} {'val_mse':>15} {'val_mae':>15} "
+            f"{'lr':>15} {'epoch_s':>15} {'elapsed_s':>15}\n"
+        )
 
     best_val_mse = float("inf")
     best_epoch = 0
     global_step = 0
     gradient_clip = float(training["gradient_clip"])
     train_loader_prefetches = _loader_prefetches_to_device(train_loader)
+    training_start = time.perf_counter()
 
     logger.info("Starting training for %d epochs", epochs)
+    logger.info("Detailed training progress log: %s", progress_log_path)
     for epoch in range(1, epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         train_sq_error = torch.zeros((), device=device, dtype=precision.stats_dtype)
         train_elements = torch.zeros((), device=device, dtype=torch.int64)
@@ -875,19 +910,35 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
             amp_dtype=precision.amp_dtype,
         )
         lr_current = float(optimizer.param_groups[0]["lr"])
-        logger.info(
-            "Epoch %d/%d | train_mse=%.6e | val_mse=%.6e | val_mae=%.6e | lr=%.3e",
-            epoch,
-            epochs,
-            train_mse,
-            val_metrics["mse"],
-            val_metrics["mae"],
-            lr_current,
+        epoch_seconds = float(time.perf_counter() - epoch_start)
+        elapsed_seconds = float(time.perf_counter() - training_start)
+        progress_line = _format_progress_line(
+            epoch=epoch,
+            epochs=epochs,
+            train_mse=train_mse,
+            val_mse=float(val_metrics["mse"]),
+            val_mae=float(val_metrics["mae"]),
+            lr=lr_current,
+            epoch_seconds=epoch_seconds,
+            elapsed_seconds=elapsed_seconds,
         )
+        logger.info("%s", progress_line)
 
         with history_path.open("a", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow([epoch, train_mse, val_metrics["mse"], val_metrics["mae"], lr_current])
+            writer.writerow(
+                [
+                    epoch,
+                    train_mse,
+                    val_metrics["mse"],
+                    val_metrics["mae"],
+                    lr_current,
+                    epoch_seconds,
+                    elapsed_seconds,
+                ]
+            )
+        with progress_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(progress_line + "\n")
 
         checkpoint = {
             "epoch": epoch,

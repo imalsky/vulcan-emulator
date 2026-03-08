@@ -898,6 +898,4 @@ def _cleanup_worker_dirs(settings: WorkerSettings) -> None:
     worker_root = Path(settings.worker_root)
     if not worker_root.is_dir():
         return
-    for worker_dir in worker_root.glob("worker_*"):
-        if worker_dir.is_dir():
-            shutil.rmtree(worker_dir, ignore_errors=True)
+    shutil.rmtree(worker_root, ignore_errors=True)

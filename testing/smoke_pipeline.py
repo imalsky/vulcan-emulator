@@ -53,8 +53,12 @@ def main() -> None:
     data_root = PROJECT_ROOT / str(config["paths"]["data_root"])
     logs_root = PROJECT_ROOT / str(config["paths"]["logs_root"])
     run_dir = PROJECT_ROOT / str(config["paths"]["models_root"]) / str(config["training"]["output_folder"])
-    processed_root = data_root / "processed"
-    raw_runs_root = data_root / "raw" / "runs"
+    processed_root = PROJECT_ROOT / str(
+        config["paths"].get("processed_root", str(Path(config["paths"]["data_root"]) / "processed"))
+    )
+    raw_runs_root = PROJECT_ROOT / str(
+        config["paths"].get("raw_root", str(Path(config["paths"]["data_root"]) / "raw"))
+    )
 
     for path in (data_root, logs_root, run_dir):
         if path.is_dir():
