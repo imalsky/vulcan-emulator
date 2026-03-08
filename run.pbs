@@ -108,6 +108,15 @@ RUN_DIR="${CONFIG_INFO[3]}"
 TRAIN_DEVICE="${CONFIG_INFO[4]}"
 export TRAIN_DEVICE
 
+if [ -n "${VULCAN_SOURCE_OVERRIDE:-}" ]; then
+  VULCAN_SOURCE="${VULCAN_SOURCE_OVERRIDE}"
+elif [ ! -e "${VULCAN_SOURCE}" ] && [ -d "${PROJECT_ROOT}/../VULCAN" ]; then
+  VULCAN_SOURCE="${PROJECT_ROOT}/../VULCAN"
+elif [ ! -e "${VULCAN_SOURCE}" ] && [ -d "${PROJECT_ROOT}/../VULCAN-master" ]; then
+  VULCAN_SOURCE="${PROJECT_ROOT}/../VULCAN-master"
+fi
+export VULCAN_EMULATOR_VULCAN_SOURCE="${VULCAN_SOURCE}"
+
 if [ -z "${TRAIN_LOG}" ]; then
   TRAIN_LOG="${LOGS_ROOT}/training_${PBS_JOBID:-manual}.log"
 fi
@@ -119,6 +128,9 @@ echo "Host: $(hostname)"
 echo "Project root: ${PROJECT_ROOT}"
 echo "Config: ${CONFIG_ABS}"
 echo "VULCAN source: ${VULCAN_SOURCE}"
+if [ "${VULCAN_SOURCE}" != "${CONFIG_INFO[1]}" ]; then
+  echo "VULCAN source override active (config requested ${CONFIG_INFO[1]})"
+fi
 echo "Training device from config: ${TRAIN_DEVICE}"
 
 for required_path in \
