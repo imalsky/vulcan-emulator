@@ -263,6 +263,7 @@ def _run_preflight_smoke(
         tmpdir = Path(tmpdir_name)
         worker_dir = tmpdir / "worker"
         shutil.copytree(vulcan_source, worker_dir)
+        _patch_op_convergence_compat(worker_dir)
 
         generated_atm_dir = worker_dir / "atm" / "generated"
         generated_atm_dir.mkdir(parents=True, exist_ok=True)
@@ -283,8 +284,8 @@ def _run_preflight_smoke(
             dt_min=1.0e-14,
             dt_max=1.0e-8,
             count_max=1,
-            trun_min=0.0,
-            count_min=0,
+            trun_min=1.0,
+            count_min=10,
         )
         smoke_cfg = _apply_run_config(
             baseline_cfg=baseline_cfg,
@@ -384,6 +385,35 @@ def _replace_assignment(text: str, key: str, value: Any) -> str:
     return replaced
 
 
+def _patch_op_convergence_compat(worker_dir: Path) -> None:
+    """Patch the worker copy of ``op.py`` for numpy array compatibility.
+
+    Some VULCAN versions assign ``t_time = var.t_time`` (a Python list) in the
+    convergence checker without converting to a numpy array first, which causes
+    a ``TypeError`` on ``list - float``.  This adds the missing ``np.asarray``
+    conversion when needed.  The patch is a no-op if the conversion already
+    exists.
+    """
+    op_path = worker_dir / "op.py"
+    if not op_path.is_file():
+        return
+    text = op_path.read_text(encoding="utf-8")
+    if "np.asarray(var.t_time" in text:
+        return
+    patched = re.sub(
+        r"(t_time\s*=\s*)var\.t_time\b(?!\s*[.\[])",
+        r"\1np.asarray(var.t_time, dtype=float)",
+        text,
+    )
+    patched = re.sub(
+        r"(y_time\s*=\s*)var\.y_time\b(?!\s*[.\[])",
+        r"\1np.asarray(var.y_time)",
+        patched,
+    )
+    if patched != text:
+        op_path.write_text(patched, encoding="utf-8")
+
+
 def _ensure_worker_context(settings: WorkerSettings) -> dict[str, Any]:
     """Create or reuse the per-process copied VULCAN worker tree."""
     cache_key = "context"
@@ -400,6 +430,7 @@ def _ensure_worker_context(settings: WorkerSettings) -> dict[str, Any]:
     if worker_dir.exists():
         shutil.rmtree(worker_dir)
     shutil.copytree(source, worker_dir)
+    _patch_op_convergence_compat(worker_dir)
 
     baseline_cfg_path = worker_dir / "vulcan_cfg.py"
     baseline_cfg_text = baseline_cfg_path.read_text(encoding="utf-8")
