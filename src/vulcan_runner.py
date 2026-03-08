@@ -97,6 +97,23 @@ class RunResult:
 _WORKER_CACHE: dict[str, Any] = {}
 
 
+def _apply_vulcan_runtime_compat(worker_dir: Path) -> None:
+    """Patch known legacy VULCAN runtime issues inside one copied worker tree."""
+    op_path = worker_dir / "op.py"
+    if not op_path.is_file():
+        raise VulcanRuntimeError(f"VULCAN runtime is missing op.py: {op_path}")
+
+    text = op_path.read_text(encoding="utf-8")
+    legacy_line = "indx = np.abs(t_time-var.t*st_factor).argmin()"
+    patched_line = "indx = np.abs(np.asarray(t_time, dtype=float) - var.t * st_factor).argmin()"
+    if patched_line in text:
+        return
+    if legacy_line not in text:
+        return
+
+    op_path.write_text(text.replace(legacy_line, patched_line), encoding="utf-8")
+
+
 def _load_available_species(vulcan_source: Path) -> list[str]:
     """Parse the bundled VULCAN species list from ``chem_funs.py``."""
     chem_funs_path = vulcan_source / "chem_funs.py"
@@ -254,6 +271,7 @@ def _run_preflight_smoke(
         tmpdir = Path(tmpdir_name)
         worker_dir = tmpdir / "worker"
         shutil.copytree(vulcan_source, worker_dir)
+        _apply_vulcan_runtime_compat(worker_dir)
 
         generated_atm_dir = worker_dir / "atm" / "generated"
         generated_atm_dir.mkdir(parents=True, exist_ok=True)
@@ -402,6 +420,7 @@ def _ensure_worker_context(settings: WorkerSettings) -> dict[str, Any]:
     if worker_dir.exists():
         shutil.rmtree(worker_dir)
     shutil.copytree(source, worker_dir)
+    _apply_vulcan_runtime_compat(worker_dir)
 
     baseline_cfg_path = worker_dir / "vulcan_cfg.py"
     baseline_cfg_text = baseline_cfg_path.read_text(encoding="utf-8")
