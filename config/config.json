@@ -42,7 +42,7 @@
     "dt_min": 1e-14,
     "dt_max": 1000000000000.0,
     "count_max": 200000,
-    "trun_min": 100.0,
+    "trun_min": 1e+13,
     "count_min": 120,
     "ini_mix": "EQ",
     "atm_base": "H2"
