@@ -280,8 +280,9 @@ def _run_preflight_smoke(
             dt_min=1.0e-14,
             dt_max=1.0e-8,
             count_max=1,
-            trun_min=0.0,
-            count_min=0,
+            # Keep the smoke run out of VULCAN's steady-state convergence branch.
+            trun_min=1.0,
+            count_min=10,
             y_time_freq=1,
         )
         smoke_cfg = _apply_run_config(
