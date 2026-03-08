@@ -26,22 +26,26 @@
     "save_evo_frq": 1
   },
   "trajectory_sampling": {
+    "mode": "fixed_dt_post_equilibrium",
     "pairs_per_run": 64,
-    "requested_dt_min_s": 1e-06,
-    "requested_dt_max_s": 1e+12,
-    "requested_dt_spacing": "log_uniform",
-    "allow_anchor_at_t0": true,
+    "fixed_requested_dt_s": 10.0,
+    "post_equilibrium_time_min_s": 10.0,
+    "post_equilibrium_min_fraction_of_final_time": 0.0,
+    "anchor_sampling": "uniform_valid_anchors",
+    "target_selection": "nearest_saved_snapshot",
     "min_future_saved_steps": 1,
+    "max_target_relative_dt_error": 0.5,
     "rollout_eval_points": 6
   },
   "vulcan_runtime": {
-    "runtime": 1e+12,
+    "runtime": 1000000000000.0,
     "dt_min": 1e-14,
-    "dt_max": 1e+10,
+    "dt_max": 10000000000.0,
     "count_max": 100000,
     "trun_min": 0.0,
     "count_min": 0,
-    "y_time_freq": 1
+    "ini_mix": "EQ",
+    "atm_base": "H2"
   },
   "tp_sampler": {
     "pressure_grid": {
@@ -132,22 +136,76 @@
   "physics_toggles": {
     "use_photochemistry": false,
     "use_ion_chemistry": false,
-    "use_transport": true,
+    "use_eddy_diffusion": true,
+    "use_molecular_diffusion": true,
+    "use_upwind_molecular_diffusion": false,
     "use_boundary_conditions": false,
-    "use_condensation_optional": true
+    "use_condensation": false,
+    "use_settling": false,
+    "use_initial_cold_trap": true,
+    "use_sat_surface_h2o": false,
+    "use_lowT_limit_rates": false,
+    "use_adaptive_rtol": true
   },
   "data_spec": {
     "state_species": [
-      "H2", "He", "H", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "C2H2",
-      "N2", "OH", "O", "NO", "NO2", "O2", "H2CO", "CH3OH", "C2H4", "C2H6"
+      "H2",
+      "He",
+      "H",
+      "H2O",
+      "CH4",
+      "CO",
+      "CO2",
+      "NH3",
+      "HCN",
+      "C2H2",
+      "N2",
+      "OH",
+      "O",
+      "NO",
+      "NO2",
+      "O2",
+      "H2CO",
+      "CH3OH",
+      "C2H4",
+      "C2H6"
     ],
     "output_species": [
-      "H2", "He", "H", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "C2H2",
-      "N2", "OH", "O", "NO", "NO2", "O2", "H2CO", "CH3OH", "C2H4", "C2H6"
+      "H2",
+      "He",
+      "H",
+      "H2O",
+      "CH4",
+      "CO",
+      "CO2",
+      "NH3",
+      "HCN",
+      "C2H2",
+      "N2",
+      "OH",
+      "O",
+      "NO",
+      "NO2",
+      "O2",
+      "H2CO",
+      "CH3OH",
+      "C2H4",
+      "C2H6"
     ],
-    "required_input_profiles": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
-    "required_global_inputs": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
-    "required_state_inputs": ["anchor_ymix"],
+    "required_input_profiles": [
+      "pressure_bar",
+      "temperature_k",
+      "kzz_cm2_s"
+    ],
+    "required_global_inputs": [
+      "gravity_cm_s2",
+      "metallicity_log10",
+      "c_to_o",
+      "log10_dt_s"
+    ],
+    "required_state_inputs": [
+      "anchor_ymix"
+    ],
     "time_input_transform": "log10_dt_seconds",
     "strict_non_finite": true
   },

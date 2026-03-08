@@ -279,33 +279,64 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
 
 
 def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
-    """Validate irregular transition-pair sampling controls."""
+    """Validate fixed-dt post-equilibrium transition sampling controls."""
     _require_keys(
         cfg,
         {
+            "mode",
             "pairs_per_run",
-            "requested_dt_min_s",
-            "requested_dt_max_s",
-            "requested_dt_spacing",
-            "allow_anchor_at_t0",
+            "fixed_requested_dt_s",
+            "post_equilibrium_time_min_s",
+            "post_equilibrium_min_fraction_of_final_time",
+            "anchor_sampling",
+            "target_selection",
             "min_future_saved_steps",
+            "max_target_relative_dt_error",
             "rollout_eval_points",
         },
         "trajectory_sampling",
     )
+    if str(cfg["mode"]) != "fixed_dt_post_equilibrium":
+        raise ConfigValidationError(
+            "trajectory_sampling.mode must be 'fixed_dt_post_equilibrium'."
+        )
     if _as_int(cfg["pairs_per_run"], "trajectory_sampling.pairs_per_run") <= 0:
         raise ConfigValidationError("trajectory_sampling.pairs_per_run must be > 0.")
-    dt_min = _as_float(cfg["requested_dt_min_s"], "trajectory_sampling.requested_dt_min_s")
-    dt_max = _as_float(cfg["requested_dt_max_s"], "trajectory_sampling.requested_dt_max_s")
-    if dt_min <= 0.0 or dt_max <= dt_min:
+
+    fixed_requested_dt_s = _as_float(
+        cfg["fixed_requested_dt_s"],
+        "trajectory_sampling.fixed_requested_dt_s",
+    )
+    if fixed_requested_dt_s <= 0.0:
+        raise ConfigValidationError("trajectory_sampling.fixed_requested_dt_s must be > 0.")
+
+    post_equilibrium_time_min_s = _as_float(
+        cfg["post_equilibrium_time_min_s"],
+        "trajectory_sampling.post_equilibrium_time_min_s",
+    )
+    if post_equilibrium_time_min_s < 0.0:
         raise ConfigValidationError(
-            "trajectory_sampling.requested_dt_* must satisfy 0 < requested_dt_min_s < requested_dt_max_s."
+            "trajectory_sampling.post_equilibrium_time_min_s must be >= 0."
         )
-    if str(cfg["requested_dt_spacing"]) != "log_uniform":
+
+    min_fraction = _as_float(
+        cfg["post_equilibrium_min_fraction_of_final_time"],
+        "trajectory_sampling.post_equilibrium_min_fraction_of_final_time",
+    )
+    if not (0.0 <= min_fraction < 1.0):
         raise ConfigValidationError(
-            "trajectory_sampling.requested_dt_spacing must be 'log_uniform'."
+            "trajectory_sampling.post_equilibrium_min_fraction_of_final_time must be in [0, 1)."
         )
-    _ = _as_bool(cfg["allow_anchor_at_t0"], "trajectory_sampling.allow_anchor_at_t0")
+
+    if str(cfg["anchor_sampling"]) != "uniform_valid_anchors":
+        raise ConfigValidationError(
+            "trajectory_sampling.anchor_sampling must be 'uniform_valid_anchors'."
+        )
+    if str(cfg["target_selection"]) != "nearest_saved_snapshot":
+        raise ConfigValidationError(
+            "trajectory_sampling.target_selection must be 'nearest_saved_snapshot'."
+        )
+
     if _as_int(
         cfg["min_future_saved_steps"],
         "trajectory_sampling.min_future_saved_steps",
@@ -313,6 +344,16 @@ def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
         raise ConfigValidationError(
             "trajectory_sampling.min_future_saved_steps must be >= 1."
         )
+
+    max_relative_error = _as_float(
+        cfg["max_target_relative_dt_error"],
+        "trajectory_sampling.max_target_relative_dt_error",
+    )
+    if max_relative_error < 0.0:
+        raise ConfigValidationError(
+            "trajectory_sampling.max_target_relative_dt_error must be >= 0."
+        )
+
     if _as_int(cfg["rollout_eval_points"], "trajectory_sampling.rollout_eval_points") < 2:
         raise ConfigValidationError(
             "trajectory_sampling.rollout_eval_points must be >= 2."
@@ -323,7 +364,16 @@ def _validate_vulcan_runtime(cfg: dict[str, Any]) -> None:
     """Validate the explicit VULCAN runtime override section."""
     _require_keys(
         cfg,
-        {"runtime", "dt_min", "dt_max", "count_max", "trun_min", "count_min", "y_time_freq"},
+        {
+            "runtime",
+            "dt_min",
+            "dt_max",
+            "count_max",
+            "trun_min",
+            "count_min",
+            "ini_mix",
+            "atm_base",
+        },
         "vulcan_runtime",
     )
     runtime = _as_float(cfg["runtime"], "vulcan_runtime.runtime")
@@ -341,8 +391,19 @@ def _validate_vulcan_runtime(cfg: dict[str, Any]) -> None:
         raise ConfigValidationError("vulcan_runtime.trun_min must be >= 0.")
     if _as_int(cfg["count_min"], "vulcan_runtime.count_min") < 0:
         raise ConfigValidationError("vulcan_runtime.count_min must be >= 0.")
-    if _as_int(cfg["y_time_freq"], "vulcan_runtime.y_time_freq") <= 0:
-        raise ConfigValidationError("vulcan_runtime.y_time_freq must be > 0.")
+
+    ini_mix = str(cfg["ini_mix"])
+    if ini_mix != "EQ":
+        raise ConfigValidationError(
+            "vulcan_runtime.ini_mix must be 'EQ' in this codebase. Other initialization modes "
+            "need additional input artifacts that are not wired into the generator."
+        )
+
+    atm_base = str(cfg["atm_base"])
+    if atm_base not in {"H2", "N2", "O2", "CO2", "H2O"}:
+        raise ConfigValidationError(
+            "vulcan_runtime.atm_base must be one of {'H2','N2','O2','CO2','H2O'}."
+        )
 
 
 def _validate_tp_sampler(tp_cfg: dict[str, Any]) -> None:
@@ -775,34 +836,57 @@ def _validate_training(training: dict[str, Any]) -> None:
 
 
 def _validate_physics_toggles(physics: dict[str, Any]) -> None:
-    """Validate optional physics toggles against the supported v1 subset."""
+    """Validate supported VULCAN on/off physics and solver toggles."""
     _require_keys(
         physics,
         {
             "use_photochemistry",
             "use_ion_chemistry",
-            "use_transport",
+            "use_eddy_diffusion",
+            "use_molecular_diffusion",
+            "use_upwind_molecular_diffusion",
             "use_boundary_conditions",
-            "use_condensation_optional",
+            "use_condensation",
+            "use_settling",
+            "use_initial_cold_trap",
+            "use_sat_surface_h2o",
+            "use_lowT_limit_rates",
+            "use_adaptive_rtol",
         },
         "physics_toggles",
     )
     for key in (
         "use_photochemistry",
         "use_ion_chemistry",
-        "use_transport",
+        "use_eddy_diffusion",
+        "use_molecular_diffusion",
+        "use_upwind_molecular_diffusion",
         "use_boundary_conditions",
-        "use_condensation_optional",
+        "use_condensation",
+        "use_settling",
+        "use_initial_cold_trap",
+        "use_sat_surface_h2o",
+        "use_lowT_limit_rates",
+        "use_adaptive_rtol",
     ):
         _ = _as_bool(physics[key], f"physics_toggles.{key}")
 
     if physics["use_photochemistry"]:
         raise ConfigValidationError(
-            "v1 does not support photochemistry; set use_photochemistry=false."
+            "Photochemistry is intentionally not wired in this emulator. Set use_photochemistry=false."
         )
     if physics["use_ion_chemistry"]:
         raise ConfigValidationError(
-            "v1 does not support ion chemistry; set use_ion_chemistry=false."
+            "Ion chemistry is intentionally not wired in this emulator. Set use_ion_chemistry=false."
+        )
+    if physics["use_settling"] and not physics["use_condensation"]:
+        raise ConfigValidationError(
+            "physics_toggles.use_settling=true requires physics_toggles.use_condensation=true."
+        )
+    if physics["use_upwind_molecular_diffusion"] and not physics["use_molecular_diffusion"]:
+        raise ConfigValidationError(
+            "physics_toggles.use_upwind_molecular_diffusion=true requires "
+            "physics_toggles.use_molecular_diffusion=true."
         )
 
 
@@ -886,6 +970,27 @@ def _validate_log10_convention(config: dict[str, Any]) -> None:
         )
 
 
+
+def _validate_cross_section_contracts(config: dict[str, Any]) -> None:
+    """Validate relationships that span multiple config sections."""
+    trajectory_sampling = config["trajectory_sampling"]
+    vulcan_runtime = config["vulcan_runtime"]
+
+    fixed_requested_dt_s = float(trajectory_sampling["fixed_requested_dt_s"])
+    post_equilibrium_time_min_s = float(trajectory_sampling["post_equilibrium_time_min_s"])
+    runtime = float(vulcan_runtime["runtime"])
+
+    if fixed_requested_dt_s >= runtime:
+        raise ConfigValidationError(
+            "trajectory_sampling.fixed_requested_dt_s must be < vulcan_runtime.runtime so at least "
+            "one full requested step can fit inside a trajectory."
+        )
+    if post_equilibrium_time_min_s >= runtime:
+        raise ConfigValidationError(
+            "trajectory_sampling.post_equilibrium_time_min_s must be < vulcan_runtime.runtime."
+        )
+
+
 def load_and_validate_config(path: Path) -> dict[str, Any]:
     """Load JSON config and validate all required contract rules."""
     if not path.is_file():
@@ -930,5 +1035,6 @@ def load_and_validate_config(path: Path) -> dict[str, Any]:
         required=bool(config["physics_toggles"]["use_boundary_conditions"]),
     )
     _validate_log10_convention(config)
+    _validate_cross_section_contracts(config)
     _ = resolve_precision(config)
     return config

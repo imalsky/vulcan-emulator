@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import stat
 import subprocess
 import sys
@@ -17,7 +16,41 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from vulcan_runner import VulcanRuntimeError, preflight_vulcan_source
+from vulcan_runner import SpeciesSelection, VulcanRuntimeError, WorkerSettings, preflight_vulcan_source
+
+
+def _settings(root: Path) -> WorkerSettings:
+    return WorkerSettings(
+        vulcan_source=str(root),
+        worker_root=str(root / "workers"),
+        runs_root=str(root / "runs"),
+        species=SpeciesSelection(
+            state_species=("H2", "H2O"),
+            output_species=("H2", "H2O"),
+        ),
+        boundary_conditions=None,
+        use_eddy_diffusion=True,
+        use_molecular_diffusion=True,
+        use_upwind_molecular_diffusion=False,
+        use_condensation=False,
+        use_settling=False,
+        use_initial_cold_trap=True,
+        use_sat_surface_h2o=False,
+        use_lowT_limit_rates=False,
+        use_adaptive_rtol=True,
+        ini_mix="EQ",
+        atm_base="H2",
+        save_evo_frq=1,
+        keep_vulcan_outputs_debug=False,
+        run_timeout_seconds=1,
+        num_workers=1,
+        runtime=1.0e6,
+        dt_min=1.0e-14,
+        dt_max=1.0e3,
+        count_max=32,
+        trun_min=0.0,
+        count_min=0,
+    )
 
 
 def _write_minimal_vulcan_tree(root: Path) -> Path:
@@ -26,13 +59,13 @@ def _write_minimal_vulcan_tree(root: Path) -> Path:
     cfg_lines = [
         "save_evolution = False",
         "save_evo_frq = 1",
-        "y_time_freq = 1",
         "runtime = 1.0",
         "dt_min = 1e-14",
         "dt_max = 1e2",
         "count_max = 1",
         "trun_min = 0.0",
         "count_min = 0",
+        "use_lowT_limit_rates = False",
         "use_photo = False",
         "use_ion = False",
         "use_live_plot = False",
@@ -45,20 +78,30 @@ def _write_minimal_vulcan_tree(root: Path) -> Path:
         "output_humanread = False",
         "atm_type = 'file'",
         "Kzz_prof = 'file'",
+        "vz_prof = 'const'",
+        "const_vz = 0.0",
         "atm_file = 'atm/generated/preflight_profile.txt'",
         "out_name = 'preflight_smoke.vul'",
         "output_dir = 'output/'",
         "plot_dir = 'plot/'",
         "movie_dir = 'plot/movie/'",
         "ini_mix = 'EQ'",
+        "use_ini_cold_trap = True",
+        "atm_base = 'H2'",
         "use_solar = False",
         "use_Kzz = True",
         "use_moldiff = True",
+        "use_vm_mol = False",
+        "use_vz = False",
         "use_topflux = False",
         "use_botflux = False",
+        "top_BC_flux_file = 'atm/BC_top.txt'",
+        "bot_BC_flux_file = 'atm/BC_bot.txt'",
         "use_fix_sp_bot = {}",
+        "use_sat_surfaceH2O = False",
         "use_condense = False",
         "use_settling = False",
+        "use_adapt_rtol = True",
         "nz = 16",
         "P_b = 1.0e9",
         "P_t = 1.0",
@@ -88,9 +131,7 @@ class PreflightTests(unittest.TestCase):
             with self.assertRaises(VulcanRuntimeError):
                 preflight_vulcan_source(
                     missing,
-                    boundary_conditions=None,
-                    use_transport=True,
-                    use_condensation_optional=True,
+                    settings=_settings(missing),
                     timeout_seconds=1,
                 )
 
@@ -104,9 +145,7 @@ class PreflightTests(unittest.TestCase):
                 with self.assertRaises(VulcanRuntimeError):
                     preflight_vulcan_source(
                         root,
-                        boundary_conditions=None,
-                        use_transport=True,
-                        use_condensation_optional=True,
+                        settings=_settings(root),
                         timeout_seconds=1,
                     )
 
@@ -123,9 +162,7 @@ class PreflightTests(unittest.TestCase):
                 with self.assertRaises(VulcanRuntimeError):
                     preflight_vulcan_source(
                         root,
-                        boundary_conditions=None,
-                        use_transport=True,
-                        use_condensation_optional=True,
+                        settings=_settings(root),
                         timeout_seconds=1,
                     )
 

@@ -58,9 +58,18 @@ def _settings(tmpdir: Path) -> WorkerSettings:
             state_species=("H2", "H2O", "CO2"),
             output_species=("H2O", "H2"),
         ),
-        use_transport=True,
         boundary_conditions=None,
-        use_condensation_optional=True,
+        use_eddy_diffusion=True,
+        use_molecular_diffusion=True,
+        use_upwind_molecular_diffusion=True,
+        use_condensation=True,
+        use_settling=True,
+        use_initial_cold_trap=True,
+        use_sat_surface_h2o=False,
+        use_lowT_limit_rates=False,
+        use_adaptive_rtol=True,
+        ini_mix="EQ",
+        atm_base="H2",
         save_evo_frq=1,
         keep_vulcan_outputs_debug=False,
         run_timeout_seconds=1,
@@ -71,7 +80,6 @@ def _settings(tmpdir: Path) -> WorkerSettings:
         count_max=123,
         trun_min=0.0,
         count_min=0,
-        y_time_freq=7,
     )
 
 
@@ -112,13 +120,13 @@ class VulcanContractTests(unittest.TestCase):
             [
                 "save_evolution = False",
                 "save_evo_frq = 10",
-                "y_time_freq = 10",
                 "runtime = 1.0",
                 "dt_min = 1e-6",
                 "dt_max = 1e2",
                 "count_max = 1",
                 "trun_min = 1.0",
                 "count_min = 1",
+                "use_lowT_limit_rates = True",
                 "use_photo = True",
                 "use_ion = True",
                 "use_live_plot = True",
@@ -131,20 +139,28 @@ class VulcanContractTests(unittest.TestCase):
                 "output_humanread = True",
                 "atm_type = 'P_ana'",
                 "Kzz_prof = 'const'",
+                "vz_prof = 'const'",
+                "const_vz = 1.0",
                 "atm_file = 'atm/atm_HD189_Kzz.txt'",
                 "out_name = 'old.vul'",
                 "output_dir = 'output/'",
                 "plot_dir = 'plot/'",
                 "movie_dir = 'plot/movie/'",
                 "ini_mix = 'EQ'",
+                "use_ini_cold_trap = False",
+                "atm_base = 'H2'",
                 "use_solar = True",
                 "use_Kzz = False",
                 "use_moldiff = False",
+                "use_vm_mol = False",
+                "use_vz = True",
                 "use_topflux = False",
                 "use_botflux = False",
                 "use_fix_sp_bot = {}",
+                "use_sat_surfaceH2O = False",
                 "use_condense = False",
                 "use_settling = False",
+                "use_adapt_rtol = False",
                 "nz = 10",
                 "P_b = 1.0",
                 "P_t = 1.0e-8",
@@ -169,8 +185,15 @@ class VulcanContractTests(unittest.TestCase):
         self.assertIn("runtime = 1000000.0", rendered)
         self.assertIn("dt_max = 1000.0", rendered)
         self.assertIn("count_max = 123", rendered)
-        self.assertIn("y_time_freq = 7", rendered)
         self.assertIn("save_evolution = True", rendered)
+        self.assertIn("use_photo = False", rendered)
+        self.assertIn("use_ion = False", rendered)
+        self.assertIn("use_ini_cold_trap = True", rendered)
+        self.assertIn("use_vm_mol = True", rendered)
+        self.assertIn("use_condense = True", rendered)
+        self.assertIn("use_settling = True", rendered)
+        self.assertIn("use_adapt_rtol = True", rendered)
+        self.assertIn("atm_base = 'H2'", rendered)
 
     def test_extract_run_payload_preserves_full_trajectory_and_species_order(self) -> None:
         species = ["H2", "He", "H2O", "CO2"]

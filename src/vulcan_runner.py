@@ -2,8 +2,9 @@
 
 Manages the lifecycle of individual VULCAN chemistry runs:
 
-1. **Preflight**: Validates the VULCAN source tree (vulcan.py, FastChem binary,
-   chem_funs.py species list) and runs a one-shot smoke test.
+1. **Preflight and compatibility checks**: Validates the VULCAN source tree,
+   checks configured species against ``chem_funs.py``, and runs a one-shot
+   smoke test.
 2. **Worker isolation**: Each process gets its own copy of the VULCAN source
    tree to avoid file conflicts during parallel execution.
 3. **Config generation**: Patches ``vulcan_cfg.py`` with sampled parameters
@@ -13,9 +14,11 @@ Manages the lifecycle of individual VULCAN chemistry runs:
    to mixing ratios (``ymix = n_i / sum(n)``), deduplicates time steps, and
    writes the validated trajectory into a standardized HDF5 layout.
 
-v1 physics coverage: thermochemistry + transport + optional condensation.
-Photochemistry, ion chemistry, and non-H2 atmospheric bases are excluded
-(see spec.md Section 9.4 for full feature coverage map).
+Current physics coverage: non-photochemical VULCAN thermochemistry plus
+configurable transport, boundary conditions, condensation/settling, cold-trap,
+and selected solver/runtime toggles. Photochemistry and ion chemistry remain
+intentionally disabled in this emulator branch (see ``spec.md`` for the full
+coverage map and all exposed toggles).
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -70,9 +73,18 @@ class WorkerSettings:
     worker_root: str
     runs_root: str
     species: SpeciesSelection
-    use_transport: bool
     boundary_conditions: BoundaryConditionSettings | None
-    use_condensation_optional: bool
+    use_eddy_diffusion: bool
+    use_molecular_diffusion: bool
+    use_upwind_molecular_diffusion: bool
+    use_condensation: bool
+    use_settling: bool
+    use_initial_cold_trap: bool
+    use_sat_surface_h2o: bool
+    use_lowT_limit_rates: bool
+    use_adaptive_rtol: bool
+    ini_mix: str
+    atm_base: str
     save_evo_frq: int
     keep_vulcan_outputs_debug: bool
     run_timeout_seconds: int
@@ -83,7 +95,6 @@ class WorkerSettings:
     count_max: int
     trun_min: float
     count_min: int
-    y_time_freq: int
 
 
 @dataclass(frozen=True)
@@ -95,23 +106,6 @@ class RunResult:
 
 
 _WORKER_CACHE: dict[str, Any] = {}
-
-
-def _apply_vulcan_runtime_compat(worker_dir: Path) -> None:
-    """Patch known legacy VULCAN runtime issues inside one copied worker tree."""
-    op_path = worker_dir / "op.py"
-    if not op_path.is_file():
-        raise VulcanRuntimeError(f"VULCAN runtime is missing op.py: {op_path}")
-
-    text = op_path.read_text(encoding="utf-8")
-    legacy_line = "indx = np.abs(t_time-var.t*st_factor).argmin()"
-    patched_line = "indx = np.abs(np.asarray(t_time, dtype=float) - var.t * st_factor).argmin()"
-    if patched_line in text:
-        return
-    if legacy_line not in text:
-        return
-
-    op_path.write_text(text.replace(legacy_line, patched_line), encoding="utf-8")
 
 
 def _load_available_species(vulcan_source: Path) -> list[str]:
@@ -259,9 +253,7 @@ def _build_preflight_run_spec() -> RunSpec:
 def _run_preflight_smoke(
     *,
     vulcan_source: Path,
-    boundary_conditions: BoundaryConditionSettings | None,
-    use_transport: bool,
-    use_condensation_optional: bool,
+    settings: WorkerSettings,
     timeout_seconds: int,
 ) -> None:
     """Run a one-shot VULCAN smoke test inside an isolated worker copy."""
@@ -271,7 +263,6 @@ def _run_preflight_smoke(
         tmpdir = Path(tmpdir_name)
         worker_dir = tmpdir / "worker"
         shutil.copytree(vulcan_source, worker_dir)
-        _apply_vulcan_runtime_compat(worker_dir)
 
         generated_atm_dir = worker_dir / "atm" / "generated"
         generated_atm_dir.mkdir(parents=True, exist_ok=True)
@@ -279,17 +270,11 @@ def _run_preflight_smoke(
         _write_generated_atm_file(preflight_spec, generated_atm_dir / "preflight_profile.txt")
 
         baseline_cfg = (worker_dir / "vulcan_cfg.py").read_text(encoding="utf-8")
-        smoke_settings = WorkerSettings(
+        smoke_settings = replace(
+            settings,
             vulcan_source=str(vulcan_source),
             worker_root=str(tmpdir),
             runs_root=str(tmpdir / "runs"),
-            species=SpeciesSelection(
-                state_species=("H2", "He", "H2O"),
-                output_species=("H2", "He", "H2O"),
-            ),
-            use_transport=use_transport,
-            boundary_conditions=boundary_conditions,
-            use_condensation_optional=use_condensation_optional,
             save_evo_frq=1,
             keep_vulcan_outputs_debug=False,
             run_timeout_seconds=timeout_seconds,
@@ -298,10 +283,8 @@ def _run_preflight_smoke(
             dt_min=1.0e-14,
             dt_max=1.0e-8,
             count_max=1,
-            # Keep the smoke run out of VULCAN's steady-state convergence branch.
-            trun_min=1.0,
-            count_min=10,
-            y_time_freq=1,
+            trun_min=0.0,
+            count_min=0,
         )
         smoke_cfg = _apply_run_config(
             baseline_cfg=baseline_cfg,
@@ -345,12 +328,11 @@ def _run_preflight_smoke(
             )
 
 
+
 def preflight_vulcan_source(
     vulcan_source: Path,
     *,
-    boundary_conditions: BoundaryConditionSettings | None,
-    use_transport: bool,
-    use_condensation_optional: bool,
+    settings: WorkerSettings,
     timeout_seconds: int = 120,
 ) -> None:
     """Verify VULCAN runtime prerequisites without auto-install behavior."""
@@ -380,9 +362,7 @@ def preflight_vulcan_source(
 
     _run_preflight_smoke(
         vulcan_source=vulcan_source,
-        boundary_conditions=boundary_conditions,
-        use_transport=use_transport,
-        use_condensation_optional=use_condensation_optional,
+        settings=settings,
         timeout_seconds=timeout_seconds,
     )
 
@@ -420,7 +400,6 @@ def _ensure_worker_context(settings: WorkerSettings) -> dict[str, Any]:
     if worker_dir.exists():
         shutil.rmtree(worker_dir)
     shutil.copytree(source, worker_dir)
-    _apply_vulcan_runtime_compat(worker_dir)
 
     baseline_cfg_path = worker_dir / "vulcan_cfg.py"
     baseline_cfg_text = baseline_cfg_path.read_text(encoding="utf-8")
@@ -462,6 +441,7 @@ def _apply_run_config(
     """Apply one sampled run configuration to the copied VULCAN config template."""
     cfg = baseline_cfg
     replacements: dict[str, Any] = {
+        "use_lowT_limit_rates": bool(settings.use_lowT_limit_rates),
         "use_photo": False,
         "use_ion": False,
         "use_live_plot": False,
@@ -474,29 +454,36 @@ def _apply_run_config(
         "output_humanread": False,
         "save_evolution": True,
         "save_evo_frq": int(settings.save_evo_frq),
-        "y_time_freq": int(settings.y_time_freq),
         "runtime": float(settings.runtime),
         "dt_min": float(settings.dt_min),
         "dt_max": float(settings.dt_max),
         "count_max": int(settings.count_max),
         "trun_min": float(settings.trun_min),
         "count_min": int(settings.count_min),
+        "ini_mix": str(settings.ini_mix),
+        "use_ini_cold_trap": bool(settings.use_initial_cold_trap),
+        "atm_base": str(settings.atm_base),
+        "use_Kzz": bool(settings.use_eddy_diffusion),
+        "use_moldiff": bool(settings.use_molecular_diffusion),
+        "use_vm_mol": bool(settings.use_upwind_molecular_diffusion),
+        "use_vz": False,
         "atm_type": "file",
         "Kzz_prof": "file",
+        "vz_prof": "const",
+        "const_vz": 0.0,
         "atm_file": atm_relpath,
         "out_name": out_name,
         "output_dir": "output/",
         "plot_dir": "plot/",
         "movie_dir": "plot/movie/",
-        "ini_mix": "EQ",
         "use_solar": False,
-        "use_Kzz": bool(settings.use_transport),
-        "use_moldiff": bool(settings.use_transport),
         "use_topflux": False,
         "use_botflux": False,
         "use_fix_sp_bot": {},
-        "use_condense": bool(settings.use_condensation_optional),
-        "use_settling": bool(settings.use_condensation_optional),
+        "use_sat_surfaceH2O": bool(settings.use_sat_surface_h2o),
+        "use_condense": bool(settings.use_condensation),
+        "use_settling": bool(settings.use_settling),
+        "use_adapt_rtol": bool(settings.use_adaptive_rtol),
         "nz": int(run_spec.pressure_bar.size),
         "P_b": float(np.max(run_spec.pressure_bar) * 1.0e6),
         "P_t": float(np.min(run_spec.pressure_bar) * 1.0e6),
@@ -597,6 +584,7 @@ def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerS
     if float(times[0]) != 0.0:
         raise VulcanRuntimeError("Extracted trajectory must start at t=0.")
 
+    # Convert number densities to mixing ratios: ymix_i = n_i / sum(n_all)
     row_sums = np.sum(states, axis=2, keepdims=True)
     if np.any(~np.isfinite(row_sums)) or np.any(row_sums <= 0.0):
         raise VulcanRuntimeError("Encountered non-positive or non-finite total number density.")
@@ -753,6 +741,8 @@ def run_vulcan_jobs(
                 results.append(_run_single(spec, settings))
             return sorted(results, key=lambda item: item.run_id)
 
+        # Fan out runs across worker processes; each worker gets an isolated VULCAN tree copy.
+        # Fail-fast: cancel remaining futures on the first worker error.
         with ProcessPoolExecutor(max_workers=int(settings.num_workers)) as pool:
             futures = {pool.submit(_run_single, spec, settings): spec.run_id for spec in run_specs}
             try:

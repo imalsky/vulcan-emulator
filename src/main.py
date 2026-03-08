@@ -22,7 +22,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from config_utils import ConfigValidationError, load_and_validate_config, resolve_precision
 from logging_utils import setup_logging
 from path_utils import PathValidationError, ensure_runtime_dirs, resolve_paths
-from preprocess import PreprocessError, run_generation_and_preprocess
+from preprocess import PreprocessError, build_worker_settings, run_generation_and_preprocess
 from trainer import TrainingError, run_training
 from vulcan_runner import (
     VulcanRuntimeError,
@@ -54,23 +54,35 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _enforce_nn_environment() -> None:
-    """Require the expected conda environment before any heavy imports or IO."""
+    """Require the expected conda environment before any heavy imports or IO.
+
+    The expected environment name is read from the ``VULCAN_EMULATOR_CONDA_ENV``
+    environment variable.  If unset, it defaults to ``nn`` (the local dev env).
+    On HPC, ``run.pbs`` exports this variable after activating the cluster env.
+    """
+    expected = os.environ.get("VULCAN_EMULATOR_CONDA_ENV", "nn")
     env_name = os.environ.get("CONDA_DEFAULT_ENV")
-    expected_env = os.environ.get("VULCAN_EMULATOR_CONDA_ENV", "nn")
-    if env_name != expected_env:
+    if env_name != expected:
         raise RuntimeError(
-            f"This project must run inside conda env '{expected_env}'. "
-            f"Use: conda run -n {expected_env} python src/main.py ..."
+            f"This project must run inside conda env '{expected}'. "
+            f"Use: conda run -n {expected} python src/main.py ... "
+            "(or set VULCAN_EMULATOR_CONDA_ENV to override)."
         )
 
 
 def _resolve_config_path(arg_path: Path) -> Path:
-    """Resolve the user-provided config path relative to the project root."""
+    """Resolve the user-provided config path relative to the project root.
+
+    Uses ``VULCAN_EMULATOR_PROJECT_ROOT`` when set (HPC), otherwise derives
+    the root from this file's location (``src/..``).  Path joining uses
+    ``os.path.normpath`` instead of ``.resolve()`` so that symlink-based
+    canonical-path rewriting on HPC does not break sibling-directory references.
+    """
     if arg_path.is_absolute():
         raise RuntimeError("Config path must be relative.")
-    project_root_override = os.environ.get("VULCAN_EMULATOR_PROJECT_ROOT")
-    if project_root_override:
-        project_root = Path(os.path.normpath(project_root_override))
+    env_root = os.environ.get("VULCAN_EMULATOR_PROJECT_ROOT")
+    if env_root:
+        project_root = Path(os.path.normpath(env_root))
     else:
         project_root = Path(__file__).resolve().parent.parent
     return Path(os.path.normpath(str(project_root / arg_path)))
@@ -105,18 +117,23 @@ def main() -> int:
 
         if args.gen:
             boundary_conditions = resolve_boundary_conditions(config, paths.vulcan_source)
+            state_species = list(config["data_spec"]["state_species"])
+            output_species = list(config["data_spec"]["output_species"])
             validate_species_available(
                 paths.vulcan_source,
-                state_species=tuple(config["data_spec"]["state_species"]),
-                output_species=tuple(config["data_spec"]["output_species"]),
+                state_species=tuple(state_species),
+                output_species=tuple(output_species),
+            )
+            settings = build_worker_settings(
+                config,
+                paths,
+                boundary_conditions=boundary_conditions,
+                state_species=state_species,
+                output_species=output_species,
             )
             preflight_vulcan_source(
                 paths.vulcan_source,
-                boundary_conditions=boundary_conditions,
-                use_transport=bool(config["physics_toggles"]["use_transport"]),
-                use_condensation_optional=bool(
-                    config["physics_toggles"]["use_condensation_optional"]
-                ),
+                settings=settings,
                 timeout_seconds=min(int(config["generation"]["run_timeout_seconds"]), 120),
             )
             run_generation_and_preprocess(

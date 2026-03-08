@@ -25,6 +25,8 @@ from trainer import run_training
 
 TMP_ROOT = PROJECT_ROOT / "testing" / "_synthetic_smoke"
 CONFIG_PATH = TMP_ROOT / "synthetic_config.json"
+SYNTHETIC_FIXED_DT_S = 90.0
+SYNTHETIC_POST_EQUILIBRIUM_TIME_S = 10.0
 TOP20_SPECIES = [
     "H2", "He", "H", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "C2H2",
     "N2", "OH", "O", "NO", "NO2", "O2", "H2CO", "CH3OH", "C2H4", "C2H6",
@@ -86,13 +88,16 @@ def _config() -> dict[str, Any]:
             "save_evo_frq": 1,
         },
         "trajectory_sampling": {
-            "pairs_per_run": 6,
-            "requested_dt_min_s": 1e-3,
-            "requested_dt_max_s": 1e3,
-            "requested_dt_spacing": "log_uniform",
-            "allow_anchor_at_t0": True,
+            "mode": "fixed_dt_post_equilibrium",
+            "pairs_per_run": 1,
+            "fixed_requested_dt_s": SYNTHETIC_FIXED_DT_S,
+            "post_equilibrium_time_min_s": SYNTHETIC_POST_EQUILIBRIUM_TIME_S,
+            "post_equilibrium_min_fraction_of_final_time": 0.0,
+            "anchor_sampling": "uniform_valid_anchors",
+            "target_selection": "nearest_saved_snapshot",
             "min_future_saved_steps": 1,
-            "rollout_eval_points": 4,
+            "max_target_relative_dt_error": 0.0,
+            "rollout_eval_points": 2,
         },
         "vulcan_runtime": {
             "runtime": 1e3,
@@ -101,7 +106,8 @@ def _config() -> dict[str, Any]:
             "count_max": 1000,
             "trun_min": 0.0,
             "count_min": 0,
-            "y_time_freq": 1,
+            "ini_mix": "EQ",
+            "atm_base": "H2",
         },
         "tp_sampler": {
             "pressure_grid": {"nz": 4, "p_top_bar": 1e-3, "p_bottom_bar": 10.0},
@@ -140,9 +146,16 @@ def _config() -> dict[str, Any]:
         "physics_toggles": {
             "use_photochemistry": False,
             "use_ion_chemistry": False,
-            "use_transport": True,
+            "use_eddy_diffusion": True,
+            "use_molecular_diffusion": True,
+            "use_upwind_molecular_diffusion": False,
             "use_boundary_conditions": False,
-            "use_condensation_optional": False,
+            "use_condensation": False,
+            "use_settling": False,
+            "use_initial_cold_trap": True,
+            "use_sat_surface_h2o": False,
+            "use_lowT_limit_rates": False,
+            "use_adaptive_rtol": True,
         },
         "data_spec": {
             "state_species": TOP20_SPECIES,
@@ -275,24 +288,39 @@ def _write_raw_run(path: Path, run: dict[str, Any], state_species: list[str]) ->
 
 def _build_processed_samples(run: dict[str, Any]) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float]]:
     static = np.stack([run["pressure_bar"], run["temperature_k"], run["kzz_cm2_s"]], axis=1)
-    samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
-    for anchor_idx in range(run["time_s"].size - 1):
-        for target_idx in range(anchor_idx + 1, run["time_s"].size):
-            anchor = run["ymix_state"][anchor_idx]
-            target = run["ymix_state"][target_idx]
-            dt_s = float(run["time_s"][target_idx] - run["time_s"][anchor_idx])
-            sequence = np.concatenate([static, anchor], axis=1).astype(np.float32, copy=False)
-            globals_ = np.array(
-                [
-                    run["gravity_cm_s2"],
-                    run["metallicity_log10"],
-                    run["c_to_o"],
-                    np.log10(dt_s),
-                ],
-                dtype=np.float32,
-            )
-            samples.append((sequence, globals_, target.astype(np.float32, copy=False), dt_s))
-    return samples
+    times_s = np.asarray(run["time_s"], dtype=np.float64)
+    valid_anchor_indices = np.where(times_s >= SYNTHETIC_POST_EQUILIBRIUM_TIME_S)[0]
+    if valid_anchor_indices.size == 0:
+        raise RuntimeError("Synthetic trajectory did not contain any post-equilibrium anchor states.")
+
+    anchor_idx = int(valid_anchor_indices[0])
+    requested_target_time_s = float(times_s[anchor_idx] + SYNTHETIC_FIXED_DT_S)
+    future_times = times_s[anchor_idx + 1 :]
+    if future_times.size == 0:
+        raise RuntimeError("Synthetic trajectory did not contain a future state after the anchor.")
+
+    nearest_offset = int(np.argmin(np.abs(future_times - requested_target_time_s)))
+    target_idx = anchor_idx + 1 + nearest_offset
+    dt_s = float(times_s[target_idx] - times_s[anchor_idx])
+    if not np.isclose(dt_s, SYNTHETIC_FIXED_DT_S, rtol=0.0, atol=1.0e-12):
+        raise RuntimeError(
+            "Synthetic fixed-dt sample does not match the configured requested dt. "
+            f"actual={dt_s} requested={SYNTHETIC_FIXED_DT_S}"
+        )
+
+    anchor = run["ymix_state"][anchor_idx]
+    target = run["ymix_state"][target_idx]
+    sequence = np.concatenate([static, anchor], axis=1).astype(np.float32, copy=False)
+    globals_ = np.array(
+        [
+            run["gravity_cm_s2"],
+            run["metallicity_log10"],
+            run["c_to_o"],
+            np.log10(dt_s),
+        ],
+        dtype=np.float32,
+    )
+    return [(sequence, globals_, target.astype(np.float32, copy=False), dt_s)]
 
 
 def _write_processed_split(

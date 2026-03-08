@@ -1,541 +1,752 @@
-# Vulcan-Emulator Scientific Development Spec
+# Vulcan-Emulator Specification
 
-## 1. Purpose And Scope
+## 1. Objective
 
-This project builds a machine-learning surrogate for VULCAN 1D atmospheric chemistry.
+This repository implements a GPU-first surrogate for the non-photochemical part of the current local VULCAN codebase.
 
-- Primary objective (v1):
-  - Emulate **time-conditioned thermochemical trajectories** from VULCAN.
-  - Inputs: atmospheric setup + initial chemistry state + query time.
-  - Outputs: top-20 configured species vertical `ymix` profiles at requested time.
-- Long-term objective:
-  - Expand toward broader VULCAN feature parity (including photochemistry), without redesigning core architecture.
-- Explicit v1 exclusion:
-  - Photochemistry and ion chemistry are disabled by default.
+The current operating mode is intentionally narrower than a fully arbitrary-time emulator:
 
-## 2. Engineering Principles
+1. generate VULCAN trajectories with as much non-photochemical physics as is practical from simple config toggles,
+2. sample only late-time transitions,
+3. train the model on one fixed requested jump size,
+4. condition the model on the snapped **actual** jump size that comes from the saved VULCAN trajectory.
 
-- Fail fast:
-  - Missing files, invalid config, invalid value ranges, unsupported precision, or inconsistent artifacts must raise immediately.
-- No hidden fallback:
-  - No silent mode switching, no auto-downgrades, no "best effort" behavior.
-  - If requested behavior is unsupported, terminate with actionable error.
-- Minimal complexity in checks:
-  - Validate contracts once, early, and explicitly.
-  - Avoid layered defensive branching that hides root causes.
-- Pythonic and maintainable:
-  - Clear function boundaries, small modules, explicit typing, deterministic IO contracts.
-- Config is the single source of truth:
-  - All science/runtime behavior is config-defined, not hardcoded in execution paths.
+The shipped main configuration uses:
 
-## 3. Repository Layout
+- `trajectory_sampling.fixed_requested_dt_s = 1e12` seconds,
+- `trajectory_sampling.post_equilibrium_time_min_s = 1e12` seconds,
+- `trajectory_sampling.target_selection = "nearest_saved_snapshot"`,
+- `generation.save_evo_frq = 1`.
 
-Project root:
-- `.`
+This is a deliberate "single operational horizon after equilibration" design, not a true arbitrary-`dt` emulator.
 
-Required layout:
-- `src/`: all runtime code.
-- `config/`: required config files.
-- `data/raw/`: canonical generated trajectory data (HDF5).
-- `data/processed/`: normalized NPY shards for training.
-- `models/`: checkpoints and run artifacts.
-- `testing/`: validation and analysis scripts.
-- `unit_tests/`: fast artifact-light unit tests suitable for local Codex verification.
-- `spec.md`: this contract.
+## 2. Scope
 
-No runtime code is allowed outside `src/` for normal operation.
+Included in scope:
 
-### 3.1 Path Convention
+- VULCAN thermochemistry from the currently compiled local chemistry network,
+- sampled temperature-pressure profiles,
+- sampled eddy-diffusion profiles,
+- sampled gravity and elemental abundance controls,
+- optional molecular diffusion,
+- optional upwind molecular-diffusion discretization,
+- optional boundary conditions,
+- optional condensation and settling,
+- optional cold-trap initialization,
+- optional adaptive ODE relative tolerance,
+- optional low-temperature-limited rates,
+- configurable atmospheric base gas,
+- fixed-`dt` late-time surrogate training,
+- GPU-preloaded and vectorized surrogate training/inference.
 
-- Use relative paths everywhere (code, config, docs, logs).
-- Resolve all relative paths against project root (`.`).
-- Absolute paths are disallowed in normal runtime configuration.
+Explicitly excluded in this branch:
 
-## 4. Environment Contract
+- photochemistry,
+- ion chemistry,
+- arbitrary-time requested supervision,
+- vertical advection via `use_vz`,
+- non-equilibrium initialization modes other than `ini_mix = "EQ"`,
+- automatic chemistry-network regeneration from VULCAN source templates.
 
-- All commands run in conda environment `nn`.
-- VULCAN is **assumed pre-installed and runnable**.
-- Default VULCAN source path for subprocess execution is `../VULCAN-master`.
-- If VULCAN runtime prerequisites are missing at execution time, command fails immediately with explicit remediation text.
+## 3. Design Principles
 
-Canonical command examples:
-- `conda run -n nn python src/main.py --gen`
-- `conda run -n nn python src/main.py --train`
+The repository follows these rules.
 
-## 5. CLI Contract (`src/main.py`)
+- Fail fast on missing files, invalid config keys, invalid ranges, inconsistent artifacts, and unsupported mode combinations.
+- Keep all important science/runtime controls in config rather than hidden in code.
+- Prefer deterministic preprocessing and small explicit helper functions over implicit magic.
+- Vectorize preprocessing and training data construction wherever practical.
+- Keep training GPU-first, but do not pretend VULCAN generation itself is GPU-accelerated; the external VULCAN subprocess remains CPU-bound.
+- Remove dead configuration surface rather than keeping misleading knobs.
 
-`src/main.py` supports only explicit action flags:
+## 4. Repository Responsibilities
 
-- `--gen`:
-  - Run full data-prep stage in one command:
-    1. generate raw HDF5 trajectories via VULCAN subprocess runs
-    2. normalize and write processed NPY shards
-- `--train`:
-  - Train surrogate from processed shards.
+`src/sampling.py`
+: Samples TP, gravity, Kzz, and abundance parameters and materializes `RunSpec` objects.
 
-Rules:
-- Exactly one action is required (`--gen` or `--train`).
-- No `--install-vulcan`, no `--normalize`, no `--all`.
-- Missing prerequisites are hard failures.
-- No implicit fallback to alternate modes.
+`src/vulcan_runner.py`
+: Validates the local VULCAN tree, creates isolated worker copies, patches `vulcan_cfg.py`, launches `vulcan.py -n`, and converts `.vul` outputs into canonical raw HDF5 trajectories.
 
-## 6. VULCAN Runtime Contract
+`src/transition_sampling.py`
+: Implements fixed requested-`dt` late-time transition sampling and deterministic fixed-`dt` rollout-path construction.
 
-### 6.1 Source Path
+`src/preprocess.py`
+: Loads raw HDF5 runs, builds processed training pairs, computes normalization statistics, and writes sharded arrays plus metadata.
 
-- VULCAN source path is config-defined.
-- Default: `../VULCAN-master` relative to project root.
-- v1 uses **local source path execution** (`python vulcan.py` from source tree), not package import.
+`src/model.py`
+: Defines the transformer + FiLM transition model.
 
-### 6.2 Runtime Preflight (No Installer)
+`src/data_loader.py`
+: Loads processed shards in RAM/disk/auto modes and supports CUDA device prefetch.
 
-At the start of `--gen`, code must validate:
+`src/trainer.py`
+: Trains the surrogate, evaluates validation/test metrics, and computes fixed-`dt` rollout metrics against raw VULCAN trajectories.
 
-1. Source tree exists.
-2. Required runtime files exist:
-  - `vulcan.py`
-  - `vulcan_cfg.py`
-  - `fastchem_vulcan/`
-  - compiled `fastchem_vulcan/fastchem`
-3. VULCAN run command is executable in `nn` via a real smoke run in an isolated worker copy.
+`src/main.py`
+: Entry point for `--gen` and `--train`.
 
-Any preflight failure is fatal. The pipeline must not attempt auto-install or auto-build.
+`config/config.json`
+: Main training/generation configuration. This now defaults to the full 69-species list present in the current local `chem_funs.py`.
 
-## 7. Configuration Contract
+`config/tiny_train_smoke.json`
+: Tiny CPU-safe smoke config.
 
-All required keys must exist with exact type/range validation.
+## 5. Important Current Constraints
 
-### 7.1 Top-Level Sections
+### 5.1 Chemistry-network identity
 
-- `paths`
-- `generation`
-- `trajectory_sampling`
-- `vulcan_runtime`
-- `tp_sampler`
-- `gravity_sampler`
-- `kzz_sampler`
-- `abundance_sampler`
-- `physics_toggles`
-- `boundary_conditions` (optional; required only when enabled)
-- `data_spec`
-- `normalization`
-- `precision`
-- `training`
+The generation path runs `python vulcan.py -n` inside a copied VULCAN source tree. That means the effective chemistry network comes from the already compiled/generated VULCAN files in that tree, especially `chem_funs.py`.
 
-### 7.2 Required Section Details
+This repository does **not** rebuild the chemistry network automatically.
 
-#### `paths`
+If the VULCAN chemistry network changes, the user must:
+
+1. regenerate the VULCAN chemistry artifacts in the VULCAN tree,
+2. make sure `data_spec.state_species` and `data_spec.output_species` still match that compiled network,
+3. regenerate raw and processed data.
+
+### 5.2 Full-state closure versus reduced species
+
+The shipped main config uses the full currently compiled 69-species list from the local `chem_funs.py`, because that is the most faithful non-photochemical state representation available without further architectural changes.
+
+Reduced species subsets are still supported, but they are not fully Markov-closed with respect to the full VULCAN chemistry state.
+
+### 5.3 Equilibrium is treated as an operational regime, not a proof
+
+`post_equilibrium_time_min_s = 1e12` seconds is a practical late-time cutoff, not a mathematically guaranteed equilibrium detector.
+
+The code intentionally avoids a per-run equilibrium heuristic because that would add run-dependent ambiguity, extra passes over trajectories, and more complicated contracts. Instead, the late-time cutoff is explicit and user-controlled in config.
+
+If the chosen sampler ranges or physics toggles produce trajectories that are still drifting materially after `1e12` seconds, increase the threshold and regenerate data.
+
+## 6. Configuration Surface
+
+All important runtime, generation, and training controls are exposed through config.
+
+### 6.1 `paths`
+
 - `project_root`
-- `vulcan_source_path` (default `../VULCAN-master`)
+- `vulcan_source_path`
 - `data_root`
 - `models_root`
 - `logs_root`
 
-Path rule for this section:
-- all values must be relative paths.
+All configured paths must be relative.
 
-#### `generation`
-- `num_runs` (default first milestone: `1000`)
-- `num_workers` (multiprocess CPU workers)
-- `save_evo_frq` (snapshot saving frequency; default `1`)
-- `y_time_freq` (time-output frequency; default `1`)
-- `split_ratios` (configurable; default `train=0.80`, `val=0.10`, `test=0.10`)
+### 6.2 `generation`
+
+Controls the VULCAN-run stage and dataset sharding.
+
+Important keys:
+
+- `num_runs`
+- `num_workers`
+- `split_ratios`
 - `random_seed`
-- `keep_vulcan_outputs_debug` (`false` default)
-- `failure_policy` (`fail_on_first_error`)
+- `run_timeout_seconds`
+- `manifest_filename`
+- `split_filename`
+- `shard_size`
+- `worker_root`
+- `runs_root`
+- `save_evo_frq`
+- `keep_vulcan_outputs_debug`
+- `failure_policy`
 
-#### `tp_sampler`
-- Uses modified Line-2013 style parameterization used in prior RT work.
-- Required parameter distributions include:
-  - `log10_kappa_ir`
-  - `log10_gamma1`
-  - `log10_gamma2`
-  - `alpha_partition`
-  - `t_int`
-  - `t_irr`
-  - `temperature_shift`
-  - `kappa_pressure_power_exponent`
-  - `convective_adjustment_probability`
-- Must also define physical reject rules (e.g., non-positive temperatures).
+Important note: `save_evo_frq` is the effective saved-trajectory thinning control in the bundled VULCAN code used here.
 
-#### `kzz_sampler` (global config knobs)
-- Strategy: hybrid literature-inspired power-law family.
-- Required keys:
-  - `mode` = `power_law_profile`
-  - `log10_kzz_at_1bar_min` (default `8.0`)
-  - `log10_kzz_at_1bar_max` (default `10.0`)
-  - `beta_min` (default `0.4`)
-  - `beta_max` (default `0.6`)
-  - `kzz_floor_cm2_s`
-  - `kzz_cap_cm2_s`
-  - `pressure_unit_for_profile` (`bar`)
-- Every run must log sampled Kzz parameters and realized profile summary.
+### 6.3 `trajectory_sampling`
 
-#### `abundance_sampler` (global config knobs)
-- Required:
-  - `metallicity_mode` (log-scale multiplier)
-  - `log10_metallicity_min`
-  - `log10_metallicity_max`
-  - `c_to_o_min`
-  - `c_to_o_max`
-  - mapping rules into VULCAN elemental abundance fields
+This section now defines a fixed late-time training regime.
 
-#### `physics_toggles`
-- `use_photochemistry` (default `false`, required)
-- `use_ion_chemistry` (default `false`, required)
-- `use_transport` (default `true`)
-- `use_boundary_conditions` (default `false`)
-- `use_condensation_optional` (default `true`)
+Required keys:
 
-#### `boundary_conditions` (optional)
-- Required when `physics_toggles.use_boundary_conditions=true`
-- Required keys:
-  - `use_topflux`
-  - `use_botflux`
-  - `top_BC_flux_file`
-  - `bot_BC_flux_file`
-  - `use_fix_sp_bot`
-- Boundary-condition file paths are relative to the VULCAN source tree copied into each worker.
-- Enabling boundary conditions with no active top flux, bottom flux, or fixed bottom mixing ratios is invalid.
+- `mode = "fixed_dt_post_equilibrium"`
+- `pairs_per_run`
+- `fixed_requested_dt_s`
+- `post_equilibrium_time_min_s`
+- `post_equilibrium_min_fraction_of_final_time`
+- `anchor_sampling = "uniform_valid_anchors"`
+- `target_selection = "nearest_saved_snapshot"`
+- `min_future_saved_steps`
+- `max_target_relative_dt_error`
+- `rollout_eval_points`
 
-#### `data_spec`
-- Explicit top-20 `target_species` list is required (no default list).
-- `required_input_profiles`:
-  - `pressure_bar`
-  - `temperature_k`
-  - `kzz_cm2_s`
-- `required_global_inputs`:
-  - gravity + abundance params + run metadata used for conditioning
-- `required_state_inputs`:
-  - initial `ymix` of configured species
-- `time_input_transform` = `log10_time_seconds`
-- strict shape/dtype requirements and required HDF5 keys
+Semantics:
 
-#### `normalization`
-- Explicit per-variable methods only, no implicit defaults.
-- Target `ymix` policy:
-  - log-space transform with epsilon, then configured scaling.
+- `fixed_requested_dt_s`: the single requested horizon used to build training pairs.
+- `post_equilibrium_time_min_s`: minimum absolute anchor time allowed for training/evaluation sampling.
+- `post_equilibrium_min_fraction_of_final_time`: optional additional late-time threshold as a fraction of the trajectory end time.
+- `min_future_saved_steps`: target must be at least this many saved steps after the anchor.
+- `max_target_relative_dt_error`: maximum allowed relative mismatch between the requested `dt` and the snapped saved-state `actual_dt`.
 
-#### `precision`
-- default all FP32
-- optional AMP/BF16 only when explicitly configured and hardware-supported
-- invalid combinations hard-fail
+### 6.4 `vulcan_runtime`
 
-#### `training`
-- model family: transformer encoder + FiLM
-- objective: time-conditioned trajectory regression
-- `gpu_preload` is CUDA-only and must hard-fail on non-CUDA devices
-- explicit `data_loading` policy:
-  - `mode`: `auto` | `ram` | `disk`
-  - bounded shard cache size and mmap threshold
-  - explicit RAM safety fraction for `auto`
-  - `use_device_prefetch` is CUDA-only and must hard-fail on non-CUDA devices
-- OOM behavior: hard-fail unless user explicitly changes loading policy
+Controls the underlying VULCAN integration run.
 
-## 8. Logarithm Convention
+Required keys:
 
-All logarithms in this project are **base-10 only**.
+- `runtime`
+- `dt_min`
+- `dt_max`
+- `count_max`
+- `trun_min`
+- `count_min`
+- `ini_mix`
+- `atm_base`
 
-- No natural-log conventions are allowed in config semantics, normalization semantics, metrics semantics, or model-input transforms.
-- Any config key that implies logarithmic behavior must use explicit base-10 naming (for example `log10_*`).
+Current repository rules:
 
-## 9. Scientific Generation Design
+- `ini_mix` is explicit in config but currently restricted to `"EQ"`.
+- `atm_base` is exposed and validated against `H2`, `N2`, `O2`, `CO2`, and `H2O`.
 
-### 9.1 VULCAN-Conditioned Inputs
+### 6.5 `tp_sampler`
 
-Mandatory model inputs in v1:
+Defines the TP-profile family and its parameter distributions.
 
-1. Vertical pressure profile (`pressure_bar`)
-2. Vertical temperature profile (`temperature_k`)
-3. Vertical Kzz profile (`kzz_cm2_s`)
-4. Gravity
-5. Elemental abundance controls (metallicity + C/O derived settings)
-6. Initial composition profile for configured target species (`ymix0`)
-7. Query time encoded as `log10(time_s)`
+Important exposed knobs include:
 
-### 9.2 TP Profile Strategy
+- pressure grid: `nz`, `p_top_bar`, `p_bottom_bar`,
+- temperature bounds,
+- `max_sampling_attempts`,
+- `adiabatic_gradient`,
+- `convective_adjustment_probability`,
+- `log10_kappa_ir`,
+- `kappa_pressure_power_exponent`,
+- `log10_gamma1`,
+- `log10_gamma2`,
+- `alpha_partition`,
+- `t_int`,
+- `t_irr`,
+- `temperature_shift`.
 
-v1 uses the same high-level strategy as prior RT profile generation:
-- Modified Line-2013 style parameterized TP family.
-- Broad but controlled sampling for hot-Jupiter-relevant regime.
-- Explicit rejection criteria for non-physical outcomes.
-- No silent clipping to "fix" invalid samples.
+All of these are sampled directly from config-defined distributions.
 
-### 9.3 Kzz Parameterization Notes (v1)
+### 6.6 `gravity_sampler`
 
-Kzz is uncertain and model-dependent in exoplanet atmospheres. It varies with dynamics, pressure, temperature, and tracer behavior. For v1, this project uses a conservative, explicit family to ensure learnable coverage without pretending Kzz is uniquely known.
+Supported modes:
 
-Default profile family:
-- `Kzz(p_bar) = clamp( Kzz_1bar * p_bar^(-beta), floor, cap )`
+- `uniform`
+- `fixed`
 
-Default conservative sampled ranges:
-- `log10(Kzz_1bar [cm^2 s^-1]) in [8, 10]`
-- `beta in [0.4, 0.6]`
-- `floor` and `cap` are required config values.
+### 6.7 `kzz_sampler`
 
-Rationale:
-- wide enough to teach Kzz sensitivity
-- conservative enough for stable v1 generation
-- fully configurable for future literature updates
+Current mode:
 
-Future extension modes (not v1 default):
-- temperature-dependent Kzz families
-- species-dependent effective mixing parameterizations
-- externally supplied dynamical Kzz profiles
+- `power_law_profile`
 
-### 9.4 VULCAN Feature Coverage
+Important exposed knobs:
 
-VULCAN exposes many physics toggles and configuration options. This section documents which are supported in v1 and which are deferred.
+- `log10_kzz_at_1bar_min`
+- `log10_kzz_at_1bar_max`
+- `beta_min`
+- `beta_max`
+- `kzz_floor_cm2_s`
+- `kzz_cap_cm2_s`
+- `pressure_unit_for_profile`
 
-**Fully supported in v1:**
-- **Varying Kzz profiles**: Kzz is a per-level sequence input. The data pipeline samples power-law profiles per run and passes the realized profile as a sequence feature, so the model learns Kzz sensitivity directly.
-- **Condensation**: Controlled via `physics_toggles.use_condensation_optional`. When enabled, VULCAN's `use_condense` and `use_settling` are activated for eligible runs during data generation. This is a fixed generation-time toggle, not a per-run FiLM conditioning variable.
-- **Transport**: Enabled by default (`use_transport=true`).
-- **Boundary conditions**: Optional support via `physics_toggles.use_boundary_conditions` and the `boundary_conditions` config section.
-- **Gravity, metallicity, C/O ratio**: Sampled per run and passed as global FiLM conditioning inputs.
+### 6.8 `abundance_sampler`
 
-**Explicitly excluded in v1:**
-- **Photochemistry** (`use_photo`): Disabled. Would require stellar parameters (r_star, orbit_radius, sl_angle, sflux_file) and significantly expand the conditioning space.
-- **Ion chemistry** (`use_ion`): Disabled. Coupled to photochemistry.
-- **Stellar parameters**: Not applicable without photochemistry.
-- **Atmospheric base gas selection** (`atm_base`): v1 assumes H2-dominated atmospheres only.
+Important exposed knobs:
 
-**Not per-run conditioned (generation-level only):**
-- **Condensation toggle**: Supported as a generation-level switch but not as a per-sample FiLM feature. Adding condensation as a per-run conditioning variable would require expanding `global_dim` and the normalization pipeline—deferred to v2.
+- `metallicity_mode`
+- `log10_metallicity_min`
+- `log10_metallicity_max`
+- `c_to_o_min`
+- `c_to_o_max`
+- `solar_abundances`
 
-### 9.5 Generation Orchestration
+The code samples metallicity and C/O, derives elemental abundances, and always runs VULCAN with `use_solar = False` so that these sampled values actually control the chemistry input.
 
-- Multiprocess CPU worker pool is default.
-- Each worker runs VULCAN subprocess jobs in isolated working directories.
-- Worker failure policy:
-  - any run crash/convergence failure aborts full generation job.
-- Every run produces:
-  - sampled parameter record
-  - VULCAN output extraction payload
-  - deterministic run id and provenance metadata
+### 6.9 `physics_toggles`
 
-## 10. Data Contracts
+This section now exposes the simple non-photochemical VULCAN on/off controls that are structurally safe to map directly.
 
-### 10.1 Raw Canonical Data
+Supported keys:
 
-Format:
-- HDF5 only.
+- `use_photochemistry`
+- `use_ion_chemistry`
+- `use_eddy_diffusion`
+- `use_molecular_diffusion`
+- `use_upwind_molecular_diffusion`
+- `use_boundary_conditions`
+- `use_condensation`
+- `use_settling`
+- `use_initial_cold_trap`
+- `use_sat_surface_h2o`
+- `use_lowT_limit_rates`
+- `use_adaptive_rtol`
 
-Contract:
-- Data grouped by run id, then snapshots.
-- Required fields must include:
-  - run metadata
-  - profile inputs (`pressure_bar`, `temperature_k`, `kzz_cm2_s`)
-  - global inputs (gravity, abundance controls, BC/meta used by model)
-  - initial state (`ymix0`)
-  - snapshot time `time_s`
-  - targets (`ymix_target_top20`)
-- Any missing key, shape mismatch, NaN/Inf is fatal.
+Validation rules:
 
-`.vul` retention:
-- default: do not retain full `.vul` outputs
-- optional debug retention via config (`keep_vulcan_outputs_debug=true`)
+- `use_photochemistry` must currently be `false`.
+- `use_ion_chemistry` must currently be `false`.
+- `use_settling=true` requires `use_condensation=true`.
+- `use_upwind_molecular_diffusion=true` requires `use_molecular_diffusion=true`.
 
-### 10.2 Processed Training Data
+### 6.10 `boundary_conditions`
 
-Format:
-- NPY shards.
+Required only when `physics_toggles.use_boundary_conditions = true`.
 
-Layout:
-- `data/processed/train/`
-- `data/processed/val/`
-- `data/processed/test/`
+Required keys:
 
-Per split:
-- shard arrays for sequence inputs, global inputs, and targets
-- metadata JSON with shard counts, feature ordering, normalization fingerprint
-- `processed_fingerprint.json` linking processed artifacts to config + raw run provenance
+- `use_topflux`
+- `use_botflux`
+- `top_BC_flux_file`
+- `bot_BC_flux_file`
+- `use_fix_sp_bot`
 
-Split policy:
-- split by run/case only (never by snapshot)
-- ratios default `70/15/15`
-- split leakage across run ids is disallowed and fatal.
+### 6.11 `data_spec`
 
-`--gen` responsibility:
-- `--gen` must produce both raw and processed artifacts in one execution.
-- `--train` must refuse processed artifacts whose fingerprint/config/raw-run provenance no longer matches the current config.
+Important keys:
 
-## 11. Normalization Policy
+- `state_species`
+- `output_species`
+- `required_input_profiles`
+- `required_global_inputs`
+- `required_state_inputs`
+- `time_input_transform`
+- `strict_non_finite`
 
-- All variables require explicit configured transform.
-- Missing method/stats is fatal.
-- Target `ymix` transform:
-  - log-space with epsilon (base-10)
-  - explicit scaler per config
-- Statistics are computed on train split only.
-- No implicit normalization defaults.
+The current main config uses:
 
-## 12. Precision And Numerical Policy
+- full compiled state/output species list,
+- profile inputs: pressure, temperature, Kzz,
+- global inputs: gravity, metallicity, C/O, `log10_dt_s`,
+- state input: anchor `ymix`,
+- `time_input_transform = "log10_dt_seconds"`.
 
-Defaults:
-- input/stat/model/forward/loss/optimizer-state: `float32`
+### 6.12 `normalization`
 
-Optional mixed precision:
-- allowed only when config requests it and backend supports it
-- BF16/AMP requests on unsupported backend are fatal
+Explicit per-variable normalization rules.
 
-No automatic dtype fallback is allowed.
+The main config currently uses:
 
-## 13. Model Architecture
+- `pressure_bar`: `log-min-max`
+- `temperature_k`: `standard`
+- `kzz_cm2_s`: `log-standard`
+- `anchor_ymix`: `log-standard`
+- `gravity_cm_s2`: `log-standard`
+- `metallicity_log10`: `standard`
+- `c_to_o`: `standard`
+- `log10_dt_s`: `standard`
+- targets: `log-standard`
 
-### 13.1 Overview
+### 6.13 `precision`
 
-Architecture family: encoder-only transformer with FiLM (Feature-wise Linear Modulation) conditioning and a regression output head.
+Controls numeric dtypes for input tensors, stats accumulation, forward pass, loss, optimizer state, and optional autocast.
 
-Data flow:
+### 6.14 `training`
+
+Important keys:
+
+- `device`
+- `gpu_preload`
+- `batch_size`
+- `epochs`
+- `learning_rate`
+- `min_lr`
+- `warmup_epochs`
+- `weight_decay`
+- `gradient_clip`
+- `use_amp`
+- `num_workers`
+- `seed`
+- `data_loading`
+- `model`
+- `output_folder`
+
+The shipped main config is GPU-prioritized:
+
+- `device = "cuda"`
+- `gpu_preload = true`
+- `data_loading.mode = "ram"`
+- `data_loading.use_device_prefetch = true`
+
+## 7. VULCAN Physics Toggle Mapping
+
+This section states exactly what each exposed non-photochemical switch does.
+
+### 7.1 `use_eddy_diffusion`
+
+Mapped to VULCAN `use_Kzz`.
+
+Effect: includes vertical eddy-diffusion transport using the sampled `Kzz(p)` profile.
+
+### 7.2 `use_molecular_diffusion`
+
+Mapped to VULCAN `use_moldiff`.
+
+Effect: includes species-dependent molecular diffusion in addition to bulk eddy transport.
+
+### 7.3 `use_upwind_molecular_diffusion`
+
+Mapped to VULCAN `use_vm_mol`.
+
+Effect: enables VULCAN's alternate upwind treatment for molecular diffusion. The upstream VULCAN config comments label this path as under testing, so it is exposed but defaults to `false`.
+
+### 7.4 `use_boundary_conditions`
+
+Activates the optional `boundary_conditions` section.
+
+Effect: allows top fluxes, bottom fluxes, and/or fixed lower-boundary species mixing ratios to be applied in VULCAN.
+
+### 7.5 `use_condensation`
+
+Mapped to VULCAN `use_condense`.
+
+Effect: enables condensation reactions for configured condensable species.
+
+### 7.6 `use_settling`
+
+Mapped to VULCAN `use_settling`.
+
+Effect: includes gravitational settling of condensate particles. This is only valid when condensation is also enabled.
+
+### 7.7 `use_initial_cold_trap`
+
+Mapped to VULCAN `use_ini_cold_trap`.
+
+Effect: applies cold-trap logic during initialization of the equilibrium abundance field.
+
+### 7.8 `use_sat_surface_h2o`
+
+Mapped to VULCAN `use_sat_surfaceH2O`.
+
+Effect: enables the surface H2O saturation treatment used by VULCAN for atmospheres where near-surface H2O should be saturation-limited.
+
+### 7.9 `use_lowT_limit_rates`
+
+Mapped to VULCAN `use_lowT_limit_rates`.
+
+Effect: applies low-temperature limiting behavior to reaction rates where VULCAN supports it.
+
+### 7.10 `use_adaptive_rtol`
+
+Mapped to VULCAN `use_adapt_rtol`.
+
+Effect: allows VULCAN to adjust the relative tolerance during long integrations.
+
+### 7.11 `atm_base`
+
+Mapped directly to VULCAN `atm_base`.
+
+Effect: changes the assumed bulk atmospheric gas, which in turn changes molecular-diffusion coefficients, thermal-diffusion factors, and settling behavior inside VULCAN.
+
+### 7.12 Pinned or intentionally unsupported controls
+
+The following are intentionally pinned in this emulator branch.
+
+- `use_photo = False`
+- `use_ion = False`
+- `use_vz = False`
+- `atm_type = "file"`
+- `Kzz_prof = "file"`
+- `vz_prof = "const"`
+- `const_vz = 0.0`
+- `use_solar = False`
+- `ini_mix = "EQ"`
+
+Reasons:
+
+- photochemistry and ion chemistry require a different conditioning surface and different data semantics,
+- vertical advection requires an explicit velocity-profile contract that is not part of the current data model,
+- `atm_type` and `Kzz_prof` are pinned to file-based inputs because the repository already generates explicit TP/Kzz profiles,
+- `use_solar` is pinned off because abundances are sampled explicitly in this repository,
+- non-`EQ` initialization modes require additional file/grid contracts that are intentionally excluded for now.
+
+## 8. Raw Data Contract
+
+Each successful VULCAN run is converted into one HDF5 file under the raw runs directory.
+
+Required content:
+
+- `inputs/pressure_bar`
+- `inputs/temperature_k`
+- `inputs/kzz_cm2_s`
+- `inputs/state_species`
+- `inputs/output_species`
+- `globals/gravity_cm_s2`
+- `globals/metallicity_log10`
+- `globals/c_to_o`
+- `trajectory/time_s`
+- `trajectory/ymix_state`
+- `trajectory/ymix_output`
+
+Important details:
+
+- number densities are converted to mixing ratios before writing,
+- duplicate or non-increasing saved times are removed,
+- the initial state at `t=0` is prepended from VULCAN `y_ini`,
+- `ymix_output` is a possibly reordered subset of the full state according to `output_species`.
+
+## 9. Processed Data Contract
+
+Processed splits are stored in sharded `.npy` arrays with a metadata file per split.
+
+Per-sample tensors are:
+
+- sequence input: `[pressure_bar, temperature_k, kzz_cm2_s, anchor_ymix...]`
+- globals: `[gravity_cm_s2, metallicity_log10, c_to_o, log10_dt_s]`
+- targets: future `ymix` for `output_species`
+- stored `dt_s`: the snapped **actual** `dt`, not the nominal requested `dt`
+
+Per-split metadata includes:
+
+- feature order,
+- species order,
+- output-from-state index mapping,
+- normalization fingerprint,
+- `dt_min_s`,
+- `dt_max_s`,
+- fixed requested `dt`,
+- post-equilibrium thresholds,
+- target-selection policy,
+- mean and max relative `dt` snapping error.
+
+## 10. Fixed-`dt` Late-Time Sampling
+
+### 10.1 Current algorithm
+
+For each raw VULCAN trajectory:
+
+1. load the strictly increasing saved times,
+2. compute the late-time anchor threshold as
+   `max(post_equilibrium_time_min_s, post_equilibrium_min_fraction_of_final_time * t_final)`,
+3. keep only anchors at or after that threshold and with at least `min_future_saved_steps` future saved states,
+4. for each valid anchor, form one requested target time `t_anchor + fixed_requested_dt_s`,
+5. snap that request to the nearest saved future state,
+6. compute `actual_dt_s = t_target - t_anchor`,
+7. optionally reject the pair if the relative mismatch exceeds `max_target_relative_dt_error`,
+8. sample `pairs_per_run` anchors uniformly with replacement from the remaining valid anchor set.
+
+The model is conditioned on `log10(actual_dt_s)`, not on the nominal requested `dt`.
+
+### 10.2 Why a fixed requested `dt` is acceptable here
+
+A fixed requested `dt` is acceptable for the current objective because the intended operating regime is a repeated coarse jump after the chemistry has largely relaxed.
+
+This has several advantages.
+
+- It simplifies the learning problem. The model does not need to disentangle a broad multi-decade time-scale family from the state transition problem at the same time.
+- It improves data efficiency. Every sampled pair teaches the same nominal transition horizon.
+- It stabilizes optimization. The model sees a narrower target family and can focus capacity on chemistry-state dependence.
+- It still leaves some practical `dt` flexibility. Because the saved VULCAN times are irregular, the snapped `actual_dt_s` varies around the nominal requested value, and that snapped value is what the model actually conditions on.
+
+This is therefore a **single-horizon surrogate with moderate local `dt` variation**, not a strict delta-function in `dt` and not a true arbitrary-time emulator.
+
+### 10.3 Why the shipped config uses `1e12` seconds
+
+The current default chooses `1e12` seconds for both the requested jump and the late-time cutoff because the repository is now targeting a late, slowly evolving regime rather than the full transient approach to equilibrium.
+
+This is a heuristic default, not a theorem. It was chosen to make the training target coarse, operationally useful, and aligned with the long-runtime VULCAN integrations already configured in the project.
+
+If the saved trajectories still show meaningful drift at or after `1e12` seconds for the sampled parameter space, the user should raise `post_equilibrium_time_min_s` and regenerate the data.
+
+### 10.4 Rollout evaluation
+
+Held-out rollout evaluation now uses the same fixed-`dt` late-time path construction rather than arbitrary full-trajectory checkpoints from `t=0`.
+
+That makes evaluation consistent with the training regime.
+
+## 11. Flexible `dt` Would Require More Than Snapping
+
+The current code does **not** implement true flexible requested-time supervision.
+
+To support flexible `dt` properly, the following changes would be required.
+
+### 11.1 Requested-time supervision instead of nearest saved snapshot only
+
+The label must correspond to the requested time itself, not merely to the nearest saved VULCAN snapshot. There are two clean ways to do that.
+
+- Save trajectories densely enough that snapping error becomes negligible over the target range.
+- Interpolate or otherwise reconstruct target states at the requested times from much denser saved solver trajectories.
+
+### 11.2 Multi-`dt` sampling policy
+
+The fixed-`dt` sampler would need to be replaced with a multi-horizon sampler, for example log-uniform or staged sampling over a configured `dt` range.
+
+That means exposing and training over a `requested_dt` distribution rather than a single scalar.
+
+### 11.3 Explicit requested-versus-actual semantics
+
+The current processed data stores only the snapped `actual_dt_s` as the conditioning feature. A true flexible-`dt` design should usually retain both:
+
+- requested `dt`,
+- actual/interpolated label `dt`,
+- snapping or interpolation error diagnostics.
+
+### 11.4 Time-conditioning upgrades
+
+The current scalar `log10_dt_s` conditioning is sufficient for the fixed-horizon regime. For broad multi-decade `dt` generalization, richer time embeddings may help, such as:
+
+- a deeper conditioning MLP,
+- learned time embeddings,
+- random Fourier features,
+- curriculum training over increasingly wide `dt` ranges.
+
+### 11.5 Evaluation changes
+
+Validation and test metrics would need to be stratified by requested `dt`, not just by observed snapped `dt`, and rollout tests would need to cover multiple horizon schedules.
+
+## 12. Model Architecture
+
+The surrogate model in `src/model.py` is an encoder-only transformer with FiLM conditioning.
+
+Sequence inputs per level:
+
+- pressure,
+- temperature,
+- Kzz,
+- anchor chemistry state.
+
+Global conditioning inputs:
+
+- gravity,
+- metallicity,
+- C/O,
+- `log10_dt_s`.
+
+Architecture summary:
+
+1. static profile channels and state channels are projected separately into `d_model`,
+2. the sum is normalized and receives sinusoidal positional encoding over vertical level,
+3. global scalars are passed through an MLP conditioning projector,
+4. FiLM is applied once before the encoder and again after every transformer block,
+5. an output MLP predicts a delta,
+6. that delta is added to the anchor subset through a residual skip connection.
+
+Important consequences:
+
+- the model predicts a transition, not an absolute state from scratch,
+- the time signal is emphasized globally through FiLM rather than being appended at every level,
+- bidirectional attention is appropriate because the vertical column is not causal in level index,
+- the design remains compatible with larger full-network state vectors.
+
+## 13. Training and GPU Policy
+
+The repository prioritizes GPU-resident training.
+
+Main config defaults:
+
+- CUDA device,
+- RAM loading of processed shards,
+- preload entire split tensors to device when requested,
+- asynchronous device prefetch when loading from CPU-backed DataLoaders.
+
+Operational rules:
+
+- `gpu_preload=true` requires CUDA,
+- `use_device_prefetch=true` requires CUDA,
+- invalid precision/device combinations fail immediately,
+- training uses vectorized tensor operations only; no Python per-sample chemistry logic is executed inside the model forward path.
+
+The model is trained on normalized processed arrays. Validation/test metrics and rollout metrics are computed after decoding back to physical-space mixing ratios.
+
+## 14. Logarithm Convention
+
+All logarithms in this repository are base-10.
+
+This includes:
+
+- configuration keys named `log10_*`,
+- abundance controls,
+- Kzz controls,
+- `log10_dt_s`,
+- log-based normalization modes.
+
+## 15. Correctness Fixes Implemented In This Revision
+
+This revision intentionally fixes the following issues.
+
+1. Removed the misleading variable-`dt` training semantics. The training pipeline now explicitly uses a single fixed requested horizon plus late-time anchors.
+2. Aligned evaluation rollouts with the training semantics.
+3. Removed `y_time_freq` from the emulator config surface because the bundled VULCAN implementation used here does not actually honor it for saved chemistry evolution; `save_evo_frq` is the meaningful control.
+4. Split the old coarse runtime booleans into the actual VULCAN toggle surface: eddy diffusion, molecular diffusion, upwind molecular diffusion, boundary conditions, condensation, settling, cold trap, surface H2O saturation, low-temperature rate limits, adaptive tolerance.
+5. Exposed `atm_base` and kept `ini_mix` explicit in config.
+6. Fixed preflight so it exercises the same runtime-setting surface used by real generation.
+7. Added fixed-`dt` metadata diagnostics, including mean/max relative snapping error.
+8. Updated smoke tests and contract tests to match the new semantics.
+9. Switched the main config to the full currently compiled species list instead of the earlier reduced 20-species subset.
+
+## 16. Known Limitations
+
+- Photochemistry is still disabled by design.
+- Ion chemistry is still disabled by design.
+- Vertical advection is not wired.
+- Only `ini_mix = "EQ"` is supported.
+- Flexible requested-time supervision is not implemented.
+- The chemistry network is whatever the local VULCAN tree has already compiled; this repository does not rebuild it automatically.
+- The late-time threshold is heuristic and must be checked against the user's sampled regime.
+
+## 17. Operational Commands
+
+### 17.1 Local Development
+
+Generate raw data and processed shards:
+
+```bash
+python src/main.py --gen
 ```
-Sequence inputs [batch, nz, input_dim]    Global inputs [batch, global_dim]
-        |                                         |
-  Input Projection (Linear → d_model)             |
-        |                                         |
-  Sinusoidal Positional Encoding                   |
-        |                                         |
-  Initial FiLM Conditioning  <--------------------+
-        |                                         |
-  N × [ TransformerEncoderLayer                    |
-        + per-block FiLM ]   <--------------------+
-        |
-  Output Head (Linear → hidden → GELU → Linear → target_dim)
-        |
-  Predictions [batch, nz, target_dim]
+
+Train the surrogate:
+
+```bash
+python src/main.py --train
 ```
 
-### 13.2 Components
+The expected local workflow is:
 
-- **Input projection**: Linear layer mapping `input_dim` to `d_model`.
-- **Positional encoding**: Standard sinusoidal encoding (Vaswani et al. 2017).
-- **FiLM conditioning**: All 4 global scalars (gravity, metallicity, C/O, log10_dt) are projected through a single MLP to produce per-channel scale (`gamma`) and shift (`beta`). Applied as `(1 + gamma) * x + beta`. Clamped for stability.
-  - Initial FiLM on embeddings before the encoder stack.
-  - Per-block FiLM after each transformer encoder layer.
-- **Transformer encoder layers**: Pre-norm architecture (`norm_first=True`), multi-head self-attention, GELU activation, `batch_first=True`.
-- **Output head**: Two-layer MLP (`d_model → hidden → target_dim`) with GELU activation and no final activation clamp.
+1. validate or edit `config/config.json`,
+2. run `--gen`,
+3. inspect generated-data summaries and late-time `dt` diagnostics,
+4. run `--train`,
+5. evaluate saved rollout metrics and held-out physical-space errors.
 
-### 13.3 Sequence Inputs
+### 17.2 HPC / PBS Batch Deployment
 
-Per-layer features concatenated into `input_dim` channels:
-1. `pressure_bar` (1 channel)
-2. `temperature_k` (1 channel)
-3. `kzz_cm2_s` (1 channel)
-4. `initial_ymix` for each of the 20 target species (20 channels)
+The repository ships `run.pbs` for PBS-managed HPC clusters. Submit with:
 
-Total: `input_dim = 23`
+```bash
+qsub run.pbs
+```
 
-### 13.4 Global Inputs
+#### Environment Variables
 
-Per-sample scalar conditioning features stacked into `global_dim` channels:
-1. `gravity_cm_s2`
-2. `metallicity_log10`
-3. `c_to_o`
-4. `log10_time_s` (query time for time-conditioned prediction)
+Three environment variables control HPC-specific path and environment resolution. All are optional for local development but are set automatically by `run.pbs` on cluster nodes.
 
-Total: `global_dim = 4`
+| Variable | Purpose | Default (if unset) |
+|---|---|---|
+| `VULCAN_EMULATOR_PROJECT_ROOT` | Override the project root directory. When set, `src/main.py` and `src/path_utils.py` use this instead of deriving root from `__file__`. Paths are normalized with `os.path.normpath` (no symlink resolution). | Derived from `Path(__file__).resolve().parent.parent` |
+| `VULCAN_EMULATOR_VULCAN_SOURCE` | Override the VULCAN source tree path. Takes precedence over `paths.vulcan_source_path` in config. | Joined from project root + config `paths.vulcan_source_path` |
+| `VULCAN_EMULATOR_CONDA_ENV` | Override the expected conda environment name for the preflight check in `src/main.py`. | `"nn"` |
 
-### 13.5 Key Design Decisions
+#### Why `os.path.normpath` Instead of `Path.resolve()`
 
-- **Time conditioning via FiLM**: `log10(time_s)` is a global feature that modulates the sequence representation at every depth, enabling the single model to predict profiles at any queried time.
-- **No causal masking**: The encoder uses bidirectional self-attention across all pressure levels.
-- **Padding mask**: `True = padding position`, following PyTorch convention. v1 uses fixed-length sequences so masks are all `False`.
-- **Export compatibility**: Architecture avoids dynamic control flow for `torch.export`/`torch.compile` compatibility.
+HPC filesystems frequently use symlinks for canonical mount points (e.g., `/nobackupp19/` vs. `/home5/`). `Path.resolve()` follows symlinks, which can rewrite the project root to a canonical path that differs from the PBS working directory (`$PBS_O_WORKDIR`). This breaks sibling-directory references like `../VULCAN`.
 
-### 13.6 Hyperparameters
+All path joins in `src/path_utils.py`, `src/main.py`, and `src/preprocess.py` use `os.path.normpath` to clean `..` segments without symlink traversal when an environment-variable override is active.
 
-All hyperparameters are config-defined. Current baseline from `config/config.json`:
-- `d_model = 128`, `nhead = 8`, `num_layers = 4`, `dim_feedforward = 384`
-- `dropout = 0.0`, `film_clamp = 10.0`
-- `max_sequence_length = 64`
-- `output_head_divisor = 2`
-- `conditioning_hidden_dim = 128`
+#### `run.pbs` Workflow
 
-## 14. Training And Inference Policy
+The shipped `run.pbs` script performs the following steps:
 
-- Objective: predict top-20 species `ymix` profile at requested time.
-- Training loss:
-  - masked MSE regression loss on valid (non-padding) elements.
-- Optimizer: AdamW with cosine-warmup LR schedule.
-  - Biases and norm parameters excluded from weight decay.
-- GPU preload is default loading mode.
-- If preload OOM occurs:
-  - hard-fail unless loading mode is explicitly reconfigured.
+1. Sets `VULCAN_EMULATOR_PROJECT_ROOT` from `$PBS_O_WORKDIR`.
+2. Loads the site conda module and activates the configured environment (default: `pyt2_8_gh`).
+3. Exports `VULCAN_EMULATOR_CONDA_ENV` so the Python preflight accepts the HPC environment.
+4. Validates the VULCAN source tree and builds FastChem if the binary is missing.
+5. Runs a Python preflight that checks all required packages and GPU availability.
+6. Executes `python -u src/main.py --gen` (data generation).
+7. Executes `python -u src/main.py --train` (model training).
 
-No hard scientific threshold gate in v1:
-- always report metrics
-- do not block by fixed percent-error cutoff.
+Either stage can be skipped by commenting out the corresponding line in `run.pbs`.
 
-Post-training inference/export:
-- Runtime code must expose a physical-space predictor interface that accepts profile/state inputs and query time directly.
-- Standalone export must normalize inputs internally and return physical-space `ymix` predictions.
+#### Resource Defaults
 
-## 15. Verification, Static Analysis, And Test Matrix
+The shipped PBS directives request:
 
-All checks run in `nn`.
+- Queue: `gpu_long`
+- 1 node, 32 CPUs, 1 GPU (GH200), 400 GB RAM
+- 72-hour walltime
 
-Fast local integrity loop for Codex work:
-- `conda run -n nn pytest -q unit_tests`
-- `conda run -n nn ruff check src testing unit_tests`
-- `conda run -n nn vulture src testing unit_tests`
-
-Broader validation before accepting substantial pipeline changes:
-- `conda run -n nn pytest -q`
-
-Static checks:
-- `ruff check src testing unit_tests`
-- `vulture src testing unit_tests`
-- optional `pyflakes src testing unit_tests`
-
-Fail-fast scenarios that must be tested:
-
-1. Runtime preflight: missing VULCAN source tree/runtime files.
-2. Runtime preflight: VULCAN command non-zero exit at preflight.
-3. Generation: missing target species list.
-4. Generation: missing sampler config or invalid ranges.
-5. Generation: one worker run crash.
-6. Raw schema: missing HDF5 key.
-7. Raw schema: shape mismatch.
-8. Raw schema: NaN/Inf encountered.
-9. Split integrity: run id appears in multiple splits.
-10. Precision: invalid AMP/BF16 combination.
-11. Loader: GPU preload OOM with default policy.
-12. Training: all-padding or invalid-mask batch.
-
-Each scenario must raise explicit actionable errors.
-
-## 16. Staged Roadmap
-
-### v1 (this spec)
-- Thermochemistry trajectory surrogate with broad Kzz + abundance coverage.
-- Transport/BC coverage and optional condensation support.
-- Photochemistry disabled.
-
-### v2+
-- Add photochemistry/ion-chemistry toggles and expanded data generation.
-- Condensation as per-run FiLM conditioning (expand `global_dim`).
-- Atmospheric base gas selection beyond H2-dominated.
-- Preserve same core contracts: explicit config, fail-fast, no hidden fallback.
-
-## 17. Locked Defaults And Assumptions
-
-1. Project root: `.`
-2. Code location: all runtime code in `src/`
-3. Photochemistry excluded in v1 by default
-4. VULCAN default source path: `../VULCAN-master`
-5. VULCAN execution path: local-source subprocess execution
-6. CLI actions: **only** `--gen` and `--train`
-7. `--gen` performs generation + normalization in one command
-8. Model family baseline: transformer encoder + FiLM
-9. Objective: time-conditioned full trajectory emulation
-10. Snapshot policy: `save_evo_frq=1`, `y_time_freq=1` (save every step)
-11. Grid defaults: configurable `nz` (e.g. 12 dev, 100+ production), `P_top=1e-8 bar`, `P_bottom=1e3 bar`
-12. Abundance sampling: metallicity + C/O enabled
-13. Split policy: run-level only, configurable ratios (default `80/10/10`)
-14. Raw format: HDF5
-15. Processed format: NPY shards
-16. Target species list is required and explicit (top-20 editable config)
-17. Precision default: FP32, AMP/BF16 only by explicit valid config
-18. Quality gate: report metrics, no hard pass/fail threshold in v1
-19. All logarithms are base-10 only
-20. Engineering style: clean, correct, pythonic, fail-fast, no unexpected fallback behavior
+Adjust these to match your site's queue names and hardware.
