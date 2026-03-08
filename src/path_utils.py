@@ -39,6 +39,14 @@ def _join_project_path(root: Path, value: str, field_name: str) -> Path:
     return Path(os.path.normpath(str(root / relative)))
 
 
+def _override_path(env_name: str) -> Path | None:
+    """Return one optional absolute/relative path override from the environment."""
+    value = os.environ.get(env_name)
+    if not value:
+        return None
+    return Path(os.path.normpath(value))
+
+
 def _ensure_relative(value: str, field_name: str) -> Path:
     """Parse one configured path and reject absolute values."""
     path = Path(value)
@@ -64,11 +72,13 @@ def resolve_paths(config: dict[str, Any]) -> ProjectPaths:
             "paths.project_root must be '.' to enforce root-relative contract."
         )
 
-    vulcan_source = _join_project_path(
-        root,
-        str(paths_cfg["vulcan_source_path"]),
-        "paths.vulcan_source_path",
-    )
+    vulcan_source = _override_path("VULCAN_EMULATOR_VULCAN_SOURCE")
+    if vulcan_source is None:
+        vulcan_source = _join_project_path(
+            root,
+            str(paths_cfg["vulcan_source_path"]),
+            "paths.vulcan_source_path",
+        )
     data_root = _join_project_path(root, str(paths_cfg["data_root"]), "paths.data_root")
     models_root = _join_project_path(root, str(paths_cfg["models_root"]), "paths.models_root")
     logs_root = _join_project_path(root, str(paths_cfg["logs_root"]), "paths.logs_root")
