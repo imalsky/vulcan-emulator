@@ -23,7 +23,8 @@
     "shard_size": 64,
     "worker_root": "data/smoke/raw/_workers",
     "runs_root": "data/smoke/raw/runs",
-    "save_evo_frq": 1
+    "save_evo_frq": 10,
+    "max_trajectory_snapshots": 100
   },
   "trajectory_sampling": {
     "mode": "fixed_dt_post_equilibrium",

@@ -7,7 +7,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 100,
+    "num_runs": 500,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
@@ -16,18 +16,19 @@
     },
     "random_seed": 42,
     "keep_vulcan_outputs_debug": false,
-    "failure_policy": "fail_on_first_error",
-    "run_timeout_seconds": 900,
+    "failure_policy": "collect_all_errors",
+    "run_timeout_seconds": 120,
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",
     "shard_size": 256,
     "worker_root": "data/raw/_workers",
     "runs_root": "data/raw/runs",
-    "save_evo_frq": 1
+    "save_evo_frq": 10,
+    "max_trajectory_snapshots": 100
   },
   "trajectory_sampling": {
     "mode": "fixed_dt_post_equilibrium",
-    "pairs_per_run": 256,
+    "pairs_per_run": 64,
     "fixed_requested_dt_s": 1000000000000.0,
     "post_equilibrium_time_min_s": 1000000000000.0,
     "post_equilibrium_min_fraction_of_final_time": 0.0,
@@ -41,7 +42,7 @@
     "runtime": 1e+16,
     "dt_min": 1e-14,
     "dt_max": 1000000000000.0,
-    "count_max": 200000,
+    "count_max": 30000,
     "trun_min": 1e+13,
     "count_min": 120,
     "ini_mix": "EQ",
@@ -137,15 +138,15 @@
     "use_photochemistry": false,
     "use_ion_chemistry": false,
     "use_eddy_diffusion": true,
-    "use_molecular_diffusion": true,
+    "use_molecular_diffusion": false,
     "use_upwind_molecular_diffusion": false,
     "use_boundary_conditions": false,
-    "use_condensation": true,
-    "use_settling": true,
-    "use_initial_cold_trap": true,
+    "use_condensation": false,
+    "use_settling": false,
+    "use_initial_cold_trap": false,
     "use_sat_surface_h2o": false,
     "use_lowT_limit_rates": false,
-    "use_adaptive_rtol": true
+    "use_adaptive_rtol": false
   },
   "data_spec": {
     "state_species": [
@@ -336,7 +337,7 @@
     "device": "cuda",
     "gpu_preload": true,
     "batch_size": 32,
-    "epochs": 100,
+    "epochs": 50,
     "learning_rate": 0.0005,
     "min_lr": 1e-05,
     "warmup_epochs": 5,
