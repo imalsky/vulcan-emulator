@@ -11,6 +11,8 @@
 #   torch, numpy, scipy, h5py, tqdm
 # Required in addition when training.data_loading.mode="auto":
 #   psutil
+# Required only if fastchem_vulcan/fastchem is missing and you want this script to build it:
+#   make, g++
 # Required for the current bundled VULCAN runtime:
 #   matplotlib
 # Optional VULCAN extras only if you rebuild chem_funs.py or use image utilities:
@@ -53,6 +55,7 @@ export VULCAN_EMULATOR_CONDA_ENV="${CONDA_ENV}"
 
 CONFIG_PATH="${CONFIG_PATH:-config/config.json}"
 TRAIN_LOG="${TRAIN_LOG:-}"
+BUILD_FASTCHEM_IF_MISSING="${BUILD_FASTCHEM_IF_MISSING:-1}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export KMP_DUPLICATE_LIB_OK=TRUE
@@ -139,6 +142,14 @@ for required_path in \
     exit 1
   fi
 done
+if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ] && [ "${BUILD_FASTCHEM_IF_MISSING}" = "1" ]; then
+  if ! command -v make >/dev/null 2>&1; then
+    echo "ERROR: FastChem binary is missing and 'make' is unavailable to build it."
+    exit 1
+  fi
+  echo "Stage: building FastChem in ${VULCAN_SOURCE}/fastchem_vulcan"
+  make -C "${VULCAN_SOURCE}/fastchem_vulcan"
+fi
 if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ]; then
   echo "ERROR: missing executable FastChem binary: ${VULCAN_SOURCE}/fastchem_vulcan/fastchem"
   exit 1
