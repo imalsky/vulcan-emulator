@@ -252,9 +252,14 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
         raise ConfigValidationError("generation.num_workers must be > 0.")
     _ = _as_int(cfg["random_seed"], "generation.random_seed")
     _ = _as_bool(cfg["keep_vulcan_outputs_debug"], "generation.keep_vulcan_outputs_debug")
-    if str(cfg["failure_policy"]) not in ("fail_on_first_error", "collect_all_errors"):
+    if str(cfg["failure_policy"]) not in (
+        "fail_on_first_error",
+        "collect_all_errors",
+        "continue_on_error",
+    ):
         raise ConfigValidationError(
-            "generation.failure_policy must be 'fail_on_first_error' or 'collect_all_errors'."
+            "generation.failure_policy must be 'fail_on_first_error', "
+            "'collect_all_errors', or 'continue_on_error'."
         )
     if _as_int(cfg["run_timeout_seconds"], "generation.run_timeout_seconds") <= 0:
         raise ConfigValidationError("generation.run_timeout_seconds must be > 0.")
