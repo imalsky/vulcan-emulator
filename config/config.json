@@ -16,7 +16,7 @@
     },
     "random_seed": 42,
     "keep_vulcan_outputs_debug": false,
-    "failure_policy": "collect_all_errors",
+    "failure_policy": "continue_on_error",
     "run_timeout_seconds": 120,
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",

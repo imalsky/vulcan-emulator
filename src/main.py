@@ -134,7 +134,7 @@ def main() -> int:
             preflight_vulcan_source(
                 paths.vulcan_source,
                 settings=settings,
-                timeout_seconds=min(int(config["generation"]["run_timeout_seconds"]), 120),
+                timeout_seconds=int(config["generation"]["run_timeout_seconds"]),
             )
             run_generation_and_preprocess(
                 config,

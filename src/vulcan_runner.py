@@ -24,6 +24,7 @@ coverage map and all exposed toggles).
 from __future__ import annotations
 
 import ast
+import logging
 import os
 import pickle
 import re
@@ -40,6 +41,8 @@ import numpy as np
 from tqdm import tqdm
 
 from sampling import RunSpec
+
+logger = logging.getLogger(__name__)
 
 
 class VulcanRuntimeError(RuntimeError):
@@ -810,7 +813,11 @@ def run_vulcan_jobs(
     if int(settings.num_workers) <= 0:
         raise VulcanRuntimeError("settings.num_workers must be > 0.")
 
-    collect = failure_policy == "collect_all_errors"
+    if failure_policy not in {"fail_on_first_error", "collect_all_errors", "continue_on_error"}:
+        raise VulcanRuntimeError(f"Unsupported failure_policy: {failure_policy}")
+
+    collect = failure_policy in {"collect_all_errors", "continue_on_error"}
+    continue_on_error = failure_policy == "continue_on_error"
     runs_root = Path(settings.runs_root)
     runs_root.mkdir(parents=True, exist_ok=True)
 
@@ -826,6 +833,18 @@ def run_vulcan_jobs(
                         raise
                     errors.append(f"run_{spec.run_id:06d}: {exc}")
             if errors:
+                if continue_on_error:
+                    if not results:
+                        raise VulcanRuntimeError(
+                            "All VULCAN runs failed; cannot continue to preprocessing."
+                        )
+                    logger.warning(
+                        "Continuing after %d/%d VULCAN runs failed. Successful runs: %d.",
+                        len(errors),
+                        len(run_specs),
+                        len(results),
+                    )
+                    return sorted(results, key=lambda item: item.run_id)
                 raise VulcanRuntimeError(
                     f"{len(errors)}/{len(run_specs)} VULCAN runs failed:\n"
                     + "\n".join(errors)
@@ -852,6 +871,16 @@ def run_vulcan_jobs(
                         ) from exc
                     errors.append(f"run_{futures[future]:06d}: {exc}")
         if errors:
+            if continue_on_error:
+                if not results:
+                    raise VulcanRuntimeError("All VULCAN runs failed; cannot continue to preprocessing.")
+                logger.warning(
+                    "Continuing after %d/%d VULCAN runs failed. Successful runs: %d.",
+                    len(errors),
+                    len(run_specs),
+                    len(results),
+                )
+                return sorted(results, key=lambda item: item.run_id)
             raise VulcanRuntimeError(
                 f"{len(errors)}/{len(run_specs)} VULCAN runs failed:\n"
                 + "\n".join(errors)

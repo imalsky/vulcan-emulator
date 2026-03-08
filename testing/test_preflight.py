@@ -50,6 +50,7 @@ def _settings(root: Path) -> WorkerSettings:
         count_max=32,
         trun_min=0.0,
         count_min=0,
+        max_trajectory_snapshots=0,
     )
 
 

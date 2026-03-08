@@ -7,7 +7,9 @@ import pickle
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -18,11 +20,13 @@ if str(SRC_DIR) not in sys.path:
 
 from sampling import RunSpec
 from vulcan_runner import (
+    RunResult,
     SpeciesSelection,
     VulcanRuntimeError,
     WorkerSettings,
     _apply_run_config,
     _extract_run_payload,
+    run_vulcan_jobs,
     validate_species_available,
 )
 
@@ -80,6 +84,7 @@ def _settings(tmpdir: Path) -> WorkerSettings:
         count_max=123,
         trun_min=0.0,
         count_min=0,
+        max_trajectory_snapshots=0,
     )
 
 
@@ -257,6 +262,42 @@ class VulcanContractTests(unittest.TestCase):
         )
         np.testing.assert_allclose(payload["ymix_state"][0], expected_initial_state)
         np.testing.assert_allclose(payload["ymix_output"][0], expected_initial_output)
+
+    def test_run_vulcan_jobs_continue_on_error_returns_successes(self) -> None:
+        settings = _settings(Path("/tmp"))
+        run_specs = [replace(_run_spec(), run_id=idx) for idx in (1, 2, 3)]
+        side_effect = [
+            RunResult(run_id=1, run_file="run_000001.h5"),
+            VulcanRuntimeError("boom"),
+            RunResult(run_id=3, run_file="run_000003.h5"),
+        ]
+        with mock.patch("vulcan_runner._run_single", side_effect=side_effect), mock.patch(
+            "vulcan_runner._cleanup_worker_dirs"
+        ):
+            results = run_vulcan_jobs(
+                run_specs,
+                settings=settings,
+                failure_policy="continue_on_error",
+            )
+
+        self.assertEqual([result.run_id for result in results], [1, 3])
+
+    def test_run_vulcan_jobs_collect_all_errors_still_raises(self) -> None:
+        settings = _settings(Path("/tmp"))
+        run_specs = [replace(_run_spec(), run_id=idx) for idx in (1, 2)]
+        side_effect = [
+            RunResult(run_id=1, run_file="run_000001.h5"),
+            VulcanRuntimeError("boom"),
+        ]
+        with mock.patch("vulcan_runner._run_single", side_effect=side_effect), mock.patch(
+            "vulcan_runner._cleanup_worker_dirs"
+        ):
+            with self.assertRaisesRegex(VulcanRuntimeError, "1/2 VULCAN runs failed"):
+                run_vulcan_jobs(
+                    run_specs,
+                    settings=settings,
+                    failure_policy="collect_all_errors",
+                )
 
 
 if __name__ == "__main__":

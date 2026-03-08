@@ -65,6 +65,16 @@ class ConfigUtilsTests(unittest.TestCase):
             ):
                 load_and_validate_config(config_path)
 
+    def test_load_and_validate_config_accepts_continue_on_error_failure_policy(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["generation"]["failure_policy"] = "continue_on_error"
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = load_and_validate_config(config_path)
+
+        self.assertEqual(loaded["generation"]["failure_policy"], "continue_on_error")
+
 
 if __name__ == "__main__":
     unittest.main()
