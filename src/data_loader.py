@@ -125,6 +125,7 @@ def load_split_metadata(split_dir: Path) -> dict[str, Any]:
 
 
 def _to_tensor(array: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a numpy array to a torch tensor, casting dtype if needed."""
     tensor = torch.from_numpy(array)
     if tensor.dtype != dtype:
         tensor = tensor.to(dtype=dtype)
@@ -132,6 +133,7 @@ def _to_tensor(array: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
 
 
 def _estimate_available_ram_bytes() -> int:
+    """Estimate available system RAM in bytes, returning -1 on failure."""
     try:
         import psutil  # type: ignore
 
@@ -328,6 +330,7 @@ class ProcessedSplitDataset(Dataset):
             self._cache = OrderedDict()
 
     def _load_all_to_ram(self) -> None:
+        """Eagerly load all shards into host memory numpy arrays."""
         seq, glb, tgt, dt, _ = load_full_split_arrays(self.split_dir)
         self._ram_seq = seq
         self._ram_glb = glb
@@ -335,6 +338,7 @@ class ProcessedSplitDataset(Dataset):
         self._ram_dt = dt
 
     def _load_shard(self, shard_idx: int) -> dict[str, Any]:
+        """Load or retrieve one shard from the LRU disk cache."""
         if self._cache is None:
             raise DataLoadingError("Disk cache is not initialized.")
         cached = self._cache.pop(shard_idx, None)

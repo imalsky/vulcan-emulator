@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from hashlib import sha256
@@ -140,10 +141,12 @@ class PairSpecBundle:
 
 
 def _log10_safe(values: np.ndarray, eps: float) -> np.ndarray:
+    """Return element-wise base-10 logarithm, clamping inputs to *eps* from below."""
     return np.log10(np.maximum(values, eps))
 
 
 def _fit_for_method(values: np.ndarray, policy: _NormPolicy) -> np.ndarray:
+    """Transform *values* into the space used for fitting statistics (e.g., log10 for log-methods)."""
     if policy.method in {"log-standard", "log-min-max"}:
         return _log10_safe(values, policy.epsilon)
     if policy.method in {"standard", "none"}:
@@ -152,6 +155,7 @@ def _fit_for_method(values: np.ndarray, policy: _NormPolicy) -> np.ndarray:
 
 
 def _apply_method(values: np.ndarray, stats: dict[str, Any], policy: _NormPolicy) -> np.ndarray:
+    """Apply normalization to *values* using pre-fitted *stats* and the given *policy*."""
     data = np.asarray(values, dtype=np.float64)
     if policy.method == "none":
         return data
@@ -172,10 +176,12 @@ def _apply_method(values: np.ndarray, stats: dict[str, Any], policy: _NormPolicy
 
 
 def _numpy_stats_dtype(precision: PrecisionConfig) -> type[np.float32] | type[np.float64]:
+    """Map a PrecisionConfig stats dtype (torch) to the corresponding numpy float type."""
     return np.float64 if precision.stats_dtype == torch.float64 else np.float32
 
 
 def _read_species_dataset(dataset: h5py.Dataset) -> list[str]:
+    """Read an HDF5 string dataset and return its elements as a Python list of ``str``."""
     return [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in dataset[()]]
 
 
@@ -304,10 +310,13 @@ def _sample_pairs_for_run(
         rng=rng,
         times_s=raw.time_s,
         n_pairs=int(sampling_cfg["pairs_per_run"]),
-        requested_dt_min_s=float(sampling_cfg["requested_dt_min_s"]),
-        requested_dt_max_s=float(sampling_cfg["requested_dt_max_s"]),
-        allow_anchor_at_t0=bool(sampling_cfg["allow_anchor_at_t0"]),
+        fixed_requested_dt_s=float(sampling_cfg["fixed_requested_dt_s"]),
+        post_equilibrium_time_min_s=float(sampling_cfg["post_equilibrium_time_min_s"]),
+        post_equilibrium_min_fraction_of_final_time=float(
+            sampling_cfg["post_equilibrium_min_fraction_of_final_time"]
+        ),
         min_future_saved_steps=int(sampling_cfg["min_future_saved_steps"]),
+        max_target_relative_dt_error=float(sampling_cfg["max_target_relative_dt_error"]),
     )
 
 
@@ -319,6 +328,7 @@ def _build_pair_specs(
     state_species: list[str],
     output_species: list[str],
 ) -> list[PairSpecBundle]:
+    """Sample transition pairs for every run in *split_ids* and return them as bundles."""
     bundles: list[PairSpecBundle] = []
     seed = int(config["generation"]["random_seed"])
     for run_id in split_ids:
@@ -333,6 +343,7 @@ def _build_pair_specs(
 
 
 def _subset_stats(stats: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+    """Extract normalization stats for a subset of channels selected by *indices*."""
     subset: dict[str, Any] = {"count": int(stats["count"])}
     for field_name in ("mean", "std", "min", "max"):
         values = np.asarray(stats[field_name], dtype=np.float64)
@@ -459,12 +470,16 @@ def _write_split_shards(
     write_pos = 0
     dt_min_s = np.inf
     dt_max_s = -np.inf
+    relative_dt_error_sum = 0.0
+    relative_dt_error_max = 0.0
 
     seq_buf: np.ndarray | None = None
     glb_buf: np.ndarray | None = None
     tgt_buf: np.ndarray | None = None
     dt_buf: np.ndarray | None = None
 
+    # Shard-at-a-time writing: alloc_buffers pre-allocates numpy arrays for one
+    # full shard; flush writes the filled portion to disk and advances the shard index.
     def alloc_buffers(nz: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         return (
             np.zeros((shard_size, nz, input_dim), dtype=np.float32),
@@ -582,6 +597,9 @@ def _write_split_shards(
 
         dt_min_s = min(dt_min_s, float(np.min(pairs.actual_dt_s)))
         dt_max_s = max(dt_max_s, float(np.max(pairs.actual_dt_s)))
+        relative_dt_error = np.abs(pairs.actual_dt_s - pairs.requested_dt_s) / pairs.requested_dt_s
+        relative_dt_error_sum += float(np.sum(relative_dt_error))
+        relative_dt_error_max = max(relative_dt_error_max, float(np.max(relative_dt_error)))
 
         start = 0
         num_pairs = int(pairs.actual_dt_s.size)
@@ -607,6 +625,7 @@ def _write_split_shards(
 
     flush(write_pos)
 
+    sampling_cfg = config["trajectory_sampling"]
     metadata = {
         "split": split_name,
         "total_samples": int(total_samples),
@@ -627,12 +646,68 @@ def _write_split_shards(
         "output_species_order": list(output_species),
         "output_from_state_indices": list(output_from_state_indices),
         "normalization_fingerprint": normalization_fingerprint,
+        "sampling_mode": str(sampling_cfg["mode"]),
+        "requested_dt_s": float(sampling_cfg["fixed_requested_dt_s"]),
+        "post_equilibrium_time_min_s": float(sampling_cfg["post_equilibrium_time_min_s"]),
+        "post_equilibrium_min_fraction_of_final_time": float(
+            sampling_cfg["post_equilibrium_min_fraction_of_final_time"]
+        ),
+        "anchor_sampling": str(sampling_cfg["anchor_sampling"]),
+        "target_selection": str(sampling_cfg["target_selection"]),
+        "max_target_relative_dt_error": float(sampling_cfg["max_target_relative_dt_error"]),
         "dt_min_s": float(dt_min_s),
         "dt_max_s": float(dt_max_s),
+        "relative_dt_error_mean": float(relative_dt_error_sum / max(total_samples, 1)),
+        "relative_dt_error_max": float(relative_dt_error_max),
     }
     with (split_dir / "metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
     return metadata
+
+
+def build_worker_settings(
+    config: dict[str, Any],
+    paths: Any,
+    *,
+    boundary_conditions: BoundaryConditionSettings | None,
+    state_species: list[str],
+    output_species: list[str],
+) -> WorkerSettings:
+    """Resolve immutable VULCAN worker settings from the validated config."""
+    generation = config["generation"]
+    physics = config["physics_toggles"]
+    runtime = config["vulcan_runtime"]
+    return WorkerSettings(
+        vulcan_source=str(paths.vulcan_source),
+        worker_root=str(Path(os.path.normpath(str(paths.root / generation["worker_root"])))),
+        runs_root=str(Path(os.path.normpath(str(paths.root / generation["runs_root"])))),
+        species=SpeciesSelection(
+            state_species=tuple(state_species),
+            output_species=tuple(output_species),
+        ),
+        boundary_conditions=boundary_conditions,
+        use_eddy_diffusion=bool(physics["use_eddy_diffusion"]),
+        use_molecular_diffusion=bool(physics["use_molecular_diffusion"]),
+        use_upwind_molecular_diffusion=bool(physics["use_upwind_molecular_diffusion"]),
+        use_condensation=bool(physics["use_condensation"]),
+        use_settling=bool(physics["use_settling"]),
+        use_initial_cold_trap=bool(physics["use_initial_cold_trap"]),
+        use_sat_surface_h2o=bool(physics["use_sat_surface_h2o"]),
+        use_lowT_limit_rates=bool(physics["use_lowT_limit_rates"]),
+        use_adaptive_rtol=bool(physics["use_adaptive_rtol"]),
+        ini_mix=str(runtime["ini_mix"]),
+        atm_base=str(runtime["atm_base"]),
+        save_evo_frq=int(generation["save_evo_frq"]),
+        keep_vulcan_outputs_debug=bool(generation["keep_vulcan_outputs_debug"]),
+        run_timeout_seconds=int(generation["run_timeout_seconds"]),
+        num_workers=int(generation["num_workers"]),
+        runtime=float(runtime["runtime"]),
+        dt_min=float(runtime["dt_min"]),
+        dt_max=float(runtime["dt_max"]),
+        count_max=int(runtime["count_max"]),
+        trun_min=float(runtime["trun_min"]),
+        count_min=int(runtime["count_min"]),
+    )
 
 
 def run_generation_and_preprocess(
@@ -653,28 +728,12 @@ def run_generation_and_preprocess(
     if not run_specs:
         raise PreprocessError("Run-spec generation returned zero runs.")
 
-    settings = WorkerSettings(
-        vulcan_source=str(paths.vulcan_source),
-        worker_root=str((paths.root / generation["worker_root"]).resolve()),
-        runs_root=str((paths.root / generation["runs_root"]).resolve()),
-        species=SpeciesSelection(
-            state_species=tuple(state_species),
-            output_species=tuple(output_species),
-        ),
-        use_transport=bool(config["physics_toggles"]["use_transport"]),
+    settings = build_worker_settings(
+        config,
+        paths,
         boundary_conditions=boundary_conditions,
-        use_condensation_optional=bool(config["physics_toggles"]["use_condensation_optional"]),
-        save_evo_frq=int(generation["save_evo_frq"]),
-        keep_vulcan_outputs_debug=bool(generation["keep_vulcan_outputs_debug"]),
-        run_timeout_seconds=int(generation["run_timeout_seconds"]),
-        num_workers=int(generation["num_workers"]),
-        runtime=float(config["vulcan_runtime"]["runtime"]),
-        dt_min=float(config["vulcan_runtime"]["dt_min"]),
-        dt_max=float(config["vulcan_runtime"]["dt_max"]),
-        count_max=int(config["vulcan_runtime"]["count_max"]),
-        trun_min=float(config["vulcan_runtime"]["trun_min"]),
-        count_min=int(config["vulcan_runtime"]["count_min"]),
-        y_time_freq=int(config["vulcan_runtime"]["y_time_freq"]),
+        state_species=state_species,
+        output_species=output_species,
     )
 
     logger.info("Running %d VULCAN jobs with %d workers...", len(run_specs), generation["num_workers"])

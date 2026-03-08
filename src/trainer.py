@@ -42,6 +42,7 @@ from data_loader import DataLoadingConfig, DevicePrefetchLoader, build_training_
 from inference import PhysicalSpaceStandaloneModel, VulcanPredictor
 from model import VulcanTransitionTransformer
 from preprocess import load_raw_run_file
+from transition_sampling import TransitionSamplingError, build_rollout_indices
 from provenance import PROCESSED_FINGERPRINT_FILENAME, validate_processed_artifacts
 
 logger = logging.getLogger(__name__)
@@ -518,21 +519,31 @@ def _load_split_assignments(split_path: Path) -> dict[str, list[int]]:
     return result
 
 
-def _rollout_eval_indices(num_times: int, num_points: int) -> np.ndarray:
-    """Choose deterministic checkpoint indices spanning the full saved trajectory."""
-    if num_times < 2:
-        raise TrainingError("Rollout evaluation requires at least two saved trajectory states.")
-    if num_points < 2:
+def _rollout_eval_indices(
+    *,
+    times_s: np.ndarray,
+    fixed_requested_dt_s: float,
+    post_equilibrium_time_min_s: float,
+    post_equilibrium_min_fraction_of_final_time: float,
+    min_future_saved_steps: int,
+    max_target_relative_dt_error: float,
+    rollout_eval_points: int,
+) -> np.ndarray:
+    """Build a deterministic fixed-dt rollout path on one saved trajectory."""
+    if rollout_eval_points < 2:
         raise TrainingError("Rollout evaluation requires at least two checkpoint points.")
-    raw = np.linspace(0, num_times - 1, num=num_points, dtype=np.float64)
-    indices = np.unique(np.round(raw).astype(np.int64))
-    if indices[0] != 0:
-        indices = np.insert(indices, 0, 0)
-    if indices[-1] != num_times - 1:
-        indices = np.append(indices, num_times - 1)
-    if indices.size < 2:
-        raise TrainingError("Failed to construct rollout evaluation checkpoints.")
-    return indices
+    try:
+        return build_rollout_indices(
+            times_s=times_s,
+            fixed_requested_dt_s=fixed_requested_dt_s,
+            post_equilibrium_time_min_s=post_equilibrium_time_min_s,
+            post_equilibrium_min_fraction_of_final_time=post_equilibrium_min_fraction_of_final_time,
+            min_future_saved_steps=min_future_saved_steps,
+            max_target_relative_dt_error=max_target_relative_dt_error,
+            max_points=rollout_eval_points,
+        )
+    except TransitionSamplingError as exc:
+        raise TrainingError(f"Failed to construct fixed-dt rollout path: {exc}") from exc
 
 
 def _compute_rollout_metrics(
@@ -543,6 +554,11 @@ def _compute_rollout_metrics(
     raw_run_files: list[Path],
     split_path: Path,
     rollout_eval_points: int,
+    fixed_requested_dt_s: float,
+    post_equilibrium_time_min_s: float,
+    post_equilibrium_min_fraction_of_final_time: float,
+    min_future_saved_steps: int,
+    max_target_relative_dt_error: float,
     device: torch.device,
     forward_dtype: torch.dtype,
 ) -> dict[str, Any]:
@@ -583,7 +599,20 @@ def _compute_rollout_metrics(
             state_species=state_species,
             output_species=output_species,
         )
-        eval_indices = _rollout_eval_indices(raw.time_s.size, rollout_eval_points)
+        try:
+            eval_indices = _rollout_eval_indices(
+                times_s=raw.time_s,
+                fixed_requested_dt_s=fixed_requested_dt_s,
+                post_equilibrium_time_min_s=post_equilibrium_time_min_s,
+                post_equilibrium_min_fraction_of_final_time=post_equilibrium_min_fraction_of_final_time,
+                min_future_saved_steps=min_future_saved_steps,
+                max_target_relative_dt_error=max_target_relative_dt_error,
+                rollout_eval_points=rollout_eval_points,
+            )
+        except TrainingError:
+            continue
+        if eval_indices.size < 2:
+            continue
         current_state = np.asarray(raw.ymix_state[eval_indices[0]], dtype=np.float64)
         prev_index = int(eval_indices[0])
 
@@ -914,6 +943,13 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
         raw_run_files=artifact_info["raw_run_files"],
         split_path=artifact_info["split_path"],
         rollout_eval_points=int(config["trajectory_sampling"]["rollout_eval_points"]),
+        fixed_requested_dt_s=float(config["trajectory_sampling"]["fixed_requested_dt_s"]),
+        post_equilibrium_time_min_s=float(config["trajectory_sampling"]["post_equilibrium_time_min_s"]),
+        post_equilibrium_min_fraction_of_final_time=float(
+            config["trajectory_sampling"]["post_equilibrium_min_fraction_of_final_time"]
+        ),
+        min_future_saved_steps=int(config["trajectory_sampling"]["min_future_saved_steps"]),
+        max_target_relative_dt_error=float(config["trajectory_sampling"]["max_target_relative_dt_error"]),
         device=device,
         forward_dtype=precision.forward_dtype,
     )
