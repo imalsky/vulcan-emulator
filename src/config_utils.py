@@ -241,6 +241,7 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
             "worker_root",
             "runs_root",
             "save_evo_frq",
+            "max_trajectory_snapshots",
         },
         "generation",
     )
@@ -251,14 +252,19 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
         raise ConfigValidationError("generation.num_workers must be > 0.")
     _ = _as_int(cfg["random_seed"], "generation.random_seed")
     _ = _as_bool(cfg["keep_vulcan_outputs_debug"], "generation.keep_vulcan_outputs_debug")
-    if str(cfg["failure_policy"]) != "fail_on_first_error":
-        raise ConfigValidationError("generation.failure_policy must be 'fail_on_first_error'.")
+    if str(cfg["failure_policy"]) not in ("fail_on_first_error", "collect_all_errors"):
+        raise ConfigValidationError(
+            "generation.failure_policy must be 'fail_on_first_error' or 'collect_all_errors'."
+        )
     if _as_int(cfg["run_timeout_seconds"], "generation.run_timeout_seconds") <= 0:
         raise ConfigValidationError("generation.run_timeout_seconds must be > 0.")
     if _as_int(cfg["shard_size"], "generation.shard_size") <= 0:
         raise ConfigValidationError("generation.shard_size must be > 0.")
     if _as_int(cfg["save_evo_frq"], "generation.save_evo_frq") <= 0:
         raise ConfigValidationError("generation.save_evo_frq must be > 0.")
+    max_snap = _as_int(cfg["max_trajectory_snapshots"], "generation.max_trajectory_snapshots")
+    if max_snap < 0:
+        raise ConfigValidationError("generation.max_trajectory_snapshots must be >= 0 (0 = no limit).")
 
     for path_key in ("worker_root", "runs_root", "manifest_filename", "split_filename"):
         value = cfg[path_key]

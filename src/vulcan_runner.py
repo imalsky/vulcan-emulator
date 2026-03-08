@@ -95,6 +95,7 @@ class WorkerSettings:
     count_max: int
     trun_min: float
     count_min: int
+    max_trajectory_snapshots: int
 
 
 @dataclass(frozen=True)
@@ -560,6 +561,50 @@ def _deduplicate_strictly_increasing(
     return times[keep], states[keep]
 
 
+def _subsample_logspace(
+    times: np.ndarray,
+    states: np.ndarray,
+    n_keep: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Subsample a trajectory to approximately *n_keep* log-spaced snapshots.
+
+    Always retains the first (t=0) and last time points.  Interior points are
+    chosen as the nearest saved snapshots to log-uniformly spaced target times
+    between the first positive time and the final time.
+    """
+    if times.size <= n_keep:
+        return times, states
+
+    # Always keep index 0 (t=0) and the last index.
+    selected = {0, times.size - 1}
+
+    # Find the first positive time for log-spacing.
+    pos_mask = times > 0.0
+    if not np.any(pos_mask):
+        return times, states
+    first_pos_idx = int(np.argmax(pos_mask))
+    t_min = float(times[first_pos_idx])
+    t_max = float(times[-1])
+    if t_min >= t_max:
+        return times, states
+
+    # Generate log-spaced target times; subtract 2 for the guaranteed endpoints.
+    n_interior = max(n_keep - 2, 1)
+    targets = np.logspace(np.log10(t_min), np.log10(t_max), n_interior)
+
+    # For each target, pick the nearest saved snapshot.
+    for t in targets:
+        idx = int(np.searchsorted(times, t, side="left"))
+        idx = min(idx, times.size - 1)
+        # Check left neighbor too.
+        if idx > 0 and abs(times[idx - 1] - t) < abs(times[idx] - t):
+            idx = idx - 1
+        selected.add(idx)
+
+    keep = np.sort(np.array(list(selected), dtype=np.int64))
+    return times[keep], states[keep]
+
+
 def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerSettings) -> dict[str, Any]:
     """Extract the raw full-trajectory payload required by the transition-model pipeline."""
     with output_file.open("rb") as handle:
@@ -608,6 +653,8 @@ def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerS
     states = np.concatenate([y_ini[None, ...], y_time], axis=0)
     times = np.concatenate([np.array([0.0], dtype=np.float64), t_time], axis=0)
     times, states = _deduplicate_strictly_increasing(times, states)
+    if settings.max_trajectory_snapshots > 0:
+        times, states = _subsample_logspace(times, states, settings.max_trajectory_snapshots)
     if times.size < 2:
         raise VulcanRuntimeError(
             "VULCAN output does not contain at least one positive saved time after deduplication."
@@ -753,8 +800,9 @@ def run_vulcan_jobs(
     run_specs: list[RunSpec],
     *,
     settings: WorkerSettings,
+    failure_policy: str = "fail_on_first_error",
 ) -> list[RunResult]:
-    """Run all VULCAN jobs with fail-fast policy."""
+    """Run all VULCAN jobs with configurable failure policy."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     if not run_specs:
@@ -762,34 +810,52 @@ def run_vulcan_jobs(
     if int(settings.num_workers) <= 0:
         raise VulcanRuntimeError("settings.num_workers must be > 0.")
 
+    collect = failure_policy == "collect_all_errors"
     runs_root = Path(settings.runs_root)
     runs_root.mkdir(parents=True, exist_ok=True)
 
     results: list[RunResult] = []
+    errors: list[str] = []
     try:
         if int(settings.num_workers) == 1:
             for spec in tqdm(run_specs, desc="VULCAN runs", unit="run"):
-                results.append(_run_single(spec, settings))
+                try:
+                    results.append(_run_single(spec, settings))
+                except Exception as exc:
+                    if not collect:
+                        raise
+                    errors.append(f"run_{spec.run_id:06d}: {exc}")
+            if errors:
+                raise VulcanRuntimeError(
+                    f"{len(errors)}/{len(run_specs)} VULCAN runs failed:\n"
+                    + "\n".join(errors)
+                )
             return sorted(results, key=lambda item: item.run_id)
 
         # Fan out runs across worker processes; each worker gets an isolated VULCAN tree copy.
-        # Fail-fast: cancel remaining futures on the first worker error.
         with ProcessPoolExecutor(max_workers=int(settings.num_workers)) as pool:
             futures = {pool.submit(_run_single, spec, settings): spec.run_id for spec in run_specs}
-            try:
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc="VULCAN runs",
-                    unit="run",
-                ):
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="VULCAN runs",
+                unit="run",
+            ):
+                try:
                     results.append(future.result())
-            except Exception as exc:
-                for pending in futures:
-                    pending.cancel()
-                raise VulcanRuntimeError(
-                    f"Generation aborted due to worker failure: {exc}"
-                ) from exc
+                except Exception as exc:
+                    if not collect:
+                        for pending in futures:
+                            pending.cancel()
+                        raise VulcanRuntimeError(
+                            f"Generation aborted due to worker failure: {exc}"
+                        ) from exc
+                    errors.append(f"run_{futures[future]:06d}: {exc}")
+        if errors:
+            raise VulcanRuntimeError(
+                f"{len(errors)}/{len(run_specs)} VULCAN runs failed:\n"
+                + "\n".join(errors)
+            )
         return sorted(results, key=lambda item: item.run_id)
     finally:
         _cleanup_worker_dirs(settings)

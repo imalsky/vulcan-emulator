@@ -707,6 +707,7 @@ def build_worker_settings(
         count_max=int(runtime["count_max"]),
         trun_min=float(runtime["trun_min"]),
         count_min=int(runtime["count_min"]),
+        max_trajectory_snapshots=int(generation.get("max_trajectory_snapshots", 0)),
     )
 
 
@@ -736,9 +737,12 @@ def run_generation_and_preprocess(
         output_species=output_species,
     )
 
+    failure_policy = str(generation.get("failure_policy", "fail_on_first_error"))
     logger.info("Running %d VULCAN jobs with %d workers...", len(run_specs), generation["num_workers"])
     try:
-        results = run_vulcan_jobs(run_specs, settings=settings)
+        results = run_vulcan_jobs(
+            run_specs, settings=settings, failure_policy=failure_policy,
+        )
     except VulcanRuntimeError as exc:
         raise PreprocessError(str(exc)) from exc
 
