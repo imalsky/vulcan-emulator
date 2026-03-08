@@ -750,3 +750,11 @@ The shipped PBS directives request:
 - 72-hour walltime
 
 Adjust these to match your site's queue names and hardware.
+
+#### Parallelization Strategy
+
+VULCAN data generation is CPU-bound (each run is an external Python subprocess). It cannot be GPU-parallelized. The generation stage uses `ProcessPoolExecutor` with `generation.num_workers` parallel workers, each operating on an isolated copy of the VULCAN source tree.
+
+With 32 CPUs available, `num_workers = 30` runs up to 30 VULCAN jobs concurrently (reserving 2 CPUs for the orchestrator and OS). This scales generation near-linearly: 100 runs at 30 workers completes in roughly the wall time of 4 sequential runs.
+
+The GPU is used exclusively for the training stage (`--train`), where the full model training loop, validation, and rollout evaluation run on CUDA.
