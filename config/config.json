@@ -1,7 +1,7 @@
 {
   "paths": {
     "project_root": ".",
-    "vulcan_source_path": "../VULCAN-master",
+    "vulcan_source_path": "../VULCAN",
     "data_root": "data",
     "models_root": "models",
     "logs_root": "logs"
