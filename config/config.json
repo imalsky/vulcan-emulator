@@ -237,7 +237,7 @@
   "training": {
     "device": "cuda",
     "batch_size": 256,
-    "epochs": 100,
+    "epochs": 300,
     "learning_rate": 1e-4,
     "min_lr": 1e-06,
     "warmup_epochs": 10,
@@ -246,15 +246,15 @@
     "use_amp": false,
     "seed": 42,
     "live_sampling": {
-      "train_pairs_per_run_per_epoch": 100,
-      "eval_pairs_per_run": 100
+      "train_pairs_per_run_per_epoch": 500,
+      "eval_pairs_per_run": 500
     },
     "model": {
       "d_model": 256,
       "nhead": 4,
       "num_layers": 6,
       "dim_feedforward": 1024,
-      "dropout": 0.0,
+      "dropout": 0.05,
       "film_clamp": 10.0,
       "output_head_divisor": 2,
       "max_sequence_length": 64,

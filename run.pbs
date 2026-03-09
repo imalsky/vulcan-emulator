@@ -214,7 +214,7 @@ echo "Training log file: ${TRAIN_LOG}"
 : > "${TRAIN_LOG}"
 
 # Comment out this line if you want to skip generation.
-python -u src/main.py --gen --config "${CONFIG_PATH}"
+# python -u src/main.py --gen --config "${CONFIG_PATH}"
 
 # Comment out this line if you want to skip training and only generate data.
 # Running this line alone will reuse existing processed data if it still matches the current config.
