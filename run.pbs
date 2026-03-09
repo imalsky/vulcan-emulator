@@ -9,16 +9,13 @@
 
 # Required in the HPC conda env used for this job:
 #   torch, numpy, scipy, h5py, tqdm
-# Required in addition when training.data_loading.mode="auto":
-#   psutil
 # Required only if fastchem_vulcan/fastchem is missing and you want this script to build it:
 #   make, g++
 # Required for the current bundled VULCAN runtime:
 #   matplotlib
 # Optional VULCAN extras only if you rebuild chem_funs.py or use image utilities:
 #   sympy, Pillow
-# Current config/config.json sets training.device="cpu", so a CPU queue is sufficient.
-# Replace the queue/resource lines above with your site's CPU queue if available.
+# Current config/config.json sets training.device="cuda", and live sampling expects a GPU.
 
 set -euo pipefail
 
@@ -179,8 +176,6 @@ with config_path.open("r", encoding="utf-8") as handle:
     config = json.load(handle)
 
 required = ["torch", "numpy", "scipy", "h5py", "tqdm", "matplotlib"]
-if str(config["training"]["data_loading"]["mode"]).lower() == "auto":
-    required.append("psutil")
 
 missing: list[str] = []
 for name in required:
@@ -213,13 +208,13 @@ fi
 
 echo "Execution control:"
 echo "  Comment out either command below if you want to run only one stage."
-echo "  --gen reruns VULCAN generation and rewrites data/processed."
+echo "  --gen reruns VULCAN generation, drops failed individual VULCAN runs if usable runs remain, and rewrites data/processed."
 echo "  --train reuses existing processed data only if its provenance matches the current config."
 echo "Training log file: ${TRAIN_LOG}"
 : > "${TRAIN_LOG}"
 
 # Comment out this line if you want to skip generation.
-python -u src/main.py --gen --config "${CONFIG_PATH}"
+# python -u src/main.py --gen --config "${CONFIG_PATH}"
 
 # Comment out this line if you want to skip training and only generate data.
 # Running this line alone will reuse existing processed data if it still matches the current config.

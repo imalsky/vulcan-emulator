@@ -1,14 +1,14 @@
-"""Generation post-processing: split, sample transition pairs, normalize, and shard.
+"""Generation post-processing: split, normalize trajectories, and persist split tensors.
 
 Orchestrates the full ``--gen`` pipeline after VULCAN runs complete:
 
 1. **Run VULCAN jobs** from sampled RunSpecs (P, T, Kzz, gravity, abundances).
-2. **Sample transition pairs** (anchor/target time pairs) for every reusable raw run.
-3. **Split** usable run IDs into train/val/test by configurable ratios.
-4. **Fit normalization stats** on the *train* split only, applying the
-   configured method (standard, log-standard, log-min-max, none) per variable.
-5. **Normalize and shard** all splits into fixed-size ``.npy`` files for
-   efficient DataLoader consumption.
+2. **Split** reusable run IDs into train/val/test by configurable ratios.
+3. **Fit normalization stats** on the *train* split only, applying the
+   configured method per variable family, with fixed ``log-standard`` handling
+   for ``anchor_ymix`` and targets.
+4. **Normalize and persist** all split trajectories into padded ``.npy`` files
+   for live pair sampling during training.
 
 Key invariants:
 
@@ -36,7 +36,7 @@ import torch
 from config_utils import PrecisionConfig, resolve_conditioning_inputs
 from provenance import PROCESSED_FINGERPRINT_FILENAME, build_processed_fingerprint
 from sampling import build_run_specs
-from transition_sampling import TransitionPairs, TransitionSamplingError, sample_transition_pairs
+from transition_sampling import CandidatePairs, TransitionSamplingError, build_candidate_pairs
 from vulcan_runner import (
     BoundaryConditionSettings,
     SpeciesSelection,
@@ -108,6 +108,61 @@ class _RunningStats:
         }
 
 
+@dataclass
+class _WeightedRunningStats:
+    """Streaming weighted stats accumulator over scalar or channel vectors."""
+
+    channels: int
+    dtype: type[np.float32] | type[np.float64]
+
+    def __post_init__(self) -> None:
+        self.count = 0
+        self.weight_sum = np.zeros(self.channels, dtype=self.dtype)
+        self.weighted_sum = np.zeros(self.channels, dtype=self.dtype)
+        self.weighted_sumsq = np.zeros(self.channels, dtype=self.dtype)
+        self.min = np.full(self.channels, np.inf, dtype=self.dtype)
+        self.max = np.full(self.channels, -np.inf, dtype=self.dtype)
+
+    def update(self, values: np.ndarray, weights: np.ndarray) -> None:
+        data = np.asarray(values, dtype=self.dtype)
+        if data.ndim == 1:
+            data = data[:, None]
+        if data.shape[-1] != self.channels:
+            raise PreprocessError(
+                f"Weighted stats channel mismatch: expected {self.channels}, got {data.shape[-1]}"
+            )
+        flat = data.reshape(-1, self.channels)
+        flat_weights = np.asarray(weights, dtype=self.dtype).reshape(-1, 1)
+        if flat.shape[0] != flat_weights.shape[0]:
+            raise PreprocessError("Weighted stats update received mismatched value/weight lengths.")
+        if np.any(~np.isfinite(flat)) or np.any(~np.isfinite(flat_weights)):
+            raise PreprocessError("Non-finite values encountered while fitting weighted stats.")
+        if np.any(flat_weights <= 0.0):
+            raise PreprocessError("Weighted stats require strictly positive sample weights.")
+
+        self.count += int(flat.shape[0])
+        self.weight_sum += np.sum(flat_weights, axis=0)
+        self.weighted_sum += np.sum(flat * flat_weights, axis=0)
+        self.weighted_sumsq += np.sum(flat * flat * flat_weights, axis=0)
+        self.min = np.minimum(self.min, np.min(flat, axis=0))
+        self.max = np.maximum(self.max, np.max(flat, axis=0))
+
+    def finalize(self) -> dict[str, Any]:
+        if self.count <= 0 or np.any(self.weight_sum <= 0.0):
+            raise PreprocessError("Cannot finalize weighted stats with zero effective samples.")
+        mean = self.weighted_sum / self.weight_sum
+        var = np.maximum((self.weighted_sumsq / self.weight_sum) - mean * mean, 0.0)
+        std = np.sqrt(var)
+        std = np.where(std > 0.0, std, 1.0)
+        return {
+            "count": int(self.count),
+            "mean": mean.tolist(),
+            "std": std.tolist(),
+            "min": self.min.tolist(),
+            "max": self.max.tolist(),
+        }
+
+
 @dataclass(frozen=True)
 class _NormPolicy:
     """Normalization policy for one variable family."""
@@ -131,12 +186,11 @@ class RawRunData:
 
 
 @dataclass(frozen=True)
-class PairSpecBundle:
-    """One raw run file paired with sampled transition metadata."""
+class TrajectorySpecBundle:
+    """One reusable raw trajectory."""
 
     run_id: int
     run_file: Path
-    pairs: TransitionPairs
 
 
 def _conditioning_feature_order(config: dict[str, Any]) -> list[str]:
@@ -340,34 +394,29 @@ def _split_run_ids(
     return SplitAssignments(train=train, val=val, test=test)
 
 
-def _sample_pairs_for_run(
+def _candidate_pairs_for_raw(
     *,
     raw: RawRunData,
     config: dict[str, Any],
-    random_seed: int,
-) -> TransitionPairs:
+) -> CandidatePairs:
     sampling_cfg = config["trajectory_sampling"]
-    rng = np.random.default_rng(int(random_seed) + int(raw.run_id) * 7919)
-    return sample_transition_pairs(
-        rng=rng,
+    return build_candidate_pairs(
         times_s=raw.time_s,
-        n_pairs=int(sampling_cfg["pairs_per_run"]),
         dt_min_s=float(sampling_cfg["dt_min_s"]),
         dt_max_s=float(sampling_cfg["dt_max_s"]),
         min_future_saved_steps=int(sampling_cfg["min_future_saved_steps"]),
     )
 
 
-def _build_pair_specs(
+def _build_trajectory_specs(
     *,
     run_files: list[Path],
     config: dict[str, Any],
     state_species: list[str],
     output_species: list[str],
-) -> list[PairSpecBundle]:
-    """Sample transition pairs from every usable raw run and skip unusable trajectories."""
-    bundles: list[PairSpecBundle] = []
-    seed = int(config["generation"]["random_seed"])
+) -> list[TrajectorySpecBundle]:
+    """Keep only raw runs that contain at least one valid transition candidate."""
+    bundles: list[TrajectorySpecBundle] = []
     for run_file in run_files:
         try:
             raw = load_raw_run_file(
@@ -375,11 +424,16 @@ def _build_pair_specs(
                 state_species=state_species,
                 output_species=output_species,
             )
-            pairs = _sample_pairs_for_run(raw=raw, config=config, random_seed=seed)
+            candidates = _candidate_pairs_for_raw(raw=raw, config=config)
         except (PreprocessError, TransitionSamplingError) as exc:
-            logger.warning("Skipping raw run %s during pair sampling: %s", run_file.name, exc)
+            logger.warning("Skipping raw run %s during candidate validation: %s", run_file.name, exc)
             continue
-        bundles.append(PairSpecBundle(run_id=raw.run_id, run_file=run_file, pairs=pairs))
+        bundles.append(
+            TrajectorySpecBundle(
+                run_id=raw.run_id,
+                run_file=run_file,
+            )
+        )
     return bundles
 
 
@@ -394,7 +448,7 @@ def _subset_stats(stats: dict[str, Any], indices: list[int]) -> dict[str, Any]:
 
 def _build_normalization_stats(
     *,
-    train_bundles: list[PairSpecBundle],
+    train_bundles: list[TrajectorySpecBundle],
     config: dict[str, Any],
     state_species: list[str],
     output_species: list[str],
@@ -405,13 +459,17 @@ def _build_normalization_stats(
 
     Streaming accumulators compute mean/std/min/max over the *transformed*
     values (e.g., log10 for log-standard) so that normalization operates
-    on the scale the model actually sees.  Target stats are derived from
-    the anchor_ymix stats, subsetted to the output species channels, which
+    on the scale the model actually sees. Target stats are derived from the
+    anchor_ymix stats, subsetted to the output species channels, which
     ensures the residual skip connection works in a single shared space.
+
+    ``log10_dt_s`` is fitted against the live candidate distribution, using
+    log-uniform weights ``1 / dt`` over every valid train-split candidate.
     """
     norm_cfg = config["normalization"]
     epsilon = float(norm_cfg["epsilon"])
     global_feature_order = _conditioning_feature_order(config)
+    static_global_order = [key for key in global_feature_order if key != "log10_dt_s"]
 
     seq_methods = norm_cfg["sequence_methods"]
     global_methods = norm_cfg["global_methods"]
@@ -426,8 +484,10 @@ def _build_normalization_stats(
     state_stats = _RunningStats(len(state_species), stats_dtype)
     global_stats = {
         key: (_NormPolicy(global_methods[key], epsilon), _RunningStats(1, stats_dtype))
-        for key in global_feature_order
+        for key in static_global_order
     }
+    dt_policy = _NormPolicy(global_methods["log10_dt_s"], epsilon)
+    dt_stats = _WeightedRunningStats(1, stats_dtype)
 
     for bundle in train_bundles:
         raw = load_raw_run_file(
@@ -435,31 +495,28 @@ def _build_normalization_stats(
             state_species=state_species,
             output_species=output_species,
         )
-        pairs = bundle.pairs
         conditioning_inputs = _resolved_run_conditioning_inputs(raw, config)
+        candidates = _candidate_pairs_for_raw(raw=raw, config=config)
 
         for key in ("pressure_bar", "temperature_k", "kzz_cm2_s"):
             policy, acc = seq_stats[key]
             values = getattr(raw, key).reshape(-1, 1)
             acc.update(_fit_for_method(values, policy))
 
-        anchor_states = raw.ymix_state[pairs.anchor_index]
-        target_states = raw.ymix_state[pairs.target_index]
-        state_stats.update(_fit_for_method(anchor_states, state_policy))
-        state_stats.update(_fit_for_method(target_states, state_policy))
+        state_stats.update(_fit_for_method(raw.ymix_state, state_policy))
 
-        for key in global_feature_order:
+        for key in static_global_order:
             policy, acc = global_stats[key]
-            if key == "log10_dt_s":
-                values = np.log10(pairs.actual_dt_s).reshape(-1, 1)
-            else:
-                repeated = np.full(
-                    (pairs.actual_dt_s.size, 1),
-                    float(conditioning_inputs[key]),
-                    dtype=np.float64,
+            acc.update(
+                _fit_for_method(
+                    np.array([[conditioning_inputs[key]]], dtype=np.float64),
+                    policy,
                 )
-                values = repeated
-            acc.update(_fit_for_method(values, policy))
+            )
+
+        dt_values = np.log10(candidates.actual_dt_s).reshape(-1, 1)
+        dt_weights = 1.0 / np.maximum(candidates.actual_dt_s, np.finfo(np.float64).tiny)
+        dt_stats.update(_fit_for_method(dt_values, dt_policy), dt_weights)
 
     state_final = state_stats.finalize()
     output_final = _subset_stats(state_final, output_from_state_indices)
@@ -470,18 +527,21 @@ def _build_normalization_stats(
             for key, (policy, acc) in seq_stats.items()
         }
         | {"anchor_ymix": {"method": state_policy.method, **state_final}},
-        "globals": {
-            key: {"method": policy.method, **acc.finalize()}
-            for key, (policy, acc) in global_stats.items()
-        },
+        "globals": (
+            {
+                key: {"method": policy.method, **acc.finalize()}
+                for key, (policy, acc) in global_stats.items()
+            }
+            | {"log10_dt_s": {"method": dt_policy.method, **dt_stats.finalize()}}
+        ),
         "targets": {"ymix": {"method": target_method, **output_final}},
     }
 
 
-def _write_split_shards(
+def _write_split_trajectories(
     *,
     split_name: str,
-    bundles: list[PairSpecBundle],
+    bundles: list[TrajectorySpecBundle],
     config: dict[str, Any],
     state_species: list[str],
     output_species: list[str],
@@ -490,53 +550,24 @@ def _write_split_shards(
     normalization_fingerprint: str,
     processed_root: Path,
 ) -> dict[str, Any]:
-    """Normalize one split and write fixed-size `.npy` shards plus metadata."""
+    """Normalize one split and write padded per-run trajectory tensors plus metadata."""
     split_dir = processed_root / split_name
-    seq_dir = split_dir / "sequence_inputs"
-    glb_dir = split_dir / "globals"
-    tgt_dir = split_dir / "targets"
-    dt_dir = split_dir / "dt_s"
-    for directory in (split_dir, seq_dir, glb_dir, tgt_dir, dt_dir):
-        directory.mkdir(parents=True, exist_ok=True)
+    split_dir.mkdir(parents=True, exist_ok=True)
 
     state_dim = len(state_species)
     output_dim = len(output_species)
     input_dim = 3 + state_dim
     global_feature_order = _conditioning_feature_order(config)
+    dt_feature_index = global_feature_order.index("log10_dt_s")
+    global_static_order = [key for key in global_feature_order if key != "log10_dt_s"]
     global_dim = len(global_feature_order)
-    shard_size = int(config["generation"]["shard_size"])
+    global_static_dim = len(global_static_order)
 
     sequence_length = -1
-    total_samples = 0
-    shard_idx = 0
-    write_pos = 0
+    max_steps = 0
+    total_valid_candidates = 0
     dt_min_s = np.inf
     dt_max_s = -np.inf
-
-    seq_buf: np.ndarray | None = None
-    glb_buf: np.ndarray | None = None
-    tgt_buf: np.ndarray | None = None
-    dt_buf: np.ndarray | None = None
-
-    # Shard-at-a-time writing: alloc_buffers pre-allocates numpy arrays for one
-    # full shard; flush writes the filled portion to disk and advances the shard index.
-    def alloc_buffers(nz: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        return (
-            np.zeros((shard_size, nz, input_dim), dtype=np.float32),
-            np.zeros((shard_size, global_dim), dtype=np.float32),
-            np.zeros((shard_size, nz, output_dim), dtype=np.float32),
-            np.zeros((shard_size,), dtype=np.float32),
-        )
-
-    def flush(current_size: int) -> None:
-        nonlocal shard_idx, seq_buf, glb_buf, tgt_buf, dt_buf
-        if current_size <= 0 or seq_buf is None or glb_buf is None or tgt_buf is None or dt_buf is None:
-            return
-        np.save(seq_dir / f"shard_{shard_idx:05d}.npy", seq_buf[:current_size], allow_pickle=False)
-        np.save(glb_dir / f"shard_{shard_idx:05d}.npy", glb_buf[:current_size], allow_pickle=False)
-        np.save(tgt_dir / f"shard_{shard_idx:05d}.npy", tgt_buf[:current_size], allow_pickle=False)
-        np.save(dt_dir / f"shard_{shard_idx:05d}.npy", dt_buf[:current_size], allow_pickle=False)
-        shard_idx += 1
 
     eps = float(stats["epsilon"])
     seq_policies = {
@@ -545,9 +576,9 @@ def _write_split_shards(
     }
     global_policies = {
         key: _NormPolicy(stats["globals"][key]["method"], eps)
-        for key in global_feature_order
+        for key in global_static_order
     }
-    target_policy = _NormPolicy(stats["targets"]["ymix"]["method"], eps)
+    normalized_runs: list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]] = []
 
     for bundle in bundles:
         raw = load_raw_run_file(
@@ -555,15 +586,14 @@ def _write_split_shards(
             state_species=state_species,
             output_species=output_species,
         )
-        pairs = bundle.pairs
+        candidates = _candidate_pairs_for_raw(raw=raw, config=config)
         conditioning_inputs = _resolved_run_conditioning_inputs(raw, config)
         nz = int(raw.pressure_bar.size)
         if sequence_length < 0:
             sequence_length = nz
-            seq_buf, glb_buf, tgt_buf, dt_buf = alloc_buffers(nz)
         elif sequence_length != nz:
             raise PreprocessError(
-                "Mixed sequence lengths across runs are unsupported in v1: "
+                "Mixed vertical sequence lengths across runs are unsupported: "
                 f"{sequence_length} vs {nz}"
             )
 
@@ -582,80 +612,87 @@ def _write_split_shards(
             stats["sequence"]["kzz_cm2_s"],
             seq_policies["kzz_cm2_s"],
         )
-        static_block = np.concatenate([pressure_norm, temperature_norm, kzz_norm], axis=1)
-
-        anchor_states = raw.ymix_state[pairs.anchor_index]
-        target_outputs = raw.ymix_output[pairs.target_index]
-        anchor_norm = _apply_method(
-            anchor_states,
+        static_block = np.concatenate([pressure_norm, temperature_norm, kzz_norm], axis=1).astype(
+            np.float32,
+            copy=False,
+        )
+        state_norm = _apply_method(
+            raw.ymix_state,
             stats["sequence"]["anchor_ymix"],
             seq_policies["anchor_ymix"],
-        )
-        target_norm = _apply_method(
-            target_outputs,
-            stats["targets"]["ymix"],
-            target_policy,
-        )
-        sequence_block = np.concatenate(
-            [np.broadcast_to(static_block[None, :, :], (anchor_norm.shape[0], nz, 3)), anchor_norm],
-            axis=2,
-        )
+        ).astype(np.float32, copy=False)
 
-        global_columns: list[np.ndarray] = []
-        for key in global_feature_order:
-            if key == "log10_dt_s":
-                column = _apply_method(
-                    np.log10(pairs.actual_dt_s).reshape(-1, 1),
-                    stats["globals"][key],
-                    global_policies[key],
-                ).reshape(-1)
-            else:
-                normalized = float(
+        static_globals = np.array(
+            [
+                float(
                     _apply_method(
                         np.array([[conditioning_inputs[key]]], dtype=np.float64),
                         stats["globals"][key],
                         global_policies[key],
                     )[0, 0]
                 )
-                column = np.full(pairs.actual_dt_s.size, normalized, dtype=np.float64)
-            global_columns.append(column)
-        global_block = np.column_stack(global_columns)
+                for key in global_static_order
+            ],
+            dtype=np.float32,
+        )
 
-        dt_min_s = min(dt_min_s, float(np.min(pairs.actual_dt_s)))
-        dt_max_s = max(dt_max_s, float(np.max(pairs.actual_dt_s)))
+        n_steps = int(raw.time_s.size)
+        max_steps = max(max_steps, n_steps)
+        total_valid_candidates += int(candidates.actual_dt_s.size)
+        dt_min_s = min(dt_min_s, float(np.min(candidates.actual_dt_s)))
+        dt_max_s = max(dt_max_s, float(np.max(candidates.actual_dt_s)))
+        normalized_runs.append(
+            (
+                bundle.run_id,
+                static_block,
+                state_norm,
+                static_globals,
+                np.asarray(raw.time_s, dtype=np.float64),
+                n_steps,
+            )
+        )
 
-        start = 0
-        num_pairs = int(pairs.actual_dt_s.size)
-        while start < num_pairs:
-            if seq_buf is None or glb_buf is None or tgt_buf is None or dt_buf is None:
-                raise PreprocessError("Internal buffer allocation failure.")
-            if write_pos >= shard_size:
-                flush(shard_size)
-                write_pos = 0
-            room = shard_size - write_pos
-            n_copy = min(room, num_pairs - start)
-            end_pos = write_pos + n_copy
-            next_start = start + n_copy
+    if not normalized_runs:
+        raise PreprocessError(f"Split '{split_name}' does not contain any reusable runs.")
 
-            seq_buf[write_pos:end_pos] = sequence_block[start:next_start].astype(np.float32, copy=False)
-            glb_buf[write_pos:end_pos] = global_block[start:next_start].astype(np.float32, copy=False)
-            tgt_buf[write_pos:end_pos] = target_norm[start:next_start].astype(np.float32, copy=False)
-            dt_buf[write_pos:end_pos] = pairs.actual_dt_s[start:next_start].astype(np.float32, copy=False)
+    static_inputs = np.zeros((len(normalized_runs), sequence_length, 3), dtype=np.float32)
+    state_ymix = np.zeros(
+        (len(normalized_runs), max_steps, sequence_length, state_dim),
+        dtype=np.float32,
+    )
+    global_inputs = np.zeros((len(normalized_runs), global_static_dim), dtype=np.float32)
+    time_s = np.zeros((len(normalized_runs), max_steps), dtype=np.float64)
+    valid_steps_mask = np.zeros((len(normalized_runs), max_steps), dtype=bool)
+    run_ids = np.zeros((len(normalized_runs),), dtype=np.int64)
 
-            write_pos = end_pos
-            start = next_start
-            total_samples += n_copy
+    for row_idx, (run_id, static_block, state_block, global_block, run_time_s, n_steps) in enumerate(
+        normalized_runs
+    ):
+        static_inputs[row_idx] = static_block
+        state_ymix[row_idx, :n_steps] = state_block
+        global_inputs[row_idx] = global_block
+        time_s[row_idx, :n_steps] = run_time_s
+        valid_steps_mask[row_idx, :n_steps] = True
+        run_ids[row_idx] = int(run_id)
 
-    flush(write_pos)
+    np.save(split_dir / "static_inputs.npy", static_inputs, allow_pickle=False)
+    np.save(split_dir / "state_ymix.npy", state_ymix, allow_pickle=False)
+    np.save(split_dir / "global_inputs.npy", global_inputs, allow_pickle=False)
+    np.save(split_dir / "time_s.npy", time_s, allow_pickle=False)
+    np.save(split_dir / "valid_steps_mask.npy", valid_steps_mask, allow_pickle=False)
+    np.save(split_dir / "run_ids.npy", run_ids, allow_pickle=False)
 
     sampling_cfg = config["trajectory_sampling"]
     metadata = {
         "split": split_name,
-        "total_samples": int(total_samples),
-        "num_shards": int(shard_idx),
+        "num_runs": int(len(normalized_runs)),
+        "max_steps": int(max_steps),
+        "total_valid_candidates": int(total_valid_candidates),
         "sequence_length": int(sequence_length),
         "input_dim": int(input_dim),
         "global_dim": int(global_dim),
+        "global_static_dim": int(global_static_dim),
+        "dt_feature_index": int(dt_feature_index),
         "target_dim": int(output_dim),
         "state_dim": int(state_dim),
         "sequence_feature_order": [
@@ -665,12 +702,12 @@ def _write_split_shards(
             *[f"anchor_ymix:{species}" for species in state_species],
         ],
         "global_feature_order": list(global_feature_order),
+        "global_static_feature_order": list(global_static_order),
         "state_species_order": list(state_species),
         "output_species_order": list(output_species),
         "output_from_state_indices": list(output_from_state_indices),
         "normalization_fingerprint": normalization_fingerprint,
         "sampling_mode": str(sampling_cfg["mode"]),
-        "pairs_per_run": int(sampling_cfg["pairs_per_run"]),
         "dt_sampling_min_s": float(sampling_cfg["dt_min_s"]),
         "dt_sampling_max_s": float(sampling_cfg["dt_max_s"]),
         "min_future_saved_steps": int(sampling_cfg["min_future_saved_steps"]),
@@ -724,7 +761,7 @@ def build_worker_settings(
         count_max=int(runtime["count_max"]),
         trun_min=float(runtime["trun_min"]),
         count_min=int(runtime["count_min"]),
-        max_trajectory_snapshots=int(generation.get("max_trajectory_snapshots", 0)),
+        max_trajectory_snapshots=int(generation["max_trajectory_snapshots"]),
     )
 
 
@@ -735,7 +772,7 @@ def run_generation_and_preprocess(
     precision: PrecisionConfig,
     boundary_conditions: BoundaryConditionSettings | None,
 ) -> None:
-    """Execute `--gen`: generate raw trajectories, split by run, normalize, and write shards."""
+    """Execute `--gen`: generate raw trajectories, split by run, normalize, and write split tensors."""
     generation = config["generation"]
     state_species = list(config["data_spec"]["state_species"])
     output_species = list(config["data_spec"]["output_species"])
@@ -761,19 +798,13 @@ def run_generation_and_preprocess(
             state_species=state_species,
             output_species=output_species,
         )
-
-        failure_policy = str(generation.get("failure_policy", "fail_on_first_error"))
         logger.info(
             "Running %d VULCAN jobs with %d workers...",
             len(run_specs),
             generation["num_workers"],
         )
         try:
-            results = run_vulcan_jobs(
-                run_specs,
-                settings=settings,
-                failure_policy=failure_policy,
-            )
+            results = run_vulcan_jobs(run_specs, settings=settings)
         except VulcanRuntimeError as exc:
             raise PreprocessError(str(exc)) from exc
         run_files = [Path(result.run_file) for result in results]
@@ -781,8 +812,8 @@ def run_generation_and_preprocess(
     if not run_files:
         raise PreprocessError("No raw run files were found or generated.")
 
-    logger.info("Sampling transition pairs from raw trajectories...")
-    all_bundles = _build_pair_specs(
+    logger.info("Validating live-sampling candidates from raw trajectories...")
+    all_bundles = _build_trajectory_specs(
         run_files=run_files,
         config=config,
         state_species=state_species,
@@ -790,7 +821,7 @@ def run_generation_and_preprocess(
     )
     if not all_bundles:
         raise PreprocessError(
-            "No reusable raw trajectories produced valid transition pairs for the current config."
+            "No reusable raw trajectories produced valid transition candidates for the current config."
         )
 
     split = _split_run_ids(
@@ -807,7 +838,7 @@ def run_generation_and_preprocess(
     for split_name, bundles in split_bundles.items():
         if not bundles:
             raise PreprocessError(
-                f"No usable raw runs remained in split '{split_name}' after pair sampling."
+                f"No usable raw runs remained in split '{split_name}' after candidate validation."
             )
 
     logger.info(
@@ -831,10 +862,10 @@ def run_generation_and_preprocess(
         shutil.rmtree(processed_root)
     processed_root.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Writing processed transition shards...")
+    logger.info("Writing processed normalized trajectory splits...")
     split_metadata = {}
     for split_name in ("train", "val", "test"):
-        split_metadata[split_name] = _write_split_shards(
+        split_metadata[split_name] = _write_split_trajectories(
             split_name=split_name,
             bundles=split_bundles[split_name],
             config=config,
@@ -888,9 +919,9 @@ def run_generation_and_preprocess(
         json.dump(fingerprint, handle, indent=2)
 
     logger.info(
-        "Generation + preprocessing complete. Raw runs used: %d | train pairs: %d | val pairs: %d | test pairs: %d",
+        "Generation + preprocessing complete. Raw runs used: %d | train candidates: %d | val candidates: %d | test candidates: %d",
         len(all_bundles),
-        split_metadata["train"]["total_samples"],
-        split_metadata["val"]["total_samples"],
-        split_metadata["test"]["total_samples"],
+        split_metadata["train"]["total_valid_candidates"],
+        split_metadata["val"]["total_valid_candidates"],
+        split_metadata["test"]["total_valid_candidates"],
     )

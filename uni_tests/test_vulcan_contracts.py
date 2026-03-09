@@ -263,7 +263,7 @@ class VulcanContractTests(unittest.TestCase):
         np.testing.assert_allclose(payload["ymix_state"][0], expected_initial_state)
         np.testing.assert_allclose(payload["ymix_output"][0], expected_initial_output)
 
-    def test_run_vulcan_jobs_continue_on_error_returns_successes(self) -> None:
+    def test_run_vulcan_jobs_drops_failed_runs(self) -> None:
         settings = _settings(Path("/tmp"))
         run_specs = [replace(_run_spec(), run_id=idx) for idx in (1, 2, 3)]
         side_effect = [
@@ -274,30 +274,22 @@ class VulcanContractTests(unittest.TestCase):
         with mock.patch("vulcan_runner._run_single", side_effect=side_effect), mock.patch(
             "vulcan_runner._cleanup_worker_dirs"
         ):
-            results = run_vulcan_jobs(
-                run_specs,
-                settings=settings,
-                failure_policy="continue_on_error",
-            )
+            results = run_vulcan_jobs(run_specs, settings=settings)
 
         self.assertEqual([result.run_id for result in results], [1, 3])
 
-    def test_run_vulcan_jobs_collect_all_errors_still_raises(self) -> None:
+    def test_run_vulcan_jobs_raises_when_all_runs_fail(self) -> None:
         settings = _settings(Path("/tmp"))
         run_specs = [replace(_run_spec(), run_id=idx) for idx in (1, 2)]
         side_effect = [
-            RunResult(run_id=1, run_file="run_000001.h5"),
             VulcanRuntimeError("boom"),
+            VulcanRuntimeError("boom again"),
         ]
         with mock.patch("vulcan_runner._run_single", side_effect=side_effect), mock.patch(
             "vulcan_runner._cleanup_worker_dirs"
         ):
-            with self.assertRaisesRegex(VulcanRuntimeError, "1/2 VULCAN runs failed"):
-                run_vulcan_jobs(
-                    run_specs,
-                    settings=settings,
-                    failure_policy="collect_all_errors",
-                )
+            with self.assertRaisesRegex(VulcanRuntimeError, "All VULCAN runs failed"):
+                run_vulcan_jobs(run_specs, settings=settings)
 
 
 if __name__ == "__main__":

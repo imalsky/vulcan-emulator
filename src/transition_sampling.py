@@ -1,9 +1,8 @@
-"""Log-uniform transition-pair sampling from saved VULCAN trajectories.
+"""Transition-pair utilities for saved VULCAN trajectories.
 
 The VULCAN solver saves states at irregular times. For the current emulator
-regime, every valid ordered pair of saved snapshots is a candidate training
-example, subject to a configurable actual-dt range. Training pairs are sampled
-approximately uniformly in log(dt) by weighting candidate pairs with 1 / dt.
+regime, every valid ordered pair of saved snapshots is a candidate transition
+example, subject to a configurable actual-dt range.
 
 This supports the intended operator:
 
@@ -23,18 +22,7 @@ class TransitionSamplingError(ValueError):
 
 
 @dataclass(frozen=True)
-class TransitionPairs:
-    """A batch of anchor/target trajectory pairs."""
-
-    anchor_index: np.ndarray
-    target_index: np.ndarray
-    actual_dt_s: np.ndarray
-    anchor_time_s: np.ndarray
-    target_time_s: np.ndarray
-
-
-@dataclass(frozen=True)
-class _CandidatePairs:
+class CandidatePairs:
     """All valid ordered candidate pairs for one trajectory."""
 
     anchor_index: np.ndarray
@@ -58,13 +46,13 @@ def _validate_times(times_s: np.ndarray) -> np.ndarray:
     return times
 
 
-def _candidate_pairs(
+def build_candidate_pairs(
     *,
     times_s: np.ndarray,
     dt_min_s: float,
     dt_max_s: float,
     min_future_saved_steps: int,
-) -> _CandidatePairs:
+) -> CandidatePairs:
     """Enumerate all valid ordered pairs within the configured actual-dt range."""
     times = _validate_times(times_s)
     dt_min = float(dt_min_s)
@@ -98,63 +86,13 @@ def _candidate_pairs(
     if np.any(actual_dt_s <= 0.0):
         raise TransitionSamplingError("Sampled non-positive actual dt.")
 
-    return _CandidatePairs(
+    return CandidatePairs(
         anchor_index=anchor_index,
         target_index=target_index,
         actual_dt_s=actual_dt_s,
         anchor_time_s=anchor_time_s,
         target_time_s=target_time_s,
     )
-
-
-def sample_transition_pairs(
-    *,
-    rng: np.random.Generator,
-    times_s: np.ndarray,
-    n_pairs: int,
-    dt_min_s: float,
-    dt_max_s: float,
-    min_future_saved_steps: int = 1,
-) -> TransitionPairs:
-    """Sample up to ``n_pairs`` trajectory pairs with approximate log-uniform dt coverage.
-
-    Uniform density in log(dt) implies p(dt) ∝ 1 / dt in linear dt space.
-    We approximate this by weighting each candidate pair by 1 / actual_dt_s.
-    """
-    if n_pairs <= 0:
-        raise TransitionSamplingError("n_pairs must be > 0.")
-
-    candidates = _candidate_pairs(
-        times_s=times_s,
-        dt_min_s=dt_min_s,
-        dt_max_s=dt_max_s,
-        min_future_saved_steps=min_future_saved_steps,
-    )
-    weights = 1.0 / np.maximum(candidates.actual_dt_s, np.finfo(np.float64).tiny)
-    weight_sum = float(np.sum(weights))
-    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
-        raise TransitionSamplingError("Failed to construct finite log-uniform sampling weights.")
-    weights = weights / weight_sum
-
-    sample_size = min(int(n_pairs), int(candidates.anchor_index.size))
-    choice = rng.choice(candidates.anchor_index.size, size=sample_size, replace=False, p=weights)
-    choice = np.asarray(choice, dtype=np.int64)
-
-    anchor_index = candidates.anchor_index[choice]
-    target_index = candidates.target_index[choice]
-    actual_dt_s = candidates.actual_dt_s[choice]
-    anchor_time_s = candidates.anchor_time_s[choice]
-    target_time_s = candidates.target_time_s[choice]
-
-    order = np.lexsort((target_index, anchor_index))
-    return TransitionPairs(
-        anchor_index=anchor_index[order],
-        target_index=target_index[order],
-        actual_dt_s=actual_dt_s[order],
-        anchor_time_s=anchor_time_s[order],
-        target_time_s=target_time_s[order],
-    )
-
 
 def build_rollout_indices(*, times_s: np.ndarray, max_points: int) -> np.ndarray:
     """Build a deterministic log-spaced rollout path through a saved trajectory."""

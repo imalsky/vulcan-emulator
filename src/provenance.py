@@ -59,14 +59,21 @@ def _preprocess_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
         "num_runs": generation["num_runs"],
         "split_ratios": generation["split_ratios"],
         "random_seed": generation["random_seed"],
-        "shard_size": generation["shard_size"],
         "save_evo_frq": generation["save_evo_frq"],
+        "max_trajectory_snapshots": generation["max_trajectory_snapshots"],
         "keep_vulcan_outputs_debug": generation["keep_vulcan_outputs_debug"],
         "run_timeout_seconds": generation["run_timeout_seconds"],
     }
+    sampling = config["trajectory_sampling"]
+    relevant_sampling = {
+        "mode": sampling["mode"],
+        "dt_min_s": sampling["dt_min_s"],
+        "dt_max_s": sampling["dt_max_s"],
+        "min_future_saved_steps": sampling["min_future_saved_steps"],
+    }
     return {
         "generation": relevant_generation,
-        "trajectory_sampling": config["trajectory_sampling"],
+        "trajectory_sampling": relevant_sampling,
         "vulcan_runtime": config["vulcan_runtime"],
         "tp_sampler": config["tp_sampler"],
         "gravity_sampler": config["gravity_sampler"],
@@ -168,27 +175,30 @@ def compare_processed_fingerprints(
     existing: dict[str, Any],
 ) -> tuple[bool, str]:
     """Compare two processed-data fingerprints and explain the first mismatch."""
-    if existing.get("version") != expected["version"]:
-        return False, "fingerprint version mismatch"
-    if existing.get("config_sha256") != expected["config_sha256"]:
-        return False, "preprocessing-relevant config differs from processed artifacts"
+    try:
+        if existing["version"] != expected["version"]:
+            return False, "fingerprint version mismatch"
+        if existing["config_sha256"] != expected["config_sha256"]:
+            return False, "preprocessing-relevant config differs from processed artifacts"
 
-    for section_name in ("manifest", "splits", "normalization", "processed_summary"):
-        actual_section = existing.get(section_name)
-        if not isinstance(actual_section, dict):
-            return False, f"invalid {section_name} section in processed fingerprint"
-        if actual_section != expected[section_name]:
-            return False, f"{section_name} artifact differs from processed fingerprint"
+        for section_name in ("manifest", "splits", "normalization", "processed_summary"):
+            actual_section = existing[section_name]
+            if not isinstance(actual_section, dict):
+                return False, f"invalid {section_name} section in processed fingerprint"
+            if actual_section != expected[section_name]:
+                return False, f"{section_name} artifact differs from processed fingerprint"
 
-    actual_split_metadata = existing.get("split_metadata")
-    if not isinstance(actual_split_metadata, dict):
-        return False, "invalid split_metadata section in processed fingerprint"
-    if actual_split_metadata != expected["split_metadata"]:
-        return False, "processed split metadata differs from processed fingerprint"
+        actual_split_metadata = existing["split_metadata"]
+        if not isinstance(actual_split_metadata, dict):
+            return False, "invalid split_metadata section in processed fingerprint"
+        if actual_split_metadata != expected["split_metadata"]:
+            return False, "processed split metadata differs from processed fingerprint"
 
-    if existing.get("raw_run_files") != expected["raw_run_files"]:
-        return False, "raw run file list/size/mtime differs from processed fingerprint"
-    return True, ""
+        if existing["raw_run_files"] != expected["raw_run_files"]:
+            return False, "raw run file list/size/mtime differs from processed fingerprint"
+        return True, ""
+    except KeyError as exc:
+        return False, f"fingerprint missing required field: {exc}"
 
 
 def validate_processed_artifacts(

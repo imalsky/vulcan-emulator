@@ -2,7 +2,7 @@
 """Main CLI for vulcan-emulator.
 
 Supported actions:
-- --gen: generate raw VULCAN trajectories and processed normalized shards
+- --gen: generate raw VULCAN trajectories and processed normalized trajectory splits
 - --train: train surrogate model from processed data
 """
 

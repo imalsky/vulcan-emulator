@@ -2,7 +2,7 @@
 
 Manages the lifecycle of individual VULCAN chemistry runs:
 
-1. **Preflight and compatibility checks**: Validates the VULCAN source tree,
+1. **Preflight and runtime checks**: Validates the VULCAN source tree,
    checks configured species against ``chem_funs.py``, and runs a one-shot
    smoke test.
 2. **Worker isolation**: Each process gets its own copy of the VULCAN source
@@ -268,7 +268,6 @@ def _run_preflight_smoke(
         tmpdir = Path(tmpdir_name)
         worker_dir = tmpdir / "worker"
         shutil.copytree(vulcan_source, worker_dir)
-        _patch_op_convergence_compat(worker_dir)
 
         generated_atm_dir = worker_dir / "atm" / "generated"
         generated_atm_dir.mkdir(parents=True, exist_ok=True)
@@ -333,8 +332,6 @@ def _run_preflight_smoke(
                 f"file {output_file}."
             )
 
-
-
 def preflight_vulcan_source(
     vulcan_source: Path,
     *,
@@ -389,36 +386,6 @@ def _replace_assignment(text: str, key: str, value: Any) -> str:
         raise VulcanRuntimeError(f"Failed to set '{key}' in generated vulcan_cfg.py")
     return replaced
 
-
-def _patch_op_convergence_compat(worker_dir: Path) -> None:
-    """Patch the worker copy of ``op.py`` for numpy array compatibility.
-
-    Some VULCAN versions assign ``t_time = var.t_time`` (a Python list) in the
-    convergence checker without converting to a numpy array first, which causes
-    a ``TypeError`` on ``list - float``.  This adds the missing ``np.asarray``
-    conversion when needed.  The patch is a no-op if the conversion already
-    exists.
-    """
-    op_path = worker_dir / "op.py"
-    if not op_path.is_file():
-        return
-    text = op_path.read_text(encoding="utf-8")
-    if "np.asarray(var.t_time" in text:
-        return
-    patched = re.sub(
-        r"(t_time\s*=\s*)var\.t_time\b(?!\s*[.\[])",
-        r"\1np.asarray(var.t_time, dtype=float)",
-        text,
-    )
-    patched = re.sub(
-        r"(y_time\s*=\s*)var\.y_time\b(?!\s*[.\[])",
-        r"\1np.asarray(var.y_time)",
-        patched,
-    )
-    if patched != text:
-        op_path.write_text(patched, encoding="utf-8")
-
-
 def _ensure_worker_context(settings: WorkerSettings) -> dict[str, Any]:
     """Create or reuse the per-process copied VULCAN worker tree."""
     cache_key = "context"
@@ -435,7 +402,6 @@ def _ensure_worker_context(settings: WorkerSettings) -> dict[str, Any]:
     if worker_dir.exists():
         shutil.rmtree(worker_dir)
     shutil.copytree(source, worker_dir)
-    _patch_op_convergence_compat(worker_dir)
 
     baseline_cfg_path = worker_dir / "vulcan_cfg.py"
     baseline_cfg_text = baseline_cfg_path.read_text(encoding="utf-8")
@@ -614,13 +580,19 @@ def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerS
     with output_file.open("rb") as handle:
         data = pickle.load(handle)  # noqa: S301 - trusted, self-generated VULCAN artifact
 
-    variable = data.get("variable")
+    try:
+        variable = data["variable"]
+    except (KeyError, TypeError) as exc:
+        raise VulcanRuntimeError("Invalid .vul structure: missing 'variable' dictionary.") from exc
     if not isinstance(variable, dict):
-        raise VulcanRuntimeError("Invalid .vul structure: missing 'variable' dictionary.")
+        raise VulcanRuntimeError("Invalid .vul structure: 'variable' is not a dictionary.")
 
-    species = list(variable.get("species", []))
+    try:
+        species = list(variable["species"])
+    except KeyError as exc:
+        raise VulcanRuntimeError("Invalid .vul structure: missing 'species' in variable dictionary.") from exc
     if not species:
-        raise VulcanRuntimeError("Invalid .vul structure: missing species list.")
+        raise VulcanRuntimeError("Invalid .vul structure: empty species list.")
 
     state_species = list(settings.species.state_species)
     output_species = list(settings.species.output_species)
@@ -636,9 +608,14 @@ def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerS
             f"Configured species missing in run {run_spec.run_id}: {'; '.join(parts)}"
         )
 
-    y_ini = np.asarray(variable.get("y_ini"), dtype=np.float64)
-    y_time = np.asarray(variable.get("y_time"), dtype=np.float64)
-    t_time = np.asarray(variable.get("t_time"), dtype=np.float64)
+    try:
+        y_ini = np.asarray(variable["y_ini"], dtype=np.float64)
+        y_time = np.asarray(variable["y_time"], dtype=np.float64)
+        t_time = np.asarray(variable["t_time"], dtype=np.float64)
+    except KeyError as exc:
+        raise VulcanRuntimeError(
+            f"Invalid .vul structure: missing field {exc} in variable dictionary."
+        ) from exc
     if y_ini.ndim != 2:
         raise VulcanRuntimeError("Invalid y_ini shape in .vul output.")
     if y_time.ndim != 3 or t_time.ndim != 1:
@@ -833,21 +810,14 @@ def run_vulcan_jobs(
     run_specs: list[RunSpec],
     *,
     settings: WorkerSettings,
-    failure_policy: str = "fail_on_first_error",
 ) -> list[RunResult]:
-    """Run all VULCAN jobs with configurable failure policy."""
+    """Run all VULCAN jobs, dropping failed trajectories when others succeed."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     if not run_specs:
         raise VulcanRuntimeError("No run specs provided to VULCAN runner.")
     if int(settings.num_workers) <= 0:
         raise VulcanRuntimeError("settings.num_workers must be > 0.")
-
-    if failure_policy not in {"fail_on_first_error", "collect_all_errors", "continue_on_error"}:
-        raise VulcanRuntimeError(f"Unsupported failure_policy: {failure_policy}")
-
-    collect = failure_policy in {"collect_all_errors", "continue_on_error"}
-    continue_on_error = failure_policy == "continue_on_error"
     raw_root = Path(settings.raw_root)
     raw_root.mkdir(parents=True, exist_ok=True)
 
@@ -859,25 +829,19 @@ def run_vulcan_jobs(
                 try:
                     results.append(_run_single(spec, settings))
                 except Exception as exc:
-                    if not collect:
-                        raise
                     errors.append(f"run_{spec.run_id:06d}: {exc}")
             if errors:
-                if continue_on_error:
-                    if not results:
-                        raise VulcanRuntimeError(
-                            "All VULCAN runs failed; cannot continue to preprocessing."
-                        )
-                    logger.warning(
-                        "Continuing after %d/%d VULCAN runs failed. Successful runs: %d.",
-                        len(errors),
-                        len(run_specs),
-                        len(results),
+                if not results:
+                    raise VulcanRuntimeError(
+                        "All VULCAN runs failed; cannot continue to preprocessing.\n"
+                        + "\n".join(errors)
                     )
-                    return sorted(results, key=lambda item: item.run_id)
-                raise VulcanRuntimeError(
-                    f"{len(errors)}/{len(run_specs)} VULCAN runs failed:\n"
-                    + "\n".join(errors)
+                logger.warning(
+                    "Dropping %d/%d failed VULCAN runs. Successful runs: %d.\n%s",
+                    len(errors),
+                    len(run_specs),
+                    len(results),
+                    "\n".join(errors),
                 )
             return sorted(results, key=lambda item: item.run_id)
 
@@ -893,27 +857,19 @@ def run_vulcan_jobs(
                 try:
                     results.append(future.result())
                 except Exception as exc:
-                    if not collect:
-                        for pending in futures:
-                            pending.cancel()
-                        raise VulcanRuntimeError(
-                            f"Generation aborted due to worker failure: {exc}"
-                        ) from exc
                     errors.append(f"run_{futures[future]:06d}: {exc}")
         if errors:
-            if continue_on_error:
-                if not results:
-                    raise VulcanRuntimeError("All VULCAN runs failed; cannot continue to preprocessing.")
-                logger.warning(
-                    "Continuing after %d/%d VULCAN runs failed. Successful runs: %d.",
-                    len(errors),
-                    len(run_specs),
-                    len(results),
+            if not results:
+                raise VulcanRuntimeError(
+                    "All VULCAN runs failed; cannot continue to preprocessing.\n"
+                    + "\n".join(errors)
                 )
-                return sorted(results, key=lambda item: item.run_id)
-            raise VulcanRuntimeError(
-                f"{len(errors)}/{len(run_specs)} VULCAN runs failed:\n"
-                + "\n".join(errors)
+            logger.warning(
+                "Dropping %d/%d failed VULCAN runs. Successful runs: %d.\n%s",
+                len(errors),
+                len(run_specs),
+                len(results),
+                "\n".join(errors),
             )
         return sorted(results, key=lambda item: item.run_id)
     finally:
@@ -928,4 +884,7 @@ def _cleanup_worker_dirs(settings: WorkerSettings) -> None:
     worker_root = Path(settings.worker_root)
     if not worker_root.is_dir():
         return
-    shutil.rmtree(worker_root, ignore_errors=True)
+    try:
+        shutil.rmtree(worker_root)
+    except OSError as exc:
+        logger.warning("Worker cleanup of %s failed: %s", worker_root, exc)

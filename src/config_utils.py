@@ -311,11 +311,9 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
         "split_ratios",
         "random_seed",
         "keep_vulcan_outputs_debug",
-        "failure_policy",
         "run_timeout_seconds",
         "manifest_filename",
         "split_filename",
-        "shard_size",
         "worker_root",
         "save_evo_frq",
         "max_trajectory_snapshots",
@@ -329,24 +327,18 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
         raise ConfigValidationError("generation.num_workers must be > 0.")
     _ = _as_int(cfg["random_seed"], "generation.random_seed")
     _ = _as_bool(cfg["keep_vulcan_outputs_debug"], "generation.keep_vulcan_outputs_debug")
-    if str(cfg["failure_policy"]) not in (
-        "fail_on_first_error",
-        "collect_all_errors",
-        "continue_on_error",
-    ):
-        raise ConfigValidationError(
-            "generation.failure_policy must be 'fail_on_first_error', "
-            "'collect_all_errors', or 'continue_on_error'."
-        )
     if _as_int(cfg["run_timeout_seconds"], "generation.run_timeout_seconds") <= 0:
         raise ConfigValidationError("generation.run_timeout_seconds must be > 0.")
-    if _as_int(cfg["shard_size"], "generation.shard_size") <= 0:
-        raise ConfigValidationError("generation.shard_size must be > 0.")
     if _as_int(cfg["save_evo_frq"], "generation.save_evo_frq") <= 0:
         raise ConfigValidationError("generation.save_evo_frq must be > 0.")
     max_snap = _as_int(cfg["max_trajectory_snapshots"], "generation.max_trajectory_snapshots")
     if max_snap < 0:
         raise ConfigValidationError("generation.max_trajectory_snapshots must be >= 0 (0 = no limit).")
+    if max_snap == 1:
+        raise ConfigValidationError(
+            "generation.max_trajectory_snapshots must be 0 or >= 2 so each run keeps "
+            "t=0 plus at least one future state."
+        )
 
     for path_key in ("worker_root", "manifest_filename", "split_filename"):
         value = cfg[path_key]
@@ -368,24 +360,23 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
 
 def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
     """Validate log-uniform all-pairs transition sampling controls."""
+    allowed = {
+        "mode",
+        "dt_min_s",
+        "dt_max_s",
+        "min_future_saved_steps",
+        "rollout_eval_points",
+    }
     _require_keys(
         cfg,
-        {
-            "mode",
-            "pairs_per_run",
-            "dt_min_s",
-            "dt_max_s",
-            "min_future_saved_steps",
-            "rollout_eval_points",
-        },
+        allowed,
         "trajectory_sampling",
     )
+    _reject_extra_keys(cfg, allowed, "trajectory_sampling")
     if str(cfg["mode"]) != "log_uniform_all_pairs":
         raise ConfigValidationError(
             "trajectory_sampling.mode must be 'log_uniform_all_pairs'."
         )
-    if _as_int(cfg["pairs_per_run"], "trajectory_sampling.pairs_per_run") <= 0:
-        raise ConfigValidationError("trajectory_sampling.pairs_per_run must be > 0.")
 
     dt_min_s = _as_float(cfg["dt_min_s"], "trajectory_sampling.dt_min_s")
     dt_max_s = _as_float(cfg["dt_max_s"], "trajectory_sampling.dt_max_s")
@@ -406,6 +397,29 @@ def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
         raise ConfigValidationError(
             "trajectory_sampling.rollout_eval_points must be >= 2."
         )
+
+
+def _validate_live_sampling(cfg: dict[str, Any]) -> None:
+    """Validate per-epoch/eval live-sampling budgets."""
+    allowed = {
+        "train_pairs_per_run_per_epoch",
+        "eval_pairs_per_run",
+    }
+    _require_keys(
+        cfg,
+        allowed,
+        "training.live_sampling",
+    )
+    _reject_extra_keys(cfg, allowed, "training.live_sampling")
+    if _as_int(
+        cfg["train_pairs_per_run_per_epoch"],
+        "training.live_sampling.train_pairs_per_run_per_epoch",
+    ) <= 0:
+        raise ConfigValidationError(
+            "training.live_sampling.train_pairs_per_run_per_epoch must be > 0."
+        )
+    if _as_int(cfg["eval_pairs_per_run"], "training.live_sampling.eval_pairs_per_run") <= 0:
+        raise ConfigValidationError("training.live_sampling.eval_pairs_per_run must be > 0.")
 
 
 def _validate_vulcan_runtime(cfg: dict[str, Any]) -> None:
@@ -715,6 +729,10 @@ def _validate_normalization(norm_cfg: dict[str, Any], data_spec: dict[str, Any])
             raise ConfigValidationError(
                 f"Unsupported normalization.sequence_methods.{key}: {method}."
             )
+    if sequence_methods["anchor_ymix"] != "log-standard":
+        raise ConfigValidationError(
+            "normalization.sequence_methods.anchor_ymix must be 'log-standard'."
+        )
 
     global_methods = norm_cfg["global_methods"]
     if not isinstance(global_methods, dict) or not global_methods:
@@ -744,6 +762,8 @@ def _validate_normalization(norm_cfg: dict[str, Any], data_spec: dict[str, Any])
     target_method = str(norm_cfg["target_method"])
     if target_method not in allowed:
         raise ConfigValidationError("Unsupported normalization.target_method.")
+    if target_method != "log-standard":
+        raise ConfigValidationError("normalization.target_method must be 'log-standard'.")
     if target_method != str(sequence_methods["anchor_ymix"]):
         raise ConfigValidationError(
             "normalization.target_method must match normalization.sequence_methods.anchor_ymix "
@@ -752,35 +772,35 @@ def _validate_normalization(norm_cfg: dict[str, Any], data_spec: dict[str, Any])
 
 
 def _validate_training(training: dict[str, Any]) -> None:
-    """Validate training hyperparameters, model shape, and loading policy."""
+    """Validate training hyperparameters, model shape, and live-sampling policy."""
+    allowed = {
+        "device",
+        "batch_size",
+        "epochs",
+        "learning_rate",
+        "min_lr",
+        "warmup_epochs",
+        "weight_decay",
+        "gradient_clip",
+        "use_amp",
+        "seed",
+        "live_sampling",
+        "model",
+        "output_folder",
+        "loss",
+    }
     _require_keys(
         training,
-        {
-            "device",
-            "gpu_preload",
-            "batch_size",
-            "epochs",
-            "learning_rate",
-            "min_lr",
-            "warmup_epochs",
-            "weight_decay",
-            "gradient_clip",
-            "use_amp",
-            "num_workers",
-            "seed",
-            "data_loading",
-            "model",
-            "output_folder",
-        },
+        allowed - {"loss"},
         "training",
     )
+    _reject_extra_keys(training, allowed, "training")
 
     device = str(training["device"]).lower()
-    if device not in {"cpu", "cuda", "mps"}:
-        raise ConfigValidationError("training.device must be one of {'cpu','cuda','mps'}.")
+    if device != "cuda":
+        raise ConfigValidationError("training.device must be 'cuda' for live-sampling training.")
     if _as_int(training["batch_size"], "training.batch_size") <= 0:
         raise ConfigValidationError("training.batch_size must be > 0.")
-    gpu_preload = _as_bool(training["gpu_preload"], "training.gpu_preload")
     epochs = _as_int(training["epochs"], "training.epochs")
     if epochs <= 0:
         raise ConfigValidationError("training.epochs must be > 0.")
@@ -796,55 +816,9 @@ def _validate_training(training: dict[str, Any]) -> None:
         raise ConfigValidationError("training.weight_decay must be >= 0.")
     if _as_float(training["gradient_clip"], "training.gradient_clip") <= 0.0:
         raise ConfigValidationError("training.gradient_clip must be > 0.")
-    if _as_int(training["num_workers"], "training.num_workers") < 0:
-        raise ConfigValidationError("training.num_workers must be >= 0.")
     _ = _as_int(training["seed"], "training.seed")
     _ = _as_bool(training["use_amp"], "training.use_amp")
-
-    data_loading = training["data_loading"]
-    _require_keys(
-        data_loading,
-        {
-            "mode",
-            "max_cached_shards",
-            "large_shard_mmap_bytes",
-            "ram_safety_fraction",
-            "copy_mmap_slices",
-            "use_device_prefetch",
-        },
-        "training.data_loading",
-    )
-    mode = str(data_loading["mode"]).lower()
-    if mode not in {"auto", "ram", "disk"}:
-        raise ConfigValidationError(
-            "training.data_loading.mode must be one of {'auto','ram','disk'}."
-        )
-    if _as_int(data_loading["max_cached_shards"], "training.data_loading.max_cached_shards") <= 0:
-        raise ConfigValidationError("training.data_loading.max_cached_shards must be > 0.")
-    if _as_int(
-        data_loading["large_shard_mmap_bytes"],
-        "training.data_loading.large_shard_mmap_bytes",
-    ) <= 0:
-        raise ConfigValidationError(
-            "training.data_loading.large_shard_mmap_bytes must be > 0."
-        )
-    safety = _as_float(
-        data_loading["ram_safety_fraction"],
-        "training.data_loading.ram_safety_fraction",
-    )
-    if not (0.0 < safety <= 1.0):
-        raise ConfigValidationError("training.data_loading.ram_safety_fraction must be in (0,1].")
-    _ = _as_bool(data_loading["copy_mmap_slices"], "training.data_loading.copy_mmap_slices")
-    use_prefetch = _as_bool(
-        data_loading["use_device_prefetch"],
-        "training.data_loading.use_device_prefetch",
-    )
-    if gpu_preload and device != "cuda":
-        raise ConfigValidationError("training.gpu_preload=true requires training.device='cuda'.")
-    if use_prefetch and device != "cuda":
-        raise ConfigValidationError(
-            "training.data_loading.use_device_prefetch=true requires training.device='cuda'."
-        )
+    _validate_live_sampling(training["live_sampling"])
 
     model_cfg = training["model"]
     _require_keys(
@@ -878,8 +852,9 @@ def _validate_training(training: dict[str, Any]) -> None:
         raise ConfigValidationError("training.model.num_layers must be > 0.")
     if _as_int(model_cfg["dim_feedforward"], "training.model.dim_feedforward") <= 0:
         raise ConfigValidationError("training.model.dim_feedforward must be > 0.")
-    if _as_float(model_cfg["dropout"], "training.model.dropout") < 0.0:
-        raise ConfigValidationError("training.model.dropout must be >= 0.")
+    dropout = _as_float(model_cfg["dropout"], "training.model.dropout")
+    if not (0.0 <= dropout <= 1.0):
+        raise ConfigValidationError("training.model.dropout must be in [0, 1].")
     if _as_float(model_cfg["film_clamp"], "training.model.film_clamp") <= 0.0:
         raise ConfigValidationError("training.model.film_clamp must be > 0.")
     if _as_int(model_cfg["output_head_divisor"], "training.model.output_head_divisor") <= 0:
