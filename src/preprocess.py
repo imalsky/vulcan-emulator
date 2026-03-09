@@ -326,6 +326,10 @@ def load_raw_run_file(
         raise PreprocessError(f"Invalid sequence shapes in {path}")
     if not (pressure.shape == temperature.shape == kzz.shape):
         raise PreprocessError(f"Sequence length mismatch in {path}")
+    if np.any(pressure <= 0.0):
+        raise PreprocessError(f"inputs/pressure_bar must be strictly positive in {path}")
+    if np.any(kzz <= 0.0):
+        raise PreprocessError(f"inputs/kzz_cm2_s must be strictly positive in {path}")
     if time_s.ndim != 1 or time_s.size < 2:
         raise PreprocessError(f"trajectory/time_s must contain at least t=0 and one future state in {path}")
     if np.any(np.diff(time_s) <= 0.0):
