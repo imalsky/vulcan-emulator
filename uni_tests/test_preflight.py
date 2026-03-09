@@ -23,7 +23,7 @@ def _settings(root: Path) -> WorkerSettings:
     return WorkerSettings(
         vulcan_source=str(root),
         worker_root=str(root / "workers"),
-        runs_root=str(root / "runs"),
+        raw_root=str(root / "raw"),
         species=SpeciesSelection(
             state_species=("H2", "H2O"),
             output_species=("H2", "H2O"),

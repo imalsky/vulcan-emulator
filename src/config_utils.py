@@ -28,6 +28,31 @@ TORCH_DTYPE_MAP = {
     "float64": torch.float64,
 }
 
+SUPPORTED_ATM_BASES = ("H2", "N2", "O2", "CO2", "H2O")
+SUPPORTED_CONDITIONING_TOGGLES = (
+    "use_eddy_diffusion",
+    "use_molecular_diffusion",
+    "use_upwind_molecular_diffusion",
+    "use_boundary_conditions",
+    "use_condensation",
+    "use_settling",
+    "use_initial_cold_trap",
+    "use_sat_surface_h2o",
+    "use_lowT_limit_rates",
+    "use_adaptive_rtol",
+)
+CORE_GLOBAL_INPUTS = (
+    "gravity_cm_s2",
+    "metallicity_log10",
+    "c_to_o",
+    "log10_dt_s",
+)
+OPTIONAL_GLOBAL_INPUTS = (
+    *SUPPORTED_CONDITIONING_TOGGLES,
+    *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
+)
+SUPPORTED_GLOBAL_INPUTS = (*CORE_GLOBAL_INPUTS, *OPTIONAL_GLOBAL_INPUTS)
+
 
 @dataclass(frozen=True)
 class PrecisionConfig:
@@ -47,11 +72,60 @@ class ConfigValidationError(ValueError):
     """Raised when configuration violates required contract."""
 
 
+def static_conditioning_defaults(config: dict[str, Any]) -> dict[str, float]:
+    """Return dataset-wide conditioning values derived from config settings."""
+    physics = config["physics_toggles"]
+    runtime = config["vulcan_runtime"]
+    defaults = {
+        name: float(bool(physics[name]))
+        for name in SUPPORTED_CONDITIONING_TOGGLES
+    }
+    atm_base = str(runtime["atm_base"])
+    defaults.update(
+        {
+            f"atm_base_{name}": 1.0 if atm_base == name else 0.0
+            for name in SUPPORTED_ATM_BASES
+        }
+    )
+    return defaults
+
+
+def resolve_conditioning_inputs(
+    *,
+    raw_global_inputs: dict[str, float],
+    config: dict[str, Any],
+    required_global_inputs: list[str],
+) -> dict[str, float]:
+    """Resolve all non-time conditioning inputs for one run/sample."""
+    resolved: dict[str, float] = {}
+    defaults = static_conditioning_defaults(config)
+    for name in required_global_inputs:
+        if name == "log10_dt_s":
+            continue
+        if name in raw_global_inputs:
+            resolved[name] = float(raw_global_inputs[name])
+            continue
+        if name in defaults:
+            resolved[name] = float(defaults[name])
+            continue
+        raise ConfigValidationError(
+            f"Missing required conditioning input '{name}' in raw run globals."
+        )
+    return resolved
+
+
 def _require_keys(container: dict[str, Any], required: set[str], scope: str) -> None:
     """Require a fixed key set in one config mapping."""
     missing = sorted(required - set(container.keys()))
     if missing:
         raise ConfigValidationError(f"Missing required keys in {scope}: {missing}")
+
+
+def _reject_extra_keys(container: dict[str, Any], allowed: set[str], scope: str) -> None:
+    """Reject unexpected keys in one config mapping."""
+    extras = sorted(set(container.keys()) - allowed)
+    if extras:
+        raise ConfigValidationError(f"Unexpected keys in {scope}: {extras}")
 
 
 def _as_float(value: Any, field: str) -> float:
@@ -179,11 +253,17 @@ def _validate_relative_path_values(paths_cfg: dict[str, Any]) -> None:
 
 def _validate_paths(paths_cfg: dict[str, Any]) -> None:
     """Validate the top-level `paths` section against the project contract."""
-    _require_keys(
-        paths_cfg,
-        {"project_root", "vulcan_source_path", "data_root", "models_root", "logs_root"},
-        "paths",
-    )
+    allowed = {
+        "project_root",
+        "vulcan_source_path",
+        "data_root",
+        "raw_root",
+        "processed_root",
+        "models_root",
+        "logs_root",
+    }
+    _require_keys(paths_cfg, allowed, "paths")
+    _reject_extra_keys(paths_cfg, allowed, "paths")
     _validate_relative_path_values(paths_cfg)
     if str(paths_cfg["project_root"]) != ".":
         raise ConfigValidationError("paths.project_root must be '.'.")
@@ -225,25 +305,23 @@ def _validate_distribution_spec(spec: dict[str, Any], scope: str) -> None:
 
 def _validate_generation(cfg: dict[str, Any]) -> None:
     """Validate generation-stage controls and output-path settings."""
-    _require_keys(
-        cfg,
-        {
-            "num_runs",
-            "num_workers",
-            "split_ratios",
-            "random_seed",
-            "keep_vulcan_outputs_debug",
-            "failure_policy",
-            "run_timeout_seconds",
-            "manifest_filename",
-            "split_filename",
-            "shard_size",
-            "worker_root",
-            "save_evo_frq",
-            "max_trajectory_snapshots",
-        },
-        "generation",
-    )
+    allowed = {
+        "num_runs",
+        "num_workers",
+        "split_ratios",
+        "random_seed",
+        "keep_vulcan_outputs_debug",
+        "failure_policy",
+        "run_timeout_seconds",
+        "manifest_filename",
+        "split_filename",
+        "shard_size",
+        "worker_root",
+        "save_evo_frq",
+        "max_trajectory_snapshots",
+    }
+    _require_keys(cfg, allowed, "generation")
+    _reject_extra_keys(cfg, allowed, "generation")
 
     if _as_int(cfg["num_runs"], "generation.num_runs") <= 0:
         raise ConfigValidationError("generation.num_runs must be > 0.")
@@ -277,11 +355,6 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
         if Path(value).is_absolute():
             raise ConfigValidationError(f"generation.{path_key} must be relative, got: {value}")
 
-    if "runs_root" in cfg:
-        raise ConfigValidationError(
-            "generation.runs_root is no longer supported. Use paths.raw_root for flat raw data storage."
-        )
-
     ratios = cfg["split_ratios"]
     _require_keys(ratios, {"train", "val", "test"}, "generation.split_ratios")
     train = _as_float(ratios["train"], "generation.split_ratios.train")
@@ -294,63 +367,32 @@ def _validate_generation(cfg: dict[str, Any]) -> None:
 
 
 def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
-    """Validate fixed-dt post-equilibrium transition sampling controls."""
+    """Validate log-uniform all-pairs transition sampling controls."""
     _require_keys(
         cfg,
         {
             "mode",
             "pairs_per_run",
-            "fixed_requested_dt_s",
-            "post_equilibrium_time_min_s",
-            "post_equilibrium_min_fraction_of_final_time",
-            "anchor_sampling",
-            "target_selection",
+            "dt_min_s",
+            "dt_max_s",
             "min_future_saved_steps",
-            "max_target_relative_dt_error",
             "rollout_eval_points",
         },
         "trajectory_sampling",
     )
-    if str(cfg["mode"]) != "fixed_dt_post_equilibrium":
+    if str(cfg["mode"]) != "log_uniform_all_pairs":
         raise ConfigValidationError(
-            "trajectory_sampling.mode must be 'fixed_dt_post_equilibrium'."
+            "trajectory_sampling.mode must be 'log_uniform_all_pairs'."
         )
     if _as_int(cfg["pairs_per_run"], "trajectory_sampling.pairs_per_run") <= 0:
         raise ConfigValidationError("trajectory_sampling.pairs_per_run must be > 0.")
 
-    fixed_requested_dt_s = _as_float(
-        cfg["fixed_requested_dt_s"],
-        "trajectory_sampling.fixed_requested_dt_s",
-    )
-    if fixed_requested_dt_s <= 0.0:
-        raise ConfigValidationError("trajectory_sampling.fixed_requested_dt_s must be > 0.")
-
-    post_equilibrium_time_min_s = _as_float(
-        cfg["post_equilibrium_time_min_s"],
-        "trajectory_sampling.post_equilibrium_time_min_s",
-    )
-    if post_equilibrium_time_min_s < 0.0:
-        raise ConfigValidationError(
-            "trajectory_sampling.post_equilibrium_time_min_s must be >= 0."
-        )
-
-    min_fraction = _as_float(
-        cfg["post_equilibrium_min_fraction_of_final_time"],
-        "trajectory_sampling.post_equilibrium_min_fraction_of_final_time",
-    )
-    if not (0.0 <= min_fraction < 1.0):
-        raise ConfigValidationError(
-            "trajectory_sampling.post_equilibrium_min_fraction_of_final_time must be in [0, 1)."
-        )
-
-    if str(cfg["anchor_sampling"]) != "uniform_valid_anchors":
-        raise ConfigValidationError(
-            "trajectory_sampling.anchor_sampling must be 'uniform_valid_anchors'."
-        )
-    if str(cfg["target_selection"]) != "nearest_saved_snapshot":
-        raise ConfigValidationError(
-            "trajectory_sampling.target_selection must be 'nearest_saved_snapshot'."
-        )
+    dt_min_s = _as_float(cfg["dt_min_s"], "trajectory_sampling.dt_min_s")
+    dt_max_s = _as_float(cfg["dt_max_s"], "trajectory_sampling.dt_max_s")
+    if dt_min_s <= 0.0:
+        raise ConfigValidationError("trajectory_sampling.dt_min_s must be > 0.")
+    if dt_max_s <= dt_min_s:
+        raise ConfigValidationError("trajectory_sampling.dt_max_s must be > dt_min_s.")
 
     if _as_int(
         cfg["min_future_saved_steps"],
@@ -358,15 +400,6 @@ def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
     ) < 1:
         raise ConfigValidationError(
             "trajectory_sampling.min_future_saved_steps must be >= 1."
-        )
-
-    max_relative_error = _as_float(
-        cfg["max_target_relative_dt_error"],
-        "trajectory_sampling.max_target_relative_dt_error",
-    )
-    if max_relative_error < 0.0:
-        raise ConfigValidationError(
-            "trajectory_sampling.max_target_relative_dt_error must be >= 0."
         )
 
     if _as_int(cfg["rollout_eval_points"], "trajectory_sampling.rollout_eval_points") < 2:
@@ -415,7 +448,7 @@ def _validate_vulcan_runtime(cfg: dict[str, Any]) -> None:
         )
 
     atm_base = str(cfg["atm_base"])
-    if atm_base not in {"H2", "N2", "O2", "CO2", "H2O"}:
+    if atm_base not in set(SUPPORTED_ATM_BASES):
         raise ConfigValidationError(
             "vulcan_runtime.atm_base must be one of {'H2','N2','O2','CO2','H2O'}."
         )
@@ -631,10 +664,24 @@ def _validate_data_spec(data_spec: dict[str, Any]) -> None:
         raise ConfigValidationError(
             f"data_spec.required_input_profiles must equal {expected_inputs}."
         )
-    expected_globals = ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"]
-    if list(data_spec["required_global_inputs"]) != expected_globals:
+    required_globals = list(data_spec["required_global_inputs"])
+    expected_prefix = list(CORE_GLOBAL_INPUTS)
+    if required_globals[: len(expected_prefix)] != expected_prefix:
         raise ConfigValidationError(
-            f"data_spec.required_global_inputs must equal {expected_globals}."
+            "data_spec.required_global_inputs must begin with "
+            f"{expected_prefix}."
+        )
+    if any(name not in SUPPORTED_GLOBAL_INPUTS for name in required_globals):
+        invalid = sorted(set(required_globals) - set(SUPPORTED_GLOBAL_INPUTS))
+        raise ConfigValidationError(
+            "data_spec.required_global_inputs contains unsupported entries: "
+            f"{invalid}."
+        )
+    canonical = [name for name in SUPPORTED_GLOBAL_INPUTS if name in required_globals]
+    if required_globals != canonical:
+        raise ConfigValidationError(
+            "data_spec.required_global_inputs must follow the canonical ordering "
+            f"{canonical}."
         )
     if list(data_spec["required_state_inputs"]) != ["anchor_ymix"]:
         raise ConfigValidationError(
@@ -642,7 +689,7 @@ def _validate_data_spec(data_spec: dict[str, Any]) -> None:
         )
 
 
-def _validate_normalization(norm_cfg: dict[str, Any]) -> None:
+def _validate_normalization(norm_cfg: dict[str, Any], data_spec: dict[str, Any]) -> None:
     """Validate explicit normalization methods for all feature groups."""
     _require_keys(
         norm_cfg,
@@ -672,11 +719,11 @@ def _validate_normalization(norm_cfg: dict[str, Any]) -> None:
     global_methods = norm_cfg["global_methods"]
     if not isinstance(global_methods, dict) or not global_methods:
         raise ConfigValidationError("normalization.global_methods must be a non-empty mapping.")
-    required_globals = {"gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"}
-    if set(global_methods) != required_globals:
+    required_globals = list(data_spec["required_global_inputs"])
+    if list(global_methods.keys()) != required_globals:
         raise ConfigValidationError(
             "normalization.global_methods must define exactly keys "
-            f"{sorted(required_globals)}, got {sorted(global_methods)}."
+            f"{required_globals}, got {list(global_methods.keys())}."
         )
     for key, method in global_methods.items():
         if method not in allowed:
@@ -991,18 +1038,17 @@ def _validate_cross_section_contracts(config: dict[str, Any]) -> None:
     trajectory_sampling = config["trajectory_sampling"]
     vulcan_runtime = config["vulcan_runtime"]
 
-    fixed_requested_dt_s = float(trajectory_sampling["fixed_requested_dt_s"])
-    post_equilibrium_time_min_s = float(trajectory_sampling["post_equilibrium_time_min_s"])
+    dt_min_s = float(trajectory_sampling["dt_min_s"])
+    dt_max_s = float(trajectory_sampling["dt_max_s"])
     runtime = float(vulcan_runtime["runtime"])
 
-    if fixed_requested_dt_s >= runtime:
+    if dt_min_s >= runtime:
         raise ConfigValidationError(
-            "trajectory_sampling.fixed_requested_dt_s must be < vulcan_runtime.runtime so at least "
-            "one full requested step can fit inside a trajectory."
+            "trajectory_sampling.dt_min_s must be < vulcan_runtime.runtime."
         )
-    if post_equilibrium_time_min_s >= runtime:
+    if dt_max_s > runtime:
         raise ConfigValidationError(
-            "trajectory_sampling.post_equilibrium_time_min_s must be < vulcan_runtime.runtime."
+            "trajectory_sampling.dt_max_s must be <= vulcan_runtime.runtime."
         )
 
 
@@ -1042,7 +1088,7 @@ def load_and_validate_config(path: Path) -> dict[str, Any]:
     _validate_kzz_sampler(config["kzz_sampler"])
     _validate_abundance_sampler(config["abundance_sampler"])
     _validate_data_spec(config["data_spec"])
-    _validate_normalization(config["normalization"])
+    _validate_normalization(config["normalization"], config["data_spec"])
     _validate_training(config["training"])
     _validate_physics_toggles(config["physics_toggles"])
     _validate_boundary_conditions(

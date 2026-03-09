@@ -27,7 +27,7 @@ from provenance import (
 from trainer import TrainingError, _cast_optimizer_state, validate_processed_split_contract
 from vulcan_runner import VulcanRuntimeError, resolve_boundary_conditions
 
-BASE_CONFIG_PATH = PROJECT_ROOT / "config" / "tiny_train_smoke.json"
+BASE_CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 
 
 def _load_base_config() -> dict:
@@ -163,6 +163,9 @@ class ContractTests(unittest.TestCase):
         config = _load_base_config()
         state_species = list(config["data_spec"]["state_species"])
         output_species = list(config["data_spec"]["output_species"])
+        global_feature_order = list(config["data_spec"]["required_global_inputs"])
+        state_dim = len(state_species)
+        target_dim = len(output_species)
         expected_sequence_order = [
             "pressure_bar",
             "temperature_k",
@@ -171,15 +174,15 @@ class ContractTests(unittest.TestCase):
         ]
         metadata = {
             "sequence_length": 16,
-            "input_dim": 23,
-            "global_dim": 4,
-            "target_dim": 20,
-            "state_dim": 20,
+            "input_dim": 3 + state_dim,
+            "global_dim": len(global_feature_order),
+            "target_dim": target_dim,
+            "state_dim": state_dim,
             "sequence_feature_order": expected_sequence_order,
-            "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
+            "global_feature_order": global_feature_order,
             "state_species_order": state_species,
             "output_species_order": output_species,
-            "output_from_state_indices": list(range(20)),
+            "output_from_state_indices": list(range(target_dim)),
             "normalization_fingerprint": "a" * 64,
             "dt_min_s": 1.0,
             "dt_max_s": 10.0,

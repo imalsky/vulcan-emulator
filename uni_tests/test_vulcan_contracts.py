@@ -57,7 +57,7 @@ def _settings(tmpdir: Path) -> WorkerSettings:
     return WorkerSettings(
         vulcan_source=str(tmpdir),
         worker_root=str(tmpdir / "workers"),
-        runs_root=str(tmpdir / "runs"),
+        raw_root=str(tmpdir / "raw"),
         species=SpeciesSelection(
             state_species=("H2", "H2O", "CO2"),
             output_species=("H2O", "H2"),

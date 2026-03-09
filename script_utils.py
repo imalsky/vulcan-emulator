@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared helpers for vulcan-emulator testing scripts."""
+"""Shared helpers for repo scripts and local test utilities."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ import numpy as np
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch
 
-THIS_FILE = Path(__file__).resolve()
-PROJECT_ROOT = THIS_FILE.parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from config_utils import load_and_validate_config
 from model import VulcanTransitionTransformer
+from path_utils import resolve_paths
 
 _DTYPE_MAP: dict[str, torch.dtype] = {
     "float16": torch.float16,
@@ -33,6 +34,20 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def resolve_run_dir(*, config_path: Path, run_dir: Path | None) -> tuple[Path, Path | None]:
+    """Resolve one run directory either explicitly or from a validated config."""
+    if run_dir is not None:
+        candidate = run_dir if run_dir.is_absolute() else (PROJECT_ROOT / run_dir)
+        return candidate.resolve(), None
+
+    resolved_config = config_path if config_path.is_absolute() else (PROJECT_ROOT / config_path)
+    resolved_config = resolved_config.resolve()
+    config = load_and_validate_config(resolved_config)
+    paths = resolve_paths(config)
+    resolved_run_dir = (paths.models_root / str(config["training"]["output_folder"])).resolve()
+    return resolved_run_dir, resolved_config
 
 
 def torch_dtype_from_name(name: str) -> torch.dtype:
@@ -50,6 +65,12 @@ def load_checkpoint(run_dir: Path, checkpoint_name: str) -> dict[str, Any]:
     if not isinstance(checkpoint, dict):
         raise RuntimeError(f"Invalid checkpoint structure: {checkpoint_path}")
     return checkpoint
+
+
+def resolve_processed_root_from_checkpoint(run_dir: Path, checkpoint_name: str) -> Path:
+    """Resolve processed-root path from one saved checkpoint config."""
+    checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=checkpoint_name)
+    return (PROJECT_ROOT / str(checkpoint["config"]["paths"]["processed_root"])).resolve()
 
 
 def load_split_metadata(processed_root: Path, split: str) -> dict[str, Any]:
@@ -78,6 +99,30 @@ def iter_split_shards(
         tgt = np.load(tgt_dir / f"shard_{shard_idx:05d}.npy", allow_pickle=False)
         dt = np.load(dt_dir / f"shard_{shard_idx:05d}.npy", allow_pickle=False)
         yield seq, glb, tgt, dt
+
+
+def load_split_sample(
+    *,
+    processed_root: Path,
+    split: str,
+    sample_index: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Load one sample by global index from a processed split."""
+    if sample_index < 0:
+        raise ValueError("sample_index must be >= 0.")
+
+    remaining = int(sample_index)
+    for seq, glb, tgt, dt in iter_split_shards(processed_root=processed_root, split=split):
+        shard_size = int(seq.shape[0])
+        if remaining < shard_size:
+            return (
+                np.asarray(seq[remaining], dtype=np.float64),
+                np.asarray(glb[remaining], dtype=np.float64),
+                np.asarray(tgt[remaining], dtype=np.float64),
+                float(np.asarray(dt[remaining], dtype=np.float64)),
+            )
+        remaining -= shard_size
+    raise IndexError(f"Sample index {sample_index} is out of range for split '{split}'.")
 
 
 def build_model_from_checkpoint(

@@ -40,6 +40,7 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
+from config_utils import SUPPORTED_ATM_BASES
 from sampling import RunSpec
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ class WorkerSettings:
 
     vulcan_source: str
     worker_root: str
-    runs_root: str
+    raw_root: str
     species: SpeciesSelection
     boundary_conditions: BoundaryConditionSettings | None
     use_eddy_diffusion: bool
@@ -279,7 +280,7 @@ def _run_preflight_smoke(
             settings,
             vulcan_source=str(vulcan_source),
             worker_root=str(tmpdir),
-            runs_root=str(tmpdir / "runs"),
+            raw_root=str(tmpdir / "raw"),
             save_evo_frq=1,
             keep_vulcan_outputs_debug=False,
             run_timeout_seconds=timeout_seconds,
@@ -696,6 +697,17 @@ def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerS
         "ymix_output": np.asarray(ymix_output, dtype=np.float64),
         "state_species": state_species,
         "output_species": output_species,
+        "use_eddy_diffusion": float(settings.use_eddy_diffusion),
+        "use_molecular_diffusion": float(settings.use_molecular_diffusion),
+        "use_upwind_molecular_diffusion": float(settings.use_upwind_molecular_diffusion),
+        "use_boundary_conditions": float(settings.boundary_conditions is not None),
+        "use_condensation": float(settings.use_condensation),
+        "use_settling": float(settings.use_settling),
+        "use_initial_cold_trap": float(settings.use_initial_cold_trap),
+        "use_sat_surface_h2o": float(settings.use_sat_surface_h2o),
+        "use_lowT_limit_rates": float(settings.use_lowT_limit_rates),
+        "use_adaptive_rtol": float(settings.use_adaptive_rtol),
+        "atm_base": str(settings.atm_base),
     }
 
 
@@ -727,6 +739,24 @@ def _write_run_hdf5(run_path: Path, run_spec: RunSpec, payload: dict[str, Any]) 
             data=np.float64(run_spec.metallicity_log10),
         )
         globals_group.create_dataset("c_to_o", data=np.float64(run_spec.c_to_o))
+        for key in (
+            "use_eddy_diffusion",
+            "use_molecular_diffusion",
+            "use_upwind_molecular_diffusion",
+            "use_boundary_conditions",
+            "use_condensation",
+            "use_settling",
+            "use_initial_cold_trap",
+            "use_sat_surface_h2o",
+            "use_lowT_limit_rates",
+            "use_adaptive_rtol",
+        ):
+            globals_group.create_dataset(key, data=np.float64(payload[key]))
+        for atm_base_name in SUPPORTED_ATM_BASES:
+            globals_group.create_dataset(
+                f"atm_base_{atm_base_name}",
+                data=np.float64(1.0 if payload["atm_base"] == atm_base_name else 0.0),
+            )
 
         trajectory = handle.create_group("trajectory")
         trajectory.create_dataset("time_s", data=payload["time_s"])
@@ -790,7 +820,7 @@ def _run_single(spec: RunSpec, settings: WorkerSettings) -> RunResult:
         raise VulcanRuntimeError(f"Expected VULCAN output file not found: {output_file}")
 
     payload = _extract_run_payload(output_file, spec, settings)
-    run_file = Path(settings.runs_root) / f"run_{spec.run_id:06d}.h5"
+    run_file = Path(settings.raw_root) / f"run_{spec.run_id:06d}.h5"
     _write_run_hdf5(run_file, spec, payload)
 
     if not settings.keep_vulcan_outputs_debug:
@@ -818,8 +848,8 @@ def run_vulcan_jobs(
 
     collect = failure_policy in {"collect_all_errors", "continue_on_error"}
     continue_on_error = failure_policy == "continue_on_error"
-    runs_root = Path(settings.runs_root)
-    runs_root.mkdir(parents=True, exist_ok=True)
+    raw_root = Path(settings.raw_root)
+    raw_root.mkdir(parents=True, exist_ok=True)
 
     results: list[RunResult] = []
     errors: list[str] = []

@@ -1,13 +1,14 @@
-"""Fixed-requested-dt sampling from saved VULCAN trajectories.
+"""Log-uniform transition-pair sampling from saved VULCAN trajectories.
 
-The bundled VULCAN solver advances with adaptive internal timesteps and saves
-states at irregular times.  For the current emulator regime we intentionally
-train on a *single requested jump size* after a configurable late-time cutoff.
-Each requested jump is snapped to the nearest saved future solver snapshot, and
-that snapped ``actual_dt_s`` is what the model ultimately sees and predicts.
+The VULCAN solver saves states at irregular times. For the current emulator
+regime, every valid ordered pair of saved snapshots is a candidate training
+example, subject to a configurable actual-dt range. Training pairs are sampled
+approximately uniformly in log(dt) by weighting candidate pairs with 1 / dt.
 
-This gives a clean operating regime for the surrogate while preserving modest
-``dt`` variation from the solver's irregular save cadence.
+This supports the intended operator:
+
+- input: current atmospheric state + conditioning inputs + dt
+- output: future atmospheric state after that dt
 """
 
 from __future__ import annotations
@@ -23,20 +24,10 @@ class TransitionSamplingError(ValueError):
 
 @dataclass(frozen=True)
 class TransitionPairs:
-    """A batch of anchor/target trajectory pairs.
-
-    Attributes:
-        anchor_index: Time-axis indices into the saved trajectory for anchors.
-        target_index: Time-axis indices for targets (always > ``anchor_index``).
-        requested_dt_s: Requested time jump before snapping to a saved state.
-        actual_dt_s: True jump after snapping to the nearest saved future state.
-        anchor_time_s: Absolute simulation times of anchor snapshots.
-        target_time_s: Absolute simulation times of target snapshots.
-    """
+    """A batch of anchor/target trajectory pairs."""
 
     anchor_index: np.ndarray
     target_index: np.ndarray
-    requested_dt_s: np.ndarray
     actual_dt_s: np.ndarray
     anchor_time_s: np.ndarray
     target_time_s: np.ndarray
@@ -44,15 +35,13 @@ class TransitionPairs:
 
 @dataclass(frozen=True)
 class _CandidatePairs:
-    """Deterministic fixed-dt pair mapping for every valid anchor."""
+    """All valid ordered candidate pairs for one trajectory."""
 
     anchor_index: np.ndarray
     target_index: np.ndarray
-    requested_dt_s: np.ndarray
     actual_dt_s: np.ndarray
     anchor_time_s: np.ndarray
     target_time_s: np.ndarray
-    relative_dt_error: np.ndarray
 
 
 def _validate_times(times_s: np.ndarray) -> np.ndarray:
@@ -69,113 +58,52 @@ def _validate_times(times_s: np.ndarray) -> np.ndarray:
     return times
 
 
-def _resolved_anchor_time_threshold(
-    times_s: np.ndarray,
-    *,
-    post_equilibrium_time_min_s: float,
-    post_equilibrium_min_fraction_of_final_time: float,
-) -> float:
-    """Return the effective anchor-time threshold for late-time sampling."""
-    absolute_min = float(post_equilibrium_time_min_s)
-    if absolute_min < 0.0:
-        raise TransitionSamplingError("post_equilibrium_time_min_s must be >= 0.")
-
-    min_fraction = float(post_equilibrium_min_fraction_of_final_time)
-    if not (0.0 <= min_fraction < 1.0):
-        raise TransitionSamplingError(
-            "post_equilibrium_min_fraction_of_final_time must be in [0, 1)."
-        )
-
-    return max(absolute_min, min_fraction * float(times_s[-1]))
-
-
 def _candidate_pairs(
     *,
     times_s: np.ndarray,
-    fixed_requested_dt_s: float,
-    post_equilibrium_time_min_s: float,
-    post_equilibrium_min_fraction_of_final_time: float,
+    dt_min_s: float,
+    dt_max_s: float,
     min_future_saved_steps: int,
-    max_target_relative_dt_error: float | None,
 ) -> _CandidatePairs:
-    """Build the deterministic fixed-dt anchor->target mapping for one trajectory."""
+    """Enumerate all valid ordered pairs within the configured actual-dt range."""
     times = _validate_times(times_s)
-    requested_dt_s = float(fixed_requested_dt_s)
-    if requested_dt_s <= 0.0:
-        raise TransitionSamplingError("fixed_requested_dt_s must be > 0.")
+    dt_min = float(dt_min_s)
+    dt_max = float(dt_max_s)
+    if dt_min <= 0.0:
+        raise TransitionSamplingError("dt_min_s must be > 0.")
+    if dt_max <= dt_min:
+        raise TransitionSamplingError("dt_max_s must be > dt_min_s.")
     if min_future_saved_steps < 1:
         raise TransitionSamplingError("min_future_saved_steps must be >= 1.")
-    if max_target_relative_dt_error is not None and float(max_target_relative_dt_error) < 0.0:
-        raise TransitionSamplingError("max_target_relative_dt_error must be >= 0 when provided.")
 
-    threshold_time_s = _resolved_anchor_time_threshold(
-        times,
-        post_equilibrium_time_min_s=post_equilibrium_time_min_s,
-        post_equilibrium_min_fraction_of_final_time=post_equilibrium_min_fraction_of_final_time,
-    )
-
-    max_anchor_index = times.size - int(min_future_saved_steps)
-    if max_anchor_index <= 0:
+    anchor_index, target_index = np.triu_indices(times.size, k=int(min_future_saved_steps))
+    if anchor_index.size == 0:
         raise TransitionSamplingError("Trajectory does not contain enough future saved states.")
 
-    anchor_index = np.arange(max_anchor_index, dtype=np.int64)
     anchor_time_s = times[anchor_index]
-    valid_anchor_mask = anchor_time_s >= threshold_time_s
-    if not np.any(valid_anchor_mask):
-        raise TransitionSamplingError(
-            "No saved trajectory states satisfy the configured post-equilibrium anchor threshold."
-        )
-
-    anchor_index = anchor_index[valid_anchor_mask]
-    anchor_time_s = anchor_time_s[valid_anchor_mask]
-    min_target_index = anchor_index + int(min_future_saved_steps)
-
-    requested_target_time_s = anchor_time_s + requested_dt_s
-    right_index = np.searchsorted(times, requested_target_time_s, side="left")
-    right_index = np.clip(right_index, min_target_index, times.size - 1)
-    left_index = np.maximum(right_index - 1, min_target_index)
-
-    left_delta = np.abs(times[left_index] - requested_target_time_s)
-    right_delta = np.abs(times[right_index] - requested_target_time_s)
-    choose_left = left_delta <= right_delta
-    target_index = np.where(choose_left, left_index, right_index).astype(np.int64)
-    target_index = np.maximum(target_index, min_target_index)
-
     target_time_s = times[target_index]
     actual_dt_s = target_time_s - anchor_time_s
+    keep = (actual_dt_s >= dt_min) & (actual_dt_s <= dt_max)
+    if not np.any(keep):
+        raise TransitionSamplingError(
+            "No saved trajectory pairs satisfy the configured dt range. "
+            "Lower trajectory_sampling.dt_min_s, raise dt_max_s, or save denser trajectories."
+        )
+
+    anchor_index = anchor_index[keep].astype(np.int64, copy=False)
+    target_index = target_index[keep].astype(np.int64, copy=False)
+    actual_dt_s = actual_dt_s[keep]
+    anchor_time_s = anchor_time_s[keep]
+    target_time_s = target_time_s[keep]
     if np.any(actual_dt_s <= 0.0):
-        raise TransitionSamplingError("Sampled non-positive actual dt after target selection.")
-
-    requested_dt_block = np.full(anchor_index.shape, requested_dt_s, dtype=np.float64)
-    relative_dt_error = np.abs(actual_dt_s - requested_dt_block) / requested_dt_block
-    if max_target_relative_dt_error is not None:
-        max_relative_error = float(max_target_relative_dt_error)
-        keep = relative_dt_error <= max_relative_error
-        if not np.any(keep):
-            raise TransitionSamplingError(
-                "No candidate fixed-dt pairs satisfy max_target_relative_dt_error. "
-                "Increase snapshot density, relax the tolerance, lower the requested dt, "
-                "or lower the post-equilibrium anchor threshold."
-            )
-        anchor_index = anchor_index[keep]
-        target_index = target_index[keep]
-        requested_dt_block = requested_dt_block[keep]
-        actual_dt_s = actual_dt_s[keep]
-        anchor_time_s = anchor_time_s[keep]
-        target_time_s = target_time_s[keep]
-        relative_dt_error = relative_dt_error[keep]
-
-    if anchor_index.size == 0:
-        raise TransitionSamplingError("No valid fixed-dt transition pairs remain after filtering.")
+        raise TransitionSamplingError("Sampled non-positive actual dt.")
 
     return _CandidatePairs(
         anchor_index=anchor_index,
         target_index=target_index,
-        requested_dt_s=requested_dt_block,
         actual_dt_s=actual_dt_s,
         anchor_time_s=anchor_time_s,
         target_time_s=target_time_s,
-        relative_dt_error=relative_dt_error,
     )
 
 
@@ -184,34 +112,36 @@ def sample_transition_pairs(
     rng: np.random.Generator,
     times_s: np.ndarray,
     n_pairs: int,
-    fixed_requested_dt_s: float,
-    post_equilibrium_time_min_s: float,
-    post_equilibrium_min_fraction_of_final_time: float = 0.0,
+    dt_min_s: float,
+    dt_max_s: float,
     min_future_saved_steps: int = 1,
-    max_target_relative_dt_error: float | None = None,
 ) -> TransitionPairs:
-    """Sample fixed-requested-dt transition pairs from one saved trajectory.
+    """Sample up to ``n_pairs`` trajectory pairs with approximate log-uniform dt coverage.
 
-    The requested jump size is constant for all examples.  Anchors are sampled
-    uniformly from the subset of saved late-time states that admit a valid
-    snapped future target.
+    Uniform density in log(dt) implies p(dt) ∝ 1 / dt in linear dt space.
+    We approximate this by weighting each candidate pair by 1 / actual_dt_s.
     """
     if n_pairs <= 0:
         raise TransitionSamplingError("n_pairs must be > 0.")
 
     candidates = _candidate_pairs(
         times_s=times_s,
-        fixed_requested_dt_s=fixed_requested_dt_s,
-        post_equilibrium_time_min_s=post_equilibrium_time_min_s,
-        post_equilibrium_min_fraction_of_final_time=post_equilibrium_min_fraction_of_final_time,
+        dt_min_s=dt_min_s,
+        dt_max_s=dt_max_s,
         min_future_saved_steps=min_future_saved_steps,
-        max_target_relative_dt_error=max_target_relative_dt_error,
     )
+    weights = 1.0 / np.maximum(candidates.actual_dt_s, np.finfo(np.float64).tiny)
+    weight_sum = float(np.sum(weights))
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise TransitionSamplingError("Failed to construct finite log-uniform sampling weights.")
+    weights = weights / weight_sum
 
-    choice = rng.choice(candidates.anchor_index.size, size=int(n_pairs), replace=True).astype(np.int64)
+    sample_size = min(int(n_pairs), int(candidates.anchor_index.size))
+    choice = rng.choice(candidates.anchor_index.size, size=sample_size, replace=False, p=weights)
+    choice = np.asarray(choice, dtype=np.int64)
+
     anchor_index = candidates.anchor_index[choice]
     target_index = candidates.target_index[choice]
-    requested_dt_s = candidates.requested_dt_s[choice]
     actual_dt_s = candidates.actual_dt_s[choice]
     anchor_time_s = candidates.anchor_time_s[choice]
     target_time_s = candidates.target_time_s[choice]
@@ -220,53 +150,43 @@ def sample_transition_pairs(
     return TransitionPairs(
         anchor_index=anchor_index[order],
         target_index=target_index[order],
-        requested_dt_s=requested_dt_s[order],
         actual_dt_s=actual_dt_s[order],
         anchor_time_s=anchor_time_s[order],
         target_time_s=target_time_s[order],
     )
 
 
-def build_rollout_indices(
-    *,
-    times_s: np.ndarray,
-    fixed_requested_dt_s: float,
-    post_equilibrium_time_min_s: float,
-    post_equilibrium_min_fraction_of_final_time: float = 0.0,
-    min_future_saved_steps: int = 1,
-    max_target_relative_dt_error: float | None = None,
-    max_points: int,
-) -> np.ndarray:
-    """Build one deterministic fixed-dt rollout path through a saved trajectory.
-
-    The rollout starts at the earliest valid late-time anchor and repeatedly
-    applies the same fixed requested dt, snapping to the nearest saved future
-    state at each step.  Returned indices always remain strictly increasing.
-    """
+def build_rollout_indices(*, times_s: np.ndarray, max_points: int) -> np.ndarray:
+    """Build a deterministic log-spaced rollout path through a saved trajectory."""
+    times = _validate_times(times_s)
     if max_points < 2:
         raise TransitionSamplingError("max_points must be >= 2 for rollout evaluation.")
+    if times.size <= max_points:
+        return np.arange(times.size, dtype=np.int64)
 
-    candidates = _candidate_pairs(
-        times_s=times_s,
-        fixed_requested_dt_s=fixed_requested_dt_s,
-        post_equilibrium_time_min_s=post_equilibrium_time_min_s,
-        post_equilibrium_min_fraction_of_final_time=post_equilibrium_min_fraction_of_final_time,
-        min_future_saved_steps=min_future_saved_steps,
-        max_target_relative_dt_error=max_target_relative_dt_error,
+    positive_times = times[1:]
+    if np.any(positive_times <= 0.0):
+        raise TransitionSamplingError("Saved times beyond t=0 must be strictly positive.")
+
+    target_times = np.logspace(
+        np.log10(float(positive_times[0])),
+        np.log10(float(positive_times[-1])),
+        int(max_points - 1),
+        dtype=np.float64,
     )
-
-    mapping = {
-        int(anchor_idx): int(target_idx)
-        for anchor_idx, target_idx in zip(candidates.anchor_index, candidates.target_index, strict=True)
-    }
-    start_index = int(np.min(candidates.anchor_index))
-    indices = [start_index]
-    current_index = start_index
-    while len(indices) < int(max_points):
-        next_index = mapping.get(current_index)
-        if next_index is None or next_index <= current_index:
-            break
-        indices.append(int(next_index))
-        current_index = int(next_index)
-
-    return np.asarray(indices, dtype=np.int64)
+    sampled = np.searchsorted(times, target_times, side="left")
+    sampled = np.clip(sampled, 1, times.size - 1)
+    indices = np.unique(np.concatenate([np.array([0], dtype=np.int64), sampled.astype(np.int64)]))
+    if indices[-1] != times.size - 1:
+        indices = np.append(indices, times.size - 1)
+    if indices.size > max_points:
+        interior = indices[1:-1]
+        keep = np.linspace(0, max(interior.size - 1, 0), max_points - 2, dtype=np.int64)
+        indices = np.concatenate(
+            [
+                np.array([indices[0]], dtype=np.int64),
+                interior[keep] if interior.size > 0 else np.array([], dtype=np.int64),
+                np.array([indices[-1]], dtype=np.int64),
+            ]
+        )
+    return indices.astype(np.int64, copy=False)

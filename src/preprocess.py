@@ -33,7 +33,7 @@ import h5py
 import numpy as np
 import torch
 
-from config_utils import PrecisionConfig
+from config_utils import PrecisionConfig, resolve_conditioning_inputs
 from provenance import PROCESSED_FINGERPRINT_FILENAME, build_processed_fingerprint
 from sampling import build_run_specs
 from transition_sampling import TransitionPairs, TransitionSamplingError, sample_transition_pairs
@@ -127,9 +127,7 @@ class RawRunData:
     time_s: np.ndarray
     ymix_state: np.ndarray
     ymix_output: np.ndarray
-    gravity_cm_s2: float
-    metallicity_log10: float
-    c_to_o: float
+    global_inputs: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -139,6 +137,23 @@ class PairSpecBundle:
     run_id: int
     run_file: Path
     pairs: TransitionPairs
+
+
+def _conditioning_feature_order(config: dict[str, Any]) -> list[str]:
+    """Return the configured global conditioning feature order."""
+    return list(config["data_spec"]["required_global_inputs"])
+
+
+def _resolved_run_conditioning_inputs(raw: RawRunData, config: dict[str, Any]) -> dict[str, float]:
+    """Resolve the non-time conditioning inputs for one raw run."""
+    try:
+        return resolve_conditioning_inputs(
+            raw_global_inputs=raw.global_inputs,
+            config=config,
+            required_global_inputs=_conditioning_feature_order(config),
+        )
+    except Exception as exc:
+        raise PreprocessError(str(exc)) from exc
 
 
 def _log10_safe(values: np.ndarray, eps: float) -> np.ndarray:
@@ -242,9 +257,12 @@ def load_raw_run_file(
             output_indices,
             axis=2,
         )
-        gravity = float(np.asarray(globals_group["gravity_cm_s2"]))
-        metallicity_log10 = float(np.asarray(globals_group["metallicity_log10"]))
-        c_to_o = float(np.asarray(globals_group["c_to_o"]))
+        global_inputs: dict[str, float] = {}
+        for name, dataset in globals_group.items():
+            value = np.asarray(dataset)
+            if np.asarray(value).ndim != 0:
+                raise PreprocessError(f"globals/{name} must be a scalar dataset in {path}")
+            global_inputs[str(name)] = float(value)
         run_id = int(handle.attrs["run_id"])
 
     arrays_to_check = [pressure, temperature, kzz, time_s, ymix_state, ymix_output]
@@ -277,15 +295,13 @@ def load_raw_run_file(
         time_s=time_s,
         ymix_state=ymix_state,
         ymix_output=ymix_output,
-        gravity_cm_s2=gravity,
-        metallicity_log10=metallicity_log10,
-        c_to_o=c_to_o,
+        global_inputs=global_inputs,
     )
 
 
-def discover_existing_raw_run_files(paths: Any) -> list[Path]:
+def discover_existing_raw_run_files(raw_root: Path) -> list[Path]:
     """Return existing raw run files from the flat configured raw layout."""
-    return sorted(Path(paths.raw_root).glob("run_*.h5"))
+    return sorted(Path(raw_root).glob("run_*.h5"))
 
 
 def _split_run_ids(
@@ -336,13 +352,9 @@ def _sample_pairs_for_run(
         rng=rng,
         times_s=raw.time_s,
         n_pairs=int(sampling_cfg["pairs_per_run"]),
-        fixed_requested_dt_s=float(sampling_cfg["fixed_requested_dt_s"]),
-        post_equilibrium_time_min_s=float(sampling_cfg["post_equilibrium_time_min_s"]),
-        post_equilibrium_min_fraction_of_final_time=float(
-            sampling_cfg["post_equilibrium_min_fraction_of_final_time"]
-        ),
+        dt_min_s=float(sampling_cfg["dt_min_s"]),
+        dt_max_s=float(sampling_cfg["dt_max_s"]),
         min_future_saved_steps=int(sampling_cfg["min_future_saved_steps"]),
-        max_target_relative_dt_error=float(sampling_cfg["max_target_relative_dt_error"]),
     )
 
 
@@ -399,6 +411,7 @@ def _build_normalization_stats(
     """
     norm_cfg = config["normalization"]
     epsilon = float(norm_cfg["epsilon"])
+    global_feature_order = _conditioning_feature_order(config)
 
     seq_methods = norm_cfg["sequence_methods"]
     global_methods = norm_cfg["global_methods"]
@@ -412,10 +425,8 @@ def _build_normalization_stats(
     state_policy = _NormPolicy(seq_methods["anchor_ymix"], epsilon)
     state_stats = _RunningStats(len(state_species), stats_dtype)
     global_stats = {
-        "gravity_cm_s2": (_NormPolicy(global_methods["gravity_cm_s2"], epsilon), _RunningStats(1, stats_dtype)),
-        "metallicity_log10": (_NormPolicy(global_methods["metallicity_log10"], epsilon), _RunningStats(1, stats_dtype)),
-        "c_to_o": (_NormPolicy(global_methods["c_to_o"], epsilon), _RunningStats(1, stats_dtype)),
-        "log10_dt_s": (_NormPolicy(global_methods["log10_dt_s"], epsilon), _RunningStats(1, stats_dtype)),
+        key: (_NormPolicy(global_methods[key], epsilon), _RunningStats(1, stats_dtype))
+        for key in global_feature_order
     }
 
     for bundle in train_bundles:
@@ -425,6 +436,7 @@ def _build_normalization_stats(
             output_species=output_species,
         )
         pairs = bundle.pairs
+        conditioning_inputs = _resolved_run_conditioning_inputs(raw, config)
 
         for key in ("pressure_bar", "temperature_k", "kzz_cm2_s"):
             policy, acc = seq_stats[key]
@@ -436,18 +448,18 @@ def _build_normalization_stats(
         state_stats.update(_fit_for_method(anchor_states, state_policy))
         state_stats.update(_fit_for_method(target_states, state_policy))
 
-        for key, value in {
-            "gravity_cm_s2": raw.gravity_cm_s2,
-            "metallicity_log10": raw.metallicity_log10,
-            "c_to_o": raw.c_to_o,
-        }.items():
+        for key in global_feature_order:
             policy, acc = global_stats[key]
-            repeated = np.full((pairs.actual_dt_s.size, 1), float(value), dtype=np.float64)
-            acc.update(_fit_for_method(repeated, policy))
-
-        dt_policy, dt_acc = global_stats["log10_dt_s"]
-        log10_dt_s = np.log10(pairs.actual_dt_s).reshape(-1, 1)
-        dt_acc.update(_fit_for_method(log10_dt_s, dt_policy))
+            if key == "log10_dt_s":
+                values = np.log10(pairs.actual_dt_s).reshape(-1, 1)
+            else:
+                repeated = np.full(
+                    (pairs.actual_dt_s.size, 1),
+                    float(conditioning_inputs[key]),
+                    dtype=np.float64,
+                )
+                values = repeated
+            acc.update(_fit_for_method(values, policy))
 
     state_final = state_stats.finalize()
     output_final = _subset_stats(state_final, output_from_state_indices)
@@ -490,7 +502,8 @@ def _write_split_shards(
     state_dim = len(state_species)
     output_dim = len(output_species)
     input_dim = 3 + state_dim
-    global_dim = 4
+    global_feature_order = _conditioning_feature_order(config)
+    global_dim = len(global_feature_order)
     shard_size = int(config["generation"]["shard_size"])
 
     sequence_length = -1
@@ -499,8 +512,6 @@ def _write_split_shards(
     write_pos = 0
     dt_min_s = np.inf
     dt_max_s = -np.inf
-    relative_dt_error_sum = 0.0
-    relative_dt_error_max = 0.0
 
     seq_buf: np.ndarray | None = None
     glb_buf: np.ndarray | None = None
@@ -534,7 +545,7 @@ def _write_split_shards(
     }
     global_policies = {
         key: _NormPolicy(stats["globals"][key]["method"], eps)
-        for key in ("gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s")
+        for key in global_feature_order
     }
     target_policy = _NormPolicy(stats["targets"]["ymix"]["method"], eps)
 
@@ -545,6 +556,7 @@ def _write_split_shards(
             output_species=output_species,
         )
         pairs = bundle.pairs
+        conditioning_inputs = _resolved_run_conditioning_inputs(raw, config)
         nz = int(raw.pressure_bar.size)
         if sequence_length < 0:
             sequence_length = nz
@@ -589,46 +601,28 @@ def _write_split_shards(
             axis=2,
         )
 
-        gravity_norm = float(
-            _apply_method(
-                np.array([[raw.gravity_cm_s2]], dtype=np.float64),
-                stats["globals"]["gravity_cm_s2"],
-                global_policies["gravity_cm_s2"],
-            )[0, 0]
-        )
-        metallicity_norm = float(
-            _apply_method(
-                np.array([[raw.metallicity_log10]], dtype=np.float64),
-                stats["globals"]["metallicity_log10"],
-                global_policies["metallicity_log10"],
-            )[0, 0]
-        )
-        c_to_o_norm = float(
-            _apply_method(
-                np.array([[raw.c_to_o]], dtype=np.float64),
-                stats["globals"]["c_to_o"],
-                global_policies["c_to_o"],
-            )[0, 0]
-        )
-        dt_norm = _apply_method(
-            np.log10(pairs.actual_dt_s).reshape(-1, 1),
-            stats["globals"]["log10_dt_s"],
-            global_policies["log10_dt_s"],
-        ).reshape(-1)
-        global_block = np.column_stack(
-            [
-                np.full(pairs.actual_dt_s.size, gravity_norm, dtype=np.float64),
-                np.full(pairs.actual_dt_s.size, metallicity_norm, dtype=np.float64),
-                np.full(pairs.actual_dt_s.size, c_to_o_norm, dtype=np.float64),
-                dt_norm,
-            ]
-        )
+        global_columns: list[np.ndarray] = []
+        for key in global_feature_order:
+            if key == "log10_dt_s":
+                column = _apply_method(
+                    np.log10(pairs.actual_dt_s).reshape(-1, 1),
+                    stats["globals"][key],
+                    global_policies[key],
+                ).reshape(-1)
+            else:
+                normalized = float(
+                    _apply_method(
+                        np.array([[conditioning_inputs[key]]], dtype=np.float64),
+                        stats["globals"][key],
+                        global_policies[key],
+                    )[0, 0]
+                )
+                column = np.full(pairs.actual_dt_s.size, normalized, dtype=np.float64)
+            global_columns.append(column)
+        global_block = np.column_stack(global_columns)
 
         dt_min_s = min(dt_min_s, float(np.min(pairs.actual_dt_s)))
         dt_max_s = max(dt_max_s, float(np.max(pairs.actual_dt_s)))
-        relative_dt_error = np.abs(pairs.actual_dt_s - pairs.requested_dt_s) / pairs.requested_dt_s
-        relative_dt_error_sum += float(np.sum(relative_dt_error))
-        relative_dt_error_max = max(relative_dt_error_max, float(np.max(relative_dt_error)))
 
         start = 0
         num_pairs = int(pairs.actual_dt_s.size)
@@ -670,24 +664,18 @@ def _write_split_shards(
             "kzz_cm2_s",
             *[f"anchor_ymix:{species}" for species in state_species],
         ],
-        "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
+        "global_feature_order": list(global_feature_order),
         "state_species_order": list(state_species),
         "output_species_order": list(output_species),
         "output_from_state_indices": list(output_from_state_indices),
         "normalization_fingerprint": normalization_fingerprint,
         "sampling_mode": str(sampling_cfg["mode"]),
-        "requested_dt_s": float(sampling_cfg["fixed_requested_dt_s"]),
-        "post_equilibrium_time_min_s": float(sampling_cfg["post_equilibrium_time_min_s"]),
-        "post_equilibrium_min_fraction_of_final_time": float(
-            sampling_cfg["post_equilibrium_min_fraction_of_final_time"]
-        ),
-        "anchor_sampling": str(sampling_cfg["anchor_sampling"]),
-        "target_selection": str(sampling_cfg["target_selection"]),
-        "max_target_relative_dt_error": float(sampling_cfg["max_target_relative_dt_error"]),
+        "pairs_per_run": int(sampling_cfg["pairs_per_run"]),
+        "dt_sampling_min_s": float(sampling_cfg["dt_min_s"]),
+        "dt_sampling_max_s": float(sampling_cfg["dt_max_s"]),
+        "min_future_saved_steps": int(sampling_cfg["min_future_saved_steps"]),
         "dt_min_s": float(dt_min_s),
         "dt_max_s": float(dt_max_s),
-        "relative_dt_error_mean": float(relative_dt_error_sum / max(total_samples, 1)),
-        "relative_dt_error_max": float(relative_dt_error_max),
     }
     with (split_dir / "metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -709,7 +697,7 @@ def build_worker_settings(
     return WorkerSettings(
         vulcan_source=str(paths.vulcan_source),
         worker_root=str(Path(os.path.normpath(str(paths.root / generation["worker_root"])))),
-        runs_root=str(paths.raw_root),
+        raw_root=str(paths.raw_root),
         species=SpeciesSelection(
             state_species=tuple(state_species),
             output_species=tuple(output_species),
@@ -754,7 +742,7 @@ def run_generation_and_preprocess(
     output_from_state_indices = [state_species.index(species) for species in output_species]
     stats_dtype = _numpy_stats_dtype(precision)
 
-    run_files = discover_existing_raw_run_files(paths)
+    run_files = discover_existing_raw_run_files(paths.raw_root)
     if run_files:
         logger.info(
             "Found %d existing raw run files under %s; skipping VULCAN generation.",
