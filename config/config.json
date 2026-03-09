@@ -9,7 +9,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 1000,
+    "num_runs": 5000,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
@@ -27,8 +27,8 @@
   },
   "trajectory_sampling": {
     "mode": "log_uniform_all_pairs",
-    "dt_min_s": 1e8,
-    "dt_max_s": 1e10,
+    "dt_min_s": 1e10,
+    "dt_max_s": 1e12,
     "min_future_saved_steps": 1
   },
   "vulcan_runtime": {
@@ -236,10 +236,10 @@
   },
   "training": {
     "device": "cuda",
-    "batch_size": 256,
+    "batch_size": 512,
     "epochs": 300,
     "learning_rate": 1e-4,
-    "min_lr": 1e-06,
+    "min_lr": 1e-6,
     "warmup_epochs": 10,
     "weight_decay": 1e-05,
     "gradient_clip": 1.0,
@@ -252,7 +252,7 @@
     "model": {
       "d_model": 256,
       "nhead": 4,
-      "num_layers": 6,
+      "num_layers": 3,
       "dim_feedforward": 1024,
       "dropout": 0.05,
       "film_clamp": 10.0,
