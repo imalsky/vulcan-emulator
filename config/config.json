@@ -9,7 +9,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 5000,
+    "num_runs": 1000,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
@@ -27,10 +27,9 @@
   },
   "trajectory_sampling": {
     "mode": "log_uniform_all_pairs",
-    "dt_min_s": 1000000.0,
-    "dt_max_s": 10000000000.0,
-    "min_future_saved_steps": 1,
-    "rollout_eval_points": 8
+    "dt_min_s": 1e8,
+    "dt_max_s": 1e10,
+    "min_future_saved_steps": 1
   },
   "vulcan_runtime": {
     "runtime": 1e+13,
@@ -46,7 +45,7 @@
     "pressure_grid": {
       "nz": 50,
       "p_top_bar": 1e-08,
-      "p_bottom_bar": 1000.0
+      "p_bottom_bar": 1e3
     },
     "temperature_limits_k": {
       "min": 500.0,
@@ -96,8 +95,8 @@
     },
     "temperature_shift": {
       "distribution": "uniform",
-      "min": -600.0,
-      "max": 600.0
+      "min": -500.0,
+      "max": 500.0
     }
   },
   "gravity_sampler": {
@@ -238,10 +237,10 @@
   "training": {
     "device": "cuda",
     "batch_size": 256,
-    "epochs": 50,
-    "learning_rate": 0.0003,
+    "epochs": 100,
+    "learning_rate": 1e-4,
     "min_lr": 1e-06,
-    "warmup_epochs": 5,
+    "warmup_epochs": 10,
     "weight_decay": 1e-05,
     "gradient_clip": 1.0,
     "use_amp": false,
@@ -252,9 +251,9 @@
     },
     "model": {
       "d_model": 256,
-      "nhead": 8,
+      "nhead": 4,
       "num_layers": 6,
-      "dim_feedforward": 768,
+      "dim_feedforward": 1024,
       "dropout": 0.0,
       "film_clamp": 10.0,
       "output_head_divisor": 2,
@@ -262,7 +261,7 @@
       "conditioning_hidden_dim": 256
     },
     "loss": {
-      "lambda_z": 1.0,
+      "lambda_z": 0.5,
       "lambda_phys": 1.0
     },
     "output_folder": "trained_model"

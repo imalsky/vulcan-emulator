@@ -222,12 +222,6 @@ class ContractTests(unittest.TestCase):
         config["trajectory_sampling"]["dt_max_s"] = float(config["trajectory_sampling"]["dt_max_s"]) * 2.0
         self.assertNotEqual(stable_config_sha256(config), baseline)
 
-    def test_rollout_eval_points_do_not_change_processed_config_fingerprint(self) -> None:
-        config = _load_base_config()
-        baseline = stable_config_sha256(config)
-        config["trajectory_sampling"]["rollout_eval_points"] += 1
-        self.assertEqual(stable_config_sha256(config), baseline)
-
     def test_optimizer_state_cast_helper_applies_requested_dtype(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
         optimizer = torch.optim.AdamW([parameter], lr=1.0e-3)

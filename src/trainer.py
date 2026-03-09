@@ -11,9 +11,7 @@ Implements the full ``--train`` lifecycle:
    optional mixed-precision (AMP) training via GradScaler.
 4. **Evaluation**: Masked MSE/MAE over validation/test splits with optional
    dt-binned breakdowns showing performance across timescales.
-5. **Rollout evaluation**: Autoregressive multi-jump composition on held-out
-   raw trajectories, validating that single-step accuracy composes well.
-6. **Checkpointing**: Saves ``best.pt`` (lowest val MSE) and ``last.pt``,
+5. **Checkpointing**: Saves ``best.pt`` (lowest validation combined loss) and ``last.pt``,
    plus inference artifacts (normalization metadata, data contract).
 """
 
@@ -24,7 +22,6 @@ import json
 import logging
 import math
 import random
-import re
 import shutil
 import time
 from hashlib import sha256
@@ -36,13 +33,10 @@ import torch
 from torch import nn
 from torch.amp import GradScaler, autocast
 
-from config_utils import PrecisionConfig, resolve_conditioning_inputs
+from config_utils import PrecisionConfig
 from data_loader import load_split_metadata
-from inference import PhysicalSpaceStandaloneModel, VulcanPredictor
 from live_sampling import ProcessedTrajectoryStore
 from model import VulcanTransitionTransformer
-from preprocess import load_raw_run_file
-from transition_sampling import TransitionSamplingError, build_rollout_indices
 from provenance import PROCESSED_FINGERPRINT_FILENAME, validate_processed_artifacts
 
 logger = logging.getLogger(__name__)
@@ -62,19 +56,12 @@ def _seed_everything(seed: int) -> None:
 
 
 def _resolve_device(device_name: str) -> torch.device:
-    """Resolve the configured training device with explicit availability checks."""
-    lowered = str(device_name).lower()
-    if lowered == "cuda":
-        if not torch.cuda.is_available():
-            raise TrainingError("training.device='cuda' requested but CUDA is unavailable.")
-        return torch.device("cuda")
-    if lowered == "mps":
-        if not torch.backends.mps.is_available():
-            raise TrainingError("training.device='mps' requested but MPS is unavailable.")
-        return torch.device("mps")
-    if lowered == "cpu":
-        return torch.device("cpu")
-    raise TrainingError(f"Unsupported training.device: {device_name}")
+    """Resolve the configured CUDA training device with explicit availability checks."""
+    if str(device_name).lower() != "cuda":
+        raise TrainingError(f"Unsupported training.device: {device_name}")
+    if not torch.cuda.is_available():
+        raise TrainingError("training.device='cuda' requested but CUDA is unavailable.")
+    return torch.device("cuda")
 
 
 def _format_progress_line(
@@ -538,150 +525,6 @@ def _build_data_contract(train_meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _parse_run_id_from_path(path: Path) -> int:
-    """Extract the integer run id from a canonical raw-run filename."""
-    match = re.search(r"run_(\d+)$", path.stem)
-    if match is None:
-        raise TrainingError(f"Unable to parse run id from raw run path: {path}")
-    return int(match.group(1))
-
-
-def _load_split_assignments(split_path: Path) -> dict[str, list[int]]:
-    """Load the serialized train/val/test run split mapping."""
-    with split_path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise TrainingError(f"Invalid split file structure: {split_path}")
-    result: dict[str, list[int]] = {}
-    for key in ("train", "val", "test"):
-        values = payload.get(key)
-        if not isinstance(values, list):
-            raise TrainingError(f"Invalid split entry '{key}' in {split_path}")
-        result[key] = [int(value) for value in values]
-    return result
-
-
-def _rollout_eval_indices(
-    *,
-    times_s: np.ndarray,
-    rollout_eval_points: int,
-) -> np.ndarray:
-    """Build a deterministic rollout path on one saved trajectory."""
-    if rollout_eval_points < 2:
-        raise TrainingError("Rollout evaluation requires at least two checkpoint points.")
-    try:
-        return build_rollout_indices(
-            times_s=times_s,
-            max_points=rollout_eval_points,
-        )
-    except TransitionSamplingError as exc:
-        raise TrainingError(f"Failed to construct rollout path: {exc}") from exc
-
-
-def _compute_rollout_metrics(
-    *,
-    model: VulcanTransitionTransformer,
-    normalization_metadata: dict[str, Any],
-    data_contract: dict[str, Any],
-    raw_run_files: list[Path],
-    split_path: Path,
-    rollout_eval_points: int,
-    config: dict[str, Any],
-    device: torch.device,
-    forward_dtype: torch.dtype,
-) -> dict[str, Any]:
-    """Validate autoregressive multi-jump composition on held-out raw runs."""
-    state_species = list(data_contract["state_species_order"])
-    output_species = list(data_contract["output_species_order"])
-    if state_species != output_species:
-        return {
-            "skipped": True,
-            "reason": "rollout requires output_species == state_species",
-        }
-
-    split_assignments = _load_split_assignments(split_path)
-    test_ids = set(split_assignments["test"])
-    if not test_ids:
-        return {"skipped": True, "reason": "test split contains no raw runs"}
-
-    run_file_by_id = {_parse_run_id_from_path(path): path for path in raw_run_files}
-    wrapper = PhysicalSpaceStandaloneModel(
-        model=model,
-        normalization_metadata=normalization_metadata,
-        data_contract=data_contract,
-    ).to(device=device, dtype=forward_dtype)
-    wrapper.eval()
-    predictor = VulcanPredictor(wrapper, device=device)
-
-    total_sq_error = 0.0
-    total_abs_error = 0.0
-    total_elements = 0
-    total_steps = 0
-
-    for run_id in sorted(test_ids):
-        run_file = run_file_by_id.get(run_id)
-        if run_file is None:
-            raise TrainingError(f"Missing raw run file for test run id {run_id}.")
-        raw = load_raw_run_file(
-            run_file,
-            state_species=state_species,
-            output_species=output_species,
-        )
-        static_globals = resolve_conditioning_inputs(
-            raw_global_inputs=raw.global_inputs,
-            config=config,
-            required_global_inputs=list(data_contract["global_feature_order"]),
-        )
-        try:
-            eval_indices = _rollout_eval_indices(
-                times_s=raw.time_s,
-                rollout_eval_points=rollout_eval_points,
-            )
-        except TrainingError:
-            continue
-        if eval_indices.size < 2:
-            continue
-        current_state = np.asarray(raw.ymix_state[eval_indices[0]], dtype=np.float64)
-        prev_index = int(eval_indices[0])
-
-        for next_index in eval_indices[1:]:
-            next_index_int = int(next_index)
-            dt_s = float(raw.time_s[next_index_int] - raw.time_s[prev_index])
-            prediction = predictor.predict(
-                pressure_bar=raw.pressure_bar,
-                temperature_k=raw.temperature_k,
-                kzz_cm2_s=raw.kzz_cm2_s,
-                anchor_ymix=current_state,
-                gravity_cm_s2=static_globals["gravity_cm_s2"],
-                metallicity_log10=static_globals["metallicity_log10"],
-                c_to_o=static_globals["c_to_o"],
-                dt_s=dt_s,
-                extra_global_inputs={
-                    key: value
-                    for key, value in static_globals.items()
-                    if key not in {"gravity_cm_s2", "metallicity_log10", "c_to_o"}
-                },
-            )
-            target = np.asarray(raw.ymix_output[next_index_int], dtype=np.float64)
-            diff = np.asarray(prediction, dtype=np.float64) - target
-            total_sq_error += float(np.sum(diff * diff))
-            total_abs_error += float(np.sum(np.abs(diff)))
-            total_elements += int(diff.size)
-            total_steps += 1
-            current_state = np.asarray(prediction, dtype=np.float64)
-            prev_index = next_index_int
-
-    if total_elements <= 0 or total_steps <= 0:
-        return {"skipped": True, "reason": "no rollout transitions were evaluated"}
-
-    return {
-        "skipped": False,
-        "num_steps": total_steps,
-        "mse": total_sq_error / total_elements,
-        "mae": total_abs_error / total_elements,
-    }
-
-
 def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig) -> None:
     """Execute ``--train`` with GPU-resident live pair sampling."""
     training = config["training"]
@@ -693,8 +536,6 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
         raise TrainingError(str(exc)) from exc
 
     device = _resolve_device(training["device"])
-    if device.type != "cuda":
-        raise TrainingError("Live-sampling training requires training.device='cuda'.")
     batch_size = int(training["batch_size"])
     live_sampling = training["live_sampling"]
     train_pairs_per_run = int(live_sampling["train_pairs_per_run_per_epoch"])
@@ -714,9 +555,9 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
     ).hexdigest()
 
     # ── Loss configuration ─────────────────────────────────────────
-    loss_cfg = training.get("loss", {})
-    lambda_z = float(loss_cfg.get("lambda_z", 1.0))
-    lambda_phys = float(loss_cfg.get("lambda_phys", 0.0))
+    loss_cfg = training["loss"]
+    lambda_z = float(loss_cfg["lambda_z"])
+    lambda_phys = float(loss_cfg["lambda_phys"])
     target_stats = normalization_metadata["targets"]["ymix"]
     if target_stats["method"] != "log-standard":
         raise TrainingError(
@@ -1056,25 +897,12 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
         lambda_phys=lambda_phys,
         dt_bin_edges=test_dt_edges,
     )
-    rollout_metrics = _compute_rollout_metrics(
-        model=model,
-        normalization_metadata=normalization_metadata,
-        data_contract=data_contract,
-        raw_run_files=artifact_info["raw_run_files"],
-        split_path=artifact_info["split_path"],
-        rollout_eval_points=int(config["trajectory_sampling"]["rollout_eval_points"]),
-        config=config,
-        device=device,
-        forward_dtype=precision.forward_dtype,
-    )
-
     metrics = {
         "best_epoch": best_epoch,
         "best_val_combined_loss": best_val_combined,
         "loss_config": {"lambda_z": lambda_z, "lambda_phys": lambda_phys},
         "val": final_val_metrics,
         "test": final_test_metrics,
-        "rollout": rollout_metrics,
     }
     with (run_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)

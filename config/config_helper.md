@@ -13,13 +13,12 @@ Required keys:
 - `dt_min_s`
 - `dt_max_s`
 - `min_future_saved_steps`
-- `rollout_eval_points`
 
 Notes:
 
 - `mode` must be `"log_uniform_all_pairs"`
 - `pairs_per_run` is no longer a valid config key
-- `rollout_eval_points` affects rollout evaluation only, not processed data generation
+- rollout/autoregressive config knobs are not part of the current contract
 
 ## `generation`
 
@@ -69,6 +68,8 @@ Notes:
 - `device` must be `"cuda"`
 - `gpu_preload`, `num_workers`, and `training.data_loading` are legacy keys and are rejected
 - `training.model.dropout` must be within `[0, 1]`
+- `training.loss` is required and must define exactly `lambda_z` and `lambda_phys`
+- `training.loss.lambda_z` and `training.loss.lambda_phys` must be `>= 0`
 
 ## `normalization`
 
@@ -104,4 +105,3 @@ Processed-data provenance does not depend on:
 
 - `training.live_sampling.train_pairs_per_run_per_epoch`
 - `training.live_sampling.eval_pairs_per_run`
-- `trajectory_sampling.rollout_eval_points`

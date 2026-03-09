@@ -365,7 +365,6 @@ def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
         "dt_min_s",
         "dt_max_s",
         "min_future_saved_steps",
-        "rollout_eval_points",
     }
     _require_keys(
         cfg,
@@ -391,11 +390,6 @@ def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
     ) < 1:
         raise ConfigValidationError(
             "trajectory_sampling.min_future_saved_steps must be >= 1."
-        )
-
-    if _as_int(cfg["rollout_eval_points"], "trajectory_sampling.rollout_eval_points") < 2:
-        raise ConfigValidationError(
-            "trajectory_sampling.rollout_eval_points must be >= 2."
         )
 
 
@@ -789,11 +783,7 @@ def _validate_training(training: dict[str, Any]) -> None:
         "output_folder",
         "loss",
     }
-    _require_keys(
-        training,
-        allowed - {"loss"},
-        "training",
-    )
+    _require_keys(training, allowed, "training")
     _reject_extra_keys(training, allowed, "training")
 
     device = str(training["device"]).lower()
@@ -821,21 +811,19 @@ def _validate_training(training: dict[str, Any]) -> None:
     _validate_live_sampling(training["live_sampling"])
 
     model_cfg = training["model"]
-    _require_keys(
-        model_cfg,
-        {
-            "d_model",
-            "nhead",
-            "num_layers",
-            "dim_feedforward",
-            "dropout",
-            "film_clamp",
-            "output_head_divisor",
-            "max_sequence_length",
-            "conditioning_hidden_dim",
-        },
-        "training.model",
-    )
+    allowed_model = {
+        "d_model",
+        "nhead",
+        "num_layers",
+        "dim_feedforward",
+        "dropout",
+        "film_clamp",
+        "output_head_divisor",
+        "max_sequence_length",
+        "conditioning_hidden_dim",
+    }
+    _require_keys(model_cfg, allowed_model, "training.model")
+    _reject_extra_keys(model_cfg, allowed_model, "training.model")
     d_model = _as_int(model_cfg["d_model"], "training.model.d_model")
     if d_model <= 0:
         raise ConfigValidationError("training.model.d_model must be > 0.")
@@ -870,6 +858,17 @@ def _validate_training(training: dict[str, Any]) -> None:
         raise ConfigValidationError("training.output_folder must be a non-empty relative path.")
     if Path(output_folder).is_absolute():
         raise ConfigValidationError("training.output_folder must be relative.")
+
+    loss_cfg = training["loss"]
+    allowed_loss = {"lambda_z", "lambda_phys"}
+    _require_keys(loss_cfg, allowed_loss, "training.loss")
+    _reject_extra_keys(loss_cfg, allowed_loss, "training.loss")
+    lambda_z = _as_float(loss_cfg["lambda_z"], "training.loss.lambda_z")
+    lambda_phys = _as_float(loss_cfg["lambda_phys"], "training.loss.lambda_phys")
+    if lambda_z < 0.0:
+        raise ConfigValidationError("training.loss.lambda_z must be >= 0.")
+    if lambda_phys < 0.0:
+        raise ConfigValidationError("training.loss.lambda_phys must be >= 0.")
 
 
 def _validate_physics_toggles(physics: dict[str, Any]) -> None:

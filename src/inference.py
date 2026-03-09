@@ -1,4 +1,4 @@
-"""Physical-space inference helpers for trained VULCAN transition surrogates.
+"""Physical-space inference helpers for trained VULCAN single-step transition surrogates.
 
 Provides two main interfaces for running predictions in physical units:
 
@@ -9,7 +9,7 @@ Provides two main interfaces for running predictions in physical units:
 
 - **VulcanPredictor**: NumPy-facing convenience class wrapping the above.
   Accepts numpy arrays / scalars, handles batching, and exposes ``predict()``
-  for single-step and ``rollout()`` for multi-step autoregressive composition.
+  for single-step transitions.
 
 Normalization roundtrip: physical -> log10 (if applicable) -> standardize ->
 model -> destandardize -> 10^x (if applicable) -> physical.
@@ -506,9 +506,8 @@ class VulcanPredictor:
     """Convenience NumPy-facing predictor for physical-space inference.
 
     Wraps :class:`PhysicalSpaceStandaloneModel` with automatic numpy-to-torch
-    conversion, batch dimension handling, and device placement.  Use
-    ``predict()`` for single-step transitions or ``rollout()`` to compose
-    multiple sequential time jumps autoregressively.
+    conversion, batch dimension handling, and device placement for single-step
+    transition prediction.
     """
 
     def __init__(self, model: PhysicalSpaceStandaloneModel, *, device: torch.device) -> None:
@@ -596,50 +595,6 @@ class VulcanPredictor:
         return output
 
     __call__ = predict
-
-    def rollout(
-        self,
-        *,
-        pressure_bar: Any,
-        temperature_k: Any,
-        kzz_cm2_s: Any,
-        anchor_ymix: Any,
-        gravity_cm_s2: Any,
-        metallicity_log10: Any,
-        c_to_o: Any,
-        step_dt_s: Any,
-        extra_global_inputs: dict[str, Any] | None = None,
-    ) -> np.ndarray:
-        """Compose multiple transition jumps sequentially.
-
-        This requires the model output species to equal the model state species.
-        """
-        if self.state_species != self.target_species:
-            raise InferenceError(
-                "rollout requires output_species == state_species so the predicted state is closed under iteration."
-            )
-        steps = np.asarray(step_dt_s, dtype=np.float64).reshape(-1)
-        if steps.size == 0:
-            raise InferenceError("step_dt_s must contain at least one positive step.")
-        if np.any(steps <= 0.0):
-            raise InferenceError("All rollout step_dt_s entries must be strictly positive.")
-
-        state = np.asarray(anchor_ymix, dtype=np.float64)
-        outputs = []
-        for dt in steps:
-            state = self.predict(
-                pressure_bar=pressure_bar,
-                temperature_k=temperature_k,
-                kzz_cm2_s=kzz_cm2_s,
-                anchor_ymix=state,
-                gravity_cm_s2=gravity_cm_s2,
-                metallicity_log10=metallicity_log10,
-                c_to_o=c_to_o,
-                dt_s=float(dt),
-                extra_global_inputs=extra_global_inputs,
-            )
-            outputs.append(np.asarray(state, dtype=np.float64))
-        return np.stack(outputs, axis=0)
 
     def _coerce_profiles(
         self,

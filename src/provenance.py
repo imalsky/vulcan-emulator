@@ -258,12 +258,6 @@ def validate_processed_artifacts(
         )
 
     return {
-        "manifest": manifest,
-        "expected_fingerprint": expected_fingerprint,
         "fingerprint_path": fingerprint_path,
         "normalization_path": normalization_path,
-        "summary_path": summary_path,
-        "raw_run_files": raw_run_files,
-        "split_path": split_path,
-        "split_metadata_paths": split_metadata_paths,
     }
