@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Export the trained physical-space model on CPU and CUDA when available."""
+"""Export the trained physical-space model on CPU and CUDA when available.
+
+The exported ``.pt2`` files are fully standalone: all normalization statistics
+(mean, std, min, max per variable) are baked into the model as registered
+buffers, so the file operates entirely in physical space without needing any
+external metadata files (normalization_metadata.json, data_contract.json, etc.).
+
+Input signature (all physical units):
+    pressure_bar      [batch, nz]              Pressure in bar
+    temperature_k     [batch, nz]              Temperature in Kelvin
+    kzz_cm2_s         [batch, nz]              Eddy diffusion in cm^2/s
+    anchor_ymix       [batch, nz, n_species]   Mixing ratios (dimensionless)
+    gravity_cm_s2     [batch]                  Surface gravity in cm/s^2
+    metallicity_log10 [batch]                  log10(metallicity / solar)
+    c_to_o            [batch]                  Carbon-to-oxygen ratio
+    dt_s              [batch]                  Time step in seconds
+
+Output:
+    predicted_ymix    [batch, nz, n_output]    Predicted mixing ratios (physical)
+"""
 
 from __future__ import annotations
 
@@ -18,7 +37,13 @@ if str(SRC_DIR) not in sys.path:
 import torch
 
 from inference import load_physical_space_model, physical_inputs_from_processed_arrays
-from script_utils import load_split_sample, resolve_processed_root_from_checkpoint, resolve_run_dir
+from script_utils import (
+    load_checkpoint,
+    load_fixed_split_sample,
+    load_json,
+    resolve_processed_root_from_checkpoint,
+    resolve_run_dir,
+)
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 RUN_DIR_OVERRIDE: Path | None = None
@@ -42,9 +67,12 @@ def _example_tensors(
         checkpoint_name=checkpoint_name,
         device=device,
     )
-    seq, glb, _tgt, _dt = load_split_sample(
+    checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=checkpoint_name)
+    seq, glb, _tgt, _dt = load_fixed_split_sample(
         processed_root=processed_root,
         split=TEST_SPLIT,
+        config=checkpoint["config"],
+        normalization_metadata=load_json(processed_root / "normalization_metadata.json"),
         sample_index=sample_index,
     )
     example = physical_inputs_from_processed_arrays(

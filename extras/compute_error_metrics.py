@@ -24,7 +24,7 @@ from script_utils import (
     PROJECT_ROOT,
     build_model_from_checkpoint,
     denormalize,
-    iter_split_shards,
+    iter_fixed_split_batches,
     load_checkpoint,
     load_json,
     load_split_metadata,
@@ -65,25 +65,28 @@ def main() -> None:
     abs_pct_sum = np.zeros(n_species, dtype=np.float64)
     rows = 0
 
-    for seq, glb, tgt, _dt in iter_split_shards(processed_root=processed_root, split=split):
-        shard_samples = int(seq.shape[0])
-        for start in range(0, shard_samples, batch_size):
-            end = min(start + batch_size, shard_samples)
-            seq_batch = torch.from_numpy(seq[start:end]).to(dtype=forward_dtype)
-            glb_batch = torch.from_numpy(glb[start:end]).to(dtype=forward_dtype)
-            tgt_batch = np.asarray(tgt[start:end], dtype=np.float64)
+    for seq, glb, tgt, _dt in iter_fixed_split_batches(
+        processed_root=processed_root,
+        split=split,
+        config=config,
+        normalization_metadata=norm_meta,
+        batch_size=batch_size,
+    ):
+        seq_batch = torch.from_numpy(seq).to(dtype=forward_dtype)
+        glb_batch = torch.from_numpy(glb).to(dtype=forward_dtype)
+        tgt_batch = np.asarray(tgt, dtype=np.float64)
 
-            with torch.inference_mode():
-                pred = model(seq_batch, glb_batch, padding_mask=None)
+        with torch.inference_mode():
+            pred = model(seq_batch, glb_batch, padding_mask=None)
 
-            pred_phys = denormalize(pred.detach().cpu().numpy(), target_stats)
-            tgt_phys = denormalize(tgt_batch, target_stats)
-            diff = pred_phys - tgt_phys
-            abs_sum += np.sum(np.abs(diff), axis=(0, 1))
-            sq_sum += np.sum(diff * diff, axis=(0, 1))
-            denom = np.maximum(np.abs(tgt_phys), 1e-30)
-            abs_pct_sum += np.sum(np.abs(diff) / denom, axis=(0, 1))
-            rows += diff.shape[0] * diff.shape[1]
+        pred_phys = denormalize(pred.detach().cpu().numpy(), target_stats)
+        tgt_phys = denormalize(tgt_batch, target_stats)
+        diff = pred_phys - tgt_phys
+        abs_sum += np.sum(np.abs(diff), axis=(0, 1))
+        sq_sum += np.sum(diff * diff, axis=(0, 1))
+        denom = np.maximum(np.abs(tgt_phys), 1e-30)
+        abs_pct_sum += np.sum(np.abs(diff) / denom, axis=(0, 1))
+        rows += diff.shape[0] * diff.shape[1]
 
     if rows <= 0:
         raise RuntimeError("No samples were evaluated.")

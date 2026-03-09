@@ -29,16 +29,22 @@ except ImportError as exc:
     raise RuntimeError("matplotlib is required for benchmarking plots. Install project dependencies.") from exc
 
 from inference import load_physical_space_model, physical_inputs_from_processed_arrays
-from script_utils import iter_split_shards, load_split_metadata, resolve_processed_root_from_checkpoint, resolve_run_dir
+from script_utils import (
+    count_fixed_split_samples,
+    iter_fixed_split_batches,
+    load_checkpoint,
+    resolve_processed_root_from_checkpoint,
+    resolve_run_dir,
+)
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 RUN_DIR_OVERRIDE: Path | None = None
 TEST_SPLIT = "test"
 CHECKPOINT_NAME = "best.pt"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-WARMUP_ITERS = 25
-BENCHMARK_ITERS = 200
+BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
+WARMUP_ITERS = 5
+BENCHMARK_ITERS = 10
 FIGURES_SUBDIR = "figures"
 PLOT_FILENAME = "benchmark_batch_size_vs_time.png"
 STYLE_PATH = Path(__file__).with_name("science.mplstyle")
@@ -54,13 +60,18 @@ def _synchronize(device: torch.device) -> None:
 def _load_vectorized_batch(
     *,
     processed_root: Path,
+    config: dict,
     batch_size: int,
     normalization_metadata: dict,
     data_contract: dict,
 ) -> dict[str, np.ndarray]:
     """Load one contiguous batch and convert it back to physical inputs."""
-    metadata = load_split_metadata(processed_root=processed_root, split=TEST_SPLIT)
-    total_samples = int(metadata["total_samples"])
+    total_samples = count_fixed_split_samples(
+        processed_root=processed_root,
+        split=TEST_SPLIT,
+        config=config,
+        normalization_metadata=normalization_metadata,
+    )
     if total_samples <= 0:
         raise RuntimeError(f"No samples are available in split '{TEST_SPLIT}'.")
 
@@ -69,10 +80,14 @@ def _load_vectorized_batch(
     glb_parts: list[np.ndarray] = []
     remaining = actual_batch_size
 
-    for seq, glb, _tgt, _dt in iter_split_shards(processed_root=processed_root, split=TEST_SPLIT):
+    for seq, glb, _tgt, _dt in iter_fixed_split_batches(
+        processed_root=processed_root,
+        split=TEST_SPLIT,
+        config=config,
+        normalization_metadata=normalization_metadata,
+        batch_size=actual_batch_size,
+    ):
         take = min(remaining, int(seq.shape[0]))
-        if take <= 0:
-            break
         seq_parts.append(np.asarray(seq[:take], dtype=np.float64))  # shape: (batch, nz, input_dim)
         glb_parts.append(np.asarray(glb[:take], dtype=np.float64))  # shape: (batch, global_dim)
         remaining -= take
@@ -204,14 +219,19 @@ def main() -> None:
     resolved_device = torch.device(DEVICE)
     run_dir, config_path = resolve_run_dir(config_path=CONFIG_PATH, run_dir=RUN_DIR_OVERRIDE)
     processed_root = resolve_processed_root_from_checkpoint(run_dir=run_dir, checkpoint_name=CHECKPOINT_NAME)
+    checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=CHECKPOINT_NAME)
     model, normalization_metadata, data_contract = load_physical_space_model(
         run_dir,
         checkpoint_name=CHECKPOINT_NAME,
         device=resolved_device,
     )
 
-    split_metadata = load_split_metadata(processed_root=processed_root, split=TEST_SPLIT)
-    total_samples = int(split_metadata["total_samples"])
+    total_samples = count_fixed_split_samples(
+        processed_root=processed_root,
+        split=TEST_SPLIT,
+        config=checkpoint["config"],
+        normalization_metadata=normalization_metadata,
+    )
     max_requested_batch_size = max(int(value) for value in BATCH_SIZES)
     max_loaded_batch_size = min(max_requested_batch_size, total_samples)
     if max_loaded_batch_size <= 0:
@@ -219,6 +239,7 @@ def main() -> None:
 
     physical_inputs = _load_vectorized_batch(
         processed_root=processed_root,
+        config=checkpoint["config"],
         batch_size=max_loaded_batch_size,
         normalization_metadata=normalization_metadata,
         data_contract=data_contract,

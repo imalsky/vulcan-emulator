@@ -17,7 +17,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from preprocess import _build_pair_specs, discover_existing_raw_run_files, load_raw_run_file
+from preprocess import _build_trajectory_specs, discover_existing_raw_run_files, load_raw_run_file
 
 
 def _write_raw_run(
@@ -103,7 +103,7 @@ class PreprocessContractsTests(unittest.TestCase):
 
         self.assertEqual(discovered, [direct_run])
 
-    def test_build_pair_specs_skips_runs_without_valid_log_dt_pairs(self) -> None:
+    def test_build_trajectory_specs_skips_runs_without_valid_log_dt_pairs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ve_preprocess_pairs_") as tmpdir_name:
             tmpdir = Path(tmpdir_name)
             species = ["H2", "He", "H2O"]
@@ -131,16 +131,14 @@ class PreprocessContractsTests(unittest.TestCase):
             )
 
             config: dict[str, Any] = {
-                "generation": {"random_seed": 7},
                 "trajectory_sampling": {
-                    "pairs_per_run": 1,
                     "dt_min_s": 10.0,
                     "dt_max_s": 20.0,
                     "min_future_saved_steps": 1,
                 },
             }
 
-            bundles = _build_pair_specs(
+            bundles = _build_trajectory_specs(
                 run_files=[invalid_run_path, valid_run_path],
                 config=config,
                 state_species=species,

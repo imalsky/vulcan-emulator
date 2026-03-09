@@ -18,18 +18,15 @@
     },
     "random_seed": 42,
     "keep_vulcan_outputs_debug": false,
-    "failure_policy": "continue_on_error",
     "run_timeout_seconds": 180,
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",
-    "shard_size": 4096,
     "worker_root": "data/raw/_workers",
     "save_evo_frq": 10,
     "max_trajectory_snapshots": 200
   },
   "trajectory_sampling": {
     "mode": "log_uniform_all_pairs",
-    "pairs_per_run": 100,
     "dt_min_s": 1000000.0,
     "dt_max_s": 10000000000.0,
     "min_future_saved_steps": 1,
@@ -240,7 +237,6 @@
   },
   "training": {
     "device": "cuda",
-    "gpu_preload": false,
     "batch_size": 256,
     "epochs": 50,
     "learning_rate": 0.0003,
@@ -249,15 +245,10 @@
     "weight_decay": 1e-05,
     "gradient_clip": 1.0,
     "use_amp": false,
-    "num_workers": 0,
     "seed": 42,
-    "data_loading": {
-      "mode": "ram",
-      "max_cached_shards": 2,
-      "large_shard_mmap_bytes": 134217728,
-      "ram_safety_fraction": 0.8,
-      "copy_mmap_slices": false,
-      "use_device_prefetch": true
+    "live_sampling": {
+      "train_pairs_per_run_per_epoch": 100,
+      "eval_pairs_per_run": 100
     },
     "model": {
       "d_model": 256,
@@ -269,6 +260,10 @@
       "output_head_divisor": 2,
       "max_sequence_length": 64,
       "conditioning_hidden_dim": 256
+    },
+    "loss": {
+      "lambda_z": 1.0,
+      "lambda_phys": 1.0
     },
     "output_folder": "trained_model"
   }

@@ -75,15 +75,14 @@ class ConfigUtilsTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigValidationError, "Missing required keys in paths"):
                 load_and_validate_config(config_path)
 
-    def test_load_and_validate_config_accepts_continue_on_error_failure_policy(self) -> None:
+    def test_load_and_validate_config_rejects_legacy_failure_policy_key(self) -> None:
         config = deepcopy(_load_base_config())
         config["generation"]["failure_policy"] = "continue_on_error"
         with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
-            loaded = load_and_validate_config(config_path)
-
-        self.assertEqual(loaded["generation"]["failure_policy"], "continue_on_error")
+            with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in generation"):
+                load_and_validate_config(config_path)
 
     def test_shipped_config_has_explicit_flat_data_paths(self) -> None:
         config = load_and_validate_config(BASE_CONFIG_PATH)
@@ -97,6 +96,102 @@ class ConfigUtilsTests(unittest.TestCase):
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in generation"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_requires_live_sampling_section(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["training"].pop("live_sampling")
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Missing required keys in training"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_non_cuda_training_device(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["training"]["device"] = "cpu"
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ConfigValidationError,
+                "training.device must be 'cuda' for live-sampling training",
+            ):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_legacy_trajectory_sampling_key(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["trajectory_sampling"]["pairs_per_run"] = 100
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in trajectory_sampling"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_legacy_generation_shard_size_key(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["generation"]["shard_size"] = 4096
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in generation"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_single_snapshot_cap(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["generation"]["max_trajectory_snapshots"] = 1
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ConfigValidationError,
+                "max_trajectory_snapshots must be 0 or >= 2",
+            ):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_non_log_standard_anchor_normalization(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["normalization"]["sequence_methods"]["anchor_ymix"] = "standard"
+        config["normalization"]["target_method"] = "standard"
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ConfigValidationError,
+                "anchor_ymix must be 'log-standard'",
+            ):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_non_log_standard_target_normalization(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["normalization"]["target_method"] = "none"
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ConfigValidationError,
+                "target_method must be 'log-standard'",
+            ):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_dropout_above_one(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["training"]["model"]["dropout"] = 1.5
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "training.model.dropout must be in \\[0, 1\\]"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_legacy_training_loader_keys(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["training"]["gpu_preload"] = False
+        config["training"]["num_workers"] = 0
+        config["training"]["data_loading"] = {"mode": "ram"}
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in training"):
                 load_and_validate_config(config_path)
 
 

@@ -22,6 +22,7 @@ from config_utils import ConfigValidationError, load_and_validate_config
 from provenance import (
     PROCESSED_FINGERPRINT_FILENAME,
     build_processed_fingerprint,
+    stable_config_sha256,
     validate_processed_artifacts,
 )
 from trainer import TrainingError, _cast_optimizer_state, validate_processed_split_contract
@@ -96,15 +97,19 @@ class ContractTests(unittest.TestCase):
 
             split_meta = {
                 "split": "train",
-                "total_samples": 1,
-                "num_shards": 1,
+                "num_runs": 1,
+                "max_steps": 2,
+                "total_valid_candidates": 1,
                 "sequence_length": 2,
                 "input_dim": 5,
                 "global_dim": 4,
+                "global_static_dim": 3,
+                "dt_feature_index": 3,
                 "target_dim": 2,
                 "state_dim": 2,
                 "sequence_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s", "anchor_ymix:H2", "anchor_ymix:He"],
                 "global_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"],
+                "global_static_feature_order": ["gravity_cm_s2", "metallicity_log10", "c_to_o"],
                 "state_species_order": ["H2", "He"],
                 "output_species_order": ["H2", "He"],
                 "output_from_state_indices": [0, 1],
@@ -176,10 +181,16 @@ class ContractTests(unittest.TestCase):
             "sequence_length": 16,
             "input_dim": 3 + state_dim,
             "global_dim": len(global_feature_order),
+            "global_static_dim": len(global_feature_order) - 1,
+            "dt_feature_index": global_feature_order.index("log10_dt_s"),
             "target_dim": target_dim,
             "state_dim": state_dim,
+            "num_runs": 2,
+            "max_steps": 8,
+            "total_valid_candidates": 6,
             "sequence_feature_order": expected_sequence_order,
             "global_feature_order": global_feature_order,
+            "global_static_feature_order": [name for name in global_feature_order if name != "log10_dt_s"],
             "state_species_order": state_species,
             "output_species_order": output_species,
             "output_from_state_indices": list(range(target_dim)),
@@ -197,6 +208,25 @@ class ContractTests(unittest.TestCase):
                 test_meta=metadata,
                 expected_norm_fingerprint="a" * 64,
             )
+
+    def test_live_sampling_budgets_do_not_change_processed_config_fingerprint(self) -> None:
+        config = _load_base_config()
+        baseline = stable_config_sha256(config)
+        config["training"]["live_sampling"]["train_pairs_per_run_per_epoch"] += 7
+        config["training"]["live_sampling"]["eval_pairs_per_run"] += 3
+        self.assertEqual(stable_config_sha256(config), baseline)
+
+    def test_dt_bounds_do_change_processed_config_fingerprint(self) -> None:
+        config = _load_base_config()
+        baseline = stable_config_sha256(config)
+        config["trajectory_sampling"]["dt_max_s"] = float(config["trajectory_sampling"]["dt_max_s"]) * 2.0
+        self.assertNotEqual(stable_config_sha256(config), baseline)
+
+    def test_rollout_eval_points_do_not_change_processed_config_fingerprint(self) -> None:
+        config = _load_base_config()
+        baseline = stable_config_sha256(config)
+        config["trajectory_sampling"]["rollout_eval_points"] += 1
+        self.assertEqual(stable_config_sha256(config), baseline)
 
     def test_optimizer_state_cast_helper_applies_requested_dtype(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))

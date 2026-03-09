@@ -29,7 +29,7 @@ except ImportError as exc:
 from script_utils import (
     build_model_from_checkpoint,
     denormalize,
-    iter_split_shards,
+    iter_fixed_split_batches,
     load_checkpoint,
     load_json,
     load_split_metadata,
@@ -74,21 +74,25 @@ def main() -> None:
 
     abs_sum = np.zeros(len(species), dtype=np.float64)
     total_rows = 0
-    for seq, glb, tgt, _dt in iter_split_shards(processed_root=processed_root, split=TEST_SPLIT):
-        shard_samples = int(seq.shape[0])
-        for start in range(0, shard_samples, BATCH_SIZE):
-            end = min(start + BATCH_SIZE, shard_samples)
-            seq_batch = torch.from_numpy(seq[start:end]).to(dtype=forward_dtype)
-            glb_batch = torch.from_numpy(glb[start:end]).to(dtype=forward_dtype)
-            tgt_batch = np.asarray(tgt[start:end], dtype=np.float64)
+    normalization_metadata = load_json(processed_root / "normalization_metadata.json")
+    for seq, glb, tgt, _dt in iter_fixed_split_batches(
+        processed_root=processed_root,
+        split=TEST_SPLIT,
+        config=checkpoint["config"],
+        normalization_metadata=normalization_metadata,
+        batch_size=BATCH_SIZE,
+    ):
+        seq_batch = torch.from_numpy(seq).to(dtype=forward_dtype)
+        glb_batch = torch.from_numpy(glb).to(dtype=forward_dtype)
+        tgt_batch = np.asarray(tgt, dtype=np.float64)
 
-            with torch.inference_mode():
-                pred = model(seq_batch, glb_batch, padding_mask=None)
+        with torch.inference_mode():
+            pred = model(seq_batch, glb_batch, padding_mask=None)
 
-            pred_phys = denormalize(pred.detach().cpu().numpy(), target_stats)
-            tgt_phys = denormalize(tgt_batch, target_stats)
-            abs_sum += np.sum(np.abs(pred_phys - tgt_phys), axis=(0, 1))
-            total_rows += int(pred_phys.shape[0] * pred_phys.shape[1])
+        pred_phys = denormalize(pred.detach().cpu().numpy(), target_stats)
+        tgt_phys = denormalize(tgt_batch, target_stats)
+        abs_sum += np.sum(np.abs(pred_phys - tgt_phys), axis=(0, 1))
+        total_rows += int(pred_phys.shape[0] * pred_phys.shape[1])
 
     if total_rows <= 0:
         raise RuntimeError("No samples were evaluated.")

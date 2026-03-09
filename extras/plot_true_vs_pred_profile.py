@@ -27,9 +27,11 @@ except ImportError as exc:
 
 from inference import VulcanPredictor, load_physical_space_model, physical_inputs_from_processed_arrays
 from script_utils import (
+    count_fixed_split_samples,
     denormalize,
-    load_split_sample,
-    load_split_metadata,
+    load_checkpoint,
+    load_fixed_split_sample,
+    load_json,
     resolve_processed_root_from_checkpoint,
     resolve_run_dir,
 )
@@ -49,10 +51,19 @@ STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 plt.style.use(str(STYLE_PATH))
 
 
-def _choose_sample_index(*, processed_root: Path) -> int:
+def _choose_sample_index(
+    *,
+    processed_root: Path,
+    config: dict,
+    normalization_metadata: dict,
+) -> int:
     """Select one sample index uniformly from the test split."""
-    metadata = load_split_metadata(processed_root=processed_root, split=TEST_SPLIT)
-    total_samples = int(metadata["total_samples"])
+    total_samples = count_fixed_split_samples(
+        processed_root=processed_root,
+        split=TEST_SPLIT,
+        config=config,
+        normalization_metadata=normalization_metadata,
+    )
     if total_samples <= 0:
         raise RuntimeError(f"No samples are available in split '{TEST_SPLIT}'.")
     rng = np.random.default_rng(RANDOM_SEED)
@@ -66,13 +77,21 @@ def main() -> None:
 
     run_dir, config_path = resolve_run_dir(config_path=CONFIG_PATH, run_dir=RUN_DIR_OVERRIDE)
     processed_root = resolve_processed_root_from_checkpoint(run_dir=run_dir, checkpoint_name=CHECKPOINT_NAME)
-    sample_index = _choose_sample_index(processed_root=processed_root)
+    checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=CHECKPOINT_NAME)
+    normalization_metadata = load_json(processed_root / "normalization_metadata.json")
+    sample_index = _choose_sample_index(
+        processed_root=processed_root,
+        config=checkpoint["config"],
+        normalization_metadata=normalization_metadata,
+    )
     figures_dir = run_dir / FIGURES_SUBDIR
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    seq, glb, tgt, dt_s = load_split_sample(
+    seq, glb, tgt, dt_s = load_fixed_split_sample(
         processed_root=processed_root,
         split=TEST_SPLIT,
+        config=checkpoint["config"],
+        normalization_metadata=normalization_metadata,
         sample_index=sample_index,
     )
     wrapper, normalization_metadata, data_contract = load_physical_space_model(
