@@ -17,7 +17,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from preprocess import _build_trajectory_specs, discover_existing_raw_run_files, load_raw_run_file
+from preprocess import PreprocessError, _build_trajectory_specs, discover_existing_raw_run_files, load_raw_run_file
 
 
 def _write_raw_run(
@@ -29,20 +29,30 @@ def _write_raw_run(
     time_s: np.ndarray,
     ymix_state: np.ndarray,
     ymix_output: np.ndarray,
+    pressure: np.ndarray | None = None,
+    kzz: np.ndarray | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     str_dtype = h5py.string_dtype(encoding="utf-8")
     nz = int(ymix_state.shape[1])
-    pressure = np.logspace(1.0, -1.0, nz, dtype=np.float64)
+    pressure_values = (
+        np.asarray(pressure, dtype=np.float64)
+        if pressure is not None
+        else np.logspace(1.0, -1.0, nz, dtype=np.float64)
+    )
     temperature = np.full((nz,), 1000.0, dtype=np.float64)
-    kzz = np.full((nz,), 1.0e9, dtype=np.float64)
+    kzz_values = (
+        np.asarray(kzz, dtype=np.float64)
+        if kzz is not None
+        else np.full((nz,), 1.0e9, dtype=np.float64)
+    )
 
     with h5py.File(path, "w") as handle:
         handle.attrs["run_id"] = int(run_id)
         inputs = handle.create_group("inputs")
-        inputs.create_dataset("pressure_bar", data=pressure)
+        inputs.create_dataset("pressure_bar", data=pressure_values)
         inputs.create_dataset("temperature_k", data=temperature)
-        inputs.create_dataset("kzz_cm2_s", data=kzz)
+        inputs.create_dataset("kzz_cm2_s", data=kzz_values)
         inputs.create_dataset("state_species", data=np.asarray(state_species, dtype=str_dtype))
         inputs.create_dataset("output_species", data=np.asarray(output_species, dtype=str_dtype))
 
@@ -102,6 +112,52 @@ class PreprocessContractsTests(unittest.TestCase):
             discovered = discover_existing_raw_run_files(raw_root)
 
         self.assertEqual(discovered, [direct_run])
+
+    def test_load_raw_run_file_rejects_nonpositive_pressure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ve_preprocess_pressure_") as tmpdir_name:
+            run_path = Path(tmpdir_name) / "run_000123.h5"
+            species = ["H2", "He"]
+            ymix = np.full((3, 2, 2), 0.5, dtype=np.float64)
+            _write_raw_run(
+                run_path,
+                run_id=123,
+                state_species=species,
+                output_species=species,
+                time_s=np.array([0.0, 10.0, 20.0], dtype=np.float64),
+                ymix_state=ymix,
+                ymix_output=ymix,
+                pressure=np.array([1.0, 0.0], dtype=np.float64),
+            )
+
+            with self.assertRaisesRegex(PreprocessError, "pressure_bar must be strictly positive"):
+                load_raw_run_file(
+                    run_path,
+                    state_species=species,
+                    output_species=species,
+                )
+
+    def test_load_raw_run_file_rejects_nonpositive_kzz(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ve_preprocess_kzz_") as tmpdir_name:
+            run_path = Path(tmpdir_name) / "run_000123.h5"
+            species = ["H2", "He"]
+            ymix = np.full((3, 2, 2), 0.5, dtype=np.float64)
+            _write_raw_run(
+                run_path,
+                run_id=123,
+                state_species=species,
+                output_species=species,
+                time_s=np.array([0.0, 10.0, 20.0], dtype=np.float64),
+                ymix_state=ymix,
+                ymix_output=ymix,
+                kzz=np.array([1.0e9, -1.0], dtype=np.float64),
+            )
+
+            with self.assertRaisesRegex(PreprocessError, "kzz_cm2_s must be strictly positive"):
+                load_raw_run_file(
+                    run_path,
+                    state_species=species,
+                    output_species=species,
+                )
 
     def test_build_trajectory_specs_skips_runs_without_valid_log_dt_pairs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ve_preprocess_pairs_") as tmpdir_name:
