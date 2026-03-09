@@ -128,6 +128,15 @@ class ConfigUtilsTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in trajectory_sampling"):
                 load_and_validate_config(config_path)
 
+    def test_load_and_validate_config_rejects_legacy_rollout_eval_points_key(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["trajectory_sampling"]["rollout_eval_points"] = 8
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in trajectory_sampling"):
+                load_and_validate_config(config_path)
+
     def test_load_and_validate_config_rejects_legacy_generation_shard_size_key(self) -> None:
         config = deepcopy(_load_base_config())
         config["generation"]["shard_size"] = 4096
@@ -181,6 +190,33 @@ class ConfigUtilsTests(unittest.TestCase):
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaisesRegex(ConfigValidationError, "training.model.dropout must be in \\[0, 1\\]"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_requires_training_loss(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["training"].pop("loss")
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Missing required keys in training"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_negative_loss_weight(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["training"]["loss"]["lambda_phys"] = -1.0
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "training.loss.lambda_phys must be >= 0"):
+                load_and_validate_config(config_path)
+
+    def test_load_and_validate_config_rejects_unexpected_training_model_keys(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["training"]["model"]["legacy_width"] = 123
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in training.model"):
                 load_and_validate_config(config_path)
 
     def test_load_and_validate_config_rejects_legacy_training_loader_keys(self) -> None:

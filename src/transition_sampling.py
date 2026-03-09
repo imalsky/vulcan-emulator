@@ -4,7 +4,7 @@ The VULCAN solver saves states at irregular times. For the current emulator
 regime, every valid ordered pair of saved snapshots is a candidate transition
 example, subject to a configurable actual-dt range.
 
-This supports the intended operator:
+This supports the intended single-step operator:
 
 - input: current atmospheric state + conditioning inputs + dt
 - output: future atmospheric state after that dt
@@ -93,38 +93,3 @@ def build_candidate_pairs(
         anchor_time_s=anchor_time_s,
         target_time_s=target_time_s,
     )
-
-def build_rollout_indices(*, times_s: np.ndarray, max_points: int) -> np.ndarray:
-    """Build a deterministic log-spaced rollout path through a saved trajectory."""
-    times = _validate_times(times_s)
-    if max_points < 2:
-        raise TransitionSamplingError("max_points must be >= 2 for rollout evaluation.")
-    if times.size <= max_points:
-        return np.arange(times.size, dtype=np.int64)
-
-    positive_times = times[1:]
-    if np.any(positive_times <= 0.0):
-        raise TransitionSamplingError("Saved times beyond t=0 must be strictly positive.")
-
-    target_times = np.logspace(
-        np.log10(float(positive_times[0])),
-        np.log10(float(positive_times[-1])),
-        int(max_points - 1),
-        dtype=np.float64,
-    )
-    sampled = np.searchsorted(times, target_times, side="left")
-    sampled = np.clip(sampled, 1, times.size - 1)
-    indices = np.unique(np.concatenate([np.array([0], dtype=np.int64), sampled.astype(np.int64)]))
-    if indices[-1] != times.size - 1:
-        indices = np.append(indices, times.size - 1)
-    if indices.size > max_points:
-        interior = indices[1:-1]
-        keep = np.linspace(0, max(interior.size - 1, 0), max_points - 2, dtype=np.int64)
-        indices = np.concatenate(
-            [
-                np.array([indices[0]], dtype=np.int64),
-                interior[keep] if interior.size > 0 else np.array([], dtype=np.int64),
-                np.array([indices[-1]], dtype=np.int64),
-            ]
-        )
-    return indices.astype(np.int64, copy=False)

@@ -14,7 +14,7 @@ The core workflow is:
 2. split runs into train/val/test with no run leakage,
 3. normalize and persist full trajectories,
 4. train with live transition-pair sampling on GPU,
-5. evaluate single-step and optional rollout behavior,
+5. evaluate single-step behavior,
 6. export or inspect trained runs with local utility scripts.
 
 This is not a steady-state regressor, not a photochemical emulator, and not a
@@ -82,9 +82,6 @@ Rules:
 - the actual dt must lie in `[dt_min_s, dt_max_s]`
 - `min_future_saved_steps` becomes the minimum index gap between anchor and target
 - trajectories with no valid candidates are skipped during `--gen`
-
-`trajectory_sampling.rollout_eval_points` affects rollout evaluation only. It
-does not affect processed tensors or their provenance.
 
 ## 5. Split And Leakage Contract
 
@@ -283,6 +280,7 @@ Training is CUDA-only.
 - `seed`
 - `live_sampling`
 - `model`
+- `loss`
 - `output_folder`
 
 `training.live_sampling` requires:
@@ -290,12 +288,17 @@ Training is CUDA-only.
 - `train_pairs_per_run_per_epoch`
 - `eval_pairs_per_run`
 
+`training.loss` requires:
+
+- `lambda_z`
+- `lambda_phys`
+
 Optimizer and loss behavior remain unchanged:
 
 - optimizer: AdamW with explicit bias/norm no-decay grouping
 - schedule: linear warmup then cosine decay to `min_lr`
 - gradient clipping: global norm clip
-- checkpointing: `best.pt` and `last.pt`
+- checkpointing: `best.pt` (lowest validation combined loss) and `last.pt`
 
 The current shipped model hyperparameters are:
 
@@ -323,11 +326,8 @@ Reported metrics remain:
 Final dt-bin summaries are built from the actual dt values present in the fixed
 eval pair tables, not from the full split candidate range.
 
-Rollout evaluation remains raw-trajectory based and is allowed only when:
-
-- `output_species == state_species`
-
-Otherwise rollout metrics are skipped.
+Future work may reintroduce multi-step rollout evaluation or autoregressive
+utilities, but the current contract intentionally excludes them.
 
 ## 12. Generation And Reuse Rules
 
@@ -348,7 +348,6 @@ Changing only:
 
 - `training.live_sampling.train_pairs_per_run_per_epoch`
 - `training.live_sampling.eval_pairs_per_run`
-- `trajectory_sampling.rollout_eval_points`
 
 does not require rerunning `--gen`.
 
@@ -376,7 +375,6 @@ Processed provenance explicitly excludes:
 
 - live train pair budget
 - live eval pair budget
-- rollout evaluation point count
 
 Those settings change training/evaluation behavior, not processed tensors.
 
@@ -433,8 +431,9 @@ Core inference remains in `src/inference.py`:
 - `PhysicalSpaceStandaloneModel`
 - `VulcanPredictor`
 
-These still operate on physical-space inputs and outputs. Checkpoint format,
-inference artifacts, and the transformer architecture remain unchanged.
+These operate on physical-space inputs and outputs for single-step transitions.
+Checkpoint format, inference artifacts, and the transformer architecture remain
+unchanged.
 
 Local scripts under `extras/` now build deterministic fixed eval pairs from the
 processed trajectory splits instead of reading pair shards directly.
