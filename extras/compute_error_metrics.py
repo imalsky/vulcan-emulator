@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
 import os
@@ -13,12 +12,15 @@ from pathlib import Path
 import numpy as np
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-TESTING_DIR = Path(__file__).resolve().parent
-if str(TESTING_DIR) not in sys.path:
-    sys.path.insert(0, str(TESTING_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 import torch
 
-from common import (
+from script_utils import (
     PROJECT_ROOT,
     build_model_from_checkpoint,
     denormalize,
@@ -28,33 +30,25 @@ from common import (
     load_split_metadata,
 )
 
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compute per-species error metrics.")
-    parser.add_argument("--run-dir", type=Path, default=Path("models/trained_model"))
-    parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--checkpoint", type=str, default="best.pt")
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--out-dir", type=Path, default=Path("testing/results"))
-    return parser.parse_args()
+FIGURES_SUBDIR = "figures"
 
 
 def main() -> None:
-    args = _parse_args()
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be > 0.")
+    run_dir = (PROJECT_ROOT / "models" / "trained_model").resolve()
+    split = "test"
+    checkpoint_name = "best.pt"
+    batch_size = 256
 
-    run_dir = (PROJECT_ROOT / args.run_dir).resolve()
-    out_dir = (PROJECT_ROOT / args.out_dir).resolve()
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0.")
+
+    out_dir = (run_dir / FIGURES_SUBDIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=args.checkpoint)
+    checkpoint = load_checkpoint(run_dir=run_dir, checkpoint_name=checkpoint_name)
     config = checkpoint["config"]
-    processed_root_cfg = str(
-        config["paths"].get("processed_root", str(Path(config["paths"]["data_root"]) / "processed"))
-    )
-    processed_root = (PROJECT_ROOT / processed_root_cfg).resolve()
-    split_meta = load_split_metadata(processed_root=processed_root, split=args.split)
+    processed_root = (PROJECT_ROOT / str(config["paths"]["processed_root"])).resolve()
+    split_meta = load_split_metadata(processed_root=processed_root, split=split)
     model, forward_dtype = build_model_from_checkpoint(
         checkpoint=checkpoint,
         split_metadata=split_meta,
@@ -71,10 +65,10 @@ def main() -> None:
     abs_pct_sum = np.zeros(n_species, dtype=np.float64)
     rows = 0
 
-    for seq, glb, tgt, _dt in iter_split_shards(processed_root=processed_root, split=args.split):
+    for seq, glb, tgt, _dt in iter_split_shards(processed_root=processed_root, split=split):
         shard_samples = int(seq.shape[0])
-        for start in range(0, shard_samples, args.batch_size):
-            end = min(start + args.batch_size, shard_samples)
+        for start in range(0, shard_samples, batch_size):
+            end = min(start + batch_size, shard_samples)
             seq_batch = torch.from_numpy(seq[start:end]).to(dtype=forward_dtype)
             glb_batch = torch.from_numpy(glb[start:end]).to(dtype=forward_dtype)
             tgt_batch = np.asarray(tgt[start:end], dtype=np.float64)
@@ -107,8 +101,8 @@ def main() -> None:
         )
 
     summary = {
-        "split": args.split,
-        "checkpoint": args.checkpoint,
+        "split": split,
+        "checkpoint": checkpoint_name,
         "samples": rows,
         "species_count": n_species,
         "overall_mae": float(abs_sum.sum() / total_elements),

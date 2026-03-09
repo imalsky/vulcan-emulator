@@ -7,7 +7,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import h5py
@@ -100,11 +99,11 @@ class PreprocessContractsTests(unittest.TestCase):
             direct_run.write_bytes(b"")
             nested_legacy_run.write_bytes(b"")
 
-            discovered = discover_existing_raw_run_files(SimpleNamespace(raw_root=raw_root))
+            discovered = discover_existing_raw_run_files(raw_root)
 
         self.assertEqual(discovered, [direct_run])
 
-    def test_build_pair_specs_skips_runs_without_valid_fixed_dt_pairs(self) -> None:
+    def test_build_pair_specs_skips_runs_without_valid_log_dt_pairs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ve_preprocess_pairs_") as tmpdir_name:
             tmpdir = Path(tmpdir_name)
             species = ["H2", "He", "H2O"]
@@ -135,11 +134,9 @@ class PreprocessContractsTests(unittest.TestCase):
                 "generation": {"random_seed": 7},
                 "trajectory_sampling": {
                     "pairs_per_run": 1,
-                    "fixed_requested_dt_s": 10.0,
-                    "post_equilibrium_time_min_s": 0.0,
-                    "post_equilibrium_min_fraction_of_final_time": 0.0,
+                    "dt_min_s": 10.0,
+                    "dt_max_s": 20.0,
                     "min_future_saved_steps": 1,
-                    "max_target_relative_dt_error": 0.0,
                 },
             }
 

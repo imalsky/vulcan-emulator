@@ -20,7 +20,7 @@ if str(SRC_DIR) not in sys.path:
 
 from config_utils import ConfigValidationError, load_and_validate_config, resolve_precision
 
-BASE_CONFIG_PATH = PROJECT_ROOT / "config" / "tiny_train_smoke.json"
+BASE_CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 
 
 def _load_base_config() -> dict[str, Any]:
@@ -31,7 +31,7 @@ def _load_base_config() -> dict[str, Any]:
 class ConfigUtilsTests(unittest.TestCase):
     """Unit tests for config parsing and precision policy validation."""
 
-    def test_shipped_smoke_config_loads_and_resolves_precision(self) -> None:
+    def test_shipped_config_loads_and_resolves_precision(self) -> None:
         config = load_and_validate_config(BASE_CONFIG_PATH)
         precision = resolve_precision(config)
         self.assertEqual(precision.input_dtype, torch.float32)
@@ -45,6 +45,7 @@ class ConfigUtilsTests(unittest.TestCase):
 
     def test_resolve_precision_rejects_amp_when_device_is_not_cuda(self) -> None:
         config = deepcopy(_load_base_config())
+        config["training"]["device"] = "cpu"
         config["training"]["use_amp"] = True
         config["precision"]["amp_autocast_dtype"] = "float16"
         with self.assertRaisesRegex(
@@ -65,6 +66,15 @@ class ConfigUtilsTests(unittest.TestCase):
             ):
                 load_and_validate_config(config_path)
 
+    def test_load_and_validate_config_requires_explicit_processed_root(self) -> None:
+        config = deepcopy(_load_base_config())
+        config["paths"].pop("processed_root")
+        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
+            config_path = Path(tmpdir_name) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigValidationError, "Missing required keys in paths"):
+                load_and_validate_config(config_path)
+
     def test_load_and_validate_config_accepts_continue_on_error_failure_policy(self) -> None:
         config = deepcopy(_load_base_config())
         config["generation"]["failure_policy"] = "continue_on_error"
@@ -75,23 +85,18 @@ class ConfigUtilsTests(unittest.TestCase):
 
         self.assertEqual(loaded["generation"]["failure_policy"], "continue_on_error")
 
-    def test_load_and_validate_config_allows_generation_without_runs_root(self) -> None:
-        config = deepcopy(_load_base_config())
-        config["generation"].pop("runs_root", None)
-        with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
-            config_path = Path(tmpdir_name) / "config.json"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
-            loaded = load_and_validate_config(config_path)
+    def test_shipped_config_has_explicit_flat_data_paths(self) -> None:
+        config = load_and_validate_config(BASE_CONFIG_PATH)
+        self.assertEqual(config["paths"]["raw_root"], "data/raw")
+        self.assertEqual(config["paths"]["processed_root"], "data/processed")
 
-        self.assertNotIn("runs_root", loaded["generation"])
-
-    def test_load_and_validate_config_rejects_deprecated_runs_root(self) -> None:
+    def test_load_and_validate_config_rejects_unexpected_generation_keys(self) -> None:
         config = deepcopy(_load_base_config())
         config["generation"]["runs_root"] = "data/raw/runs"
         with tempfile.TemporaryDirectory(prefix="ve_cfg_unit_") as tmpdir_name:
             config_path = Path(tmpdir_name) / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(ConfigValidationError, "generation.runs_root is no longer supported"):
+            with self.assertRaisesRegex(ConfigValidationError, "Unexpected keys in generation"):
                 load_and_validate_config(config_path)
 
 

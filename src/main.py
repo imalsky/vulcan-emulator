@@ -121,7 +121,7 @@ def main() -> int:
             json.dump(config, handle, indent=2)
 
         if args.gen:
-            existing_raw_run_files = discover_existing_raw_run_files(paths)
+            existing_raw_run_files = discover_existing_raw_run_files(paths.raw_root)
             boundary_conditions = None
             if existing_raw_run_files:
                 logger.info(

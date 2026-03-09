@@ -4,8 +4,8 @@ Architecture: Transformer Encoder + FiLM (Feature-wise Linear Modulation).
 
 Data flow::
 
-    Sequence inputs [batch, nz, 3+state_dim]   Global inputs [batch, 4]
-            |                                    (g, [M/H], C/O, log10_dt)
+    Sequence inputs [batch, nz, 3+state_dim]   Global inputs [batch, num_globals]
+            |                                    (gravity, abundances, dt, toggles, ...)
       Profile projection (P,T,Kzz -> d_model)         |
       + State projection (ymix -> d_model)       MLP -> d_model
             |                                          |
@@ -105,25 +105,27 @@ class FiLMLayer(nn.Module):
 class ConditioningProjector(nn.Module):
     """Project global conditioning scalars into one dense conditioning vector.
 
-    All four global inputs (gravity, metallicity, C/O, log10_dt) are processed
-    through a single two-layer MLP, then refined through a residual MLP with
-    LayerNorm.  The output is a ``[batch, d_model]`` conditioning vector
-    consumed by FiLM layers throughout the transformer stack.
+    All configured global inputs are processed through a single two-layer MLP,
+    then refined through a residual MLP with LayerNorm.  The output is a
+    ``[batch, d_model]`` conditioning vector consumed by FiLM layers
+    throughout the transformer stack.
 
-    The time dimension (log10_dt) is already pre-transformed to log10 space
-    by the normalization pipeline, so no additional Fourier expansion is needed;
-    the MLP can learn to respond to the normalized scalar directly.
+    ``log10_dt`` is already pre-transformed to log10 space by the normalization
+    pipeline, so no additional Fourier expansion is needed; the MLP can learn
+    to respond to the normalized scalar directly.
 
     Args:
         d_model: Output conditioning dimension.
         hidden_dim: Hidden size for the projection MLP.
-        num_globals: Number of global conditioning inputs (default 4).
+        num_globals: Number of global conditioning inputs.
     """
 
-    def __init__(self, *, d_model: int, hidden_dim: int, num_globals: int = 4) -> None:
+    def __init__(self, *, d_model: int, hidden_dim: int, num_globals: int) -> None:
         super().__init__()
         if hidden_dim <= 0:
             raise ValueError("hidden_dim must be > 0.")
+        if num_globals <= 0:
+            raise ValueError("num_globals must be > 0.")
         self.num_globals = num_globals
         self.global_mlp = nn.Sequential(
             nn.Linear(num_globals, hidden_dim),
@@ -188,6 +190,7 @@ class VulcanTransitionTransformer(nn.Module):
         output_head_divisor: ``d_model // divisor`` sets the output MLP hidden size.
         max_sequence_length: Maximum number of pressure levels for positional encoding.
         conditioning_hidden_dim: Hidden dimension for the conditioning projector.
+        num_globals: Number of global conditioning inputs.
     """
 
     def __init__(
@@ -205,6 +208,7 @@ class VulcanTransitionTransformer(nn.Module):
         output_head_divisor: int,
         max_sequence_length: int,
         conditioning_hidden_dim: int,
+        num_globals: int = 4,
     ) -> None:
         super().__init__()
         if state_dim <= 0 or output_dim <= 0:
@@ -234,6 +238,7 @@ class VulcanTransitionTransformer(nn.Module):
         self.conditioner = ConditioningProjector(
             d_model=d_model,
             hidden_dim=conditioning_hidden_dim,
+            num_globals=num_globals,
         )
         self.initial_film = FiLMLayer(d_model, d_model, clamp=film_clamp)
         self.encoder_layers = nn.ModuleList(
@@ -303,7 +308,7 @@ class VulcanTransitionTransformer(nn.Module):
         x = self.input_norm(x)
         x = self.posenc(x)
 
-        # Build the global conditioning vector from [gravity, metallicity, C/O, log10_dt].
+        # Build the conditioning vector from the normalized global input features.
         condition = self.conditioner(conditioning_inputs)
 
         # Apply initial FiLM modulation before the encoder stack.

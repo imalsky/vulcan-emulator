@@ -1,7 +1,7 @@
 {
   "paths": {
     "project_root": ".",
-    "vulcan_source_path": "../VULCAN",
+    "vulcan_source_path": "../VULCAN-master",
     "data_root": "data",
     "raw_root": "data/raw",
     "processed_root": "data/processed",
@@ -9,7 +9,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 500,
+    "num_runs": 5000,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
@@ -19,45 +19,41 @@
     "random_seed": 42,
     "keep_vulcan_outputs_debug": false,
     "failure_policy": "continue_on_error",
-    "run_timeout_seconds": 120,
+    "run_timeout_seconds": 180,
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",
-    "shard_size": 256,
+    "shard_size": 4096,
     "worker_root": "data/raw/_workers",
     "save_evo_frq": 10,
-    "max_trajectory_snapshots": 0
+    "max_trajectory_snapshots": 200
   },
   "trajectory_sampling": {
-    "mode": "fixed_dt_post_equilibrium",
-    "pairs_per_run": 64,
-    "fixed_requested_dt_s": 1000000000000.0,
-    "post_equilibrium_time_min_s": 1000000000000.0,
-    "post_equilibrium_min_fraction_of_final_time": 0.0,
-    "anchor_sampling": "uniform_valid_anchors",
-    "target_selection": "nearest_saved_snapshot",
+    "mode": "log_uniform_all_pairs",
+    "pairs_per_run": 100,
+    "dt_min_s": 1000000.0,
+    "dt_max_s": 10000000000.0,
     "min_future_saved_steps": 1,
-    "max_target_relative_dt_error": 0.5,
     "rollout_eval_points": 8
   },
   "vulcan_runtime": {
-    "runtime": 1e+16,
+    "runtime": 1e+13,
     "dt_min": 1e-14,
     "dt_max": 1000000000000.0,
     "count_max": 30000,
-    "trun_min": 1e+13,
+    "trun_min": 1e+11,
     "count_min": 120,
     "ini_mix": "EQ",
     "atm_base": "H2"
   },
   "tp_sampler": {
     "pressure_grid": {
-      "nz": 12,
+      "nz": 50,
       "p_top_bar": 1e-08,
       "p_bottom_bar": 1000.0
     },
     "temperature_limits_k": {
-      "min": 100.0,
-      "max": 4000.0
+      "min": 500.0,
+      "max": 2500.0
     },
     "max_sampling_attempts": 32,
     "adiabatic_gradient": 0.286,
@@ -110,14 +106,14 @@
   "gravity_sampler": {
     "distribution": "uniform",
     "min_cm_s2": 500.0,
-    "max_cm_s2": 5000.0
+    "max_cm_s2": 20000.0
   },
   "kzz_sampler": {
     "mode": "power_law_profile",
-    "log10_kzz_at_1bar_min": 8.0,
-    "log10_kzz_at_1bar_max": 10.0,
-    "beta_min": 0.4,
-    "beta_max": 0.6,
+    "log10_kzz_at_1bar_min": 7.0,
+    "log10_kzz_at_1bar_max": 11.0,
+    "beta_min": 0.3,
+    "beta_max": 0.7,
     "kzz_floor_cm2_s": 10000000.0,
     "kzz_cap_cm2_s": 1000000000000.0,
     "pressure_unit_for_profile": "bar"
@@ -125,7 +121,7 @@
   "abundance_sampler": {
     "metallicity_mode": "log10_scale",
     "log10_metallicity_min": -0.5,
-    "log10_metallicity_max": 1.0,
+    "log10_metallicity_max": 2.0,
     "c_to_o_min": 0.3,
     "c_to_o_max": 1.2,
     "solar_abundances": {
@@ -139,15 +135,15 @@
     "use_photochemistry": false,
     "use_ion_chemistry": false,
     "use_eddy_diffusion": true,
-    "use_molecular_diffusion": false,
+    "use_molecular_diffusion": true,
     "use_upwind_molecular_diffusion": false,
     "use_boundary_conditions": false,
     "use_condensation": false,
     "use_settling": false,
-    "use_initial_cold_trap": false,
-    "use_sat_surface_h2o": false,
+    "use_initial_cold_trap": true,
+    "use_sat_surface_h2o": true,
     "use_lowT_limit_rates": false,
-    "use_adaptive_rtol": false
+    "use_adaptive_rtol": true
   },
   "data_spec": {
     "state_species": [
@@ -179,7 +175,22 @@
       "gravity_cm_s2",
       "metallicity_log10",
       "c_to_o",
-      "log10_dt_s"
+      "log10_dt_s",
+      "use_eddy_diffusion",
+      "use_molecular_diffusion",
+      "use_upwind_molecular_diffusion",
+      "use_boundary_conditions",
+      "use_condensation",
+      "use_settling",
+      "use_initial_cold_trap",
+      "use_sat_surface_h2o",
+      "use_lowT_limit_rates",
+      "use_adaptive_rtol",
+      "atm_base_H2",
+      "atm_base_N2",
+      "atm_base_O2",
+      "atm_base_CO2",
+      "atm_base_H2O"
     ],
     "required_state_inputs": [
       "anchor_ymix"
@@ -199,7 +210,22 @@
       "gravity_cm_s2": "log-standard",
       "metallicity_log10": "standard",
       "c_to_o": "standard",
-      "log10_dt_s": "standard"
+      "log10_dt_s": "standard",
+      "use_eddy_diffusion": "none",
+      "use_molecular_diffusion": "none",
+      "use_upwind_molecular_diffusion": "none",
+      "use_boundary_conditions": "none",
+      "use_condensation": "none",
+      "use_settling": "none",
+      "use_initial_cold_trap": "none",
+      "use_sat_surface_h2o": "none",
+      "use_lowT_limit_rates": "none",
+      "use_adaptive_rtol": "none",
+      "atm_base_H2": "none",
+      "atm_base_N2": "none",
+      "atm_base_O2": "none",
+      "atm_base_CO2": "none",
+      "atm_base_H2O": "none"
     },
     "target_method": "log-standard"
   },
@@ -214,11 +240,11 @@
   },
   "training": {
     "device": "cuda",
-    "gpu_preload": true,
-    "batch_size": 32,
+    "gpu_preload": false,
+    "batch_size": 256,
     "epochs": 50,
-    "learning_rate": 0.0005,
-    "min_lr": 1e-05,
+    "learning_rate": 0.0003,
+    "min_lr": 1e-06,
     "warmup_epochs": 5,
     "weight_decay": 1e-05,
     "gradient_clip": 1.0,
@@ -234,15 +260,15 @@
       "use_device_prefetch": true
     },
     "model": {
-      "d_model": 128,
+      "d_model": 256,
       "nhead": 8,
-      "num_layers": 4,
-      "dim_feedforward": 384,
+      "num_layers": 6,
+      "dim_feedforward": 768,
       "dropout": 0.0,
       "film_clamp": 10.0,
       "output_head_divisor": 2,
       "max_sequence_length": 64,
-      "conditioning_hidden_dim": 128
+      "conditioning_hidden_dim": 256
     },
     "output_folder": "trained_model"
   }

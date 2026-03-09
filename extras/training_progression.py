@@ -3,18 +3,20 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import os
 import sys
 import tempfile
 from pathlib import Path
 
-TESTING_DIR = Path(__file__).resolve().parent
-if str(TESTING_DIR) not in sys.path:
-    sys.path.insert(0, str(TESTING_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-from common import PROJECT_ROOT
+from script_utils import PROJECT_ROOT
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "vulcan_emulator_mpl"))
 os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "vulcan_emulator_cache"))
@@ -24,14 +26,12 @@ try:
 except ImportError as exc:
     raise RuntimeError("matplotlib is required for plotting. Install project dependencies.") from exc
 
+RUN_DIR = PROJECT_ROOT / "models" / "trained_model"
+FIGURES_SUBDIR = "figures"
+FILENAME = "training_progression.png"
+STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 
-def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for training-curve plotting."""
-    parser = argparse.ArgumentParser(description="Plot training progression.")
-    parser.add_argument("--run-dir", type=Path, default=Path("models/trained_model"))
-    parser.add_argument("--out-dir", type=Path, default=Path("testing/figures"))
-    parser.add_argument("--filename", type=str, default="training_progression.png")
-    return parser.parse_args()
+plt.style.use(str(STYLE_PATH))
 
 
 def _load_log(path: Path) -> tuple[list[int], list[float], list[float], list[float], list[float]]:
@@ -58,10 +58,9 @@ def _load_log(path: Path) -> tuple[list[int], list[float], list[float], list[flo
 
 def main() -> None:
     """Render training and learning-rate curves from one run directory."""
-    args = _parse_args()
-    run_dir = (PROJECT_ROOT / args.run_dir).resolve()
-    out_dir = (PROJECT_ROOT / args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = RUN_DIR.resolve()
+    figures_dir = run_dir / FIGURES_SUBDIR
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = run_dir / "training_log.csv"
     if not log_path.is_file():
@@ -69,7 +68,7 @@ def main() -> None:
 
     epochs, train_mse, val_mse, val_mae, lrs = _load_log(log_path)
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
 
     axes[0].plot(epochs, train_mse, label="train_mse", linewidth=2.0)
     axes[0].plot(epochs, val_mse, label="val_mse", linewidth=2.0)
@@ -87,12 +86,15 @@ def main() -> None:
     axes[1].grid(alpha=0.3)
     axes[1].legend()
 
-    output_path = out_dir / args.filename
+    output_path = figures_dir / FILENAME
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-    print(f"Saved training progression figure: {output_path}")
+    print("Training progression plot")
+    print(f"  Run dir : {run_dir}")
+    print(f"  Log     : {log_path}")
+    print(f"  Output  : {output_path}")
 
 
 if __name__ == "__main__":

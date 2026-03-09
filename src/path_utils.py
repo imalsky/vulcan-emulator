@@ -128,17 +128,12 @@ def resolve_paths(config: dict[str, Any]) -> ProjectPaths:
         root, _ensure_relative(str(paths_cfg["logs_root"]), "paths.logs_root")
     )
 
-    raw_root_cfg = str(paths_cfg.get("raw_root", ""))
-    processed_root_cfg = str(paths_cfg.get("processed_root", ""))
-    raw_root = (
-        _join_project_path(root, _ensure_relative(raw_root_cfg, "paths.raw_root"))
-        if raw_root_cfg
-        else data_root / "raw"
+    raw_root = _join_project_path(
+        root, _ensure_relative(str(paths_cfg["raw_root"]), "paths.raw_root")
     )
-    processed_root = (
-        _join_project_path(root, _ensure_relative(processed_root_cfg, "paths.processed_root"))
-        if processed_root_cfg
-        else data_root / "processed"
+    processed_root = _join_project_path(
+        root,
+        _ensure_relative(str(paths_cfg["processed_root"]), "paths.processed_root"),
     )
 
     return ProjectPaths(

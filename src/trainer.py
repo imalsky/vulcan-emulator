@@ -38,7 +38,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from config_utils import PrecisionConfig
+from config_utils import PrecisionConfig, resolve_conditioning_inputs
 from data_loader import DataLoadingConfig, DevicePrefetchLoader, build_training_loader
 from inference import PhysicalSpaceStandaloneModel, VulcanPredictor
 from model import VulcanTransitionTransformer
@@ -460,7 +460,7 @@ def validate_processed_split_contract(
         "kzz_cm2_s",
         *[f"anchor_ymix:{species_name}" for species_name in expected_state_species],
     ]
-    expected_global_order = ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"]
+    expected_global_order = list(config["data_spec"]["required_global_inputs"])
     expected_output_from_state = [expected_state_species.index(species) for species in expected_output_species]
 
     if train_meta["sequence_feature_order"] != expected_sequence_order:
@@ -546,28 +546,18 @@ def _load_split_assignments(split_path: Path) -> dict[str, list[int]]:
 def _rollout_eval_indices(
     *,
     times_s: np.ndarray,
-    fixed_requested_dt_s: float,
-    post_equilibrium_time_min_s: float,
-    post_equilibrium_min_fraction_of_final_time: float,
-    min_future_saved_steps: int,
-    max_target_relative_dt_error: float,
     rollout_eval_points: int,
 ) -> np.ndarray:
-    """Build a deterministic fixed-dt rollout path on one saved trajectory."""
+    """Build a deterministic rollout path on one saved trajectory."""
     if rollout_eval_points < 2:
         raise TrainingError("Rollout evaluation requires at least two checkpoint points.")
     try:
         return build_rollout_indices(
             times_s=times_s,
-            fixed_requested_dt_s=fixed_requested_dt_s,
-            post_equilibrium_time_min_s=post_equilibrium_time_min_s,
-            post_equilibrium_min_fraction_of_final_time=post_equilibrium_min_fraction_of_final_time,
-            min_future_saved_steps=min_future_saved_steps,
-            max_target_relative_dt_error=max_target_relative_dt_error,
             max_points=rollout_eval_points,
         )
     except TransitionSamplingError as exc:
-        raise TrainingError(f"Failed to construct fixed-dt rollout path: {exc}") from exc
+        raise TrainingError(f"Failed to construct rollout path: {exc}") from exc
 
 
 def _compute_rollout_metrics(
@@ -578,11 +568,7 @@ def _compute_rollout_metrics(
     raw_run_files: list[Path],
     split_path: Path,
     rollout_eval_points: int,
-    fixed_requested_dt_s: float,
-    post_equilibrium_time_min_s: float,
-    post_equilibrium_min_fraction_of_final_time: float,
-    min_future_saved_steps: int,
-    max_target_relative_dt_error: float,
+    config: dict[str, Any],
     device: torch.device,
     forward_dtype: torch.dtype,
 ) -> dict[str, Any]:
@@ -623,14 +609,14 @@ def _compute_rollout_metrics(
             state_species=state_species,
             output_species=output_species,
         )
+        static_globals = resolve_conditioning_inputs(
+            raw_global_inputs=raw.global_inputs,
+            config=config,
+            required_global_inputs=list(data_contract["global_feature_order"]),
+        )
         try:
             eval_indices = _rollout_eval_indices(
                 times_s=raw.time_s,
-                fixed_requested_dt_s=fixed_requested_dt_s,
-                post_equilibrium_time_min_s=post_equilibrium_time_min_s,
-                post_equilibrium_min_fraction_of_final_time=post_equilibrium_min_fraction_of_final_time,
-                min_future_saved_steps=min_future_saved_steps,
-                max_target_relative_dt_error=max_target_relative_dt_error,
                 rollout_eval_points=rollout_eval_points,
             )
         except TrainingError:
@@ -648,10 +634,15 @@ def _compute_rollout_metrics(
                 temperature_k=raw.temperature_k,
                 kzz_cm2_s=raw.kzz_cm2_s,
                 anchor_ymix=current_state,
-                gravity_cm_s2=raw.gravity_cm_s2,
-                metallicity_log10=raw.metallicity_log10,
-                c_to_o=raw.c_to_o,
+                gravity_cm_s2=static_globals["gravity_cm_s2"],
+                metallicity_log10=static_globals["metallicity_log10"],
+                c_to_o=static_globals["c_to_o"],
                 dt_s=dt_s,
+                extra_global_inputs={
+                    key: value
+                    for key, value in static_globals.items()
+                    if key not in {"gravity_cm_s2", "metallicity_log10", "c_to_o"}
+                },
             )
             target = np.asarray(raw.ymix_output[next_index_int], dtype=np.float64)
             diff = np.asarray(prediction, dtype=np.float64) - target
@@ -774,6 +765,7 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
         output_head_divisor=int(model_cfg["output_head_divisor"]),
         max_sequence_length=int(model_cfg["max_sequence_length"]),
         conditioning_hidden_dim=int(model_cfg["conditioning_hidden_dim"]),
+        num_globals=int(train_meta["global_dim"]),
     ).to(device=device, dtype=precision.model_dtype)
 
     optimizer = _build_optimizer(
@@ -994,13 +986,7 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
         raw_run_files=artifact_info["raw_run_files"],
         split_path=artifact_info["split_path"],
         rollout_eval_points=int(config["trajectory_sampling"]["rollout_eval_points"]),
-        fixed_requested_dt_s=float(config["trajectory_sampling"]["fixed_requested_dt_s"]),
-        post_equilibrium_time_min_s=float(config["trajectory_sampling"]["post_equilibrium_time_min_s"]),
-        post_equilibrium_min_fraction_of_final_time=float(
-            config["trajectory_sampling"]["post_equilibrium_min_fraction_of_final_time"]
-        ),
-        min_future_saved_steps=int(config["trajectory_sampling"]["min_future_saved_steps"]),
-        max_target_relative_dt_error=float(config["trajectory_sampling"]["max_target_relative_dt_error"]),
+        config=config,
         device=device,
         forward_dtype=precision.forward_dtype,
     )

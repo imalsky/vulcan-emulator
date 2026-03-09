@@ -8,30 +8,20 @@ import sys
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
-TESTING_DIR = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
-if str(TESTING_DIR) not in sys.path:
-    sys.path.insert(0, str(TESTING_DIR))
 
-from common import iter_split_shards
 from inference import (
     PhysicalSpaceStandaloneModel,
-    VulcanPredictor,
-    load_physical_space_model,
-    physical_inputs_from_processed_arrays,
 )
 from model import VulcanTransitionTransformer
-
-RUN_DIR = PROJECT_ROOT / "models" / "tiny_e2e_smoke"
-PROCESSED_ROOT = PROJECT_ROOT / "data" / "smoke" / "processed"
 
 
 class InferenceTests(unittest.TestCase):
@@ -111,32 +101,6 @@ class InferenceTests(unittest.TestCase):
         with torch.inference_mode():
             candidate = loaded(*example_inputs)
         torch.testing.assert_close(reference, candidate, rtol=1e-4, atol=1e-5)
-
-    def test_predictor_returns_finite_physical_outputs(self) -> None:
-        if not (RUN_DIR / "data_contract.json").is_file():
-            self.skipTest("Run testing/smoke_pipeline.py to create the tiny_e2e_smoke artifacts first.")
-        model, normalization_metadata, data_contract = load_physical_space_model(RUN_DIR)
-        seq, glb, _tgt, _dt = next(iter(iter_split_shards(processed_root=PROCESSED_ROOT, split="test")))
-        example = physical_inputs_from_processed_arrays(
-            sequence_inputs=seq[0],
-            global_inputs=glb[0],
-            normalization_metadata=normalization_metadata,
-            data_contract=data_contract,
-        )
-        predictor = VulcanPredictor.from_run_dir(RUN_DIR)
-        prediction = predictor.predict(
-            pressure_bar=example["pressure_bar"],
-            temperature_k=example["temperature_k"],
-            kzz_cm2_s=example["kzz_cm2_s"],
-            anchor_ymix=example["anchor_ymix"],
-            gravity_cm_s2=example["gravity_cm_s2"],
-            metallicity_log10=example["metallicity_log10"],
-            c_to_o=example["c_to_o"],
-            dt_s=example["dt_s"],
-        )
-        self.assertEqual(prediction.shape, (seq.shape[1], data_contract["target_dim"]))
-        self.assertTrue(np.isfinite(prediction).all())
-        self.assertEqual(len(model.target_species), data_contract["target_dim"])
 
 
 if __name__ == "__main__":

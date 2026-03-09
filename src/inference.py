@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from config_utils import static_conditioning_defaults
 from model import VulcanTransitionTransformer
 
 _TORCH_DTYPES: dict[str, torch.dtype] = {
@@ -140,6 +141,7 @@ class PhysicalSpaceStandaloneModel(nn.Module):
         model: VulcanTransitionTransformer,
         normalization_metadata: dict[str, Any],
         data_contract: dict[str, Any],
+        default_global_inputs: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -148,6 +150,12 @@ class PhysicalSpaceStandaloneModel(nn.Module):
         self.target_dim = int(data_contract["target_dim"])
         self.state_species = list(data_contract["state_species_order"])
         self.target_species = list(data_contract["output_species_order"])
+        self.global_feature_order = list(data_contract["global_feature_order"])
+        self.default_global_inputs = {
+            str(key): float(value)
+            for key, value in dict(default_global_inputs or {}).items()
+            if key in self.global_feature_order and key != "log10_dt_s"
+        }
 
         epsilon = float(normalization_metadata["epsilon"])
         self.register_buffer("epsilon", torch.tensor(epsilon, dtype=torch.float32), persistent=False)
@@ -156,20 +164,22 @@ class PhysicalSpaceStandaloneModel(nn.Module):
         self.temperature_method = str(normalization_metadata["sequence"]["temperature_k"]["method"])
         self.kzz_method = str(normalization_metadata["sequence"]["kzz_cm2_s"]["method"])
         self.anchor_method = str(normalization_metadata["sequence"]["anchor_ymix"]["method"])
-        self.gravity_method = str(normalization_metadata["globals"]["gravity_cm_s2"]["method"])
-        self.metallicity_method = str(normalization_metadata["globals"]["metallicity_log10"]["method"])
-        self.c_to_o_method = str(normalization_metadata["globals"]["c_to_o"]["method"])
-        self.dt_method = str(normalization_metadata["globals"]["log10_dt_s"]["method"])
+        self.global_methods = {
+            name: str(normalization_metadata["globals"][name]["method"])
+            for name in self.global_feature_order
+        }
         self.target_method = str(normalization_metadata["targets"]["ymix"]["method"])
 
         self._register_stat_block("pressure", normalization_metadata["sequence"]["pressure_bar"], size=1)
         self._register_stat_block("temperature", normalization_metadata["sequence"]["temperature_k"], size=1)
         self._register_stat_block("kzz", normalization_metadata["sequence"]["kzz_cm2_s"], size=1)
         self._register_stat_block("anchor", normalization_metadata["sequence"]["anchor_ymix"], size=self.state_dim)
-        self._register_stat_block("gravity", normalization_metadata["globals"]["gravity_cm_s2"], size=1)
-        self._register_stat_block("metallicity", normalization_metadata["globals"]["metallicity_log10"], size=1)
-        self._register_stat_block("c_to_o", normalization_metadata["globals"]["c_to_o"], size=1)
-        self._register_stat_block("dt", normalization_metadata["globals"]["log10_dt_s"], size=1)
+        for name in self.global_feature_order:
+            self._register_stat_block(
+                self._global_prefix(name),
+                normalization_metadata["globals"][name],
+                size=1,
+            )
         self._register_stat_block("target", normalization_metadata["targets"]["ymix"], size=self.target_dim)
 
     def _register_stats_buffer(self, name: str, values: Any) -> None:
@@ -186,6 +196,29 @@ class PhysicalSpaceStandaloneModel(nn.Module):
         for field_name, default_values in defaults.items():
             self._register_stats_buffer(f"{prefix}_{field_name}", stats.get(field_name, default_values))
 
+    def _global_prefix(self, name: str) -> str:
+        return f"global_{name}"
+
+    def _coerce_global_tensor(
+        self,
+        value: Tensor | float,
+        *,
+        name: str,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        tensor = value if torch.is_tensor(value) else torch.as_tensor(value, dtype=dtype, device=device)
+        tensor = tensor.to(dtype=dtype, device=device)
+        if tensor.ndim == 0:
+            tensor = tensor.expand(batch_size)
+        if tensor.ndim != 1 or int(tensor.shape[0]) != batch_size:
+            raise ValueError(f"{name} must have shape [batch].")
+        return tensor
+
+    def _global_stat_tensor(self, name: str, field_name: str, *, dtype: torch.dtype, device: torch.device) -> Tensor:
+        return getattr(self, f"{self._global_prefix(name)}_{field_name}").to(dtype=dtype, device=device)
+
     def forward(
         self,
         pressure_bar: Tensor,
@@ -196,6 +229,7 @@ class PhysicalSpaceStandaloneModel(nn.Module):
         metallicity_log10: Tensor,
         c_to_o: Tensor,
         dt_s: Tensor,
+        extra_global_inputs: dict[str, Tensor | float] | None = None,
     ) -> Tensor:
         if pressure_bar.ndim != 2 or temperature_k.ndim != 2 or kzz_cm2_s.ndim != 2:
             raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must have shape [batch, nz].")
@@ -267,52 +301,53 @@ class PhysicalSpaceStandaloneModel(nn.Module):
             upper=self.anchor_max.to(dtype=dtype, device=device),
         )
 
-        gravity_norm = _normalize_with_stats(
-            gravity_cm_s2,
-            method=self.gravity_method,
-            epsilon=epsilon,
-            mean=self.gravity_mean.to(dtype=dtype, device=device),
-            std=self.gravity_std.to(dtype=dtype, device=device),
-            lower=self.gravity_min.to(dtype=dtype, device=device),
-            upper=self.gravity_max.to(dtype=dtype, device=device),
-        )
-        metallicity_norm = _normalize_with_stats(
-            metallicity_log10,
-            method=self.metallicity_method,
-            epsilon=epsilon,
-            mean=self.metallicity_mean.to(dtype=dtype, device=device),
-            std=self.metallicity_std.to(dtype=dtype, device=device),
-            lower=self.metallicity_min.to(dtype=dtype, device=device),
-            upper=self.metallicity_max.to(dtype=dtype, device=device),
-        )
-        c_to_o_norm = _normalize_with_stats(
-            c_to_o,
-            method=self.c_to_o_method,
-            epsilon=epsilon,
-            mean=self.c_to_o_mean.to(dtype=dtype, device=device),
-            std=self.c_to_o_std.to(dtype=dtype, device=device),
-            lower=self.c_to_o_min.to(dtype=dtype, device=device),
-            upper=self.c_to_o_max.to(dtype=dtype, device=device),
-        )
+        provided_globals: dict[str, Tensor | float] = {
+            "gravity_cm_s2": gravity_cm_s2,
+            "metallicity_log10": metallicity_log10,
+            "c_to_o": c_to_o,
+        }
+        if extra_global_inputs is not None:
+            provided_globals.update(extra_global_inputs)
+
+        normalized_globals: list[Tensor] = []
         log10_dt_s = torch.log10(dt_s)
-        dt_norm = _normalize_with_stats(
-            log10_dt_s,
-            method=self.dt_method,
-            epsilon=epsilon,
-            mean=self.dt_mean.to(dtype=dtype, device=device),
-            std=self.dt_std.to(dtype=dtype, device=device),
-            lower=self.dt_min.to(dtype=dtype, device=device),
-            upper=self.dt_max.to(dtype=dtype, device=device),
-        )
+        for name in self.global_feature_order:
+            if name == "log10_dt_s":
+                values = self._coerce_global_tensor(
+                    log10_dt_s,
+                    name="dt_s",
+                    batch_size=batch_size,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                source = provided_globals.get(name, self.default_global_inputs.get(name))
+                if source is None:
+                    raise ValueError(f"Missing required global conditioning input '{name}'.")
+                values = self._coerce_global_tensor(
+                    source,
+                    name=name,
+                    batch_size=batch_size,
+                    dtype=dtype,
+                    device=device,
+                )
+            normalized_globals.append(
+                _normalize_with_stats(
+                    values,
+                    method=self.global_methods[name],
+                    epsilon=epsilon,
+                    mean=self._global_stat_tensor(name, "mean", dtype=dtype, device=device),
+                    std=self._global_stat_tensor(name, "std", dtype=dtype, device=device),
+                    lower=self._global_stat_tensor(name, "min", dtype=dtype, device=device),
+                    upper=self._global_stat_tensor(name, "max", dtype=dtype, device=device),
+                )
+            )
 
         sequence_inputs = torch.cat(
             [pressure_norm.unsqueeze(-1), temperature_norm.unsqueeze(-1), kzz_norm.unsqueeze(-1), anchor_norm],
             dim=-1,
         )
-        conditioning_inputs = torch.stack(
-            [gravity_norm, metallicity_norm, c_to_o_norm, dt_norm],
-            dim=-1,
-        )
+        conditioning_inputs = torch.stack(normalized_globals, dim=-1)
         normalized_prediction = self.model(sequence_inputs, conditioning_inputs, padding_mask=None)
         return _denormalize_with_stats(
             normalized_prediction,
@@ -359,6 +394,7 @@ def load_physical_space_model(
         output_head_divisor=int(model_cfg["output_head_divisor"]),
         max_sequence_length=int(model_cfg["max_sequence_length"]),
         conditioning_hidden_dim=int(model_cfg["conditioning_hidden_dim"]),
+        num_globals=int(data_contract["global_dim"]),
     ).to(device=device, dtype=_torch_dtype_from_name(str(precision_cfg["model_dtype"])))
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -367,6 +403,7 @@ def load_physical_space_model(
         model=model,
         normalization_metadata=normalization_metadata,
         data_contract=data_contract,
+        default_global_inputs=static_conditioning_defaults(config),
     ).to(device=device, dtype=_torch_dtype_from_name(str(precision_cfg["forward_dtype"])))
     wrapper.eval()
     return wrapper, normalization_metadata, data_contract
@@ -410,47 +447,58 @@ def physical_inputs_from_processed_arrays(
         "kzz_cm2_s",
         *[f"anchor_ymix:{species_name}" for species_name in state_species],
     ]
-    expected_global_order = ["gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s"]
     if list(data_contract["sequence_feature_order"]) != expected_sequence_order:
         raise InferenceError("data_contract sequence_feature_order is incompatible with transition inference.")
-    if list(data_contract["global_feature_order"]) != expected_global_order:
-        raise InferenceError("data_contract global_feature_order is incompatible with transition inference.")
 
     pressure = _denormalize_numpy(seq[..., 0], normalization_metadata["sequence"]["pressure_bar"])
     temperature = _denormalize_numpy(seq[..., 1], normalization_metadata["sequence"]["temperature_k"])
     kzz = _denormalize_numpy(seq[..., 2], normalization_metadata["sequence"]["kzz_cm2_s"])
     anchor_ymix = _denormalize_numpy(seq[..., 3:], normalization_metadata["sequence"]["anchor_ymix"])
-    gravity = _denormalize_numpy(glb[..., 0], normalization_metadata["globals"]["gravity_cm_s2"])
-    metallicity = _denormalize_numpy(glb[..., 1], normalization_metadata["globals"]["metallicity_log10"])
-    c_to_o = _denormalize_numpy(glb[..., 2], normalization_metadata["globals"]["c_to_o"])
-    log10_dt_s = _denormalize_numpy(glb[..., 3], normalization_metadata["globals"]["log10_dt_s"])
+    global_values = {
+        name: _denormalize_numpy(glb[..., idx], normalization_metadata["globals"][name])
+        for idx, name in enumerate(data_contract["global_feature_order"])
+    }
+    log10_dt_s = np.asarray(global_values.pop("log10_dt_s"), dtype=np.float64)
     dt_s = np.power(10.0, log10_dt_s)
+
+    base_globals = {
+        key: np.asarray(global_values.pop(key), dtype=np.float64)
+        for key in ("gravity_cm_s2", "metallicity_log10", "c_to_o")
+    }
 
     result = {
         "pressure_bar": pressure,
         "temperature_k": temperature,
         "kzz_cm2_s": kzz,
         "anchor_ymix": anchor_ymix,
-        "gravity_cm_s2": gravity,
-        "metallicity_log10": metallicity,
-        "c_to_o": c_to_o,
+        "gravity_cm_s2": base_globals["gravity_cm_s2"],
+        "metallicity_log10": base_globals["metallicity_log10"],
+        "c_to_o": base_globals["c_to_o"],
         "dt_s": dt_s,
         "state_species": state_species,
         "output_species": output_species,
     }
+    if global_values:
+        result["extra_global_inputs"] = {key: np.asarray(value, dtype=np.float64) for key, value in global_values.items()}
     if squeeze_batch:
-        return {
+        squeezed = {
             "pressure_bar": pressure[0],
             "temperature_k": temperature[0],
             "kzz_cm2_s": kzz[0],
             "anchor_ymix": anchor_ymix[0],
-            "gravity_cm_s2": gravity[0],
-            "metallicity_log10": metallicity[0],
-            "c_to_o": c_to_o[0],
+            "gravity_cm_s2": base_globals["gravity_cm_s2"][0],
+            "metallicity_log10": base_globals["metallicity_log10"][0],
+            "c_to_o": base_globals["c_to_o"][0],
             "dt_s": dt_s[0],
             "state_species": state_species,
             "output_species": output_species,
         }
+        if global_values:
+            squeezed["extra_global_inputs"] = {
+                key: np.asarray(value, dtype=np.float64)[0]
+                for key, value in global_values.items()
+            }
+        return squeezed
     return result
 
 
@@ -496,6 +544,7 @@ class VulcanPredictor:
         metallicity_log10: Any,
         c_to_o: Any,
         dt_s: Any,
+        extra_global_inputs: dict[str, Any] | None = None,
     ) -> np.ndarray:
         pressure_np, squeeze_batch = self._coerce_profiles(pressure_bar, "pressure_bar")
         temperature_np, _ = self._coerce_profiles(
@@ -519,6 +568,10 @@ class VulcanPredictor:
         dt_np = self._coerce_globals(dt_s, "dt_s", batch_size=pressure_np.shape[0])
         if np.any(dt_np <= 0.0):
             raise InferenceError("dt_s must be strictly positive for log10 conditioning.")
+        extras_np = {
+            name: self._coerce_globals(value, name, batch_size=pressure_np.shape[0])
+            for name, value in dict(extra_global_inputs or {}).items()
+        }
 
         model_dtype = next(self.model.parameters()).dtype
         with torch.inference_mode():
@@ -531,6 +584,10 @@ class VulcanPredictor:
                 torch.as_tensor(metallicity_np, dtype=model_dtype, device=self.device),
                 torch.as_tensor(c_to_o_np, dtype=model_dtype, device=self.device),
                 torch.as_tensor(dt_np, dtype=model_dtype, device=self.device),
+                extra_global_inputs={
+                    name: torch.as_tensor(value, dtype=model_dtype, device=self.device)
+                    for name, value in extras_np.items()
+                } if extras_np else None,
             )
 
         output = prediction.detach().cpu().numpy()
@@ -551,6 +608,7 @@ class VulcanPredictor:
         metallicity_log10: Any,
         c_to_o: Any,
         step_dt_s: Any,
+        extra_global_inputs: dict[str, Any] | None = None,
     ) -> np.ndarray:
         """Compose multiple transition jumps sequentially.
 
@@ -578,6 +636,7 @@ class VulcanPredictor:
                 metallicity_log10=metallicity_log10,
                 c_to_o=c_to_o,
                 dt_s=float(dt),
+                extra_global_inputs=extra_global_inputs,
             )
             outputs.append(np.asarray(state, dtype=np.float64))
         return np.stack(outputs, axis=0)
