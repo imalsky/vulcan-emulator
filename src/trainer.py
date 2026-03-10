@@ -693,6 +693,7 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
 
     history_path = run_dir / "training_log.csv"
     progress_log_path = paths.logs_root / f"training_progress_{training['output_folder']}.log"
+    progress_log_path.parent.mkdir(parents=True, exist_ok=True)
     with history_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(

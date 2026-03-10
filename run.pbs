@@ -53,6 +53,11 @@ export VULCAN_EMULATOR_CONDA_ENV="${CONDA_ENV}"
 CONFIG_PATH="${CONFIG_PATH:-config/config.json}"
 TRAIN_LOG="${TRAIN_LOG:-}"
 BUILD_FASTCHEM_IF_MISSING="${BUILD_FASTCHEM_IF_MISSING:-1}"
+RUN_MODE="${RUN_MODE:-train}"
+HYPERPARAM_TRIALS="${HYPERPARAM_TRIALS:-12}"
+HYPERPARAM_TRIAL_EPOCHS="${HYPERPARAM_TRIAL_EPOCHS:-20}"
+HYPERPARAM_OVERWRITE="${HYPERPARAM_OVERWRITE:-0}"
+export RUN_MODE
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export KMP_DUPLICATE_LIB_OK=TRUE
@@ -74,6 +79,14 @@ if [ ! -f "${CONFIG_PATH}" ]; then
 fi
 if [ ! -f "${PROJECT_ROOT}/src/main.py" ]; then
   echo "ERROR: src/main.py not found under ${PROJECT_ROOT}"
+  exit 1
+fi
+if [ ! -f "${PROJECT_ROOT}/src/hyperparam_testing.py" ]; then
+  echo "ERROR: src/hyperparam_testing.py not found under ${PROJECT_ROOT}"
+  exit 1
+fi
+if [ "${RUN_MODE}" != "train" ] && [ "${RUN_MODE}" != "hyperparam" ]; then
+  echo "ERROR: RUN_MODE must be 'train' or 'hyperparam', got: ${RUN_MODE}"
   exit 1
 fi
 
@@ -99,6 +112,7 @@ print(
     )
 )
 print(str(config["training"]["device"]).lower())
+print(Path(os.path.normpath(str(project_root / config["paths"]["models_root"] / "hyperparam_testing"))))
 PY
 )
 
@@ -107,13 +121,14 @@ VULCAN_SOURCE="${CONFIG_INFO[1]}"
 LOGS_ROOT="${CONFIG_INFO[2]}"
 RUN_DIR="${CONFIG_INFO[3]}"
 TRAIN_DEVICE="${CONFIG_INFO[4]}"
+HYPERPARAM_ROOT="${CONFIG_INFO[5]}"
 export TRAIN_DEVICE
 
 VULCAN_SOURCE="${VULCAN_SOURCE_OVERRIDE}"
 export VULCAN_EMULATOR_VULCAN_SOURCE="${VULCAN_SOURCE}"
 
 if [ -z "${TRAIN_LOG}" ]; then
-  TRAIN_LOG="${LOGS_ROOT}/training_${PBS_JOBID:-manual}.log"
+  TRAIN_LOG="${LOGS_ROOT}/${RUN_MODE}_${PBS_JOBID:-manual}.log"
 fi
 
 mkdir -p "${LOGS_ROOT}" "$(dirname "${TRAIN_LOG}")"
@@ -126,30 +141,35 @@ echo "VULCAN source: ${VULCAN_SOURCE}"
 if [ "${VULCAN_SOURCE}" != "${CONFIG_INFO[1]}" ]; then
   echo "VULCAN source override active (config requested ${CONFIG_INFO[1]})"
 fi
+echo "Run mode: ${RUN_MODE}"
 echo "Training device from config: ${TRAIN_DEVICE}"
 
-for required_path in \
-  "${VULCAN_SOURCE}" \
-  "${VULCAN_SOURCE}/vulcan.py" \
-  "${VULCAN_SOURCE}/vulcan_cfg.py" \
-  "${VULCAN_SOURCE}/chem_funs.py" \
-  "${VULCAN_SOURCE}/fastchem_vulcan"; do
-  if [ ! -e "${required_path}" ]; then
-    echo "ERROR: missing VULCAN runtime path: ${required_path}"
+if [ "${RUN_MODE}" = "train" ]; then
+  for required_path in \
+    "${VULCAN_SOURCE}" \
+    "${VULCAN_SOURCE}/vulcan.py" \
+    "${VULCAN_SOURCE}/vulcan_cfg.py" \
+    "${VULCAN_SOURCE}/chem_funs.py" \
+    "${VULCAN_SOURCE}/fastchem_vulcan"; do
+    if [ ! -e "${required_path}" ]; then
+      echo "ERROR: missing VULCAN runtime path: ${required_path}"
+      exit 1
+    fi
+  done
+  if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ] && [ "${BUILD_FASTCHEM_IF_MISSING}" = "1" ]; then
+    if ! command -v make >/dev/null 2>&1; then
+      echo "ERROR: FastChem binary is missing and 'make' is unavailable to build it."
+      exit 1
+    fi
+    echo "Stage: building FastChem in ${VULCAN_SOURCE}/fastchem_vulcan"
+    make -C "${VULCAN_SOURCE}/fastchem_vulcan"
+  fi
+  if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ]; then
+    echo "ERROR: missing executable FastChem binary: ${VULCAN_SOURCE}/fastchem_vulcan/fastchem"
     exit 1
   fi
-done
-if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ] && [ "${BUILD_FASTCHEM_IF_MISSING}" = "1" ]; then
-  if ! command -v make >/dev/null 2>&1; then
-    echo "ERROR: FastChem binary is missing and 'make' is unavailable to build it."
-    exit 1
-  fi
-  echo "Stage: building FastChem in ${VULCAN_SOURCE}/fastchem_vulcan"
-  make -C "${VULCAN_SOURCE}/fastchem_vulcan"
-fi
-if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ]; then
-  echo "ERROR: missing executable FastChem binary: ${VULCAN_SOURCE}/fastchem_vulcan/fastchem"
-  exit 1
+else
+  echo "Hyperparameter mode skips VULCAN/FastChem preflight."
 fi
 
 if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
@@ -161,6 +181,21 @@ if [ "${TRAIN_DEVICE}" = "cuda" ]; then
   if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
     echo "ERROR: training.device='cuda' but no visible NVIDIA GPU is available."
     exit 1
+  fi
+fi
+
+if [ "${RUN_MODE}" = "hyperparam" ]; then
+  if ! python - <<'PY'
+import optuna
+print(optuna.__version__)
+PY
+  then
+    echo "Stage: installing optuna"
+    python -m pip install --user optuna
+    python - <<'PY'
+import optuna
+print(optuna.__version__)
+PY
   fi
 fi
 
@@ -176,6 +211,8 @@ with config_path.open("r", encoding="utf-8") as handle:
     config = json.load(handle)
 
 required = ["torch", "numpy", "scipy", "h5py", "tqdm", "matplotlib"]
+if os.environ.get("RUN_MODE") == "hyperparam":
+    required.append("optuna")
 
 missing: list[str] = []
 for name in required:
@@ -206,21 +243,42 @@ then
   exit 1
 fi
 
-echo "Execution control:"
-echo "  Comment out either command below if you want to run only one stage."
-echo "  --gen reruns VULCAN generation, drops failed individual VULCAN runs if usable runs remain, and rewrites data/processed."
-echo "  --train reuses existing processed data only if its provenance matches the current config."
-echo "Training log file: ${TRAIN_LOG}"
-: > "${TRAIN_LOG}"
+if [ "${RUN_MODE}" = "train" ]; then
+  echo "Execution control:"
+  echo "  Comment out either command below if you want to run only one stage."
+  echo "  --gen reruns VULCAN generation, drops failed individual VULCAN runs if usable runs remain, and rewrites data/processed."
+  echo "  --train reuses existing processed data only if its provenance matches the current config."
+  echo "Training log file: ${TRAIN_LOG}"
+  : > "${TRAIN_LOG}"
 
-# Comment out this line if you want to skip generation.
-#####python -u src/main.py --gen --config "${CONFIG_PATH}"
+  # Comment out this line if you want to skip generation.
+  #####python -u src/main.py --gen --config "${CONFIG_PATH}"
 
-# Comment out this line if you want to skip training and only generate data.
-# Running this line alone will reuse existing processed data if it still matches the current config.
-python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+  # Comment out this line if you want to skip training and only generate data.
+  # Running this line alone will reuse existing processed data if it still matches the current config.
+  python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+else
+  echo "Hyperparameter search settings:"
+  echo "  trials: ${HYPERPARAM_TRIALS}"
+  echo "  trial epochs: ${HYPERPARAM_TRIAL_EPOCHS}"
+  echo "  overwrite: ${HYPERPARAM_OVERWRITE}"
+  echo "  output root: ${HYPERPARAM_ROOT}"
+
+  HYPERPARAM_ARGS=(
+    --config "${CONFIG_PATH}"
+    --trials "${HYPERPARAM_TRIALS}"
+    --trial-epochs "${HYPERPARAM_TRIAL_EPOCHS}"
+  )
+  if [ "${HYPERPARAM_OVERWRITE}" = "1" ]; then
+    HYPERPARAM_ARGS+=(--overwrite)
+  fi
+  python -u src/hyperparam_testing.py "${HYPERPARAM_ARGS[@]}"
+fi
 
 echo "Completed successfully."
-if [ -f "${RUN_DIR}/best.pt" ]; then
+if [ "${RUN_MODE}" = "train" ] && [ -f "${RUN_DIR}/best.pt" ]; then
   echo "Best checkpoint: ${RUN_DIR}/best.pt"
+fi
+if [ "${RUN_MODE}" = "hyperparam" ] && [ -f "${HYPERPARAM_ROOT}/best_model/best.pt" ]; then
+  echo "Best checkpoint: ${HYPERPARAM_ROOT}/best_model/best.pt"
 fi

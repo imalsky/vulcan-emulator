@@ -345,6 +345,8 @@ utilities, but the current contract intentionally excludes them.
 `generation.max_trajectory_snapshots` must be `0` (no cap) or `>= 2`.
 
 `--train` does not regenerate data. It requires a matching processed fingerprint.
+`src/hyperparam_testing.py` also reuses existing processed artifacts only; it
+never calls generation.
 
 Changing only:
 
@@ -417,6 +419,20 @@ models/
     processed_fingerprint.json
     training_log.csv
     figures/
+  hyperparam_testing/
+    best_config.json
+    best_model/
+      best.pt
+      metrics.json
+      data_contract.json
+      normalization_metadata.json
+      processed_fingerprint.json
+      training_log.csv
+    logs/
+      trial_000.log
+      trial_000_training_log.csv
+      trial_000_summary.json
+      ...
 
 logs/
   runtime_config_<action>_<timestamp>.json
@@ -436,6 +452,12 @@ Core inference remains in `src/inference.py`:
 These operate on physical-space inputs and outputs for single-step transitions.
 Checkpoint format, inference artifacts, and the transformer architecture remain
 unchanged.
+
+Training utilities now also include `src/hyperparam_testing.py`, which runs a
+small Optuna search over training-only hyperparameters while preserving the
+same processed-data and checkpoint contracts as normal training. It keeps one
+promoted winning checkpoint under `models/hyperparam_testing/best_model/` and
+stores per-trial logs/summaries under `models/hyperparam_testing/logs/`.
 
 Local scripts under `extras/` now build deterministic fixed eval pairs from the
 processed trajectory splits instead of reading pair shards directly.
@@ -462,6 +484,7 @@ The goal is fail-fast scientific correctness, not compatibility shims.
 
 - `python src/main.py --gen --config config/config.json`
 - `python src/main.py --train --config config/config.json`
+- `python src/hyperparam_testing.py --config config/config.json --overwrite`
 
 ### Batch / HPC
 
@@ -471,7 +494,16 @@ Environment variables may override path resolution:
 - `VULCAN_EMULATOR_VULCAN_SOURCE`
 - `VULCAN_EMULATOR_CONDA_ENV`
 
-The shipped batch script assumes GPU training.
+The shipped batch script assumes GPU training and supports two modes:
+
+- `RUN_MODE=train` runs the standard `src/main.py --train` path
+- `RUN_MODE=hyperparam` runs `src/hyperparam_testing.py`
+
+Hyperparameter batch runs accept:
+
+- `HYPERPARAM_TRIALS`
+- `HYPERPARAM_TRIAL_EPOCHS`
+- `HYPERPARAM_OVERWRITE`
 
 ## 18. Conventions
 
