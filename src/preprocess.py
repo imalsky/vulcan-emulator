@@ -34,7 +34,13 @@ import numpy as np
 import torch
 
 from config_utils import PrecisionConfig, resolve_conditioning_inputs
-from provenance import PROCESSED_FINGERPRINT_FILENAME, build_processed_fingerprint
+from provenance import (
+    PROCESSED_FINGERPRINT_FILENAME,
+    build_processed_fingerprint,
+    load_json_dict,
+    raw_generation_config_sha256,
+    resolve_manifest_all_raw_run_files,
+)
 from sampling import build_run_specs
 from transition_sampling import CandidatePairs, TransitionSamplingError, build_candidate_pairs
 from vulcan_runner import (
@@ -198,6 +204,39 @@ def _conditioning_feature_order(config: dict[str, Any]) -> list[str]:
     return list(config["data_spec"]["required_global_inputs"])
 
 
+_SUPPORTED_SOURCE_KINDS = frozenset({"analytic", "roth"})
+
+
+def _coerce_source_kind(source_raw: Any, path: Path) -> str:
+    """Decode and validate one raw-run source kind."""
+    if isinstance(source_raw, bytes):
+        source_kind = source_raw.decode("utf-8")
+    else:
+        source_kind = str(source_raw)
+    if source_kind not in _SUPPORTED_SOURCE_KINDS:
+        raise PreprocessError(
+            f"sampler/source_kind must be one of {sorted(_SUPPORTED_SOURCE_KINDS)} in {path}"
+        )
+    return source_kind
+
+
+def _read_raw_source_kind(path: Path) -> str:
+    """Read the mandatory source-kind marker from one raw run file."""
+    with h5py.File(path, "r") as handle:
+        if "sampler" not in handle or "source_kind" not in handle["sampler"]:
+            raise PreprocessError(f"sampler/source_kind is required in {path}")
+        return _coerce_source_kind(handle["sampler"]["source_kind"][()], path)
+
+
+def _count_raw_source_kinds(run_files: list[Path]) -> dict[str, int]:
+    """Count raw runs by source kind from the on-disk raw artifacts."""
+    counts: dict[str, int] = {}
+    for run_file in run_files:
+        source_kind = _read_raw_source_kind(run_file)
+        counts[source_kind] = counts.get(source_kind, 0) + 1
+    return counts
+
+
 def _resolved_run_conditioning_inputs(raw: RawRunData, config: dict[str, Any]) -> dict[str, float]:
     """Resolve the non-time conditioning inputs for one raw run."""
     try:
@@ -318,6 +357,9 @@ def load_raw_run_file(
                 raise PreprocessError(f"globals/{name} must be a scalar dataset in {path}")
             global_inputs[str(name)] = float(value)
         run_id = int(handle.attrs["run_id"])
+        if "sampler" not in handle or "source_kind" not in handle["sampler"]:
+            raise PreprocessError(f"sampler/source_kind is required in {path}")
+        _ = _coerce_source_kind(handle["sampler"]["source_kind"][()], path)
 
     arrays_to_check = [pressure, temperature, kzz, time_s, ymix_state, ymix_output]
     if any(np.any(~np.isfinite(array)) for array in arrays_to_check):
@@ -360,6 +402,84 @@ def load_raw_run_file(
 def discover_existing_raw_run_files(raw_root: Path) -> list[Path]:
     """Return existing raw run files from the flat configured raw layout."""
     return sorted(Path(raw_root).glob("run_*.h5"))
+
+
+def validate_existing_raw_reuse(
+    config: dict[str, Any],
+    paths: Any,
+    *,
+    run_files: list[Path],
+) -> None:
+    """Fail fast when existing raw runs do not match the current raw-generation config."""
+    if not run_files:
+        return
+
+    manifest_path = paths.data_root / str(config["generation"]["manifest_filename"])
+    if not manifest_path.is_file():
+        raise PreprocessError(
+            "Existing raw run files were found, but dataset_manifest.json is missing. "
+            "Delete stale raw runs or regenerate with the current config."
+        )
+
+    manifest = load_json_dict(manifest_path)
+    expected_hash = raw_generation_config_sha256(config)
+    existing_hash = manifest.get("raw_generation_config_sha256")
+    if existing_hash != expected_hash:
+        raise PreprocessError(
+            "Existing raw run files do not match the current raw-generation config "
+            "(analytic/Roth source mix or VULCAN generation controls changed). "
+            "Delete stale raw runs before rerunning --gen."
+        )
+
+    try:
+        manifest_run_files = resolve_manifest_all_raw_run_files(manifest, project_root=paths.root)
+    except RuntimeError as exc:
+        raise PreprocessError(str(exc)) from exc
+
+    expected_paths = sorted(path.resolve() for path in manifest_run_files)
+    actual_paths = sorted(path.resolve() for path in run_files)
+    if actual_paths != expected_paths:
+        expected_set = set(expected_paths)
+        actual_set = set(actual_paths)
+        missing = [str(path) for path in expected_paths if path not in actual_set]
+        unexpected = [str(path) for path in actual_paths if path not in expected_set]
+        details: list[str] = []
+        if missing:
+            details.append(f"missing manifest-listed files: {missing}")
+        if unexpected:
+            details.append(f"unexpected raw files: {unexpected}")
+        suffix = f" ({'; '.join(details)})" if details else ""
+        raise PreprocessError(
+            "Existing raw run files do not match dataset_manifest.json. "
+            "Delete stale raw runs or regenerate with the current config."
+            f"{suffix}"
+        )
+
+    manifest_source_counts = manifest.get("source_counts")
+    if not isinstance(manifest_source_counts, dict) or not manifest_source_counts:
+        raise PreprocessError(
+            "dataset_manifest.json must contain a non-empty 'source_counts' mapping."
+        )
+    expected_source_counts: dict[str, int] = {}
+    for key, value in manifest_source_counts.items():
+        if key not in _SUPPORTED_SOURCE_KINDS:
+            raise PreprocessError(
+                "dataset_manifest.json contains an unsupported source_counts key: "
+                f"{key}."
+            )
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise PreprocessError(
+                "dataset_manifest.json contains an invalid source_counts value for "
+                f"{key}: {value!r}."
+            )
+        expected_source_counts[str(key)] = int(value)
+
+    actual_source_counts = _count_raw_source_kinds(run_files)
+    if actual_source_counts != expected_source_counts:
+        raise PreprocessError(
+            "Existing raw run source counts do not match dataset_manifest.json. "
+            "Delete stale raw runs or regenerate with the current config."
+        )
 
 
 def _split_run_ids(
@@ -785,6 +905,7 @@ def run_generation_and_preprocess(
 
     run_files = discover_existing_raw_run_files(paths.raw_root)
     if run_files:
+        validate_existing_raw_reuse(config, paths, run_files=run_files)
         logger.info(
             "Found %d existing raw run files under %s; skipping VULCAN generation.",
             len(run_files),
@@ -882,12 +1003,17 @@ def run_generation_and_preprocess(
         )
 
     usable_run_files = sorted({bundle.run_file for bundle in all_bundles}, key=str)
+    all_raw_run_files = sorted(set(run_files), key=str)
+    source_counts = _count_raw_source_kinds(all_raw_run_files)
     manifest = {
         "num_runs": len(all_bundles),
         "run_files": [str(path.relative_to(paths.root)) for path in usable_run_files],
+        "all_raw_run_files": [str(path.relative_to(paths.root)) for path in all_raw_run_files],
         "split": split_map,
         "state_species": state_species,
         "output_species": output_species,
+        "source_counts": source_counts,
+        "raw_generation_config_sha256": raw_generation_config_sha256(config),
     }
     manifest_path = paths.data_root / str(generation["manifest_filename"])
     with manifest_path.open("w", encoding="utf-8") as handle:

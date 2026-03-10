@@ -24,6 +24,7 @@ def _write_raw_run(
     path: Path,
     *,
     run_id: int,
+    source_kind: str = "analytic",
     state_species: list[str],
     output_species: list[str],
     time_s: np.ndarray,
@@ -65,6 +66,8 @@ def _write_raw_run(
         trajectory.create_dataset("time_s", data=np.asarray(time_s, dtype=np.float64))
         trajectory.create_dataset("ymix_state", data=np.asarray(ymix_state, dtype=np.float64))
         trajectory.create_dataset("ymix_output", data=np.asarray(ymix_output, dtype=np.float64))
+        sampler = handle.create_group("sampler")
+        sampler.create_dataset("source_kind", data=np.asarray(source_kind, dtype=str_dtype))
 
 
 class PreprocessContractsTests(unittest.TestCase):
@@ -153,6 +156,30 @@ class PreprocessContractsTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(PreprocessError, "kzz_cm2_s must be strictly positive"):
+                load_raw_run_file(
+                    run_path,
+                    state_species=species,
+                    output_species=species,
+                )
+
+    def test_load_raw_run_file_requires_source_kind(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ve_preprocess_source_kind_") as tmpdir_name:
+            run_path = Path(tmpdir_name) / "run_000123.h5"
+            species = ["H2", "He"]
+            ymix = np.full((3, 2, 2), 0.5, dtype=np.float64)
+            _write_raw_run(
+                run_path,
+                run_id=123,
+                state_species=species,
+                output_species=species,
+                time_s=np.array([0.0, 10.0, 20.0], dtype=np.float64),
+                ymix_state=ymix,
+                ymix_output=ymix,
+            )
+            with h5py.File(run_path, "a") as handle:
+                del handle["sampler"]
+
+            with self.assertRaisesRegex(PreprocessError, "sampler/source_kind is required"):
                 load_raw_run_file(
                     run_path,
                     state_species=species,

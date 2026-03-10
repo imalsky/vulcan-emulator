@@ -79,6 +79,7 @@ def _preprocess_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
         "gravity_sampler": config["gravity_sampler"],
         "kzz_sampler": config["kzz_sampler"],
         "abundance_sampler": config["abundance_sampler"],
+        "roth_sampler": config["roth_sampler"],
         "physics_toggles": config["physics_toggles"],
         "boundary_conditions": config.get("boundary_conditions"),
         "data_spec": config["data_spec"],
@@ -86,10 +87,44 @@ def _preprocess_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _raw_generation_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract the config subset that defines raw VULCAN generation content."""
+    generation = config["generation"]
+    relevant_generation = {
+        "num_runs": generation["num_runs"],
+        "random_seed": generation["random_seed"],
+        "save_evo_frq": generation["save_evo_frq"],
+        "max_trajectory_snapshots": generation["max_trajectory_snapshots"],
+    }
+    return {
+        "generation": relevant_generation,
+        "vulcan_runtime": config["vulcan_runtime"],
+        "tp_sampler": config["tp_sampler"],
+        "roth_sampler": config["roth_sampler"],
+        "gravity_sampler": config["gravity_sampler"],
+        "kzz_sampler": config["kzz_sampler"],
+        "abundance_sampler": config["abundance_sampler"],
+        "physics_toggles": config["physics_toggles"],
+        "boundary_conditions": config.get("boundary_conditions"),
+        "data_spec": config["data_spec"],
+    }
+
+
 def stable_config_sha256(config: dict[str, Any]) -> str:
     """Hash the preprocessing-relevant subset of the configuration deterministically."""
     payload = json.dumps(
         _preprocess_relevant_config(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return _sha256_bytes(payload.encode("utf-8"))
+
+
+def raw_generation_config_sha256(config: dict[str, Any]) -> str:
+    """Hash the config subset that determines raw run content and source mix."""
+    payload = json.dumps(
+        _raw_generation_relevant_config(config),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -114,6 +149,39 @@ def resolve_manifest_run_files(manifest: dict[str, Any], project_root: Path) -> 
             path = path.resolve()
         if not path.is_file():
             raise RuntimeError(f"Raw run file listed in dataset_manifest.json is missing: {path}")
+        resolved_paths.append(path)
+    return resolved_paths
+
+
+def resolve_manifest_all_raw_run_files(
+    manifest: dict[str, Any],
+    project_root: Path,
+) -> list[Path]:
+    """Resolve the full raw-run file list when the manifest records it."""
+    all_raw_run_files = manifest.get("all_raw_run_files")
+    if all_raw_run_files is None:
+        raise RuntimeError(
+            "dataset_manifest.json is missing 'all_raw_run_files'. Regenerate raw data "
+            "with the current code before reusing existing raw runs."
+        )
+    if not isinstance(all_raw_run_files, list) or not all_raw_run_files:
+        raise RuntimeError(
+            "dataset_manifest.json must contain a non-empty 'all_raw_run_files' list."
+        )
+
+    resolved_paths: list[Path] = []
+    for item in all_raw_run_files:
+        if not isinstance(item, str) or not item:
+            raise RuntimeError("dataset_manifest.json contains an invalid all_raw_run_files entry.")
+        path = Path(item)
+        if not path.is_absolute():
+            path = (project_root / path).resolve()
+        else:
+            path = path.resolve()
+        if not path.is_file():
+            raise RuntimeError(
+                f"Raw run file listed in dataset_manifest.json is missing: {path}"
+            )
         resolved_paths.append(path)
     return resolved_paths
 

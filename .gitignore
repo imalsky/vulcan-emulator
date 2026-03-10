@@ -62,6 +62,7 @@ logs/
 *.h5
 *.npy
 *.npz
+roth/roth-grid/
 
 # Log files
 *.log

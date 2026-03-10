@@ -741,10 +741,15 @@ def _write_run_hdf5(run_path: Path, run_spec: RunSpec, payload: dict[str, Any]) 
         trajectory.create_dataset("ymix_output", data=payload["ymix_output"])
 
         sampler = handle.create_group("sampler")
+        sampler.create_dataset("source_kind", data=np.asarray(run_spec.source_tag, dtype=str_dtype))
+        if run_spec.source_file is not None:
+            sampler.create_dataset("source_file", data=np.asarray(run_spec.source_file, dtype=str_dtype))
         for key, value in run_spec.tp_params.items():
             sampler.create_dataset(f"tp_{key}", data=np.float64(value))
         for key, value in run_spec.kzz_params.items():
             sampler.create_dataset(f"kzz_{key}", data=np.float64(value))
+        for key, value in run_spec.source_metadata.items():
+            sampler.create_dataset(key, data=np.float64(value))
 
 
 def _run_single(spec: RunSpec, settings: WorkerSettings) -> RunResult:

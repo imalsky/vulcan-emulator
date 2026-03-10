@@ -28,6 +28,27 @@ Notes:
 - `failure_policy` is no longer a valid config key; `--gen` always drops failed VULCAN runs when any usable runs survive
 - `max_trajectory_snapshots` must be `0` or `>= 2`; `0` means no cap
 
+## `roth_sampler`
+
+This section adds Roth GCM PT columns as an additive TP source during `--gen`.
+
+Required keys:
+
+- `enabled`
+- `num_profiles`
+- `data_glob`
+- `source_globals_mode`
+- `filters`
+- `column_filters`
+- `interpolation`
+
+Notes:
+
+- `source_globals_mode` must currently be `"pt_only"`
+- `filters` are allow-lists, not ranges
+- deleting one value from a filter list excludes that Roth subset
+- `roth/roth-grid/` is local data and is git-ignored
+
 ## `training.live_sampling`
 
 This section controls live pair sampling during training and fixed eval-pair
