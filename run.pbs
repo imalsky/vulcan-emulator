@@ -53,7 +53,7 @@ export VULCAN_EMULATOR_CONDA_ENV="${CONDA_ENV}"
 CONFIG_PATH="${CONFIG_PATH:-config/config.json}"
 TRAIN_LOG="${TRAIN_LOG:-}"
 BUILD_FASTCHEM_IF_MISSING="${BUILD_FASTCHEM_IF_MISSING:-1}"
-RUN_MODE="${RUN_MODE:-train}"
+RUN_MODE="${RUN_MODE:-pipeline}"
 HYPERPARAM_TRIALS="${HYPERPARAM_TRIALS:-12}"
 HYPERPARAM_TRIAL_EPOCHS="${HYPERPARAM_TRIAL_EPOCHS:-20}"
 HYPERPARAM_OVERWRITE="${HYPERPARAM_OVERWRITE:-0}"
@@ -85,8 +85,8 @@ if [ ! -f "${PROJECT_ROOT}/src/hyperparam_testing.py" ]; then
   echo "ERROR: src/hyperparam_testing.py not found under ${PROJECT_ROOT}"
   exit 1
 fi
-if [ "${RUN_MODE}" != "train" ] && [ "${RUN_MODE}" != "hyperparam" ]; then
-  echo "ERROR: RUN_MODE must be 'train' or 'hyperparam', got: ${RUN_MODE}"
+if [ "${RUN_MODE}" != "pipeline" ] && [ "${RUN_MODE}" != "train" ] && [ "${RUN_MODE}" != "hyperparam" ]; then
+  echo "ERROR: RUN_MODE must be 'pipeline', 'train', or 'hyperparam', got: ${RUN_MODE}"
   exit 1
 fi
 
@@ -144,7 +144,7 @@ fi
 echo "Run mode: ${RUN_MODE}"
 echo "Training device from config: ${TRAIN_DEVICE}"
 
-if [ "${RUN_MODE}" = "train" ]; then
+if [ "${RUN_MODE}" != "hyperparam" ]; then
   for required_path in \
     "${VULCAN_SOURCE}" \
     "${VULCAN_SOURCE}/vulcan.py" \
@@ -168,7 +168,8 @@ if [ "${RUN_MODE}" = "train" ]; then
     echo "ERROR: missing executable FastChem binary: ${VULCAN_SOURCE}/fastchem_vulcan/fastchem"
     exit 1
   fi
-else
+fi
+if [ "${RUN_MODE}" = "hyperparam" ]; then
   echo "Hyperparameter mode skips VULCAN/FastChem preflight."
 fi
 
@@ -184,21 +185,6 @@ if [ "${TRAIN_DEVICE}" = "cuda" ]; then
   fi
 fi
 
-if [ "${RUN_MODE}" = "hyperparam" ]; then
-  if ! python - <<'PY'
-import optuna
-print(optuna.__version__)
-PY
-  then
-    echo "Stage: installing optuna"
-    python -m pip install --user optuna
-    python - <<'PY'
-import optuna
-print(optuna.__version__)
-PY
-  fi
-fi
-
 if ! python - "${CONFIG_PATH}" <<'PY'
 import importlib
 import json
@@ -210,9 +196,9 @@ config_path = Path(sys.argv[1])
 with config_path.open("r", encoding="utf-8") as handle:
     config = json.load(handle)
 
-required = ["torch", "numpy", "scipy", "h5py", "tqdm", "matplotlib"]
-if os.environ.get("RUN_MODE") == "hyperparam":
-    required.append("optuna")
+required = ["torch", "numpy", "scipy", "h5py", "tqdm"]
+if os.environ.get("RUN_MODE") != "hyperparam":
+    required.append("matplotlib")
 
 missing: list[str] = []
 for name in required:
@@ -243,21 +229,22 @@ then
   exit 1
 fi
 
-if [ "${RUN_MODE}" = "train" ]; then
-  echo "Execution control:"
-  echo "  Comment out either command below if you want to run only one stage."
-  echo "  --gen reruns VULCAN generation, drops failed individual VULCAN runs if usable runs remain, and rewrites data/processed."
-  echo "  --train reuses existing processed data only if its provenance matches the current config."
-  echo "Training log file: ${TRAIN_LOG}"
-  : > "${TRAIN_LOG}"
+ensure_optuna() {
+  if ! python - <<'PY'
+import optuna
+print(optuna.__version__)
+PY
+  then
+    echo "Stage: installing optuna"
+    python -m pip install --user optuna
+    python - <<'PY'
+import optuna
+print(optuna.__version__)
+PY
+  fi
+}
 
-  # Comment out this line if you want to skip generation.
-  #####python -u src/main.py --gen --config "${CONFIG_PATH}"
-
-  # Comment out this line if you want to skip training and only generate data.
-  # Running this line alone will reuse existing processed data if it still matches the current config.
-  python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
-else
+run_hyperparam_search() {
   echo "Hyperparameter search settings:"
   echo "  trials: ${HYPERPARAM_TRIALS}"
   echo "  trial epochs: ${HYPERPARAM_TRIAL_EPOCHS}"
@@ -272,13 +259,45 @@ else
   if [ "${HYPERPARAM_OVERWRITE}" = "1" ]; then
     HYPERPARAM_ARGS+=(--overwrite)
   fi
-  python -u src/hyperparam_testing.py "${HYPERPARAM_ARGS[@]}"
+  ensure_optuna
+  python -u src/hyperparam_testing.py "${HYPERPARAM_ARGS[@]}" 2>&1 | tee -a "${TRAIN_LOG}"
+}
+
+if [ "${RUN_MODE}" = "pipeline" ]; then
+  echo "Execution control:"
+  echo "  Default: regenerate data, then run hyperparameter search."
+  echo "  To switch to a standard full run:"
+  echo "    1. comment out the run_hyperparam_search line below"
+  echo "    2. uncomment the standard training line below"
+  echo "Training log file: ${TRAIN_LOG}"
+  : > "${TRAIN_LOG}"
+
+  # Comment out this line if you want to skip generation.
+  python -u src/main.py --gen --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+
+  # Comment out this line to skip hyperparameter search.
+  run_hyperparam_search
+
+  # Uncomment this line instead for a standard full run on the regenerated data.
+  # python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+elif [ "${RUN_MODE}" = "train" ]; then
+  echo "Execution control:"
+  echo "  Standard training-only mode."
+  echo "Training log file: ${TRAIN_LOG}"
+  : > "${TRAIN_LOG}"
+  python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+else
+  echo "Execution control:"
+  echo "  Hyperparameter-search-only mode."
+  echo "Training log file: ${TRAIN_LOG}"
+  : > "${TRAIN_LOG}"
+  run_hyperparam_search
 fi
 
 echo "Completed successfully."
-if [ "${RUN_MODE}" = "train" ] && [ -f "${RUN_DIR}/best.pt" ]; then
+if [ -f "${RUN_DIR}/best.pt" ]; then
   echo "Best checkpoint: ${RUN_DIR}/best.pt"
 fi
-if [ "${RUN_MODE}" = "hyperparam" ] && [ -f "${HYPERPARAM_ROOT}/best_model/best.pt" ]; then
+if [ -f "${HYPERPARAM_ROOT}/best_model/best.pt" ]; then
   echo "Best checkpoint: ${HYPERPARAM_ROOT}/best_model/best.pt"
 fi
