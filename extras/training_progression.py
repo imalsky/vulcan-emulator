@@ -16,12 +16,13 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from script_utils import PROJECT_ROOT
+from script_utils import resolve_run_dir
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "vulcan_emulator_mpl"))
 os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "vulcan_emulator_cache"))
 
-RUN_DIR = PROJECT_ROOT / "models" / "trained_model"
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+RUN_DIR_OVERRIDE: Path | None = None
 FIGURES_SUBDIR = "figures"
 FILENAME = "training_progression.png"
 STYLE_PATH = Path(__file__).with_name("science.mplstyle")
@@ -65,7 +66,7 @@ def _load_log(
 def main() -> None:
     """Render training and learning-rate curves from one run directory."""
     plt = _load_pyplot()
-    run_dir = RUN_DIR.resolve()
+    run_dir, config_path = resolve_run_dir(config_path=CONFIG_PATH, run_dir=RUN_DIR_OVERRIDE)
     figures_dir = run_dir / FIGURES_SUBDIR
     figures_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,6 +101,7 @@ def main() -> None:
     plt.close(fig)
 
     print("Training progression plot")
+    print(f"  Config  : {config_path if config_path is not None else 'explicit run dir override'}")
     print(f"  Run dir : {run_dir}")
     print(f"  Log     : {log_path}")
     print(f"  Output  : {output_path}")

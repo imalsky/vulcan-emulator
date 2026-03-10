@@ -300,17 +300,19 @@ Optimizer and loss behavior remain unchanged:
 - gradient clipping: global norm clip
 - checkpointing: `best.pt` (lowest validation combined loss) and `last.pt`
 
-The current shipped model hyperparameters are:
+Model architecture is configured under `training.model`. The exact numeric values
+are intentionally config-defined rather than fixed by this spec, but the model
+contract expects these parameters:
 
-- `d_model = 256`
-- `nhead = 8`
-- `num_layers = 6`
-- `dim_feedforward = 768`
-- `dropout = 0.0`
-- `film_clamp = 10.0`
-- `output_head_divisor = 2`
-- `max_sequence_length = 64`
-- `conditioning_hidden_dim = 256`
+- `d_model`: transformer embedding width for profile/state features and FiLM conditioning
+- `nhead`: number of attention heads in each transformer block
+- `num_layers`: number of transformer blocks
+- `dim_feedforward`: hidden width of each transformer feedforward block
+- `dropout`: dropout probability used inside transformer blocks
+- `film_clamp`: clamp applied to FiLM modulation terms
+- `output_head_divisor`: output-head width control via `d_model // output_head_divisor`
+- `max_sequence_length`: maximum supported vertical sequence length for positional encoding
+- `conditioning_hidden_dim`: hidden width of the global-conditioning MLP
 
 ## 11. Evaluation Contract
 

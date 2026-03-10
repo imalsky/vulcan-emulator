@@ -63,6 +63,7 @@ logs/
 *.npy
 *.npz
 roth/roth-grid/
+roth/figures/
 
 # Log files
 *.log

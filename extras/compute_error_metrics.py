@@ -28,13 +28,16 @@ from script_utils import (
     load_checkpoint,
     load_json,
     load_split_metadata,
+    resolve_run_dir,
 )
 
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+RUN_DIR_OVERRIDE: Path | None = None
 FIGURES_SUBDIR = "figures"
 
 
 def main() -> None:
-    run_dir = (PROJECT_ROOT / "models" / "trained_model").resolve()
+    run_dir, config_path = resolve_run_dir(config_path=CONFIG_PATH, run_dir=RUN_DIR_OVERRIDE)
     split = "test"
     checkpoint_name = "best.pt"
     batch_size = 256
@@ -127,6 +130,7 @@ def main() -> None:
 
     print(f"Saved error summary: {json_path}")
     print(f"Saved per-species metrics: {csv_path}")
+    print(f"Resolved config path: {config_path if config_path is not None else 'explicit run dir override'}")
 
 
 if __name__ == "__main__":

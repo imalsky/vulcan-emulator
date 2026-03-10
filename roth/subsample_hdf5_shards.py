@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Randomly subsamples sequences from a large HDF5 file and splits the result
-into N shards (default: 5) named *_1.h5, *_2.h5, ... for downstream parallelism.
+Randomly subsample a large HDF5 dataset and split it into output shards.
 
 Single-pass over the source file; reads sequential batches and writes the
 selected rows to the correct shard(s) to minimize random I/O.
+
+This is a generic standalone utility. It is not Roth-specific despite living
+under `roth/`.
 """
 
 import argparse

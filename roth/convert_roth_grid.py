@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Processes 3D GCM P-T profiles for use with 1D radiative transfer models.
+Convert Roth GCM PT grid files into one standalone HDF5 profile dataset.
 
 This script performs the following steps:
 1.  Scans a directory for GCM output files with a specific naming convention.
@@ -12,6 +12,9 @@ This script performs the following steps:
 6.  Interpolates each 1D profile onto a new, user-defined pressure grid.
 7.  Sets planet mass and radius to 1 M_jup and 1 R_jup, and derives gravity.
 8.  Saves profiles to HDF5 (normal mode) or a set number of JSONs (test mode).
+
+This utility is standalone and separate from the maintained `roth_sampler`
+integration used by `src/main.py --gen`.
 """
 
 import logging
