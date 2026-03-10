@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import shutil
 import sys
 from copy import deepcopy
+from json.encoder import INFINITY, _make_iterencode, encode_basestring, encode_basestring_ascii
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,49 @@ PROMOTED_ARTIFACTS = (
     "normalization_metadata.json",
     "processed_fingerprint.json",
 )
+FLOAT_SIG_FIGS = 4
+
+
+class _ScientificNotationJSONEncoder(json.JSONEncoder):
+    """JSON encoder that renders floats in scientific notation with fixed sig figs."""
+
+    def iterencode(self, o: Any, _one_shot: bool = False):
+        markers = {} if self.check_circular else None
+        string_encoder = encode_basestring_ascii if self.ensure_ascii else encode_basestring
+
+        def floatstr(
+            value: float,
+            allow_nan: bool = self.allow_nan,
+            positive_inf: float = INFINITY,
+            negative_inf: float = -INFINITY,
+        ) -> str:
+            if value != value:
+                text = "NaN"
+            elif value == positive_inf:
+                text = "Infinity"
+            elif value == negative_inf:
+                text = "-Infinity"
+            else:
+                return f"{float(value):.{FLOAT_SIG_FIGS - 1}e}"
+            if not allow_nan:
+                raise ValueError(
+                    "Out of range float values are not JSON compliant: " + repr(value)
+                )
+            return text
+
+        iterencode = _make_iterencode(
+            markers,
+            self.default,
+            string_encoder,
+            self.indent,
+            floatstr,
+            self.key_separator,
+            self.item_separator,
+            self.sort_keys,
+            self.skipkeys,
+            _one_shot,
+        )
+        return iterencode(o, 0)
 
 
 def _positive_int(value: str) -> int:
@@ -175,7 +220,48 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     """Write one JSON object with stable formatting."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+        json.dump(
+            payload,
+            handle,
+            indent=2,
+            sort_keys=True,
+            cls=_ScientificNotationJSONEncoder,
+        )
+
+
+def _rewrite_json_file(path: Path) -> None:
+    """Rewrite one existing JSON artifact with the scientific-notation encoder."""
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Expected JSON object in {path}, found {type(payload).__name__}.")
+    _write_json(path, payload)
+
+
+def _rewrite_training_log_csv(path: Path) -> None:
+    """Rewrite one copied training log with scientific notation and four sig figs."""
+    if not path.is_file():
+        return
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        if fieldnames is None:
+            raise RuntimeError(f"Missing CSV header in {path}.")
+        rows = list(reader)
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            formatted: dict[str, str] = {}
+            for key, value in row.items():
+                if value is None or value == "":
+                    formatted[key] = ""
+                elif key == "epoch":
+                    formatted[key] = str(int(float(value)))
+                else:
+                    formatted[key] = f"{float(value):.{FLOAT_SIG_FIGS - 1}e}"
+            writer.writerow(formatted)
 
 
 def _ensure_trial_training_log(path: Path) -> None:
@@ -197,6 +283,7 @@ def _copy_trial_training_log(
     if source.is_file():
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
+        _rewrite_training_log_csv(destination)
     else:
         _ensure_trial_training_log(destination)
 
@@ -308,6 +395,14 @@ def _promote_best_trial(
     checkpoint["config"] = promoted_config
     torch.save(checkpoint, best_checkpoint_path)
 
+    _rewrite_training_log_csv(best_model_dir / "training_log.csv")
+    for json_name in (
+        "metrics.json",
+        "data_contract.json",
+        "normalization_metadata.json",
+        "processed_fingerprint.json",
+    ):
+        _rewrite_json_file(best_model_dir / json_name)
     _write_json(output_root / "best_config.json", promoted_config)
 
 

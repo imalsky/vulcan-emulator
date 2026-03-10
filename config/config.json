@@ -9,7 +9,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 2000,
+    "num_runs": 1000,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
@@ -22,12 +22,12 @@
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",
     "worker_root": "data/raw/_workers",
-    "save_evo_frq": 10,
-    "max_trajectory_snapshots": 200
+    "save_evo_frq": 1,
+    "max_trajectory_snapshots": 1000
   },
   "trajectory_sampling": {
     "mode": "log_uniform_all_pairs",
-    "dt_min_s": 1e10,
+    "dt_min_s": 1e8,
     "dt_max_s": 1e12,
     "min_future_saved_steps": 1
   },
@@ -301,8 +301,8 @@
     "use_amp": false,
     "seed": 42,
     "live_sampling": {
-      "train_pairs_per_run_per_epoch": 1000,
-      "eval_pairs_per_run": 1000
+      "train_pairs_per_run_per_epoch": 100,
+      "eval_pairs_per_run": 100
     },
     "model": {
       "d_model": 512,

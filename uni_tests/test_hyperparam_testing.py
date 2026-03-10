@@ -138,10 +138,14 @@ class HyperparamTestingTests(unittest.TestCase):
             for training_log_path in sorted((output_root / "logs").glob("trial_*_training_log.csv")):
                 rows = training_log_path.read_text(encoding="utf-8").strip().splitlines()
                 self.assertEqual(len(rows), 2, training_log_path.name)
+                self.assertIn("1.000e-01", rows[1], training_log_path.name)
 
             best_config = json.loads(best_config_path.read_text(encoding="utf-8"))
             self.assertEqual(best_config["paths"]["models_root"], "models")
             self.assertEqual(best_config["training"]["output_folder"], "hyperparam_testing/best_model")
+            self.assertIn("1.000e+13", best_config_path.read_text(encoding="utf-8"))
+            self.assertIn("1.000e-01", (best_model_dir / "metrics.json").read_text(encoding="utf-8"))
+            self.assertIn("1.000e-04", (best_model_dir / "training_log.csv").read_text(encoding="utf-8"))
 
             checkpoint = torch.load(best_model_dir / "best.pt", map_location="cpu", weights_only=False)
             self.assertEqual(
