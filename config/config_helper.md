@@ -1,7 +1,7 @@
 # Config Reference
 
 Short reference for the current `config/config.json` schema. For the full
-pipeline contract, see [`spec.md`](/Users/imalsky/Desktop/VULCAN_Project/vulcan-emulator/spec.md).
+pipeline contract, see [`spec.md`](../spec.md).
 
 ## `trajectory_sampling`
 

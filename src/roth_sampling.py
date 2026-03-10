@@ -27,6 +27,8 @@ ROTH_COLUMN_FILTER_KEYS = ("lon", "lat")
 _GRAVITATIONAL_CONSTANT = 6.67430e-11
 _JUPITER_RADIUS_M = 7.1492e7
 _JUPITER_MASS_KG = 1.89813e27
+_ROTH_MIN_TEMPERATURE_K = 0.0
+_ROTH_MAX_TEMPERATURE_K = 2500.0
 
 
 class RothSamplingError(ValueError):
@@ -261,6 +263,16 @@ def _passes_column_filters(
     return True
 
 
+def _allowed_value_mask(values: np.ndarray, allowed: list[float]) -> np.ndarray:
+    """Vectorized allow-list matching with the same tolerance as `_numeric_allowed`."""
+    if not allowed:
+        return np.ones(values.shape, dtype=bool)
+    mask = np.zeros(values.shape, dtype=bool)
+    for candidate in allowed:
+        mask |= np.isclose(values, float(candidate), atol=1.0e-9, rtol=0.0)
+    return mask
+
+
 def iter_roth_columns(filepath: Path) -> Iterator[tuple[float, float, np.ndarray, np.ndarray]]:
     """Yield one native Roth PT column at a time from a grid file."""
     current_lon: float | None = None
@@ -273,7 +285,10 @@ def iter_roth_columns(filepath: Path) -> Iterator[tuple[float, float, np.ndarray
             stripped = raw_line.strip()
             if not stripped:
                 continue
-            tokens = [token for token in re.split(r"[,\s]+", stripped) if token]
+            if "," in stripped:
+                tokens = [token for token in stripped.split(",") if token]
+            else:
+                tokens = stripped.split()
             if len(tokens) < 5:
                 continue
             try:
@@ -322,7 +337,11 @@ def _validate_native_column(
         return None
     if np.any(~np.isfinite(pressure_bar)) or np.any(~np.isfinite(temperature_k)):
         return None
-    if np.any(pressure_bar <= 0.0) or np.any(temperature_k <= 0.0):
+    if np.any(pressure_bar <= 0.0):
+        return None
+    if np.any(temperature_k <= _ROTH_MIN_TEMPERATURE_K):
+        return None
+    if np.any(temperature_k > _ROTH_MAX_TEMPERATURE_K):
         return None
 
     order = np.argsort(pressure_bar)
@@ -372,9 +391,212 @@ def interpolate_roth_temperature(
             target_log_p[target_log_p > source_log_p[-1]] - source_log_p[-1]
         )
 
-    if np.any(~np.isfinite(result)) or np.any(result <= 0.0):
+    if np.any(~np.isfinite(result)) or np.any(result <= _ROTH_MIN_TEMPERATURE_K):
+        raise RothSamplingError("Interpolated Roth temperature profile is invalid.")
+    if np.any(result > _ROTH_MAX_TEMPERATURE_K):
         raise RothSamplingError("Interpolated Roth temperature profile is invalid.")
     return result.astype(np.float64), extrapolated_top, extrapolated_bottom
+
+
+def _load_roth_file_matrix(filepath: Path) -> np.ndarray | None:
+    """Load one regular Roth file into a dense `(n_columns, n_levels, 11)` float matrix."""
+    lines = filepath.read_text(encoding="utf-8").splitlines()
+    if len(lines) <= 1:
+        return None
+
+    levels_per_column = 0
+    for line in lines[1:]:
+        if line.strip():
+            levels_per_column += 1
+        elif levels_per_column > 0:
+            break
+    if levels_per_column <= 0:
+        return None
+
+    cleaned = "\n".join(line for line in lines[1:] if line.strip())
+    raw = np.fromstring(cleaned.replace("\n", ","), sep=",", dtype=np.float64)
+    if raw.size == 0 or raw.size % 11 != 0:
+        return None
+
+    rows = raw.reshape(-1, 11)
+    if rows.shape[0] % levels_per_column != 0:
+        return None
+    return rows.reshape(-1, levels_per_column, 11)
+
+
+def _iter_valid_roth_candidates_slow(
+    *,
+    file_info: RothFileInfo,
+    column_filters: dict[str, Any],
+    min_source_levels: int,
+    target_pressure_bar: np.ndarray,
+) -> Iterator[
+    tuple[
+        RothFileInfo,
+        float,
+        float,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        bool,
+        bool,
+    ]
+]:
+    """Fallback per-column Roth candidate enumeration for irregular files."""
+    for lon_deg, lat_deg, native_pressure_bar, native_temperature_k in iter_roth_columns(file_info.path):
+        if not _passes_column_filters(
+            lon_deg=lon_deg,
+            lat_deg=lat_deg,
+            column_filters=column_filters,
+        ):
+            continue
+        validated = _validate_native_column(
+            pressure_bar=native_pressure_bar,
+            temperature_k=native_temperature_k,
+            min_source_levels=min_source_levels,
+        )
+        if validated is None:
+            continue
+        try:
+            interpolated_temperature_k, extrapolated_top, extrapolated_bottom = (
+                interpolate_roth_temperature(
+                    pressure_bar=validated[0],
+                    temperature_k=validated[1],
+                    target_pressure_bar=target_pressure_bar,
+                )
+            )
+        except RothSamplingError:
+            continue
+        yield (
+            file_info,
+            float(lon_deg),
+            float(lat_deg),
+            validated[0],
+            validated[1],
+            interpolated_temperature_k,
+            bool(extrapolated_top),
+            bool(extrapolated_bottom),
+        )
+
+
+def _iter_valid_roth_candidates(
+    *,
+    file_info: RothFileInfo,
+    column_filters: dict[str, Any],
+    min_source_levels: int,
+    target_pressure_bar: np.ndarray,
+) -> Iterator[
+    tuple[
+        RothFileInfo,
+        float,
+        float,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        bool,
+        bool,
+    ]
+]:
+    """Enumerate valid Roth candidates, using a fast path for regular grid files."""
+    matrix = _load_roth_file_matrix(file_info.path)
+    if matrix is None or matrix.shape[1] < min_source_levels:
+        yield from _iter_valid_roth_candidates_slow(
+            file_info=file_info,
+            column_filters=column_filters,
+            min_source_levels=min_source_levels,
+            target_pressure_bar=target_pressure_bar,
+        )
+        return
+
+    lon_deg = np.asarray(matrix[:, 0, 1], dtype=np.float64)
+    lat_deg = np.asarray(matrix[:, 0, 2], dtype=np.float64)
+    pressure_bar = np.asarray(matrix[:, :, 3], dtype=np.float64)
+    temperature_k = np.asarray(matrix[:, :, 4], dtype=np.float64)
+
+    lon_allowed = [float(value) for value in list(column_filters.get("lon", []))]
+    lat_allowed = [float(value) for value in list(column_filters.get("lat", []))]
+    column_mask = _allowed_value_mask(lon_deg, lon_allowed) & _allowed_value_mask(lat_deg, lat_allowed)
+    if not np.any(column_mask):
+        return
+
+    lon_deg = lon_deg[column_mask]
+    lat_deg = lat_deg[column_mask]
+    pressure_bar = pressure_bar[column_mask]
+    temperature_k = temperature_k[column_mask]
+
+    order = np.argsort(pressure_bar, axis=1)
+    pressure_sorted = np.take_along_axis(pressure_bar, order, axis=1)
+    temperature_sorted = np.take_along_axis(temperature_k, order, axis=1)
+
+    valid_mask = (
+        np.all(np.isfinite(pressure_sorted), axis=1)
+        & np.all(np.isfinite(temperature_sorted), axis=1)
+        & np.all(pressure_sorted > 0.0, axis=1)
+        & np.all(temperature_sorted > _ROTH_MIN_TEMPERATURE_K, axis=1)
+        & np.all(temperature_sorted <= _ROTH_MAX_TEMPERATURE_K, axis=1)
+        & np.all(np.diff(pressure_sorted, axis=1) > 0.0, axis=1)
+    )
+    if not np.any(valid_mask):
+        return
+
+    lon_deg = lon_deg[valid_mask]
+    lat_deg = lat_deg[valid_mask]
+    pressure_sorted = pressure_sorted[valid_mask]
+    temperature_sorted = temperature_sorted[valid_mask]
+
+    if not np.all(np.isclose(pressure_sorted, pressure_sorted[:1], atol=1.0e-12, rtol=0.0)):
+        yield from _iter_valid_roth_candidates_slow(
+            file_info=file_info,
+            column_filters=column_filters,
+            min_source_levels=min_source_levels,
+            target_pressure_bar=target_pressure_bar,
+        )
+        return
+
+    source_log_p = np.log10(pressure_sorted[0])
+    target_log_p = np.log10(np.asarray(target_pressure_bar, dtype=np.float64))
+    interpolator = PchipInterpolator(source_log_p, temperature_sorted, axis=1, extrapolate=False)
+    derivative = interpolator.derivative()
+
+    interpolated_temperature_k = np.empty(
+        (temperature_sorted.shape[0], target_log_p.size),
+        dtype=np.float64,
+    )
+    inside = (target_log_p >= source_log_p[0]) & (target_log_p <= source_log_p[-1])
+    interpolated_temperature_k[:, inside] = interpolator(target_log_p[inside])
+
+    extrapolated_top = bool(np.any(target_log_p < source_log_p[0]))
+    extrapolated_bottom = bool(np.any(target_log_p > source_log_p[-1]))
+    if extrapolated_top:
+        top_offsets = target_log_p[target_log_p < source_log_p[0]] - source_log_p[0]
+        slope_top = np.asarray(derivative(source_log_p[0]), dtype=np.float64)
+        interpolated_temperature_k[:, target_log_p < source_log_p[0]] = (
+            temperature_sorted[:, [0]] + slope_top[:, None] * top_offsets[None, :]
+        )
+    if extrapolated_bottom:
+        bottom_offsets = target_log_p[target_log_p > source_log_p[-1]] - source_log_p[-1]
+        slope_bottom = np.asarray(derivative(source_log_p[-1]), dtype=np.float64)
+        interpolated_temperature_k[:, target_log_p > source_log_p[-1]] = (
+            temperature_sorted[:, [-1]] + slope_bottom[:, None] * bottom_offsets[None, :]
+        )
+
+    candidate_mask = np.all(
+        np.isfinite(interpolated_temperature_k)
+        & (interpolated_temperature_k > _ROTH_MIN_TEMPERATURE_K)
+        & (interpolated_temperature_k <= _ROTH_MAX_TEMPERATURE_K),
+        axis=1,
+    )
+    for row_index in np.flatnonzero(candidate_mask):
+        yield (
+            file_info,
+            float(lon_deg[row_index]),
+            float(lat_deg[row_index]),
+            pressure_sorted[row_index].copy(),
+            temperature_sorted[row_index].copy(),
+            interpolated_temperature_k[row_index].copy(),
+            extrapolated_top,
+            extrapolated_bottom,
+        )
 
 
 def sample_roth_profiles(
@@ -410,39 +632,28 @@ def sample_roth_profiles(
     valid_columns = 0
 
     for file_info in files:
-        for lon_deg, lat_deg, native_pressure_bar, native_temperature_k in iter_roth_columns(
-            file_info.path
+        for (
+            _candidate_file_info,
+            lon_deg,
+            lat_deg,
+            native_pressure_bar,
+            native_temperature_k,
+            interpolated_temperature_k,
+            extrapolated_top,
+            extrapolated_bottom,
+        ) in _iter_valid_roth_candidates(
+            file_info=file_info,
+            column_filters=column_filters,
+            min_source_levels=min_source_levels,
+            target_pressure_bar=target_pressure_bar,
         ):
-            if not _passes_column_filters(
-                lon_deg=lon_deg,
-                lat_deg=lat_deg,
-                column_filters=column_filters,
-            ):
-                continue
-            validated = _validate_native_column(
-                pressure_bar=native_pressure_bar,
-                temperature_k=native_temperature_k,
-                min_source_levels=min_source_levels,
-            )
-            if validated is None:
-                continue
-            try:
-                interpolated_temperature_k, extrapolated_top, extrapolated_bottom = (
-                    interpolate_roth_temperature(
-                        pressure_bar=validated[0],
-                        temperature_k=validated[1],
-                        target_pressure_bar=target_pressure_bar,
-                    )
-                )
-            except RothSamplingError:
-                continue
             valid_columns += 1
             candidate = (
                 file_info,
                 float(lon_deg),
                 float(lat_deg),
-                validated[0],
-                validated[1],
+                native_pressure_bar,
+                native_temperature_k,
                 interpolated_temperature_k,
                 bool(extrapolated_top),
                 bool(extrapolated_bottom),
@@ -457,7 +668,8 @@ def sample_roth_profiles(
     if valid_columns < target_count:
         raise RothSamplingError(
             "Requested "
-            f"{target_count} Roth profiles, but only {valid_columns} valid filtered columns exist."
+            f"{target_count} Roth profiles, but only {valid_columns} valid filtered columns exist "
+            "after rejecting temperatures <= 0 K or > 2500 K."
         )
 
     root = _project_root() if project_root is None else project_root

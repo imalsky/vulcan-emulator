@@ -9,7 +9,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 1000,
+    "num_runs": 4000,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
@@ -44,11 +44,11 @@
   "tp_sampler": {
     "pressure_grid": {
       "nz": 50,
-      "p_top_bar": 1e-08,
-      "p_bottom_bar": 1e3
+      "p_top_bar": 1e-07,
+      "p_bottom_bar": 3e2
     },
     "temperature_limits_k": {
-      "min": 500.0,
+      "min": 300.0,
       "max": 2500.0
     },
     "max_sampling_attempts": 32,
@@ -56,23 +56,23 @@
     "convective_adjustment_probability": 0.3333333333,
     "log10_kappa_ir": {
       "distribution": "uniform",
-      "min": -2.5,
-      "max": 2.5
+      "min": -3.0,
+      "max": 0.5
     },
     "kappa_pressure_power_exponent": {
       "distribution": "uniform",
-      "min": -0.5,
-      "max": 1.0
+      "min": 0.0,
+      "max": 0.7
     },
     "log10_gamma1": {
       "distribution": "uniform",
-      "min": -2.0,
-      "max": 2.0
+      "min": -2.5,
+      "max": 2.5
     },
     "log10_gamma2": {
       "distribution": "uniform",
-      "min": -2.0,
-      "max": 2.0
+      "min": -2.5,
+      "max": 2.5
     },
     "alpha_partition": {
       "distribution": "uniform",
@@ -81,17 +81,17 @@
     },
     "t_int": {
       "distribution": "normal",
-      "mean": 300.0,
-      "std": 700.0,
+      "mean": 500.0,
+      "std": 100.0,
       "min": 50.0,
-      "max": 3000.0
+      "max": 800.0
     },
     "t_irr": {
       "distribution": "normal",
-      "mean": 1800.0,
+      "mean": 1700.0,
       "std": 500.0,
-      "min": 200.0,
-      "max": 4000.0
+      "min": 1000.0,
+      "max": 2600.0
     },
     "temperature_shift": {
       "distribution": "uniform",
@@ -100,8 +100,8 @@
     }
   },
   "roth_sampler": {
-    "enabled": false,
-    "num_profiles": 0,
+    "enabled": true,
+    "num_profiles": 1000,
     "data_glob": "roth/roth-grid/PTprofiles/*.dat",
     "source_globals_mode": "pt_only",
     "filters": {
@@ -156,17 +156,17 @@
   },
   "gravity_sampler": {
     "distribution": "uniform",
-    "min_cm_s2": 500.0,
-    "max_cm_s2": 20000.0
+    "min_cm_s2": 700.0,
+    "max_cm_s2": 4000.0
   },
   "kzz_sampler": {
     "mode": "power_law_profile",
-    "log10_kzz_at_1bar_min": 7.0,
+    "log10_kzz_at_1bar_min": 8.0,
     "log10_kzz_at_1bar_max": 11.0,
-    "beta_min": 0.3,
-    "beta_max": 0.7,
-    "kzz_floor_cm2_s": 10000000.0,
-    "kzz_cap_cm2_s": 1000000000000.0,
+    "beta_min": 0.2,
+    "beta_max": 0.6,
+    "kzz_floor_cm2_s": 100000000.0,
+    "kzz_cap_cm2_s": 100000000000.0,
     "pressure_unit_for_profile": "bar"
   },
   "abundance_sampler": {
@@ -291,8 +291,8 @@
   },
   "training": {
     "device": "cuda",
-    "batch_size": 512,
-    "epochs": 300,
+    "batch_size": 256,
+    "epochs": 100,
     "learning_rate": 1e-4,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
@@ -301,8 +301,8 @@
     "use_amp": false,
     "seed": 42,
     "live_sampling": {
-      "train_pairs_per_run_per_epoch": 5000,
-      "eval_pairs_per_run": 5000
+      "train_pairs_per_run_per_epoch": 1000,
+      "eval_pairs_per_run": 1000
     },
     "model": {
       "d_model": 512,
@@ -319,6 +319,6 @@
       "lambda_z": 0.5,
       "lambda_phys": 1.0
     },
-    "output_folder": "v2"
+    "output_folder": "v3"
   }
 }

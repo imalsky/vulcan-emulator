@@ -235,6 +235,42 @@ class RothSamplingTests(unittest.TestCase):
         self.assertEqual((profiles[0].lon_deg, profiles[0].lat_deg), (20.0, 20.0))
         self.assertTrue(np.all(profiles[0].interpolated_temperature_k > 0.0))
 
+    def test_sample_roth_profiles_skips_columns_above_temperature_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ve_roth_hot_") as tmpdir_name:
+            root = Path(tmpdir_name)
+            roth_root = root / "roth-grid" / "PTprofiles"
+            _write_roth_file(
+                roth_root / "PTprofiles-Teq_1000-LogMet_0.0-LogDrag_0-Mstar_0.8-Rp_1.3-logG_0.8-TiOVO_false.dat",
+                columns=[
+                    (-10.0, -10.0, [1.0e-6, 1.0e-5, 1.0e-4], [1600.0, 2000.0, 2400.0]),
+                    (20.0, 20.0, [1.0e-6, 1.0e-5, 1.0e-4], [700.0, 900.0, 1100.0]),
+                ],
+            )
+            config = _load_base_config()
+            config["roth_sampler"]["enabled"] = True
+            config["roth_sampler"]["num_profiles"] = 1
+            config["roth_sampler"]["data_glob"] = "roth-grid/PTprofiles/*.dat"
+            config["roth_sampler"]["filters"]["Teq"] = [1000.0]
+            config["roth_sampler"]["filters"]["LogMet"] = [0.0]
+            config["roth_sampler"]["filters"]["LogDrag"] = [0.0]
+            config["roth_sampler"]["filters"]["Mstar"] = [0.8]
+            config["roth_sampler"]["filters"]["Rp"] = [1.3]
+            config["roth_sampler"]["filters"]["logG"] = [0.8]
+            config["roth_sampler"]["filters"]["TiOVO"] = [False]
+            config["tp_sampler"]["pressure_grid"]["nz"] = 8
+            config["tp_sampler"]["pressure_grid"]["p_top_bar"] = 1.0e-8
+            config["tp_sampler"]["pressure_grid"]["p_bottom_bar"] = 1.0e1
+            with mock.patch.dict(os.environ, {"VULCAN_EMULATOR_PROJECT_ROOT": str(root)}):
+                profiles = sample_roth_profiles(
+                    config,
+                    target_pressure_bar=np.logspace(1.0, -8.0, 8, dtype=np.float64),
+                    rng=np.random.default_rng(0),
+                )
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual((profiles[0].lon_deg, profiles[0].lat_deg), (20.0, 20.0))
+        self.assertLessEqual(float(np.max(profiles[0].interpolated_temperature_k)), 2500.0)
+
     def test_build_run_specs_preserves_analytic_prefix_when_roth_enabled(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ve_roth_runspec_") as tmpdir_name:
             root = Path(tmpdir_name)

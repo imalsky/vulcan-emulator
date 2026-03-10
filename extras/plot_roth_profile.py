@@ -79,11 +79,7 @@ def main() -> None:
     config = load_and_validate_config(config_path)
     plot_config = copy.deepcopy(config)
     plot_config["roth_sampler"]["enabled"] = True
-    plot_config["roth_sampler"]["num_profiles"] = max(
-        int(plot_config["roth_sampler"]["num_profiles"]),
-        args.sample_index + 1,
-        1,
-    )
+    plot_config["roth_sampler"]["num_profiles"] = max(args.sample_index + 1, 1)
 
     pressure_bar = build_pressure_grid(plot_config["tp_sampler"])
     rng = np.random.default_rng(int(plot_config["generation"]["random_seed"]) + 1)
