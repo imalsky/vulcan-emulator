@@ -18,7 +18,7 @@
     },
     "random_seed": 42,
     "keep_vulcan_outputs_debug": false,
-    "run_timeout_seconds": 600,
+    "run_timeout_seconds": 180,
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",
     "worker_root": "data/raw/_workers",
@@ -156,8 +156,8 @@
   },
   "gravity_sampler": {
     "distribution": "uniform",
-    "min_cm_s2": 700.0,
-    "max_cm_s2": 4000.0
+    "min_cm_s2": 10000.0,
+    "max_cm_s2": 20000.0
   },
   "kzz_sampler": {
     "mode": "power_law_profile",
@@ -172,7 +172,7 @@
   "abundance_sampler": {
     "metallicity_mode": "log10_scale",
     "log10_metallicity_min": -0.5,
-    "log10_metallicity_max": 2.0,
+    "log10_metallicity_max": 0.5,
     "c_to_o_min": 0.3,
     "c_to_o_max": 1.2,
     "solar_abundances": {
