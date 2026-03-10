@@ -9,7 +9,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 4000,
+    "num_runs": 2000,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
