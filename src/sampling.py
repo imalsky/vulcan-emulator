@@ -17,11 +17,13 @@ handles TP profiles that violate physical temperature bounds.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 from scipy.special import expn
+
+from roth_sampling import RothSamplingError, sample_roth_profiles
 
 
 class SamplingError(ValueError):
@@ -42,6 +44,9 @@ class RunSpec:
     abundances: dict[str, float]
     tp_params: dict[str, float]
     kzz_params: dict[str, float]
+    source_tag: str = "analytic"
+    source_file: str | None = None
+    source_metadata: dict[str, float] = field(default_factory=dict)
 
 
 def _sample_distribution(spec: dict[str, Any], rng: np.random.Generator, name: str) -> float:
@@ -282,10 +287,13 @@ def sample_gravity(gravity_cfg: dict[str, Any], rng: np.random.Generator) -> flo
     raise SamplingError(f"Unsupported gravity_sampler.distribution: {distribution}")
 
 
-def build_run_specs(config: dict[str, Any]) -> list[RunSpec]:
-    """Create deterministic run specifications from configured samplers."""
+def build_analytic_run_specs(
+    config: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+) -> list[RunSpec]:
+    """Create deterministic analytic run specifications from configured samplers."""
     generation = config["generation"]
-    rng = np.random.default_rng(int(generation["random_seed"]))
     pressure_bar = build_pressure_grid(config["tp_sampler"])
     tp_cfg = config["tp_sampler"]
     gravity_cfg = config["gravity_sampler"]
@@ -326,6 +334,8 @@ def build_run_specs(config: dict[str, Any]) -> list[RunSpec]:
                     abundances=abundances,
                     tp_params=tp_params,
                     kzz_params=kzz_params,
+                    source_tag="analytic",
+                    source_metadata={"source_is_roth": 0.0},
                 )
             )
             break
@@ -341,3 +351,88 @@ def build_run_specs(config: dict[str, Any]) -> list[RunSpec]:
             )
 
     return run_specs
+
+
+def build_roth_run_specs(
+    config: dict[str, Any],
+    *,
+    start_run_id: int,
+    rng: np.random.Generator,
+) -> list[RunSpec]:
+    """Create deterministic Roth-derived run specifications on the shared target grid."""
+    roth_cfg = config["roth_sampler"]
+    if not bool(roth_cfg["enabled"]) or int(roth_cfg["num_profiles"]) <= 0:
+        return []
+
+    if str(roth_cfg["source_globals_mode"]) != "pt_only":
+        raise SamplingError("roth_sampler.source_globals_mode must be 'pt_only'.")
+
+    pressure_bar = build_pressure_grid(config["tp_sampler"])
+    try:
+        selected_profiles = sample_roth_profiles(
+            config,
+            target_pressure_bar=pressure_bar,
+            rng=rng,
+        )
+    except RothSamplingError as exc:
+        raise SamplingError(str(exc)) from exc
+
+    gravity_cfg = config["gravity_sampler"]
+    kzz_cfg = config["kzz_sampler"]
+    run_specs: list[RunSpec] = []
+    for offset, profile in enumerate(selected_profiles):
+        abundances, metallicity_log10, c_to_o = sample_abundances(
+            config["abundance_sampler"],
+            rng,
+        )
+        gravity_cm_s2 = sample_gravity(gravity_cfg, rng)
+        kzz_cm2_s, kzz_params = sample_kzz_profile(pressure_bar, kzz_cfg, rng)
+        run_specs.append(
+            RunSpec(
+                run_id=start_run_id + offset,
+                pressure_bar=pressure_bar.copy(),
+                temperature_k=profile.interpolated_temperature_k.copy(),
+                kzz_cm2_s=kzz_cm2_s,
+                gravity_cm_s2=gravity_cm_s2,
+                metallicity_log10=metallicity_log10,
+                c_to_o=c_to_o,
+                abundances=abundances,
+                tp_params={},
+                kzz_params=kzz_params,
+                source_tag="roth",
+                source_file=profile.source_relpath,
+                source_metadata={
+                    "source_is_roth": 1.0,
+                    "source_Teq": float(profile.metadata["Teq"]),
+                    "source_LogMet": float(profile.metadata["LogMet"]),
+                    "source_LogDrag": float(profile.metadata["LogDrag"]),
+                    "source_Mstar": float(profile.metadata["Mstar"]),
+                    "source_Rp": float(profile.metadata["Rp"]),
+                    "source_logG": float(profile.metadata["logG"]),
+                    "source_TiOVO": 1.0 if bool(profile.metadata["TiOVO"]) else 0.0,
+                    "source_lon_deg": float(profile.lon_deg),
+                    "source_lat_deg": float(profile.lat_deg),
+                    "source_planet_mass_jup": float(profile.planet_mass_jup),
+                    "source_native_pressure_min_bar": float(profile.native_pressure_min_bar),
+                    "source_native_pressure_max_bar": float(profile.native_pressure_max_bar),
+                    "source_extrapolated_top": 1.0 if profile.extrapolated_top else 0.0,
+                    "source_extrapolated_bottom": 1.0 if profile.extrapolated_bottom else 0.0,
+                },
+            )
+        )
+    return run_specs
+
+
+def build_run_specs(config: dict[str, Any]) -> list[RunSpec]:
+    """Create deterministic analytic and Roth-derived run specifications."""
+    generation = config["generation"]
+    seed = int(generation["random_seed"])
+    analytic_rng = np.random.default_rng(seed)
+    roth_rng = np.random.default_rng(seed + 1)
+    analytic_specs = build_analytic_run_specs(config, rng=analytic_rng)
+    roth_specs = build_roth_run_specs(
+        config,
+        start_run_id=len(analytic_specs),
+        rng=roth_rng,
+    )
+    return [*analytic_specs, *roth_specs]

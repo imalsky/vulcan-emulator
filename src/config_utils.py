@@ -20,6 +20,12 @@ from typing import Any
 
 import torch
 
+from roth_sampling import (
+    ROTH_COLUMN_FILTER_KEYS,
+    ROTH_FILTER_KEYS,
+    ROTH_OPTIONAL_FILTER_KEYS,
+)
+
 SUPPORTED_DTYPE_NAMES = {"float16", "bfloat16", "float32", "float64", "none"}
 TORCH_DTYPE_MAP = {
     "float16": torch.float16,
@@ -625,6 +631,116 @@ def _validate_abundance_sampler(abund_cfg: dict[str, Any]) -> None:
             raise ConfigValidationError(f"Solar abundance {key} must be > 0.")
 
 
+def _validate_numeric_allowlist(values: Any, field: str) -> list[float]:
+    """Validate one numeric allow-list, permitting an empty list."""
+    if not isinstance(values, list):
+        raise ConfigValidationError(f"{field} must be a list.")
+    parsed: list[float] = []
+    for idx, value in enumerate(values):
+        parsed.append(_as_float(value, f"{field}[{idx}]"))
+    return parsed
+
+
+def _validate_bool_allowlist(values: Any, field: str) -> list[bool]:
+    """Validate one boolean allow-list, permitting an empty list."""
+    if not isinstance(values, list):
+        raise ConfigValidationError(f"{field} must be a list.")
+    parsed: list[bool] = []
+    for idx, value in enumerate(values):
+        if not isinstance(value, bool):
+            raise ConfigValidationError(f"{field}[{idx}] must be a boolean.")
+        parsed.append(bool(value))
+    return parsed
+
+
+def _validate_roth_sampler(roth_cfg: dict[str, Any]) -> None:
+    """Validate Roth PT-grid controls and allow-list filters."""
+    allowed = {
+        "enabled",
+        "num_profiles",
+        "data_glob",
+        "source_globals_mode",
+        "filters",
+        "column_filters",
+        "interpolation",
+    }
+    _require_keys(roth_cfg, allowed, "roth_sampler")
+    _reject_extra_keys(roth_cfg, allowed, "roth_sampler")
+
+    enabled = _as_bool(roth_cfg["enabled"], "roth_sampler.enabled")
+    num_profiles = _as_int(roth_cfg["num_profiles"], "roth_sampler.num_profiles")
+    if num_profiles < 0:
+        raise ConfigValidationError("roth_sampler.num_profiles must be >= 0.")
+    if not enabled and num_profiles > 0:
+        raise ConfigValidationError(
+            "roth_sampler.num_profiles must be 0 when roth_sampler.enabled is false."
+        )
+    data_glob = roth_cfg["data_glob"]
+    if not isinstance(data_glob, str) or not data_glob:
+        raise ConfigValidationError("roth_sampler.data_glob must be a non-empty string.")
+    if Path(data_glob).is_absolute():
+        raise ConfigValidationError("roth_sampler.data_glob must be relative.")
+    if str(roth_cfg["source_globals_mode"]) != "pt_only":
+        raise ConfigValidationError("roth_sampler.source_globals_mode must be 'pt_only'.")
+
+    filters = roth_cfg["filters"]
+    required_filters = set((*ROTH_FILTER_KEYS, *ROTH_OPTIONAL_FILTER_KEYS))
+    if not isinstance(filters, dict):
+        raise ConfigValidationError("roth_sampler.filters must be a mapping.")
+    _require_keys(filters, required_filters, "roth_sampler.filters")
+    _reject_extra_keys(filters, required_filters, "roth_sampler.filters")
+    for key in ROTH_FILTER_KEYS:
+        field = f"roth_sampler.filters.{key}"
+        if key == "TiOVO":
+            _validate_bool_allowlist(filters[key], field)
+        else:
+            _validate_numeric_allowlist(filters[key], field)
+    _validate_numeric_allowlist(
+        filters["planet_mass_jup"],
+        "roth_sampler.filters.planet_mass_jup",
+    )
+
+    column_filters = roth_cfg["column_filters"]
+    if not isinstance(column_filters, dict):
+        raise ConfigValidationError("roth_sampler.column_filters must be a mapping.")
+    _require_keys(column_filters, set(ROTH_COLUMN_FILTER_KEYS), "roth_sampler.column_filters")
+    _reject_extra_keys(column_filters, set(ROTH_COLUMN_FILTER_KEYS), "roth_sampler.column_filters")
+    for key in ROTH_COLUMN_FILTER_KEYS:
+        _validate_numeric_allowlist(column_filters[key], f"roth_sampler.column_filters.{key}")
+
+    interpolation = roth_cfg["interpolation"]
+    if not isinstance(interpolation, dict):
+        raise ConfigValidationError("roth_sampler.interpolation must be a mapping.")
+    _require_keys(
+        interpolation,
+        {"method", "min_source_levels"},
+        "roth_sampler.interpolation",
+    )
+    _reject_extra_keys(
+        interpolation,
+        {"method", "min_source_levels"},
+        "roth_sampler.interpolation",
+    )
+    if (
+        str(interpolation["method"])
+        != "pchip_log_pressure_linear_extrapolation"
+    ):
+        raise ConfigValidationError(
+            "roth_sampler.interpolation.method must be "
+            "'pchip_log_pressure_linear_extrapolation'."
+        )
+    if (
+        _as_int(
+            interpolation["min_source_levels"],
+            "roth_sampler.interpolation.min_source_levels",
+        )
+        < 2
+    ):
+        raise ConfigValidationError(
+            "roth_sampler.interpolation.min_source_levels must be >= 2."
+        )
+
+
 def _validate_species_list(species: Any, field: str) -> list[str]:
     """Validate one ordered species-name list."""
     if not isinstance(species, list) or not species:
@@ -1042,6 +1158,7 @@ def load_and_validate_config(path: Path) -> dict[str, Any]:
         "trajectory_sampling",
         "vulcan_runtime",
         "tp_sampler",
+        "roth_sampler",
         "gravity_sampler",
         "kzz_sampler",
         "abundance_sampler",
@@ -1058,6 +1175,7 @@ def load_and_validate_config(path: Path) -> dict[str, Any]:
     _validate_trajectory_sampling(config["trajectory_sampling"])
     _validate_vulcan_runtime(config["vulcan_runtime"])
     _validate_tp_sampler(config["tp_sampler"])
+    _validate_roth_sampler(config["roth_sampler"])
     _validate_gravity_sampler(config["gravity_sampler"])
     _validate_kzz_sampler(config["kzz_sampler"])
     _validate_abundance_sampler(config["abundance_sampler"])

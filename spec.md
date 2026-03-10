@@ -480,3 +480,99 @@ The shipped batch script assumes GPU training.
 - Kzz is cm^2/s
 - gravity is cm/s^2
 - config keys with `log10_` prefixes are already base-10 transformed
+
+## 19. Roth PT Source
+
+Roth GCM PT columns can be added as a second TP source during `--gen`.
+
+This source is configured under `roth_sampler` and is additive:
+
+- `generation.num_runs` still controls analytic runs only
+- `roth_sampler.num_profiles` adds extra Roth-derived runs on top
+- Roth integration happens before VULCAN execution by producing standard `RunSpec`
+  objects on the shared emulator pressure grid
+
+### Roth Filter Semantics
+
+`roth_sampler.filters` uses explicit allow-lists:
+
+- `Teq`
+- `LogMet`
+- `LogDrag`
+- `Mstar`
+- `Rp`
+- `logG`
+- `TiOVO`
+- optional derived `planet_mass_jup`
+
+The shipped config defaults these allow-lists to all currently discovered
+filename values in the Roth grid.  To exclude a subset, remove entries from the
+corresponding list.
+
+Example:
+
+- removing `2200.0` from `roth_sampler.filters.Teq` excludes all Roth files with `Teq_2200`
+
+Optional `column_filters.lon` and `column_filters.lat` apply the same allow-list
+idea to individual lon/lat columns after file-level filtering.
+
+### Roth Validity Rules
+
+Each Roth `.dat` file is expanded into individual lon/lat PT columns.
+
+Columns are skipped when they fail any of the following:
+
+- fewer than `roth_sampler.interpolation.min_source_levels` source levels
+- non-finite temperature or pressure values
+- non-positive pressures
+- non-positive temperatures
+- duplicate or non-monotonic pressure levels
+
+Malformed singleton columns are therefore ignored automatically.
+
+### Shared-Grid Interpolation
+
+Roth columns are interpolated onto the same pressure grid used by analytic runs:
+
+- target grid = `tp_sampler.pressure_grid`
+- interpolation variable = `log10(pressure_bar)`
+- in-domain interpolator = monotone PCHIP
+- out-of-domain extrapolation = linear continuation using the edge slope in
+  log-pressure space
+
+Native source pressure bounds and top/bottom extrapolation flags are stored in
+the raw run `sampler/` group for provenance.
+
+### `pt_only` Semantics
+
+The current Roth mode is `roth_sampler.source_globals_mode = "pt_only"`.
+
+In this mode:
+
+- Roth provides only `temperature_k`
+- the shared target `pressure_bar` grid still comes from `tp_sampler.pressure_grid`
+- `gravity_cm_s2`, `metallicity_log10`, `c_to_o`, elemental abundances, and
+  `kzz_cm2_s` still come from the existing analytic samplers
+- Roth metadata affects selection and provenance only; it does not override the
+  VULCAN conditioning globals
+
+### Raw Reuse And Provenance
+
+The dataset manifest now records:
+
+- `raw_generation_config_sha256`
+- `source_counts` over the full raw `run_*.h5` set
+
+When raw `run_*.h5` files already exist, reuse is allowed only if the stored
+raw-generation config hash matches the current analytic/Roth generation config.
+If the hash differs, generation fails fast instead of silently mixing stale raw
+runs with a new source configuration.
+
+Processed-data provenance also includes `roth_sampler`, so changing Roth
+selection or interpolation controls requires rerunning `--gen`.
+
+### Git Policy
+
+- keep existing reference files under `roth/`
+- keep local Roth data under `roth/roth-grid/`
+- `roth/roth-grid/` is git-ignored and should not be committed
