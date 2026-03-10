@@ -308,17 +308,17 @@
       "d_model": 512,
       "nhead": 8,
       "num_layers": 6,
-      "dim_feedforward": 1024,
+      "dim_feedforward": 2048,
       "dropout": 0.05,
       "film_clamp": 10.0,
       "output_head_divisor": 2,
       "max_sequence_length": 64,
-      "conditioning_hidden_dim": 256
+      "conditioning_hidden_dim": 1024
     },
     "loss": {
       "lambda_z": 0.5,
       "lambda_phys": 1.0
     },
-    "output_folder": "v3"
+    "output_folder": "v4"
   }
 }
