@@ -26,7 +26,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ProjectPaths:
-    """Resolved project paths used by pipeline actions."""
+    """Resolved absolute paths for all pipeline directories."""
 
     root: Path
     vulcan_source: Path

@@ -179,7 +179,12 @@ class _NormPolicy:
 
 @dataclass(frozen=True)
 class RawRunData:
-    """Validated raw trajectory payload loaded from one HDF5 run file."""
+    """Validated raw trajectory payload loaded from one HDF5 run file.
+
+    Targets are derived from ``ymix_state`` via ``output_from_state_indices``,
+    so only the state array is stored here.  The raw ``ymix_output`` dataset is
+    validated during loading for shape/finiteness but is not retained.
+    """
 
     run_id: int
     pressure_bar: np.ndarray
@@ -187,7 +192,6 @@ class RawRunData:
     kzz_cm2_s: np.ndarray
     time_s: np.ndarray
     ymix_state: np.ndarray
-    ymix_output: np.ndarray
     global_inputs: dict[str, float]
 
 
@@ -300,7 +304,12 @@ def load_raw_run_file(
     state_species: list[str],
     output_species: list[str],
 ) -> RawRunData:
-    """Load one raw run HDF5 file and validate the transition-model science contract."""
+    """Load one raw run HDF5 file and validate the transition-model science contract.
+
+    Both ``ymix_state`` and ``ymix_output`` are validated for shape and finiteness,
+    but only ``ymix_state`` is retained.  Targets are derived at training time from
+    ``ymix_state`` via ``output_from_state_indices``.
+    """
     if not path.is_file():
         raise PreprocessError(f"Missing run file: {path}")
 
@@ -361,6 +370,8 @@ def load_raw_run_file(
             raise PreprocessError(f"sampler/source_kind is required in {path}")
         _ = _coerce_source_kind(handle["sampler"]["source_kind"][()], path)
 
+    # Validate all loaded arrays for finiteness (including ymix_output for
+    # raw-file integrity, even though it is not retained in RawRunData).
     arrays_to_check = [pressure, temperature, kzz, time_s, ymix_state, ymix_output]
     if any(np.any(~np.isfinite(array)) for array in arrays_to_check):
         raise PreprocessError(f"Non-finite values found in raw run file: {path}")
@@ -394,7 +405,6 @@ def load_raw_run_file(
         kzz_cm2_s=kzz,
         time_s=time_s,
         ymix_state=ymix_state,
-        ymix_output=ymix_output,
         global_inputs=global_inputs,
     )
 

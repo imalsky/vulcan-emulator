@@ -1,4 +1,11 @@
-"""GPU/CPU live transition-pair sampling from normalized trajectory splits."""
+"""GPU-resident live transition-pair sampling from normalized trajectory splits.
+
+Loads processed split arrays onto the target device once, builds a candidate
+table of all valid (anchor, target) index pairs, and provides per-epoch
+resampling for training and deterministic fixed sampling for evaluation.
+Batch assembly happens entirely on-device with no host-to-device copies in
+the training hot path.
+"""
 
 from __future__ import annotations
 
@@ -72,7 +79,12 @@ class LivePairBatchLoader:
 
 
 class ProcessedTrajectoryStore:
-    """One processed split loaded into memory/device for live candidate sampling."""
+    """One processed split loaded into memory/device for live candidate sampling.
+
+    Holds normalized trajectory tensors and a precomputed candidate table on the
+    target device.  Provides train-epoch resampling (with log-uniform weights)
+    and fixed eval sampling (deterministic seed, sampled once and reused).
+    """
 
     def __init__(
         self,
@@ -192,6 +204,12 @@ class ProcessedTrajectoryStore:
         selected_candidate_indices: torch.Tensor,
         full_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble one batch of (sequence, globals, target, padding_mask, dt_s) on device.
+
+        Gathers static profiles + anchor state into the sequence tensor, inserts
+        the normalized log10(dt) into the global vector at ``dt_feature_index``,
+        and extracts the target output-species subset from the target time step.
+        """
         candidate_ids = selected_candidate_indices.to(device=self.device, dtype=torch.long)
         run_idx = self.candidates.run_index[candidate_ids]
         anchor_idx = self.candidates.anchor_index[candidate_ids]
@@ -236,6 +254,12 @@ class ProcessedTrajectoryStore:
         seed: int,
         warn_shortfall: bool,
     ) -> torch.Tensor:
+        """Sample up to ``pairs_per_run`` candidates per run using log-uniform weights.
+
+        Samples without replacement when possible.  If a run has fewer valid
+        candidates than requested, all of them are used and a warning is logged
+        once.  The selected indices are globally shuffled before return.
+        """
         if pairs_per_run <= 0:
             raise LiveSamplingError("pairs_per_run must be > 0.")
         generator_device = self.device.type if self.device.type == "cuda" else "cpu"
@@ -284,6 +308,7 @@ class ProcessedTrajectoryStore:
 
 
 def _normalize_log10_dt(values: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
+    """Apply normalization to pre-computed log10(dt) values using the stored dt stats."""
     method = str(stats["method"])
     data = np.asarray(values, dtype=np.float64)
     if method == "none":
@@ -302,6 +327,12 @@ def _build_candidate_table(
     config: dict[str, Any],
     device: torch.device,
 ) -> CandidateTable:
+    """Build the full candidate table for one split from its time arrays.
+
+    Enumerates all valid (anchor, target) pairs per run, computes actual dt,
+    normalized log10(dt), and log-uniform sampling weights (1/dt), then
+    transfers everything to the target device as contiguous tensors.
+    """
     sampling_cfg = config["trajectory_sampling"]
     dt_stats = normalization_metadata["globals"]["log10_dt_s"]
 

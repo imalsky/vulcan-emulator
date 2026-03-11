@@ -48,6 +48,23 @@ def _load_json_dict(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _load_dict_from_checkpoint_or_disk(
+    *,
+    checkpoint: dict[str, Any],
+    key: str,
+    path: Path,
+) -> dict[str, Any]:
+    """Load one inference artifact from the checkpoint when embedded, else from disk."""
+    embedded = checkpoint.get(key)
+    if embedded is not None:
+        if not isinstance(embedded, dict):
+            raise InferenceError(
+                f"Checkpoint field '{key}' must be a JSON-like object, found {type(embedded).__name__}."
+            )
+        return embedded
+    return _load_json_dict(path)
+
+
 def _torch_dtype_from_name(name: str) -> torch.dtype:
     lowered = str(name).lower()
     if lowered not in _TORCH_DTYPES:
@@ -375,8 +392,16 @@ def load_physical_space_model(
     if not isinstance(checkpoint, dict):
         raise InferenceError(f"Invalid checkpoint payload: {checkpoint_path}")
 
-    normalization_metadata = _load_json_dict(resolved_run_dir / "normalization_metadata.json")
-    data_contract = _load_json_dict(resolved_run_dir / "data_contract.json")
+    normalization_metadata = _load_dict_from_checkpoint_or_disk(
+        checkpoint=checkpoint,
+        key="normalization_metadata",
+        path=resolved_run_dir / "normalization_metadata.json",
+    )
+    data_contract = _load_dict_from_checkpoint_or_disk(
+        checkpoint=checkpoint,
+        key="data_contract",
+        path=resolved_run_dir / "data_contract.json",
+    )
     config = checkpoint["config"]
     model_cfg = config["training"]["model"]
     precision_cfg = config["precision"]

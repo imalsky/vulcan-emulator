@@ -22,7 +22,6 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 cd "${PROJECT_ROOT}"
 export VULCAN_EMULATOR_PROJECT_ROOT="${PROJECT_ROOT}"
-VULCAN_SOURCE_OVERRIDE="${VULCAN_SOURCE_OVERRIDE:-${PROJECT_ROOT}/../VULCAN}"
 
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
@@ -58,6 +57,8 @@ HYPERPARAM_TRIALS="${HYPERPARAM_TRIALS:-12}"
 HYPERPARAM_TRIAL_EPOCHS="${HYPERPARAM_TRIAL_EPOCHS:-20}"
 HYPERPARAM_OVERWRITE="${HYPERPARAM_OVERWRITE:-0}"
 export RUN_MODE
+DID_STANDARD_TRAIN=0
+DID_HYPERPARAM=0
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export KMP_DUPLICATE_LIB_OK=TRUE
@@ -124,8 +125,13 @@ TRAIN_DEVICE="${CONFIG_INFO[4]}"
 HYPERPARAM_ROOT="${CONFIG_INFO[5]}"
 export TRAIN_DEVICE
 
-VULCAN_SOURCE="${VULCAN_SOURCE_OVERRIDE}"
-export VULCAN_EMULATOR_VULCAN_SOURCE="${VULCAN_SOURCE}"
+if [ -n "${VULCAN_SOURCE_OVERRIDE:-}" ]; then
+  VULCAN_SOURCE="${VULCAN_SOURCE_OVERRIDE}"
+  export VULCAN_EMULATOR_VULCAN_SOURCE="${VULCAN_SOURCE}"
+else
+  VULCAN_SOURCE="${CONFIG_INFO[1]}"
+  unset VULCAN_EMULATOR_VULCAN_SOURCE || true
+fi
 
 if [ -z "${TRAIN_LOG}" ]; then
   TRAIN_LOG="${LOGS_ROOT}/${RUN_MODE}_${PBS_JOBID:-manual}.log"
@@ -260,31 +266,32 @@ run_hyperparam_search() {
     HYPERPARAM_ARGS+=(--overwrite)
   fi
   ensure_optuna
+  DID_HYPERPARAM=1
   python -u src/hyperparam_testing.py "${HYPERPARAM_ARGS[@]}" 2>&1 | tee -a "${TRAIN_LOG}"
 }
 
 if [ "${RUN_MODE}" = "pipeline" ]; then
   echo "Execution control:"
-  echo "  Default: regenerate data, then run hyperparameter search."
-  echo "  To switch to a standard full run:"
-  echo "    1. comment out the run_hyperparam_search line below"
-  echo "    2. uncomment the standard training line below"
+  echo "  Default: regenerate data, then run standard training."
+  echo "  Hyperparameter search wiring is left in place below but disabled by default."
   echo "Training log file: ${TRAIN_LOG}"
   : > "${TRAIN_LOG}"
 
   # Comment out this line if you want to skip generation.
   python -u src/main.py --gen --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
 
-  # Comment out this line to skip hyperparameter search.
-  run_hyperparam_search
+  # Uncomment this line to run hyperparameter search instead of standard training.
+  # run_hyperparam_search
 
-  # Uncomment this line instead for a standard full run on the regenerated data.
-  # python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+  # Standard full run on the regenerated data.
+  DID_STANDARD_TRAIN=1
+  python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
 elif [ "${RUN_MODE}" = "train" ]; then
   echo "Execution control:"
   echo "  Standard training-only mode."
   echo "Training log file: ${TRAIN_LOG}"
   : > "${TRAIN_LOG}"
+  DID_STANDARD_TRAIN=1
   python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
 else
   echo "Execution control:"
@@ -295,9 +302,9 @@ else
 fi
 
 echo "Completed successfully."
-if [ -f "${RUN_DIR}/best.pt" ]; then
+if [ "${DID_STANDARD_TRAIN}" = "1" ] && [ -f "${RUN_DIR}/best.pt" ]; then
   echo "Best checkpoint: ${RUN_DIR}/best.pt"
 fi
-if [ -f "${HYPERPARAM_ROOT}/best_model/best.pt" ]; then
+if [ "${DID_HYPERPARAM}" = "1" ] && [ -f "${HYPERPARAM_ROOT}/best_model/best.pt" ]; then
   echo "Best checkpoint: ${HYPERPARAM_ROOT}/best_model/best.pt"
 fi

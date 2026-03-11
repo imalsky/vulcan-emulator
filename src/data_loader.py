@@ -1,4 +1,9 @@
-"""Processed normalized-trajectory split loading utilities."""
+"""Processed normalized-trajectory split loading utilities.
+
+Loads the padded ``.npy`` arrays and ``metadata.json`` produced by ``--gen``
+for one train/val/test split, validating shapes, finiteness, and metadata
+contracts before returning a :class:`ProcessedSplitArrays` bundle.
+"""
 
 from __future__ import annotations
 

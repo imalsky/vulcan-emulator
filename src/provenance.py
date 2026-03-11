@@ -53,7 +53,12 @@ def load_json_dict(path: Path) -> dict[str, Any]:
 
 
 def _preprocess_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Extract only config sections that affect generated processed artifacts."""
+    """Extract only config sections that affect generated processed artifacts.
+
+    Excludes live sampling budgets (``train_pairs_per_run_per_epoch``,
+    ``eval_pairs_per_run``) since those change training behavior but not the
+    processed tensors.
+    """
     generation = config["generation"]
     relevant_generation = {
         "num_runs": generation["num_runs"],
@@ -88,7 +93,12 @@ def _preprocess_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _raw_generation_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Extract the config subset that defines raw VULCAN generation content."""
+    """Extract the config subset that defines raw VULCAN generation content.
+
+    Used to detect when existing raw ``run_*.h5`` files were produced under a
+    different source configuration (analytic/Roth mix, VULCAN runtime controls,
+    etc.) and should not be reused.
+    """
     generation = config["generation"]
     relevant_generation = {
         "num_runs": generation["num_runs"],
