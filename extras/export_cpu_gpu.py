@@ -40,7 +40,6 @@ from inference import load_physical_space_model, physical_inputs_from_processed_
 from script_utils import (
     load_checkpoint,
     load_fixed_split_sample,
-    load_json,
     resolve_processed_root_from_checkpoint,
     resolve_run_dir,
 )
@@ -72,7 +71,7 @@ def _example_tensors(
         processed_root=processed_root,
         split=TEST_SPLIT,
         config=checkpoint["config"],
-        normalization_metadata=load_json(processed_root / "normalization_metadata.json"),
+        normalization_metadata=normalization_metadata,
         sample_index=sample_index,
     )
     example = physical_inputs_from_processed_arrays(

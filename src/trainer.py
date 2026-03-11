@@ -187,15 +187,26 @@ def _compute_combined_loss(
     lambda_z: float,
     lambda_phys: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute combined loss: lambda_z * MSE(z) + lambda_phys * MAE(log10_phys).
+    """Compute combined loss: ``lambda_z * MSE(z) + lambda_phys * MAE(log10_phys)``.
 
-    The fractional (physical-space) term measures multiplicative error:
-    |log10(pred_phys) - log10(true_phys)| = target_std * |pred_z - true_z|
-    since for log-standard normalization, log10(phys) = z * std + mean.
+    The physical-space term measures multiplicative (log10) error without
+    leaving normalized space.  Since log-standard normalization gives
+    ``log10(phys) = z * std + mean``, the log10-space absolute error is just
+    ``target_std * |pred_z - true_z|``.  This avoids denormalization during
+    training while still penalizing physically meaningful relative errors.
 
-    Returns (total_loss, mse_z, mae_log10,
-             sq_error_sum, abs_error_sum, weighted_abs_sum, total_elements,
-             sample_sq, sample_abs, sample_elements).
+    Args:
+        diff: ``pred - target`` in normalized space, shape ``[B, nz, S]``.
+        padding_mask: ``True`` = padding, shape ``[B, nz]``, or ``None``.
+        target_std: Per-species std from log-standard normalization, shape ``[S]``.
+        lambda_z: Weight on the normalized-space MSE term.
+        lambda_phys: Weight on the physical-space MAE(log10) term.
+
+    Returns:
+        10-tuple of ``(total_loss, mse_z, mae_log10,
+        sq_error_sum, abs_error_sum, weighted_abs_sum, total_elements,
+        sample_sq, sample_abs, sample_elements)`` for flexible aggregation
+        across batches and dt-bins.
     """
     abs_diff = diff.abs()
     sq_diff = diff * diff
@@ -278,7 +289,12 @@ def _evaluate(
     lambda_phys: float,
     dt_bin_edges: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Evaluate one split and optionally accumulate dt-binned metrics."""
+    """Evaluate one split and optionally accumulate dt-binned metrics.
+
+    Returns a dict with ``mse``, ``mae``, ``mae_log10``, ``combined_loss``,
+    and (when ``dt_bin_edges`` is provided) a ``dt_bins`` list with per-bin
+    MSE/MAE breakdowns.
+    """
     model.eval()
     loader_prefetches = _loader_prefetches_to_device(loader)
     total_sq_error = torch.zeros((), device=device, dtype=stats_dtype)
@@ -526,7 +542,13 @@ def _build_data_contract(train_meta: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig) -> None:
-    """Execute ``--train`` with GPU-resident live pair sampling."""
+    """Execute ``--train`` with GPU-resident live pair sampling.
+
+    Validates processed artifacts, loads splits onto GPU, builds the model,
+    trains for the configured number of epochs with per-epoch train-pair
+    resampling, evaluates on fixed val/test pairs, and writes checkpoints
+    (``best.pt``, ``last.pt``) plus final ``metrics.json``.
+    """
     training = config["training"]
     _seed_everything(int(training["seed"]))
 
@@ -845,6 +867,7 @@ def run_training(config: dict[str, Any], paths: Any, precision: PrecisionConfig)
             "scaler_state": scaler.state_dict() if scaler_enabled else None,
             "config": config,
             "data_contract": data_contract,
+            "normalization_metadata": normalization_metadata,
             "normalization_fingerprint": expected_norm_fingerprint,
         }
         torch.save(checkpoint, run_dir / "last.pt")

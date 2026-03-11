@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Run a small self-contained Optuna study over training-only hyperparameters."""
+"""Run a small self-contained Optuna study over training-only hyperparameters.
+
+Searches over architecture presets, optimizer settings, and data-sampling
+budgets while reusing existing processed data artifacts.  Each trial runs
+a full ``run_training()`` call in a temporary scratch directory.  The
+winning trial is promoted into ``models/hyperparam_testing/best_model/``
+with rewritten paths and reformatted numeric outputs.
+
+This script never calls ``--gen`` and never modifies processed data.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +21,6 @@ import os
 import shutil
 import sys
 from copy import deepcopy
-from json.encoder import INFINITY, _make_iterencode, encode_basestring, encode_basestring_ascii
 from pathlib import Path
 from typing import Any
 
@@ -61,46 +69,97 @@ PROMOTED_ARTIFACTS = (
 FLOAT_SIG_FIGS = 4
 
 
+def _format_floats(obj: Any) -> Any:
+    """Recursively format all floats in a JSON-serializable object to scientific notation.
+
+    Walks dicts, lists, and tuples, converting every ``float`` to a string
+    representation with ``FLOAT_SIG_FIGS`` significant figures.  The formatted
+    strings are wrapped so that ``json.dumps`` emits them unquoted by using a
+    custom encoder's ``default`` hook on sentinel objects.
+    """
+    if isinstance(obj, float):
+        return _FormattedFloat(obj)
+    if isinstance(obj, dict):
+        return {key: _format_floats(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_format_floats(item) for item in obj]
+    return obj
+
+
+class _FormattedFloat:
+    """Sentinel that carries a pre-formatted float string for JSON output."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, value: float) -> None:
+        self.text = f"{value:.{FLOAT_SIG_FIGS - 1}e}"
+
+
 class _ScientificNotationJSONEncoder(json.JSONEncoder):
-    """JSON encoder that renders floats in scientific notation with fixed sig figs."""
+    """JSON encoder that renders floats in scientific notation with fixed sig figs.
+
+    Works by pre-formatting the payload via :func:`_format_floats` before
+    encoding, avoiding reliance on CPython-private ``json.encoder`` internals.
+    """
+
+    def encode(self, o: Any) -> str:
+        formatted = _format_floats(o)
+        indent_size = self.indent if isinstance(self.indent, int) else 2
+        return self._encode_recursive(formatted, depth=0, indent_size=indent_size)
 
     def iterencode(self, o: Any, _one_shot: bool = False):
-        markers = {} if self.check_circular else None
-        string_encoder = encode_basestring_ascii if self.ensure_ascii else encode_basestring
+        return iter([self.encode(o)])
 
-        def floatstr(
-            value: float,
-            allow_nan: bool = self.allow_nan,
-            positive_inf: float = INFINITY,
-            negative_inf: float = -INFINITY,
-        ) -> str:
-            if value != value:
-                text = "NaN"
-            elif value == positive_inf:
-                text = "Infinity"
-            elif value == negative_inf:
-                text = "-Infinity"
-            else:
-                return f"{float(value):.{FLOAT_SIG_FIGS - 1}e}"
-            if not allow_nan:
-                raise ValueError(
-                    "Out of range float values are not JSON compliant: " + repr(value)
-                )
-            return text
+    def _encode_recursive(self, obj: Any, *, depth: int, indent_size: int) -> str:
+        """Serialize one object, rendering ``_FormattedFloat`` values unquoted."""
+        if isinstance(obj, _FormattedFloat):
+            return obj.text
+        if obj is None:
+            return "null"
+        if isinstance(obj, bool):
+            return "true" if obj else "false"
+        if isinstance(obj, int):
+            return str(obj)
+        if isinstance(obj, float):
+            return f"{obj:.{FLOAT_SIG_FIGS - 1}e}"
+        if isinstance(obj, str):
+            return json.dumps(obj, ensure_ascii=self.ensure_ascii)
+        if isinstance(obj, dict):
+            items = sorted(obj.items()) if self.sort_keys else obj.items()
+            entries = [
+                f"{json.dumps(str(key), ensure_ascii=self.ensure_ascii)}: "
+                f"{self._encode_recursive(value, depth=depth + 1, indent_size=indent_size)}"
+                for key, value in items
+            ]
+            return self._format_compound("{", entries, "}", depth=depth, indent_size=indent_size)
+        if isinstance(obj, (list, tuple)):
+            entries = [
+                self._encode_recursive(item, depth=depth + 1, indent_size=indent_size)
+                for item in obj
+            ]
+            return self._format_compound("[", entries, "]", depth=depth, indent_size=indent_size)
+        return json.dumps(obj, ensure_ascii=self.ensure_ascii)
 
-        iterencode = _make_iterencode(
-            markers,
-            self.default,
-            string_encoder,
-            self.indent,
-            floatstr,
-            self.key_separator,
-            self.item_separator,
-            self.sort_keys,
-            self.skipkeys,
-            _one_shot,
-        )
-        return iterencode(o, 0)
+    def _format_compound(
+        self,
+        open_br: str,
+        entries: list[str],
+        close_br: str,
+        *,
+        depth: int,
+        indent_size: int,
+    ) -> str:
+        """Format a dict or list with depth-aware indentation."""
+        if self.indent is not None:
+            if not entries:
+                return f"{open_br}{close_br}"
+            inner_indent = " " * (indent_size * (depth + 1))
+            outer_indent = " " * (indent_size * depth)
+            inner = ",\n".join(f"{inner_indent}{entry}" for entry in entries)
+            return f"{open_br}\n{inner}\n{outer_indent}{close_br}"
+        if not entries:
+            return f"{open_br}{close_br}"
+        return f"{open_br}{', '.join(entries)}{close_br}"
 
 
 def _positive_int(value: str) -> int:
@@ -308,7 +367,23 @@ def _sample_trial_config(
     trial: optuna.trial.Trial,
     trial_epochs: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Clone the base config and apply one Optuna-sampled hyperparameter set."""
+    """Clone the base config and apply one Optuna-sampled hyperparameter set.
+
+    Search space:
+
+    - **architecture**: ``{256x4, 384x6, 512x8, 768x12}`` (d_model x nhead)
+    - **num_layers**: ``{4, 6, 8}``
+    - **dim_feedforward_multiplier**: ``{2, 4}`` (times d_model)
+    - **conditioning_hidden_multiplier**: ``{1, 2}`` (times d_model)
+    - **batch_size**: ``{128, 256}``
+    - **learning_rate**: log-uniform in ``[3e-5, 3e-4]``
+    - **weight_decay**: log-uniform in ``[1e-6, 1e-3]``
+    - **dropout**: ``{0.0, 0.05, 0.10, 0.15}``
+    - **train_pairs_per_run_per_epoch**: ``{500, 1000, 1500}``
+
+    Returns the mutated config and a flat dict of derived hyperparameter values
+    for logging.
+    """
     config = deepcopy(base_config)
     training = config["training"]
     model_cfg = training["model"]
@@ -372,7 +447,12 @@ def _promote_best_trial(
     best_trial_dir: Path,
     output_root: Path,
 ) -> None:
-    """Promote one winning scratch trial into the final best_model directory."""
+    """Promote one winning scratch trial into the final best_model directory.
+
+    Copies ``PROMOTED_ARTIFACTS``, rewrites the checkpoint's embedded config
+    to point at the permanent output folder, and reformats all JSON/CSV
+    artifacts with scientific notation.
+    """
     best_model_dir = output_root / "best_model"
     if best_model_dir.exists():
         shutil.rmtree(best_model_dir)
@@ -413,7 +493,19 @@ def run_hyperparameter_search(
     trial_epochs: int,
     overwrite: bool,
 ) -> dict[str, Any]:
-    """Run the Optuna study and return the winning-trial summary."""
+    """Run the Optuna study and return the winning-trial summary.
+
+    Lifecycle per trial:
+
+    1. Sample hyperparameters via TPE.
+    2. Deep-copy and mutate the base config.
+    3. Run full ``run_training()`` in a scratch directory.
+    4. Record the best-val-combined-loss as the Optuna objective.
+    5. Keep the current-best trial's scratch dir; clean up losers.
+
+    After all trials, the winning trial's artifacts are promoted into
+    ``models/hyperparam_testing/best_model/`` and the scratch root is removed.
+    """
     resolved_config_path = _resolve_config_path(config_path)
     base_config = load_and_validate_config(resolved_config_path)
     output_root = _hyperparam_root(base_config)
@@ -428,6 +520,7 @@ def run_hyperparameter_search(
 
     for _ in range(trials):
         trial = study.ask()
+        trial_recorded = False
         trial_name = _trial_name(trial.number)
         trial_log_path = output_root / "logs" / f"{trial_name}.log"
         trial_training_log_path = output_root / "logs" / f"{trial_name}_training_log.csv"
@@ -467,7 +560,6 @@ def run_hyperparameter_search(
             run_training(trial_config, trial_paths, precision)
             metrics = _load_metrics(trial_run_dir / "metrics.json")
             objective = float(metrics["best_val_combined_loss"])
-            study.tell(trial, objective)
 
             summary["status"] = "completed"
             summary["best_val_combined_loss"] = objective
@@ -491,9 +583,12 @@ def run_hyperparameter_search(
                 trial_name,
                 objective,
             )
+            study.tell(trial, objective)
+            trial_recorded = True
 
         except Exception as exc:
-            study.tell(trial, state=optuna.trial.TrialState.FAIL)
+            if not trial_recorded:
+                study.tell(trial, state=optuna.trial.TrialState.FAIL)
             summary["status"] = _classify_failure(exc)
             summary["error_type"] = type(exc).__name__
             summary["error_message"] = str(exc)

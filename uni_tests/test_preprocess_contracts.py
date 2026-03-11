@@ -98,9 +98,8 @@ class PreprocessContractsTests(unittest.TestCase):
 
         self.assertEqual(raw.run_id, 123)
         self.assertEqual(raw.ymix_state.shape, (3, 2, 2))
-        self.assertEqual(raw.ymix_output.shape, (3, 2, 2))
         np.testing.assert_allclose(raw.ymix_state, ymix_state[:, :, [0, 2]])
-        np.testing.assert_allclose(raw.ymix_output, ymix_output[:, :, [3, 0]])
+        self.assertFalse(hasattr(raw, "ymix_output"))
 
     def test_discover_existing_raw_run_files_only_uses_flat_raw_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ve_preprocess_discover_") as tmpdir_name:

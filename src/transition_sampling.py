@@ -53,7 +53,12 @@ def build_candidate_pairs(
     dt_max_s: float,
     min_future_saved_steps: int,
 ) -> CandidatePairs:
-    """Enumerate all valid ordered pairs within the configured actual-dt range."""
+    """Enumerate all valid ordered pairs within the configured actual-dt range.
+
+    Returns every (anchor, target) index pair where the index gap satisfies
+    ``min_future_saved_steps`` and the realized ``dt = time[target] - time[anchor]``
+    lies within ``[dt_min_s, dt_max_s]``.
+    """
     times = _validate_times(times_s)
     dt_min = float(dt_min_s)
     dt_max = float(dt_max_s)

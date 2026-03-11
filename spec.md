@@ -41,6 +41,10 @@ Current shipped species:
 - `N2`
 - `NH3`
 
+`physics_toggles` includes `use_photochemistry` and `use_ion_chemistry` for
+validation purposes only.  Both must be `false` in the current regime and are
+not passed as model conditioning inputs.
+
 ## 3. Raw Trajectory Semantics
 
 Each raw HDF5 run stores one VULCAN trajectory with:
@@ -56,6 +60,11 @@ The raw loader requires:
 - strictly increasing `time_s`,
 - at least one saved future state beyond `t=0`,
 - requested species to exist in the stored species lists.
+
+In memory, raw preprocessing keeps only the configured `ymix_state` subset.
+`trajectory/ymix_output` is still validated on load for file integrity, but
+targets are derived later from `ymix_state` via `output_from_state_indices`
+rather than carried as a second in-memory trajectory tensor.
 
 The raw files remain the authoritative source of trajectory content. They are
 never rewritten by training.
@@ -262,7 +271,23 @@ Each live batch is assembled as:
 - `padding_mask = all_false`, because `nz` is fixed and batching is by pair, not
   by variable vertical length
 
-## 10. Training Contract
+## 10. Precision Contract
+
+`precision` controls dtype selection across the training pipeline:
+
+- `input_dtype`: dtype for loaded processed tensors on device
+- `stats_accumulation_dtype`: dtype for running metric accumulators
+- `model_dtype`: dtype for model parameters
+- `forward_dtype`: dtype for input tensors during the forward pass
+- `loss_dtype`: dtype for loss computation and target tensors
+- `optimizer_state_dtype`: dtype for optimizer state tensors
+- `amp_autocast_dtype`: autocast dtype for AMP (`"none"` disables AMP autocast)
+
+All fields default to `"float32"` in the shipped config. Supported values are
+`"float16"`, `"bfloat16"`, `"float32"`, `"float64"`, and `"none"` (for the
+AMP field only).
+
+## 11. Training Contract
 
 Training is CUDA-only.
 
@@ -314,7 +339,7 @@ contract expects these parameters:
 - `max_sequence_length`: maximum supported vertical sequence length for positional encoding
 - `conditioning_hidden_dim`: hidden width of the global-conditioning MLP
 
-## 11. Evaluation Contract
+## 12. Evaluation Contract
 
 Single-step validation/test metrics are computed on the fixed eval pairs.
 
@@ -331,7 +356,7 @@ eval pair tables, not from the full split candidate range.
 Future work may reintroduce multi-step rollout evaluation or autoregressive
 utilities, but the current contract intentionally excludes them.
 
-## 12. Generation And Reuse Rules
+## 13. Generation And Reuse Rules
 
 `--gen` behaves as follows:
 
@@ -358,7 +383,7 @@ does not require rerunning `--gen`.
 Changing candidate validity, normalization, raw data, or run splits does require
 rerunning `--gen`.
 
-## 13. Provenance Contract
+## 14. Provenance Contract
 
 Processed provenance depends on:
 
@@ -382,7 +407,7 @@ Processed provenance explicitly excludes:
 
 Those settings change training/evaluation behavior, not processed tensors.
 
-## 14. Filesystem Layout
+## 15. Filesystem Layout
 
 ```text
 data/
@@ -442,7 +467,7 @@ logs/
 
 `generation.worker_root` remains temporary scratch space for VULCAN workers.
 
-## 15. Inference And Utility Scripts
+## 16. Inference And Utility Scripts
 
 Core inference remains in `src/inference.py`:
 
@@ -450,8 +475,11 @@ Core inference remains in `src/inference.py`:
 - `VulcanPredictor`
 
 These operate on physical-space inputs and outputs for single-step transitions.
-Checkpoint format, inference artifacts, and the transformer architecture remain
-unchanged.
+Each training checkpoint embeds the model config, data contract, and
+normalization metadata needed to rebuild the physical-space wrapper from
+`best.pt` alone. The sidecar `data_contract.json` and
+`normalization_metadata.json` files are still written for inspection and local
+utilities. The transformer architecture remains unchanged.
 
 Training utilities now also include `src/hyperparam_testing.py`, which runs a
 small Optuna search over training-only hyperparameters while preserving the
@@ -459,10 +487,38 @@ same processed-data and checkpoint contracts as normal training. It keeps one
 promoted winning checkpoint under `models/hyperparam_testing/best_model/` and
 stores per-trial logs/summaries under `models/hyperparam_testing/logs/`.
 
+The shipped hyperparameter search contract is:
+
+- Optuna TPE sampler seeded from `training.seed`
+- objective = `metrics.json["best_val_combined_loss"]`
+- every trial runs in an isolated scratch output folder under
+  `models/hyperparam_testing/_scratch/`
+- processed data, split assignments, normalization metadata, and
+  `training.live_sampling.eval_pairs_per_run` stay fixed across trials
+- only training-only knobs may vary per trial:
+  - architecture preset: `{256x4, 384x6, 512x8, 768x12}` for `(d_model, nhead)`
+  - `num_layers` in `{4, 6, 8}`
+  - `dim_feedforward = d_model * {2, 4}`
+  - `conditioning_hidden_dim = d_model * {1, 2}`
+  - `batch_size` in `{128, 256}`
+  - `learning_rate` log-uniform in `[3e-5, 3e-4]`
+  - `weight_decay` log-uniform in `[1e-6, 1e-3]`
+- `dropout` in `{0.0, 0.05, 0.10, 0.15}`
+- `train_pairs_per_run_per_epoch` in `{500, 1000, 1500}`
+- `epochs = --trial-epochs`, with `warmup_epochs` clamped to that trial budget
+- the promoted `best_model` checkpoint is the winning trial checkpoint at that
+  trial budget; there is no automatic retraining pass at the base
+  `training.epochs` value
+
+The winning checkpoint is promoted by copying only the inference/training
+artifacts needed for downstream use, rewriting the embedded config so the
+checkpoint points at `hyperparam_testing/best_model`, and deleting the scratch
+trial tree afterward.
+
 Local scripts under `extras/` now build deterministic fixed eval pairs from the
 processed trajectory splits instead of reading pair shards directly.
 
-## 16. Failure Philosophy
+## 17. Failure Philosophy
 
 The repository is intentionally strict:
 
@@ -478,7 +534,7 @@ splits.
 
 The goal is fail-fast scientific correctness, not compatibility shims.
 
-## 17. Environment
+## 18. Environment
 
 ### Local
 
@@ -494,10 +550,15 @@ Environment variables may override path resolution:
 - `VULCAN_EMULATOR_VULCAN_SOURCE`
 - `VULCAN_EMULATOR_CONDA_ENV`
 
-The shipped batch script assumes GPU training and supports two modes:
+The shipped batch script assumes GPU training and supports three modes:
 
+- `RUN_MODE=pipeline` is the default and runs `src/main.py --gen` followed by `src/hyperparam_testing.py`
 - `RUN_MODE=train` runs the standard `src/main.py --train` path
 - `RUN_MODE=hyperparam` runs `src/hyperparam_testing.py`
+
+By default, `run.pbs` follows `paths.vulcan_source_path` from the config. Set
+`VULCAN_SOURCE_OVERRIDE` only when you intentionally want the batch job to use a
+different VULCAN checkout.
 
 Hyperparameter batch runs accept:
 
@@ -505,7 +566,7 @@ Hyperparameter batch runs accept:
 - `HYPERPARAM_TRIAL_EPOCHS`
 - `HYPERPARAM_OVERWRITE`
 
-## 18. Conventions
+## 19. Conventions
 
 - all logarithms are base-10
 - padding mask follows PyTorch convention: `True = padding`
@@ -515,7 +576,7 @@ Hyperparameter batch runs accept:
 - gravity is cm/s^2
 - config keys with `log10_` prefixes are already base-10 transformed
 
-## 19. Roth PT Source
+## 20. Roth PT Source
 
 Roth GCM PT columns can be added as a second TP source during `--gen`.
 

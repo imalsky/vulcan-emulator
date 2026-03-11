@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"^import\\\\|^from\" /Users/imalsky/Desktop/VULCAN_Project/vulcan-emulator/roth/*.py)"
+    ]
+  }
+}

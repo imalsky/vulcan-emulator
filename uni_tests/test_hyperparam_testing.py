@@ -48,11 +48,21 @@ def _write_trial_artifacts(run_dir: Path, config: dict, objective: float) -> Non
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_training_log(run_dir / "training_log.csv")
     (run_dir / "last.pt").write_bytes(b"last")
-    torch.save({"config": config, "model_state": {}}, run_dir / "best.pt")
+    data_contract = {"sequence_length": 1}
+    normalization_metadata = {"targets": {"ymix": {"std": [1.0], "method": "log-standard"}}}
+    torch.save(
+        {
+            "config": config,
+            "model_state": {},
+            "data_contract": data_contract,
+            "normalization_metadata": normalization_metadata,
+        },
+        run_dir / "best.pt",
+    )
     for filename, payload in (
         ("metrics.json", {"best_val_combined_loss": objective}),
-        ("data_contract.json", {"sequence_length": 1}),
-        ("normalization_metadata.json", {"targets": {"ymix": {"std": [1.0], "method": "log-standard"}}}),
+        ("data_contract.json", data_contract),
+        ("normalization_metadata.json", normalization_metadata),
         ("processed_fingerprint.json", {"version": 2}),
     ):
         with (run_dir / filename).open("w", encoding="utf-8") as handle:
@@ -153,6 +163,11 @@ class HyperparamTestingTests(unittest.TestCase):
                 "hyperparam_testing/best_model",
             )
             self.assertEqual(checkpoint["config"]["paths"]["models_root"], "models")
+            self.assertEqual(checkpoint["data_contract"]["sequence_length"], 1)
+            self.assertEqual(
+                checkpoint["normalization_metadata"]["targets"]["ymix"]["method"],
+                "log-standard",
+            )
 
     def test_search_records_failed_trials_and_continues(self) -> None:
         call_counter = {"count": 0}

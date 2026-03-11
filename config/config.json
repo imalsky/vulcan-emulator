@@ -9,7 +9,7 @@
     "logs_root": "logs"
   },
   "generation": {
-    "num_runs": 1000,
+    "num_runs": 5000,
     "num_workers": 64,
     "split_ratios": {
       "train": 0.8,
@@ -18,7 +18,7 @@
     },
     "random_seed": 42,
     "keep_vulcan_outputs_debug": false,
-    "run_timeout_seconds": 180,
+    "run_timeout_seconds": 120,
     "manifest_filename": "dataset_manifest.json",
     "split_filename": "splits.json",
     "worker_root": "data/raw/_workers",
@@ -56,23 +56,23 @@
     "convective_adjustment_probability": 0.3333333333,
     "log10_kappa_ir": {
       "distribution": "uniform",
-      "min": -3.0,
-      "max": 0.5
+      "min": -2.5,
+      "max": 2.5
     },
     "kappa_pressure_power_exponent": {
       "distribution": "uniform",
-      "min": 0.0,
-      "max": 0.7
+      "min": -0.5,
+      "max": 1.0
     },
     "log10_gamma1": {
       "distribution": "uniform",
-      "min": -2.5,
-      "max": 2.5
+      "min": -2.0,
+      "max": 2.0
     },
     "log10_gamma2": {
       "distribution": "uniform",
-      "min": -2.5,
-      "max": 2.5
+      "min": -2.0,
+      "max": 2.0
     },
     "alpha_partition": {
       "distribution": "uniform",
@@ -83,15 +83,15 @@
       "distribution": "normal",
       "mean": 500.0,
       "std": 100.0,
-      "min": 50.0,
+      "min": 200.0,
       "max": 800.0
     },
     "t_irr": {
       "distribution": "normal",
-      "mean": 1700.0,
+      "mean": 1500.0,
       "std": 500.0,
       "min": 1000.0,
-      "max": 2600.0
+      "max": 2500.0
     },
     "temperature_shift": {
       "distribution": "uniform",
@@ -101,7 +101,7 @@
   },
   "roth_sampler": {
     "enabled": true,
-    "num_profiles": 1000,
+    "num_profiles": 2000,
     "data_glob": "roth/roth-grid/PTprofiles/*.dat",
     "source_globals_mode": "pt_only",
     "filters": {
@@ -296,24 +296,24 @@
     "learning_rate": 1e-4,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
-    "weight_decay": 1e-05,
+    "weight_decay": 5e-05,
     "gradient_clip": 1.0,
     "use_amp": false,
     "seed": 42,
     "live_sampling": {
-      "train_pairs_per_run_per_epoch": 100,
+      "train_pairs_per_run_per_epoch": 1000,
       "eval_pairs_per_run": 100
     },
     "model": {
-      "d_model": 512,
-      "nhead": 8,
+      "d_model": 384,
+      "nhead": 6,
       "num_layers": 6,
-      "dim_feedforward": 2048,
-      "dropout": 0.05,
+      "dim_feedforward": 768,
+      "dropout": 0.0,
       "film_clamp": 10.0,
       "output_head_divisor": 2,
       "max_sequence_length": 64,
-      "conditioning_hidden_dim": 1024
+      "conditioning_hidden_dim": 384
     },
     "loss": {
       "lambda_z": 0.5,
