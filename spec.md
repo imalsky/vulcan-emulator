@@ -443,7 +443,14 @@ models/
     normalization_metadata.json
     processed_fingerprint.json
     training_log.csv
+    standalone_model_cpu.pt2          # optional, written by extras/export_cpu_gpu.py
+    standalone_model_cuda.pt2         # optional, written by extras/export_cpu_gpu.py on CUDA hosts
     figures/
+      true_vs_pred_profile_sample_*.png
+      tp_profile_sample_*.png
+      training_progression.png
+      error_metrics.json
+      error_metrics_per_species.csv
   hyperparam_testing/
     best_config.json
     best_model/
@@ -517,6 +524,24 @@ trial tree afterward.
 
 Local scripts under `extras/` now build deterministic fixed eval pairs from the
 processed trajectory splits instead of reading pair shards directly.
+
+Additional current utility-script behavior:
+
+- `extras/export_cpu_gpu.py` can write fully standalone
+  `standalone_model_<device>.pt2` exports. These exported programs bake in the
+  normalization/data-contract state and run directly in physical space without
+  requiring the sidecar JSON files.
+- `extras/compute_error_metrics.py` writes `error_metrics.json` and
+  `error_metrics_per_species.csv` under `<run_dir>/figures/`.
+- `extras/plot_true_vs_pred_profile.py` resolves the target run from
+  `models/<MODEL_DIR_NAME>` at the top of the script, then uses the selected
+  checkpoint's embedded config to locate processed data and rebuild the model.
+- `extras/plot_true_vs_pred_profile.py` selects one test example from the fixed
+  eval sample pool using `SAMPLE_SELECTION_MODE`. The default
+  `"uniform_log_dt"` mode chooses a non-empty `log10(dt)` bin uniformly and
+  then samples uniformly within that bin, which gives better dt-range coverage
+  than uniform sampling over sample index. The fallback `"uniform"` mode samples
+  directly over the fixed eval sample indices.
 
 ## 17. Failure Philosophy
 
