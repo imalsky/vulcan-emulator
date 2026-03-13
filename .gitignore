@@ -41,6 +41,7 @@ venv/
 .DS_Store
 
 # Vulcan-emulator generated artifacts (data, models, logs)
+data/*
 data/raw/
 data/processed/
 data/**/raw/
