@@ -27,6 +27,7 @@ venv/
 .vscode/
 .cursorignore
 .cursorindexingignore
+.claude/settings.local.json
 
 # Type checkers / linters
 .mypy_cache/
