@@ -1,698 +1,574 @@
-# VULCAN Emulator Spec
+# Photochemical VULCAN Surrogate Spec
 
-## 1. Purpose
+## Scope
 
-This repository trains a transformer surrogate for VULCAN 1D thermochemical
-trajectories. The learned operator is a variable-dt state transition:
+This repository builds a JAX-native surrogate for 1D VULCAN chemistry trajectories.
+The intended production path is a strict VULCAN-backed photochemical workflow for hot
+Jupiter profiles, with explicit stellar-spectrum conditioning and an export path that
+can be embedded in ExoJAX.
 
-- input: atmospheric profiles, conditioning scalars, current chemistry state, realized dt
-- output: future chemistry state after that dt
+The differentiable part of the system is the trained surrogate and its exported
+physical-space transition function. Raw VULCAN generation and preprocessing are offline
+data-pipeline steps and are not part of the differentiable runtime.
 
-The core workflow is:
+## End-to-End Pipeline
 
-1. generate or reuse raw VULCAN trajectories,
-2. split runs into train/val/test with no run leakage,
-3. normalize and persist full trajectories,
-4. train with live transition-pair sampling on GPU,
-5. evaluate single-step behavior,
-6. export or inspect trained runs with local utility scripts.
+The codebase is organized around four stages:
 
-This is not a steady-state regressor, not a photochemical emulator, and not a
-backward-compatible multi-layout pipeline.
+1. `gen`
+   Generate raw trajectory files in HDF5, either from a real VULCAN checkout or from the
+   synthetic smoke-test generator.
+2. `preprocess`
+   Align raw runs to the configured species contract, resample spectra to a fixed grid,
+   split runs into train/val/test, and write normalized NumPy tensors plus metadata.
+3. `train`
+   Build live transition samples from the processed trajectories, train the transformer
+   surrogate, write checkpoints, and export the best model to a standalone JAX bundle.
+4. `inference` / `exojax_adapter`
+   Load either a checkpoint or an export bundle and expose a pure-JAX physical-space
+   transition operator.
 
-## 2. Current Operating Regime
+## CLI Contract
 
-The shipped config is intentionally narrow:
+The CLI entrypoint is [src/main.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/main.py).
 
-- `trajectory_sampling.mode = "log_uniform_all_pairs"`
-- one model is trained over one bounded dt range configured by
-  `trajectory_sampling.dt_min_s` and `trajectory_sampling.dt_max_s`
-- training is CUDA-only
-- the current state/output species set is the reduced top-8 set
+Supported commands:
 
-Current shipped species:
+- `python -m src.main --config <path> gen`
+- `python -m src.main --config <path> preprocess`
+- `python -m src.main --config <path> train`
+- `python -m src.main --config <path> hyperparam`
+- `python -m src.main --config <path> show-config`
+
+Command behavior:
+
+- `gen` prints the raw root, run count, and generation metadata paths.
+- `preprocess` prints the processed-root summary payload.
+- `train` prints the checkpoint, export, history, and metrics paths.
+- `hyperparam` runs the built-in small hyperparameter sweep.
+- `show-config` prints the validated configuration after defaults and validation-derived
+  fields are applied.
+
+The default CLI config is `config/config.json`. For smoke runs, use the
+same file and set `generation.mode = "synthetic"`.
+
+## Configuration Contract
+
+The validated configuration is defined in
+[src/config_utils.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/config_utils.py).
+
+### Current Working Assumptions
+
+The shipped configuration and runtime are currently set up around the following choices:
+
+- stellar spectrum: use the WASP-39b Frances stellar surface-flux file as the input spectrum
+- Kzz: use a single constant `sampling.kzz_cm2_s` value at every pressure level
+- equilibrium-first inference: use `equilibrium()` to predict near-EQ abundances from the
+  physical inputs, while keeping `predict()` and `step_from_equilibrium()` available for
+  future disequilibrium-focused training and inference
+- equilibrium anchor selection: default to `inference.equilibrium_anchor.step_index = 0`,
+  so the anchor is the first saved trajectory profile and therefore as close as possible
+  to the EQ state at trajectory start
+- spectrum compression: run the fixed-grid stellar spectrum through the configurable
+  internal encoder, with the shipped config using `encoder_mode = "autoencoder"`
+- extensibility: the physical-space API still accepts full per-level `kzz_cm2_s` inputs
+  and arbitrary anchor states, so later retraining on disequilibrium trajectories does
+  not require changing the exported interface
+
+Required top-level sections:
+
+- `paths`
+- `data_spec`
+- `physics_toggles`
+- `vulcan_runtime`
+- `sampling`
+- `stellar_spectrum`
+- `generation`
+- `trajectory_sampling`
+- `preprocessing`
+- `normalization`
+- `training`
+
+Important derived contracts:
+
+- `data_spec.state_species` defines the ordered per-level anchor-state basis.
+- `data_spec.output_species` defines the ordered per-level target basis.
+- `data_spec.required_global_inputs` defines the full conditioning order and must include
+  `log10_dt_s`.
+- `data_spec.global_static_feature_order` is the same order with `log10_dt_s` removed.
+- `data_spec.global_feature_order` is the full global order including `log10_dt_s`.
+- `data_spec.dt_feature_index` is the insertion point for normalized `log10_dt_s`.
+
+Default species order:
 
 - `H2`
 - `He`
+- `H`
+- `O`
+- `OH`
 - `H2O`
 - `CO`
 - `CO2`
 - `CH4`
 - `N2`
 - `NH3`
+- `H2S`
+- `SH`
+- `S`
+- `SO`
+- `SO2`
+- `S2`
 
-`physics_toggles` includes `use_photochemistry` and `use_ion_chemistry` for
-validation purposes only.  Both must be `false` in the current regime and are
-not passed as model conditioning inputs.
+Global-conditioning semantics:
 
-## 3. Raw Trajectory Semantics
+- `gravity_cm_s2`, `metallicity_log10`, `c_to_o`, and `log10_dt_s` are the core physical
+  conditioning scalars.
+- `use_*` toggles are persisted into the dataset and conditioned on directly.
+- `atm_base_*` one-hot features encode the selected atmospheric base gas.
+- `metallicity_log10` is kept in physical units in normalization, while `gravity_cm_s2`
+  is log-standardized and `c_to_o` is standardized.
 
-Each raw HDF5 run stores one VULCAN trajectory with:
+## Module Responsibilities
 
-- `inputs/pressure_bar`, `inputs/temperature_k`, `inputs/kzz_cm2_s`
-- `inputs/state_species`, `inputs/output_species`
-- `globals/gravity_cm_s2`, `globals/metallicity_log10`, `globals/c_to_o`
-- `trajectory/time_s`, `trajectory/ymix_state`, `trajectory/ymix_output`
+Primary code paths:
 
-The raw loader requires:
+- [src/vulcan_runner.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/vulcan_runner.py):
+  raw generation, VULCAN patching, raw HDF5 writing, generation metadata.
+- [src/sampling.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/sampling.py):
+  Latin-hypercube run sampling, temperature/Kzz/time/spectrum/initial-state sampling.
+- [src/preprocess.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/preprocess.py):
+  raw-run loading, split creation, normalization fitting, processed tensor writing.
+- [src/transition_sampling.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/transition_sampling.py):
+  candidate transition construction and weighted, stratified row sampling.
+- [src/data_loader.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/data_loader.py):
+  processed split loading and batch assembly.
+- [src/jax_model.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/jax_model.py):
+  FiLM-conditioned transformer definition and parameter initialization.
+- [src/trainer.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/trainer.py):
+  training loop, evaluation, checkpoint writing, export.
+- [src/export_jax.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/export_jax.py):
+  standalone export bundle serialization.
+- [src/inference.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/inference.py):
+  physical-space runtime wrapper around checkpoints or exports.
+- [src/exojax_adapter.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/exojax_adapter.py):
+  ExoJAX-oriented export loader.
 
-- finite numeric arrays,
-- strictly increasing `time_s`,
-- at least one saved future state beyond `t=0`,
-- requested species to exist in the stored species lists.
+## Raw Generation Contract
 
-In memory, raw preprocessing keeps only the configured `ymix_state` subset.
-`trajectory/ymix_output` is still validated on load for file integrity, but
-targets are derived later from `ymix_state` via `output_from_state_indices`
-rather than carried as a second in-memory trajectory tensor.
+### Sampling
 
-The raw files remain the authoritative source of trajectory content. They are
-never rewritten by training.
+Run specifications are sampled from the ranges in `sampling`:
 
-## 4. Transition Candidate Space
+- pressure grid: log-spaced from `pressure_bottom_bar` to `pressure_top_bar`
+- temperature profile: analytic hot-Jupiter profile, or Roth profiles if
+  `roth_sampler.enabled=true`
+- Kzz profile: constant `sampling.kzz_cm2_s` applied at every pressure level
+- gravity, metallicity, C/O: Latin-hypercube sampled
+- time grid: saved-time grid with log-uniform adjacent steps between
+  `time_step_log10_min_s` and `time_step_log10_max_s`
+- stellar spectrum: loaded from the configured template file and saved into the library
 
-For a trajectory with `T` saved snapshots, every ordered pair `(i, j)` with
-`j > i` is a candidate transition. This gives `T * (T - 1) / 2` possible pairs
-before filtering.
+Strict input rules:
 
-The only supported candidate regime is:
+- if `roth_sampler.enabled=true`, at least one profile must match the configured glob
+  and filters or generation fails;
+- `stellar_spectrum.template_file` must exist or generation fails;
+- if `generation.mode="vulcan"`, the configured VULCAN checkout, cfg file, and chemistry
+  file must exist or generation fails.
 
-- `trajectory_sampling.mode = "log_uniform_all_pairs"`
+### Generation Modes
 
-Candidate validity is defined by:
+`generation.mode="vulcan"`:
 
-- `trajectory_sampling.dt_min_s`
-- `trajectory_sampling.dt_max_s`
-- `trajectory_sampling.min_future_saved_steps`
+- copies the configured VULCAN source tree into per-run worker directories;
+- writes an atmosphere file with `Pressure Temp Kzz` columns;
+- writes a VULCAN-format stellar surface-flux file;
+- optionally regenerates `chem_funs.py`;
+- runs VULCAN and converts the resulting `.vul` pickle to raw HDF5.
 
-Rules:
+`generation.mode="synthetic"`:
 
-- pairs are filtered by actual realized `dt = time_s[j] - time_s[i]`
-- the actual dt must lie in `[dt_min_s, dt_max_s]`
-- `min_future_saved_steps` becomes the minimum index gap between anchor and target
-- trajectories with no valid candidates are skipped during `--gen`
+- exists only for tests and smoke runs;
+- uses a deterministic toy sulfur photochemistry with oxidation radicals (`H`, `O`,
+  `OH`) and vertical mixing;
+- is not intended for science training corpora.
 
-## 5. Split And Leakage Contract
+Both modes support CPU-side parallel raw generation via `generation.parallel_workers`.
 
-Splitting is always done at the run level, never at the sampled-pair level.
+### Initialization & Equilibrium-First Approach
 
-Consequences:
+Every VULCAN run is explicitly initialized from thermochemical equilibrium:
 
-- every raw trajectory belongs to exactly one of `train`, `val`, or `test`
-- live-sampled anchor/target pairs from one run never cross split boundaries
-- normalization is fit on the train split only
+- `ini_mix = 'EQ'` — FastChem computes the equilibrium abundances at each P-T level
+- `use_condense = False` — no condensation during initialization or integration
+- `use_photo = True` — photochemistry is enabled (driven by the patched stellar spectrum)
 
-This prevents state leakage across train and evaluation.
+These three settings are patched directly into `vulcan_cfg.py` by the runner and do not
+rely on VULCAN-checkout defaults.  This means `trajectory[0]` in the raw HDF5 output is
+always the FastChem equilibrium state for the sampled conditions.
 
-## 6. Processed Data Design
+The inference API mirrors this equilibrium-first design:
 
-`data/raw` stays raw. `data/processed` contains normalized split trajectories,
-not precomputed sampled transition pairs.
+- `equilibrium()` returns near-EQ abundances for a given P-T profile and conditioning
+  inputs by calling the surrogate with a minimal timestep (`log10_dt_s = 0`, i.e. dt = 1 s).
+- `step_from_equilibrium(dt_s=...)` first computes equilibrium, then evolves the state
+  forward by the user-supplied timestep.
+- `predict()` remains available for arbitrary anchor-state transitions.
+
+The default workflow is: call `equilibrium()` to get the EQ state, then optionally call
+`predict()` with a user-defined dt to evolve forward from that anchor.
+
+### VULCAN Config Patching
+
+When running in real VULCAN mode, the runner patches `vulcan_cfg.py` to set:
+
+- `ini_mix = 'EQ'` (FastChem equilibrium initialization)
+- chemistry toggles such as `use_photo`, `use_ion`, `use_Kzz`, `use_moldiff`
+- `use_condense = False` (no condensation)
+- `network`
+- `atm_file`
+- `sflux_file`
+- `atm_base`
+- `atm_type = 'file'`
+- `Kzz_prof = 'file'`
+- `T_cross_sp = vulcan_runtime.t_cross_sp`
+- `nz`, `P_b`, `P_t`
+- `gs`, `r_star`, `orbit_radius`, `sl_angle`, `f_diurnal`
+- elemental abundances derived from metallicity and C/O
+- output/save flags needed to persist time-history trajectories
+
+`vulcan_runtime.t_cross_sp` must only contain species supported by the target VULCAN
+checkout. The shipped WASP-39b config uses the sulfur-relevant supported subset:
+`H2O`, `H2S`, `SH`, `SO2`, and `S2`.
+
+### Raw HDF5 Layout
+
+Each raw run stores:
+
+- `inputs/pressure_bar`
+- `inputs/temperature_k`
+- `inputs/kzz_cm2_s`
+- `inputs/state_species`
+- `inputs/output_species`
+- `globals/<name>` for every persisted global scalar
+- `trajectory/time_s`
+- `trajectory/ymix_state`
+- `trajectory/ymix_output`
+- `spectrum/name`
+- `spectrum/wavelength_nm`
+- `spectrum/flux_erg_cm2_s_nm`
+
+For real VULCAN conversion:
+
+- the converter accepts `variable.ymix_time` directly when present;
+- otherwise it derives mixing ratios from `variable.y_time / atm.n_0`;
+- species are then reindexed into the configured `state_species` and `output_species`
+  orders before writing HDF5.
+
+### Raw Dataset Metadata
+
+Each raw dataset also writes:
+
+- `generation_manifest.json`
+- `sampling_coverage.json`
+
+`generation_manifest.json` records the generated files and provenance hashes.
+`sampling_coverage.json` records realized min/max coverage for gravity, metallicity, C/O,
+temperature, Kzz, adjacent saved `dt`, and pressure.
+
+## Preprocessing Contract
+
+Preprocessing is defined in
+[src/preprocess.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/preprocess.py).
+
+### Split Logic
+
+- raw runs are shuffled with `preprocessing.seed`;
+- train/val/test fractions come from config;
+- the splitter enforces at least one run in each split.
+
+### Spectrum Handling
+
+- each raw spectrum is resampled to a fixed linear wavelength grid defined by
+  `stellar_spectrum.wavelength_min_nm`, `stellar_spectrum.wavelength_max_nm`, and
+  `stellar_spectrum.num_bins`;
+- the resampled wavelength grid is written into both `normalization.json` and
+  `data_contract.json`.
+
+### Normalization Contract
+
+Normalization is fit on the train split only.
+
+Blocks:
+
+- `sequence_static`
+  three one-feature blocks for `pressure_bar`, `temperature_k`, and `kzz_cm2_s`, using
+  the methods from `normalization.sequence_methods`
+- `state`
+  log-standard normalization of anchor-state trajectories with `state_floor`
+- `target`
+  log-standard normalization of target trajectories with `state_floor`
+- `global_static`
+  mixed normalization over the static global vector
+- `log10_dt_s`
+  standard normalization using weighted transition statistics from valid train-split pairs
+- `spectrum`
+  log-standard normalization with `spectrum_floor`
+
+`log10_dt_s` statistics are fit using transition weights proportional to `1 / dt`.
+
+### Processed Files
 
 Each processed split directory contains:
 
-- `static_inputs.npy` with shape `[num_runs, nz, 3]`
-- `state_ymix.npy` with shape `[num_runs, max_steps, nz, state_dim]`
+- `sequence_inputs.npy` with shape `[num_runs, nz, 3]`
+- `state_trajectories.npy` with shape `[num_runs, max_steps, nz, state_dim]`
+- `target_outputs.npy` with shape `[num_runs, max_steps, nz, target_dim]`
 - `global_inputs.npy` with shape `[num_runs, global_static_dim]`
+- `spectrum_inputs.npy` with shape `[num_runs, spectrum_dim]`
 - `time_s.npy` with shape `[num_runs, max_steps]`
 - `valid_steps_mask.npy` with shape `[num_runs, max_steps]`
-- `run_ids.npy` with shape `[num_runs]`
+- `run_ids.json`
 - `metadata.json`
 
-There are no processed `sequence_inputs/`, `globals/`, `targets/`, or `dt_s/`
-pair-shard directories anymore.
+Top-level processed metadata:
 
-### Split Metadata Contract
+- `normalization.json`
+- `data_contract.json`
+- `splits.json`
+- `processed_manifest.json`
 
-Each split metadata file records:
+The current processed-data contract version is `3`.
 
-- `num_runs`
-- `max_steps`
-- `total_valid_candidates`
-- `sequence_length`
-- `input_dim`
-- `global_dim`
-- `global_static_dim`
-- `dt_feature_index`
-- `target_dim`
-- `state_dim`
-- `sequence_feature_order`
-- `global_feature_order`
-- `global_static_feature_order`
+### Data Contract Fields
+
+`data_contract.json` includes:
+
+- `processed_data_version`
 - `state_species_order`
 - `output_species_order`
-- `output_from_state_indices`
-- `normalization_fingerprint`
-- candidate-range fields (`sampling_mode`, `dt_sampling_min_s`, `dt_sampling_max_s`,
-  `min_future_saved_steps`, `dt_min_s`, `dt_max_s`)
+- `sequence_static_feature_order`
+- `global_feature_order`
+- `global_static_feature_order`
+- `dt_feature_index`
+- `sequence_dim`
+- `target_dim`
+- `spectrum_dim`
+- `spectrum_wavelength_nm`
 
-The fixed feature orders are:
+`sequence_dim` is always `3 + state_dim`, because batching concatenates normalized
+`[pressure, temperature, kzz]` with the normalized anchor state.
 
-- sequence:
-  - `pressure_bar`
-  - `temperature_k`
-  - `kzz_cm2_s`
-  - `anchor_ymix:<species>` for each configured state species
-- globals:
-  - `gravity_cm_s2`
-  - `metallicity_log10`
-  - `c_to_o`
-  - `log10_dt_s`
-  - 10 physics-toggle indicators
-  - 5 `atm_base_*` one-hot indicators
+## Transition Sampling Contract
 
-`global_inputs.npy` excludes `log10_dt_s`. That dt feature is assembled live per
-sample at training/evaluation time and inserted at `dt_feature_index`.
+Transition sampling is defined in
+[src/transition_sampling.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/transition_sampling.py)
+and [src/live_sampling.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/live_sampling.py).
 
-## 7. Normalization Contract
+Candidate-row construction:
 
-Normalization statistics are fit on the train split only.
+- valid rows are `(anchor_index, target_index)` pairs taken from saved trajectory steps;
+- `target_index` must be at least `min_future_saved_steps` after `anchor_index`;
+- `dt_s` must lie in `[dt_min_s, dt_max_s]`.
 
-Fitting rules:
-
-- `pressure_bar`, `temperature_k`, `kzz_cm2_s`:
-  - fit over all train-split runs
-- `anchor_ymix`:
-  - fit over all saved train-split states across all saved times
-- targets:
-  - reuse the `anchor_ymix` statistics subset selected by `output_from_state_indices`
-- non-dt globals:
-  - fit once per train run
-- `log10_dt_s`:
-  - fit over all valid train candidate pairs with weights proportional to `1 / dt`
-
-This keeps dt normalization aligned with the live sampler’s log-uniform target
-distribution.
-
-Supported normalization methods remain:
-
-- `standard`
-- `log-standard`
-- `log-min-max`
-- `none`
-
-`anchor_ymix` normalization is fixed to `log-standard`.
-
-`normalization.target_method` is also fixed to `log-standard`, matching
-`normalization.sequence_methods.anchor_ymix`.
-
-## 8. Live Sampling Runtime
-
-Training no longer consumes a fixed precomputed pair dataset.
-
-At `--train` time:
-
-1. each processed split is loaded once,
-2. each split is copied to GPU once,
-3. valid candidate tables are built once from `time_s` and `valid_steps_mask`,
-4. train pairs are resampled every epoch,
-5. val/test pairs are sampled once deterministically and then reused.
-
-Each candidate table stores:
+Each candidate row stores:
 
 - `run_index`
 - `anchor_index`
 - `target_index`
-- `actual_dt_s`
+- `dt_s`
+- `log10_dt_s`
 - normalized `log10_dt_s`
-- sampling weights `1 / dt`
-- per-run offsets and counts
+- `weight = 1 / dt_s`
 
-### Train Sampling
+Row selection for both train and eval:
 
-Train sampling is controlled by:
+- bins rows by `log10_dt_s` using `trajectory_sampling.num_logdt_bins`
+- allocates a near-uniform quota across non-empty bins
+- samples without replacement inside each bin using the stored `1 / dt` weights
+- uses a seeded RNG for reproducibility
 
-- `training.live_sampling.train_pairs_per_run_per_epoch`
+Train rows are resampled each epoch. Eval rows are deterministic because the RNG seed is
+fixed, not because the code takes the first sorted candidates.
 
-Per epoch, for each train run:
+## Batch Contract
 
-- sample up to `train_pairs_per_run_per_epoch` valid candidates
-- sample without replacement when possible
-- if a run has fewer valid candidates, use all of them and log once
-- concatenate all selected candidates across runs
-- globally shuffle the selected candidate rows
+Batch assembly is defined in
+[src/data_loader.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/data_loader.py).
 
-The train sample set intentionally changes across epochs.
+For each sampled row:
 
-### Fixed Eval Sampling
+- `sequence`
+  normalized `[pressure, temperature, kzz, anchor_state]` with shape
+  `[batch, nz, 3 + state_dim]`
+- `global_inputs`
+  normalized static globals with normalized `log10_dt_s` inserted at `dt_feature_index`
+- `spectrum_inputs`
+  normalized fixed-grid spectrum
+- `target`
+  normalized target state at the sampled future step
+- `dt_s`
+  physical timestep in seconds
 
-Validation and test sampling are controlled by:
+Anchor states are always drawn from `state_trajectories.npy`.
+Targets are always drawn from `target_outputs.npy`.
 
-- `training.live_sampling.eval_pairs_per_run`
+## Model Contract
 
-One fixed candidate table is built for each evaluation split at training start:
+The surrogate architecture is implemented in
+[src/jax_model.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/jax_model.py).
 
-- val uses seed `training.seed + 1`
-- test uses seed `training.seed + 2`
+Architecture summary:
 
-The same fixed eval pairs are reused for:
+- project the per-level input sequence to `d_model`
+- add sinusoidal vertical positional encoding
+- encode the stellar spectrum with mode `autoencoder`, `linear`, or `none`
+- concatenate `[global_inputs, spectrum_latent]`
+- project that context to FiLM `gamma` and `beta` parameters for each transformer layer
+- run a stack of pre-norm self-attention blocks with FiLM modulation
+- project the final hidden state to `target_dim`
 
-- epoch-by-epoch validation,
-- final `metrics.json`,
-- local helper scripts under `extras/`.
+Model dimensions are built from the processed contract plus `training.model` and
+`stellar_spectrum` settings.
 
-## 9. GPU Hot Path
+The model path is pure JAX and is compatible with `jax.grad` and `jax.jvp`.
 
-The training hot path is GPU-resident:
+## Training Contract
 
-- normalized split tensors live on GPU,
-- candidate indices live on GPU,
-- batch assembly happens on GPU,
-- no `DataLoader`, worker pool, shard cache, mmap, or per-batch host-to-device copy
-  is used in the live training path.
+Training is defined in
+[src/trainer.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/trainer.py).
 
-Each live batch is assembled as:
+Behavior:
 
-- `sequence = concat(static_inputs[run], state_ymix[run, anchor], dim=-1)`
-- `globals = concat(global_inputs[run], normalized_log10_dt)` with dt inserted at
-  `dt_feature_index`
-- `target = state_ymix[run, target][..., output_from_state_indices]`
-- `dt_s = actual_dt_s`
-- `padding_mask = all_false`, because `nz` is fixed and batching is by pair, not
-  by variable vertical length
+- if a compatible processed dataset already exists, training reuses it;
+- otherwise preprocessing is rerun;
+- if no raw dataset exists, raw generation is triggered first using the current config.
 
-## 10. Precision Contract
+Loss terms:
 
-`precision` controls dtype selection across the training pipeline:
+- normalized-space MSE on the predicted target tensor
+- physical log-space MSE after inverse normalization
+- optional spectrum autoencoder reconstruction MSE
 
-- `input_dtype`: dtype for loaded processed tensors on device
-- `stats_accumulation_dtype`: dtype for running metric accumulators
-- `model_dtype`: dtype for model parameters
-- `forward_dtype`: dtype for input tensors during the forward pass
-- `loss_dtype`: dtype for loss computation and target tensors
-- `optimizer_state_dtype`: dtype for optimizer state tensors
-- `amp_autocast_dtype`: autocast dtype for AMP (`"none"` disables AMP autocast)
+Optimization:
 
-All fields default to `"float32"` in the shipped config. Supported values are
-`"float16"`, `"bfloat16"`, `"float32"`, `"float64"`, and `"none"` (for the
-AMP field only).
+- AdamW implemented directly in JAX
+- cosine decay with optional warmup
+- global gradient clipping
 
-## 11. Training Contract
+Artifacts written under `paths.checkpoints_root`:
 
-Training is CUDA-only.
+- `best.pt`
+- `last.pt`
+- `history.json`
+- `metrics.json`
 
-`training` now requires:
+`metrics.json` includes:
 
-- `device = "cuda"`
-- `batch_size`
-- `epochs`
-- `learning_rate`
-- `min_lr`
-- `warmup_epochs`
-- `weight_decay`
-- `gradient_clip`
-- `use_amp`
-- `seed`
-- `live_sampling`
-- `model`
-- `loss`
-- `output_folder`
+- `best_val_combined_loss`
+- `test`
+- `num_train_candidates`
+- `num_val_candidates`
+- `num_test_candidates`
+- `parameter_count`
 
-`training.live_sampling` requires:
+## Export Contract
 
-- `train_pairs_per_run_per_epoch`
-- `eval_pairs_per_run`
+The standalone export bundle is written by
+[src/export_jax.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/export_jax.py)
+under `paths.jax_export_root`.
 
-`training.loss` requires:
+Files:
 
-- `lambda_z`
-- `lambda_phys`
+- `params.npz`
+- `structure.json`
+- `contract.json`
+- `normalization.json`
+- `config.json`
+- `model_dimensions.json`
 
-Optimizer and loss behavior remain unchanged:
+The export contains everything needed to reconstruct the pure-JAX transition operator
+without re-running training code.
 
-- optimizer: AdamW with explicit bias/norm no-decay grouping
-- schedule: linear warmup then cosine decay to `min_lr`
-- gradient clipping: global norm clip
-- checkpointing: `best.pt` (lowest validation combined loss) and `last.pt`
-
-Model architecture is configured under `training.model`. The exact numeric values
-are intentionally config-defined rather than fixed by this spec, but the model
-contract expects these parameters:
-
-- `d_model`: transformer embedding width for profile/state features and FiLM conditioning
-- `nhead`: number of attention heads in each transformer block
-- `num_layers`: number of transformer blocks
-- `dim_feedforward`: hidden width of each transformer feedforward block
-- `dropout`: dropout probability used inside transformer blocks
-- `film_clamp`: clamp applied to FiLM modulation terms
-- `output_head_divisor`: output-head width control via `d_model // output_head_divisor`
-- `max_sequence_length`: maximum supported vertical sequence length for positional encoding
-- `conditioning_hidden_dim`: hidden width of the global-conditioning MLP
-
-## 12. Evaluation Contract
-
-Single-step validation/test metrics are computed on the fixed eval pairs.
-
-Reported metrics remain:
-
-- normalized-space MSE
-- normalized-space MAE
-- physical-space `mae_log10` derived from target normalization stats
-- combined loss using `training.loss.lambda_z` and `training.loss.lambda_phys`
-
-Final dt-bin summaries are built from the actual dt values present in the fixed
-eval pair tables, not from the full split candidate range.
-
-Future work may reintroduce multi-step rollout evaluation or autoregressive
-utilities, but the current contract intentionally excludes them.
-
-## 13. Generation And Reuse Rules
-
-`--gen` behaves as follows:
-
-1. if `raw_root` already contains `run_*.h5`, raw generation is skipped and those files are reused
-2. otherwise, new run specs are sampled and VULCAN jobs are launched
-3. failed VULCAN jobs are dropped as long as at least one usable run survives
-4. runs with no valid transition candidates for the current dt range are skipped
-5. only usable runs are split into train/val/test
-6. `processed_root` is deleted and rebuilt as normalized trajectory splits
-
-`generation.max_trajectory_snapshots` must be `0` (no cap) or `>= 2`.
-
-`--train` does not regenerate data. It requires a matching processed fingerprint.
-`src/hyperparam_testing.py` also reuses existing processed artifacts only; it
-never calls generation.
-
-Changing only:
-
-- `training.live_sampling.train_pairs_per_run_per_epoch`
-- `training.live_sampling.eval_pairs_per_run`
-
-does not require rerunning `--gen`.
-
-Changing candidate validity, normalization, raw data, or run splits does require
-rerunning `--gen`.
-
-## 14. Provenance Contract
-
-Processed provenance depends on:
-
-- raw run file list, size, and mtime
-- dataset manifest
-- split assignment file
-- normalization metadata
-- per-split metadata
-- preprocessing-relevant config:
-  - generation controls that affect raw/processed artifacts
-  - candidate-validity settings
-  - VULCAN runtime and samplers
-  - physics toggles and boundary conditions
-  - data spec
-  - normalization config
-
-Processed provenance explicitly excludes:
-
-- live train pair budget
-- live eval pair budget
-
-Those settings change training/evaluation behavior, not processed tensors.
-
-## 15. Filesystem Layout
-
-```text
-data/
-  raw/
-    run_000000.h5
-    run_000001.h5
-    ...
-  processed/
-    train/
-      static_inputs.npy
-      state_ymix.npy
-      global_inputs.npy
-      time_s.npy
-      valid_steps_mask.npy
-      run_ids.npy
-      metadata.json
-    val/
-      ...
-    test/
-      ...
-    normalization_metadata.json
-    processed_summary.json
-    processed_fingerprint.json
-  dataset_manifest.json
-  splits.json
-
-models/
-  <output_folder>/
-    best.pt
-    last.pt
-    metrics.json
-    data_contract.json
-    normalization_metadata.json
-    processed_fingerprint.json
-    training_log.csv
-    standalone_model_cpu.pt2          # optional, written by extras/export_cpu_gpu.py
-    standalone_model_cuda.pt2         # optional, written by extras/export_cpu_gpu.py on CUDA hosts
-    figures/
-      true_vs_pred_profile_sample_*.png
-      tp_profile_sample_*.png
-      training_progression.png
-      error_metrics.json
-      error_metrics_per_species.csv
-  hyperparam_testing/
-    best_config.json
-    best_model/
-      best.pt
-      metrics.json
-      data_contract.json
-      normalization_metadata.json
-      processed_fingerprint.json
-      training_log.csv
-    logs/
-      trial_000.log
-      trial_000_training_log.csv
-      trial_000_summary.json
-      ...
-
-logs/
-  runtime_config_<action>_<timestamp>.json
-  <action>_<timestamp>.log
-  training_progress_<output_folder>.log
-```
-
-`generation.worker_root` remains temporary scratch space for VULCAN workers.
-
-## 16. Inference And Utility Scripts
-
-Core inference remains in `src/inference.py`:
-
-- `PhysicalSpaceStandaloneModel`
-- `VulcanPredictor`
-
-These operate on physical-space inputs and outputs for single-step transitions.
-Each training checkpoint embeds the model config, data contract, and
-normalization metadata needed to rebuild the physical-space wrapper from
-`best.pt` alone. The sidecar `data_contract.json` and
-`normalization_metadata.json` files are still written for inspection and local
-utilities. The transformer architecture remains unchanged.
-
-Training utilities now also include `src/hyperparam_testing.py`, which runs a
-small Optuna search over training-only hyperparameters while preserving the
-same processed-data and checkpoint contracts as normal training. It keeps one
-promoted winning checkpoint under `models/hyperparam_testing/best_model/` and
-stores per-trial logs/summaries under `models/hyperparam_testing/logs/`.
-
-The shipped hyperparameter search contract is:
-
-- Optuna TPE sampler seeded from `training.seed`
-- objective = `metrics.json["best_val_combined_loss"]`
-- every trial runs in an isolated scratch output folder under
-  `models/hyperparam_testing/_scratch/`
-- processed data, split assignments, normalization metadata, and
-  `training.live_sampling.eval_pairs_per_run` stay fixed across trials
-- only training-only knobs may vary per trial:
-  - architecture preset: `{256x4, 384x6, 512x8, 768x12}` for `(d_model, nhead)`
-  - `num_layers` in `{4, 6, 8}`
-  - `dim_feedforward = d_model * {2, 4}`
-  - `conditioning_hidden_dim = d_model * {1, 2}`
-  - `batch_size` in `{128, 256}`
-  - `learning_rate` log-uniform in `[3e-5, 3e-4]`
-  - `weight_decay` log-uniform in `[1e-6, 1e-3]`
-- `dropout` in `{0.0, 0.05, 0.10, 0.15}`
-- `train_pairs_per_run_per_epoch` in `{500, 1000, 1500}`
-- `epochs = --trial-epochs`, with `warmup_epochs` clamped to that trial budget
-- the promoted `best_model` checkpoint is the winning trial checkpoint at that
-  trial budget; there is no automatic retraining pass at the base
-  `training.epochs` value
-
-The winning checkpoint is promoted by copying only the inference/training
-artifacts needed for downstream use, rewriting the embedded config so the
-checkpoint points at `hyperparam_testing/best_model`, and deleting the scratch
-trial tree afterward.
-
-Local scripts under `extras/` now build deterministic fixed eval pairs from the
-processed trajectory splits instead of reading pair shards directly.
-
-Additional current utility-script behavior:
-
-- `extras/export_cpu_gpu.py` can write fully standalone
-  `standalone_model_<device>.pt2` exports. These exported programs bake in the
-  normalization/data-contract state and run directly in physical space without
-  requiring the sidecar JSON files.
-- `extras/compute_error_metrics.py` writes `error_metrics.json` and
-  `error_metrics_per_species.csv` under `<run_dir>/figures/`.
-- `extras/plot_true_vs_pred_profile.py` resolves the target run from
-  `models/<MODEL_DIR_NAME>` at the top of the script, then uses the selected
-  checkpoint's embedded config to locate processed data and rebuild the model.
-- `extras/plot_true_vs_pred_profile.py` selects one test example from the fixed
-  eval sample pool using `SAMPLE_SELECTION_MODE`. The default
-  `"uniform_log_dt"` mode chooses a non-empty `log10(dt)` bin uniformly and
-  then samples uniformly within that bin, which gives better dt-range coverage
-  than uniform sampling over sample index. The fallback `"uniform"` mode samples
-  directly over the fixed eval sample indices.
-
-## 17. Failure Philosophy
-
-The repository is intentionally strict:
-
-- missing config fields are errors,
-- incompatible processed artifacts are errors,
-- non-finite arrays are errors,
-- missing files are errors,
-- unsupported old layouts are not silently revived.
-
-Generation is strict about end-state usability, but individual failed VULCAN
-runs are dropped when enough successful trajectories remain to build valid
-splits.
-
-The goal is fail-fast scientific correctness, not compatibility shims.
-
-## 18. Environment
-
-### Local
-
-- `python src/main.py --gen --config config/config.json`
-- `python src/main.py --train --config config/config.json`
-- `python src/hyperparam_testing.py --config config/config.json --overwrite`
-
-### Batch / HPC
-
-Environment variables may override path resolution:
-
-- `VULCAN_EMULATOR_PROJECT_ROOT`
-- `VULCAN_EMULATOR_VULCAN_SOURCE`
-- `VULCAN_EMULATOR_CONDA_ENV`
-
-The shipped batch script assumes GPU training and supports three modes:
-
-- `RUN_MODE=pipeline` is the default and runs `src/main.py --gen` followed by `src/hyperparam_testing.py`
-- `RUN_MODE=train` runs the standard `src/main.py --train` path
-- `RUN_MODE=hyperparam` runs `src/hyperparam_testing.py`
-
-By default, `run.pbs` follows `paths.vulcan_source_path` from the config. Set
-`VULCAN_SOURCE_OVERRIDE` only when you intentionally want the batch job to use a
-different VULCAN checkout.
-
-Hyperparameter batch runs accept:
-
-- `HYPERPARAM_TRIALS`
-- `HYPERPARAM_TRIAL_EPOCHS`
-- `HYPERPARAM_OVERWRITE`
-
-## 19. Conventions
-
-- all logarithms are base-10
-- padding mask follows PyTorch convention: `True = padding`
-- pressure units are bar inside the emulator
-- temperature is Kelvin
-- Kzz is cm^2/s
-- gravity is cm/s^2
-- config keys with `log10_` prefixes are already base-10 transformed
-
-## 20. Roth PT Source
-
-Roth GCM PT columns can be added as a second TP source during `--gen`.
-
-This source is configured under `roth_sampler` and is additive:
-
-- `generation.num_runs` still controls analytic runs only
-- `roth_sampler.num_profiles` adds extra Roth-derived runs on top
-- Roth integration happens before VULCAN execution by producing standard `RunSpec`
-  objects on the shared emulator pressure grid
-
-### Roth Filter Semantics
-
-`roth_sampler.filters` uses explicit allow-lists:
-
-- `Teq`
-- `LogMet`
-- `LogDrag`
-- `Mstar`
-- `Rp`
-- `logG`
-- `TiOVO`
-- optional derived `planet_mass_jup`
-
-The shipped config defaults these allow-lists to all currently discovered
-filename values in the Roth grid.  To exclude a subset, remove entries from the
-corresponding list.
-
-Example:
-
-- removing `2200.0` from `roth_sampler.filters.Teq` excludes all Roth files with `Teq_2200`
-
-Optional `column_filters.lon` and `column_filters.lat` apply the same allow-list
-idea to individual lon/lat columns after file-level filtering.
-
-### Roth Validity Rules
-
-Each Roth `.dat` file is expanded into individual lon/lat PT columns.
-
-Columns are skipped when they fail any of the following:
-
-- fewer than `roth_sampler.interpolation.min_source_levels` source levels
-- non-finite temperature or pressure values
-- non-positive pressures
-- non-positive temperatures
-- duplicate or non-monotonic pressure levels
-
-Malformed singleton columns are therefore ignored automatically.
-
-### Shared-Grid Interpolation
-
-Roth columns are interpolated onto the same pressure grid used by analytic runs:
-
-- target grid = `tp_sampler.pressure_grid`
-- interpolation variable = `log10(pressure_bar)`
-- in-domain interpolator = monotone PCHIP
-- out-of-domain extrapolation = linear continuation using the edge slope in
-  log-pressure space
-
-Native source pressure bounds and top/bottom extrapolation flags are stored in
-the raw run `sampler/` group for provenance.
-
-### `pt_only` Semantics
-
-The current Roth mode is `roth_sampler.source_globals_mode = "pt_only"`.
-
-In this mode:
-
-- Roth provides only `temperature_k`
-- the shared target `pressure_bar` grid still comes from `tp_sampler.pressure_grid`
-- `gravity_cm_s2`, `metallicity_log10`, `c_to_o`, elemental abundances, and
-  `kzz_cm2_s` still come from the existing analytic samplers
-- Roth metadata affects selection and provenance only; it does not override the
-  VULCAN conditioning globals
-
-### Raw Reuse And Provenance
-
-The dataset manifest now records:
-
-- `raw_generation_config_sha256`
-- `source_counts` over the full raw `run_*.h5` set
-
-When raw `run_*.h5` files already exist, reuse is allowed only if the stored
-raw-generation config hash matches the current analytic/Roth generation config.
-If the hash differs, generation fails fast instead of silently mixing stale raw
-runs with a new source configuration.
-
-Processed-data provenance also includes `roth_sampler`, so changing Roth
-selection or interpolation controls requires rerunning `--gen`.
-
-### Git Policy
-
-- keep existing reference files under `roth/`
-- keep local Roth data under `roth/roth-grid/`
-- `roth/roth-grid/` is git-ignored and should not be committed
+## Inference Contract
+
+Inference is defined in
+[src/inference.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/inference.py).
+
+`load_physical_space_model()` accepts either:
+
+- a checkpoint file such as `best.pt`
+- an export directory containing the standalone bundle
+
+The exposed `transition_fn` accepts physical-space inputs:
+
+- `pressure_bar` with shape `[nz]`
+- `temperature_k` with shape `[nz]`
+- `kzz_cm2_s` with shape `[nz]`
+- `anchor_ymix` with shape `[nz, state_dim]`
+- `global_static_vector` with shape `[global_static_dim]`
+- `spectrum_inputs` with shape `[spectrum_dim]`
+- `log10_dt_s` as a scalar
+
+It returns a physical-space prediction with shape `[nz, target_dim]`.
+
+The wrapper is responsible for:
+
+- applying sequence, state, global, dt, and spectrum normalization
+- inserting normalized `log10_dt_s` at `dt_feature_index`
+- calling the JAX model
+- inverse-transforming the target prediction back to physical mixing ratios
+
+### Equilibrium-First Convenience API
+
+`PhysicalSpaceStandaloneModel` exposes two additional methods on top of `predict()`:
+
+- `equilibrium(pressure_bar, temperature_K, eddy_diffusion_cm2_s, global_inputs,
+  spectrum_inputs)` — returns near-EQ abundances by calling the surrogate with
+  `log10_dt_s = 0.0` from the configured equilibrium anchor. The shipped config uses
+  the first saved trajectory profile (`step_index = 0`), which is the closest saved
+  state to the EQ initialization. This is the recommended default entry point when you
+  only need the equilibrium state.
+
+- `step_from_equilibrium(dt_s, pressure_bar, temperature_K, eddy_diffusion_cm2_s,
+  global_inputs, spectrum_inputs)` — calls `equilibrium()` to compute the anchor, then
+  evolves forward by the user-supplied `dt_s` seconds.  Convenience wrapper for the
+  common EQ-then-evolve workflow.
+
+## ExoJAX Adapter Contract
+
+The ExoJAX-facing adapter is
+[src/exojax_adapter.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/exojax_adapter.py).
+
+`load_exojax_transition(export_root)` returns:
+
+- `transition_fn`
+- `global_static_feature_order`
+- `global_feature_order`
+- `state_species_order`
+- `spectrum_wavelength_nm`
+
+This is the intended integration surface for ExoJAX-side callers that need both the
+function and the canonical feature/species ordering metadata.
+
+## Hyperparameter Search Contract
+
+The built-in hyperparameter sweep is defined in
+[src/hyperparam_testing.py](/Users/imalsky/Desktop/VULCAN_JAX/vulcan_emulator_photochem/src/hyperparam_testing.py).
+
+It is intentionally small and writes results under `models/hyperparam_testing`:
+
+- per-trial checkpoints and exports
+- `logs/trial_XXX.json`
+- `best_config.json`
+
+This is a utility path for quick internal sweeps, not a distributed experiment manager.
+
+## Production Assumptions
+
+- The production dataset path is real VULCAN generation, not synthetic generation.
+- The shipped WASP-39b config expects the adjacent `../VULCAN-master` checkout, the
+  Frances stellar surface-flux file, and the sulfur-enabled
+  `thermo/SNCHO_photo_network_2025.txt` network.
+- Existing processed datasets from earlier species contracts must be regenerated when the
+  processed-data version changes.

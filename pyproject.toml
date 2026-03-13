@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vulcan-emulator-photochem"
+version = "0.1.0"
+description = "Photochemical VULCAN surrogate with sulfur chemistry, WASP-39b stellar forcing, and JAX export."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "jax>=0.4",
+  "numpy>=1.24",
+  "h5py>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["uni_tests"]

@@ -1,5 +1,7 @@
-"""Public package surface for vulcan-emulator."""
+from __future__ import annotations
 
-from .inference import InferenceError, VulcanPredictor
+__all__ = [
+    "__version__",
+]
 
-__all__ = ["InferenceError", "VulcanPredictor"]
+__version__ = "0.1.0"

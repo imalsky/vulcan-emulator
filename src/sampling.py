@@ -1,438 +1,331 @@
-"""Sampling utilities for TP, Kzz, abundance, and run specifications.
-
-Generates the physical parameter space for VULCAN training data:
-
-- **TP profiles**: Modified Line-2013 parameterization with configurable
-  opacity, gamma factors, internal/irradiation temperatures, and optional
-  convective adjustment.
-- **Kzz profiles**: Power-law family ``Kzz(p) = Kzz_1bar * p^(-beta)``
-  with configurable floor and cap.
-- **Abundances**: Metallicity (log-uniform) + C/O ratio sampling, with
-  elemental abundances derived from scaled solar values.
-- **Gravity**: Uniform or fixed surface gravity.
-
-All sampling distributions and ranges are config-driven.  Rejection sampling
-handles TP profiles that violate physical temperature bounds.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.special import expn
 
-from roth_sampling import RothSamplingError, sample_roth_profiles
+from .config_utils import static_conditioning_defaults
+from .roth_sampling import load_roth_profiles
+from .spectrum import (
+    SpectrumRecord,
+    load_spectrum_manifest,
+    save_spectrum_manifest,
+)
 
+# Temperature profile sampling ranges around a smooth hot-Jupiter profile.
+_TP_TRANSITION_LOG10_PRESSURE_RANGE = (-2.0, 0.7)
+_TP_TRANSITION_WIDTH_RANGE = (0.4, 1.0)
+_TP_PROFILE_NOISE_STD_K = 15.0
 
-class SamplingError(ValueError):
-    """Raised when sampled physics inputs violate constraints."""
+# Mixing profile constants used by the synthetic smoke path.
+_HELIUM_FRACTION_RANGE = (0.11, 0.17)
 
 
 @dataclass(frozen=True)
-class RunSpec:
-    """Single VULCAN run specification and sampled parameters."""
-
-    run_id: int
+class RunSpecification:
+    run_id: str
     pressure_bar: np.ndarray
     temperature_k: np.ndarray
     kzz_cm2_s: np.ndarray
-    gravity_cm_s2: float
-    metallicity_log10: float
-    c_to_o: float
-    abundances: dict[str, float]
-    tp_params: dict[str, float]
-    kzz_params: dict[str, float]
-    source_tag: str = "analytic"
-    source_file: str | None = None
-    source_metadata: dict[str, float] = field(default_factory=dict)
+    initial_ymix: np.ndarray
+    time_s: np.ndarray
+    globals: dict[str, float]
+    spectrum: SpectrumRecord
+    metadata: dict[str, Any]
 
 
-def _sample_distribution(spec: dict[str, Any], rng: np.random.Generator, name: str) -> float:
-    """Sample one scalar from an explicit uniform or normal specification."""
-    dist = str(spec["distribution"]).lower()
-    if dist == "uniform":
-        low = float(spec["min"])
-        high = float(spec["max"])
-        if high <= low:
-            raise SamplingError(f"Invalid uniform range for {name}: min={low}, max={high}")
-        return float(rng.uniform(low, high))
-
-    if dist == "normal":
-        mean = float(spec["mean"])
-        std = float(spec["std"])
-        if std <= 0:
-            raise SamplingError(f"Invalid normal std for {name}: {std}")
-        value = float(rng.normal(mean, std))
-        if "min" in spec:
-            value = max(value, float(spec["min"]))
-        if "max" in spec:
-            value = min(value, float(spec["max"]))
-        return value
-
-    raise SamplingError(f"Unsupported distribution for {name}: {dist}")
+def sample_pressure_grid(
+    *,
+    num_levels: int,
+    pressure_top_bar: float,
+    pressure_bottom_bar: float,
+) -> np.ndarray:
+    """Build the fixed pressure grid used by the surrogate."""
+    return np.logspace(
+        math.log10(pressure_bottom_bar),
+        math.log10(pressure_top_bar),
+        int(num_levels),
+        dtype=np.float64,
+    )
 
 
-def build_pressure_grid(tp_cfg: dict[str, Any]) -> np.ndarray:
-    """Construct log-spaced pressure grid in bar, descending bottom->top."""
-    grid = tp_cfg["pressure_grid"]
-    nz = int(grid["nz"])
-    p_top = float(grid["p_top_bar"])
-    p_bottom = float(grid["p_bottom_bar"])
-    if nz <= 1 or p_top <= 0 or p_bottom <= p_top:
-        raise SamplingError("Invalid pressure grid settings.")
-    return np.logspace(np.log10(p_bottom), np.log10(p_top), nz, dtype=np.float64)
-
-
-def _xi_gamma(gamma: float, tau: np.ndarray) -> np.ndarray:
-    """Evaluate the Line-2013 irradiation integral for one gamma channel.
-
-    Computes xi(gamma, tau) = 2/3 + 2/(3*gamma) * [1 + (gamma*tau/2 - 1)*exp(-gamma*tau)]
-                              + 2*gamma/3 * (1 - tau^2/2) * E_2(gamma*tau)
-
-    where E_2 is the second-order exponential integral.  This describes how
-    stellar irradiation penetrates the atmosphere as a function of optical
-    depth, and is used in the two-stream temperature profile calculation.
-
-    Args:
-        gamma: Ratio of visible to thermal opacity (dimensionless).
-        tau: Thermal optical depth profile (array over pressure levels).
-
-    Returns:
-        The irradiation function xi evaluated at each optical depth.
-    """
-    x = gamma * tau
-    x = np.maximum(x, 1e-12)
-    term1 = 2.0 / 3.0
-    term2 = (2.0 / (3.0 * gamma)) * (1.0 + ((x / 2.0) - 1.0) * np.exp(-x))
-    term3 = (2.0 * gamma / 3.0) * (1.0 - 0.5 * tau * tau) * expn(2, x)
-    return term1 + term2 + term3
-
-
-def generate_tp_profile(
+def _analytic_temperature_profile(
     pressure_bar: np.ndarray,
-    tp_cfg: dict[str, Any],
-    gravity_cm_s2: float,
+    *,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, dict[str, float]]:
-    """Generate one temperature profile from modified Line-2013 parameterization.
+    t_low: float,
+    t_high: float,
+) -> np.ndarray:
+    """Sample a smooth hot-Jupiter temperature profile on the fixed pressure grid."""
+    logp = np.log10(np.asarray(pressure_bar, dtype=np.float64))
+    t_deep = rng.uniform(t_high - 120.0, t_high)
+    t_upper = rng.uniform(t_low, t_low + 120.0)
+    logp_transition = rng.uniform(*_TP_TRANSITION_LOG10_PRESSURE_RANGE)
+    width = rng.uniform(*_TP_TRANSITION_WIDTH_RANGE)
+    logistic = 1.0 / (1.0 + np.exp(-(logp - logp_transition) / width))
+    profile = t_upper + (t_deep - t_upper) * logistic
+    profile += rng.normal(0.0, _TP_PROFILE_NOISE_STD_K, size=profile.shape)
+    return np.clip(profile, 200.0, None)
 
-    The temperature is computed from the two-stream radiative transfer solution:
 
-        T^4 = (3/4)*T_int^4*(2/3 + tau)
-              + (3/4)*T_irr^4*[(1-alpha)*xi(gamma1, tau) + alpha*xi(gamma2, tau)]
+def sample_temperature_profile(
+    pressure_bar: np.ndarray,
+    *,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample a temperature profile, optionally from an external profile library."""
+    roth_cfg = config.get("roth_sampler", {"enabled": False})
+    if roth_cfg.get("enabled", False):
+        profiles = load_roth_profiles(
+            roth_cfg["data_glob"],
+            pressure_grid_bar=pressure_bar,
+            filters=roth_cfg.get("filters", {}),
+        )
+        if not profiles:
+            raise FileNotFoundError(
+                f"roth_sampler.enabled=true but no temperature profiles matched {roth_cfg['data_glob']!r}."
+            )
+        chosen = profiles[int(rng.integers(0, len(profiles)))]
+        return np.asarray(chosen.temperature_k, dtype=np.float64)
 
-    where tau is the thermal optical depth profile derived from
-    ``kappa_IR * (p/p0)^beta``, and ``xi`` is the irradiation integral.
-
-    An optional convective adjustment enforces an adiabatic lapse rate in
-    the deep atmosphere (applied probabilistically based on config).
-
-    Args:
-        pressure_bar: Log-spaced pressure grid in bar (descending, bottom-to-top).
-        tp_cfg: TP sampler configuration with distribution specs.
-        gravity_cm_s2: Surface gravity in cm/s^2.
-        rng: NumPy random generator for reproducible sampling.
-
-    Returns:
-        Tuple of (temperature_k array, parameter dict for provenance).
-
-    Raises:
-        SamplingError: If the sampled profile violates temperature bounds or
-            contains non-finite values.
-    """
-    params = {
-        "log10_kappa_ir": _sample_distribution(tp_cfg["log10_kappa_ir"], rng, "log10_kappa_ir"),
-        "kappa_pressure_power_exponent": _sample_distribution(
-            tp_cfg["kappa_pressure_power_exponent"], rng, "kappa_pressure_power_exponent"
-        ),
-        "log10_gamma1": _sample_distribution(tp_cfg["log10_gamma1"], rng, "log10_gamma1"),
-        "log10_gamma2": _sample_distribution(tp_cfg["log10_gamma2"], rng, "log10_gamma2"),
-        "alpha_partition": _sample_distribution(tp_cfg["alpha_partition"], rng, "alpha_partition"),
-        "t_int": _sample_distribution(tp_cfg["t_int"], rng, "t_int"),
-        "t_irr": _sample_distribution(tp_cfg["t_irr"], rng, "t_irr"),
-        "temperature_shift": _sample_distribution(
-            tp_cfg["temperature_shift"], rng, "temperature_shift"
-        ),
-    }
-
-    kappa_ir = 10.0 ** params["log10_kappa_ir"]
-    gamma1 = 10.0 ** params["log10_gamma1"]
-    gamma2 = 10.0 ** params["log10_gamma2"]
-    alpha = params["alpha_partition"]
-
-    p0 = 1.0
-    tau = kappa_ir * np.power(
-        np.maximum(pressure_bar / p0, 1e-30), params["kappa_pressure_power_exponent"]
+    t_low, t_high = [float(x) for x in config["sampling"]["temperature_range_k"]]
+    return _analytic_temperature_profile(
+        pressure_bar,
+        rng=rng,
+        t_low=t_low,
+        t_high=t_high,
     )
-    xi1 = _xi_gamma(gamma1, tau)
-    xi2 = _xi_gamma(gamma2, tau)
-
-    tint4 = params["t_int"] ** 4
-    tirr4 = params["t_irr"] ** 4
-
-    t4 = (
-        (3.0 * tint4 / 4.0) * (2.0 / 3.0 + tau)
-        + (3.0 * tirr4 / 4.0) * (1.0 - alpha) * xi1
-        + (3.0 * tirr4 / 4.0) * alpha * xi2
-    )
-    t4 = np.maximum(t4, 1e-12)
-    temperature = np.power(t4, 0.25) + params["temperature_shift"]
-
-    # Optional simple convective adjustment in pressure-increasing direction.
-    prob = float(tp_cfg["convective_adjustment_probability"])
-    if rng.uniform(0.0, 1.0) < prob:
-        nabla_ad = float(tp_cfg["adiabatic_gradient"])
-        p_inc = pressure_bar[::-1]
-        t_inc = temperature[::-1].copy()
-        for idx in range(1, t_inc.size):
-            p_ratio = p_inc[idx] / p_inc[idx - 1]
-            t_max = t_inc[idx - 1] * np.power(p_ratio, nabla_ad)
-            if t_inc[idx] > t_max:
-                t_inc[idx] = t_max
-        temperature = t_inc[::-1]
-        params["convective_adjustment_applied"] = 1.0
-    else:
-        params["convective_adjustment_applied"] = 0.0
-
-    if not np.all(np.isfinite(temperature)):
-        raise SamplingError("Non-finite temperature profile sampled.")
-
-    t_min = float(tp_cfg["temperature_limits_k"]["min"])
-    t_max = float(tp_cfg["temperature_limits_k"]["max"])
-    if np.any(temperature < t_min) or np.any(temperature > t_max):
-        raise SamplingError(f"Sampled temperature out of bounds [{t_min}, {t_max}] K.")
-
-    params["gravity_cm_s2"] = float(gravity_cm_s2)
-    return temperature.astype(np.float64), params
 
 
 def sample_kzz_profile(
     pressure_bar: np.ndarray,
-    kzz_cfg: dict[str, Any],
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, dict[str, float]]:
-    """Sample Kzz power-law profile with floor/cap clipping."""
-    log10_kzz_1bar = float(
-        rng.uniform(kzz_cfg["log10_kzz_at_1bar_min"], kzz_cfg["log10_kzz_at_1bar_max"])
-    )
-    beta = float(rng.uniform(kzz_cfg["beta_min"], kzz_cfg["beta_max"]))
-    kzz_1bar = 10.0**log10_kzz_1bar
-
-    profile = kzz_1bar * np.power(np.maximum(pressure_bar, 1e-30), -beta)
-    floor = float(kzz_cfg["kzz_floor_cm2_s"])
-    cap = float(kzz_cfg["kzz_cap_cm2_s"])
-    profile = np.clip(profile, floor, cap)
-
-    if not np.all(np.isfinite(profile)):
-        raise SamplingError("Non-finite Kzz profile sampled.")
-
-    params = {
-        "log10_kzz_at_1bar": log10_kzz_1bar,
-        "beta": beta,
-        "kzz_floor_cm2_s": floor,
-        "kzz_cap_cm2_s": cap,
-    }
-    return profile.astype(np.float64), params
-
-
-def sample_abundances(
-    abundance_cfg: dict[str, Any],
-    rng: np.random.Generator,
-) -> tuple[dict[str, float], float, float]:
-    """Sample metallicity + C/O and derive elemental abundance inputs."""
-    log10_metallicity = float(
-        rng.uniform(abundance_cfg["log10_metallicity_min"], abundance_cfg["log10_metallicity_max"])
-    )
-    c_to_o = float(rng.uniform(abundance_cfg["c_to_o_min"], abundance_cfg["c_to_o_max"]))
-    metallicity_scale = 10.0**log10_metallicity
-
-    solar = abundance_cfg["solar_abundances"]
-    o_h = float(solar["O_H"]) * metallicity_scale
-    # C/H is intentionally derived from sampled O/H and C/O.
-    c_h = o_h * c_to_o
-
-    abundances = {
-        "O_H": o_h,
-        "C_H": c_h,
-        "N_H": float(solar["N_H"]) * metallicity_scale,
-        "S_H": float(solar["S_H"]) * metallicity_scale,
-        "He_H": float(solar["He_H"]),
-        "fastchem_met_scale": metallicity_scale,
-    }
-
-    if any(val <= 0.0 or not np.isfinite(val) for val in abundances.values()):
-        raise SamplingError("Invalid sampled abundance values.")
-
-    return abundances, log10_metallicity, c_to_o
-
-
-def sample_gravity(gravity_cfg: dict[str, Any], rng: np.random.Generator) -> float:
-    """Sample or resolve gravity from explicit configuration."""
-    distribution = str(gravity_cfg["distribution"]).lower()
-    if distribution == "uniform":
-        min_cm_s2 = float(gravity_cfg["min_cm_s2"])
-        max_cm_s2 = float(gravity_cfg["max_cm_s2"])
-        if min_cm_s2 <= 0.0 or max_cm_s2 <= min_cm_s2:
-            raise SamplingError("gravity_sampler uniform bounds must satisfy 0 < min < max.")
-        return float(rng.uniform(min_cm_s2, max_cm_s2))
-
-    if distribution == "fixed":
-        value_cm_s2 = float(gravity_cfg["value_cm_s2"])
-        if value_cm_s2 <= 0.0:
-            raise SamplingError("gravity_sampler.value_cm_s2 must be > 0.")
-        return value_cm_s2
-
-    raise SamplingError(f"Unsupported gravity_sampler.distribution: {distribution}")
-
-
-def build_analytic_run_specs(
-    config: dict[str, Any],
     *,
-    rng: np.random.Generator,
-) -> list[RunSpec]:
-    """Create deterministic analytic run specifications from configured samplers."""
-    generation = config["generation"]
-    pressure_bar = build_pressure_grid(config["tp_sampler"])
-    tp_cfg = config["tp_sampler"]
-    gravity_cfg = config["gravity_sampler"]
-    max_attempts = int(tp_cfg["max_sampling_attempts"])
-    if max_attempts <= 0:
-        raise SamplingError("tp_sampler.max_sampling_attempts must be > 0.")
-
-    run_specs: list[RunSpec] = []
-    for run_id in range(int(generation["num_runs"])):
-        last_tp_error: SamplingError | None = None
-        for _attempt in range(max_attempts):
-            abundances, metallicity_log10, c_to_o = sample_abundances(
-                config["abundance_sampler"],
-                rng,
-            )
-            gravity_cm_s2 = sample_gravity(gravity_cfg, rng)
-            try:
-                temperature_k, tp_params = generate_tp_profile(
-                    pressure_bar=pressure_bar,
-                    tp_cfg=tp_cfg,
-                    gravity_cm_s2=gravity_cm_s2,
-                    rng=rng,
-                )
-            except SamplingError as exc:
-                last_tp_error = exc
-                continue
-
-            kzz_cm2_s, kzz_params = sample_kzz_profile(pressure_bar, config["kzz_sampler"], rng)
-            run_specs.append(
-                RunSpec(
-                    run_id=run_id,
-                    pressure_bar=pressure_bar.copy(),
-                    temperature_k=temperature_k,
-                    kzz_cm2_s=kzz_cm2_s,
-                    gravity_cm_s2=gravity_cm_s2,
-                    metallicity_log10=metallicity_log10,
-                    c_to_o=c_to_o,
-                    abundances=abundances,
-                    tp_params=tp_params,
-                    kzz_params=kzz_params,
-                    source_tag="analytic",
-                    source_metadata={"source_is_roth": 0.0},
-                )
-            )
-            break
-        else:
-            reason = (
-                str(last_tp_error)
-                if last_tp_error is not None
-                else "unknown temperature sampling failure"
-            )
-            raise SamplingError(
-                f"Failed to sample a valid TP profile for run_id={run_id} "
-                f"after {max_attempts} attempts: {reason}"
-            )
-
-    return run_specs
-
-
-def build_roth_run_specs(
     config: dict[str, Any],
-    *,
-    start_run_id: int,
     rng: np.random.Generator,
-) -> list[RunSpec]:
-    """Create deterministic Roth-derived run specifications on the shared target grid."""
-    roth_cfg = config["roth_sampler"]
-    if not bool(roth_cfg["enabled"]) or int(roth_cfg["num_profiles"]) <= 0:
-        return []
+) -> np.ndarray:
+    """Sample a depth-constant eddy diffusion profile."""
+    del rng
+    kzz_value = float(np.clip(config["sampling"]["kzz_cm2_s"], 1.0, None))
+    return np.full(np.asarray(pressure_bar).shape, kzz_value, dtype=np.float64)
 
-    if str(roth_cfg["source_globals_mode"]) != "pt_only":
-        raise SamplingError("roth_sampler.source_globals_mode must be 'pt_only'.")
 
-    pressure_bar = build_pressure_grid(config["tp_sampler"])
-    try:
-        selected_profiles = sample_roth_profiles(
-            config,
-            target_pressure_bar=pressure_bar,
+def _heavy_species_budget(metallicity_log10: float) -> float:
+    heavy = 0.01 * (10.0 ** metallicity_log10)
+    return float(np.clip(heavy, 1.0e-4, 0.15))
+
+
+def sample_initial_ymix(
+    pressure_bar: np.ndarray,
+    *,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+    metallicity_log10: float,
+    c_to_o: float,
+) -> np.ndarray:
+    """Sample a sulfur-aware initial composition for the synthetic smoke mode."""
+    species = list(config["data_spec"]["state_species"])
+    nz = pressure_bar.size
+    state_dim = len(species)
+    y = np.full((nz, state_dim), 1.0e-30, dtype=np.float64)
+    idx = {name: i for i, name in enumerate(species)}
+
+    heavy_budget = _heavy_species_budget(metallicity_log10)
+    he_fraction = rng.uniform(*_HELIUM_FRACTION_RANGE)
+    h2_fraction = max(1.0 - heavy_budget - he_fraction, 0.7)
+
+    logp = np.log10(pressure_bar)
+    deep_weight = (logp - logp.min()) / max(logp.max() - logp.min(), 1.0e-6)
+    deep_weight = np.clip(deep_weight, 0.0, 1.0)
+
+    carbon_budget = heavy_budget * (0.35 + 0.35 * (c_to_o / max(c_to_o + 1.0, 1.0e-6)))
+    oxygen_budget = heavy_budget * 0.35
+    nitrogen_budget = heavy_budget * 0.1
+    sulfur_budget = heavy_budget * 0.03 * (10.0 ** (0.5 * metallicity_log10))
+    sulfur_budget = float(np.clip(sulfur_budget, 1.0e-8, 0.02 * heavy_budget))
+
+    y[:, idx["He"]] = he_fraction
+    y[:, idx["H2"]] = h2_fraction
+    y[:, idx["H"]] = 5.0e-7 * (1.0 + 6.0 * (1.0 - deep_weight))
+    y[:, idx["O"]] = oxygen_budget * 3.0e-4 * (1.0 + 3.0 * (1.0 - deep_weight))
+    y[:, idx["OH"]] = oxygen_budget * 8.0e-4 * (1.0 + 4.0 * (1.0 - deep_weight))
+
+    y[:, idx["H2O"]] = oxygen_budget * (0.7 + 0.3 * (1.0 - deep_weight))
+    y[:, idx["CO"]] = carbon_budget * (0.3 + 0.5 * deep_weight)
+    y[:, idx["CO2"]] = carbon_budget * (0.08 + 0.18 * (1.0 - deep_weight))
+    y[:, idx["CH4"]] = carbon_budget * (0.2 + 0.25 * (1.0 - deep_weight))
+    y[:, idx["N2"]] = nitrogen_budget * (0.6 + 0.3 * deep_weight)
+    y[:, idx["NH3"]] = nitrogen_budget * (0.2 + 0.2 * (1.0 - deep_weight))
+    y[:, idx["H2S"]] = sulfur_budget * (0.85 + 0.1 * deep_weight)
+    y[:, idx["SH"]] = sulfur_budget * 1.0e-3 * (1.0 + 2.0 * (1.0 - deep_weight))
+    y[:, idx["S"]] = sulfur_budget * 5.0e-4 * (1.0 + 2.0 * (1.0 - deep_weight))
+    y[:, idx["SO"]] = sulfur_budget * 5.0e-5
+    y[:, idx["SO2"]] = sulfur_budget * 1.0e-5
+    y[:, idx["S2"]] = sulfur_budget * 1.0e-5
+
+    perturb = np.exp(rng.normal(0.0, 0.15, size=y.shape))
+    y *= perturb
+    y = np.clip(y, 1.0e-30, None)
+    other_sum = np.sum(y[:, [i for name, i in idx.items() if name not in {"H2", "He"}]], axis=1)
+    reservoir = np.clip(1.0 - other_sum, 1.0e-4, 1.0)
+    y[:, idx["H2"]] = reservoir * (h2_fraction / max(h2_fraction + he_fraction, 1.0e-12))
+    y[:, idx["He"]] = reservoir * (he_fraction / max(h2_fraction + he_fraction, 1.0e-12))
+    y /= np.sum(y, axis=1, keepdims=True)
+    return y
+
+
+def sample_time_grid(*, config: dict[str, Any], rng: np.random.Generator) -> np.ndarray:
+    """Sample a monotonically increasing saved-time grid for the synthetic path."""
+    sampling = config["sampling"]
+    steps = int(sampling["num_time_steps"])
+    log_dt = rng.uniform(
+        float(sampling["time_step_log10_min_s"]),
+        float(sampling["time_step_log10_max_s"]),
+        size=steps - 1,
+    )
+    dt_s = np.power(10.0, np.asarray(log_dt, dtype=np.float64))
+    time_s = np.concatenate([np.array([0.0], dtype=np.float64), np.cumsum(dt_s)])
+    return time_s
+
+
+def _latin_hypercube_unit_samples(
+    *,
+    num_samples: int,
+    num_dimensions: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate a deterministic Latin-hypercube design in [0, 1]."""
+    if num_samples < 1:
+        raise ValueError("num_samples must be >= 1.")
+    cutpoints = np.linspace(0.0, 1.0, num_samples + 1, dtype=np.float64)
+    samples = np.empty((num_samples, num_dimensions), dtype=np.float64)
+    for dim in range(num_dimensions):
+        offsets = rng.uniform(0.0, 1.0, size=num_samples)
+        coords = cutpoints[:-1] + offsets * (cutpoints[1:] - cutpoints[:-1])
+        samples[:, dim] = coords[rng.permutation(num_samples)]
+    return samples
+
+
+def _scale_unit_interval(value: float, lower: float, upper: float) -> float:
+    return float(lower + value * (upper - lower))
+
+
+def _ensure_wasp39_template(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+) -> SpectrumRecord:
+    spectrum_cfg = config["stellar_spectrum"]
+    template_path = (project_root / spectrum_cfg["template_file"]).resolve()
+    if not template_path.exists():
+        raise FileNotFoundError(
+            f"Configured stellar_spectrum.template_file does not exist: {template_path}"
+        )
+    from .spectrum import read_vulcan_spectrum_txt
+
+    return read_vulcan_spectrum_txt(template_path, name=spectrum_cfg["template_name"])
+
+
+def ensure_default_spectrum_library(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+) -> Path:
+    output_dir = project_root / "data" / "spectra_library"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    template = _ensure_wasp39_template(project_root=project_root, config=config)
+    manifest_path = output_dir / "manifest.json"
+    save_spectrum_manifest([template], output_dir)
+    return manifest_path
+
+
+def load_default_spectra(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+) -> dict[str, SpectrumRecord]:
+    manifest = ensure_default_spectrum_library(project_root=project_root, config=config)
+    return load_spectrum_manifest(manifest)
+
+
+def sample_run_specifications(
+    *,
+    config: dict[str, Any],
+    project_root: Path,
+    num_runs: int | None = None,
+    seed: int | None = None,
+) -> list[RunSpecification]:
+    """Sample the atmospheric configurations used to generate raw runs."""
+    rng = np.random.default_rng(
+        int(config["generation"]["seed"] if seed is None else seed)
+    )
+    total_runs = int(config["generation"]["num_runs"] if num_runs is None else num_runs)
+    design = _latin_hypercube_unit_samples(
+        num_samples=total_runs,
+        num_dimensions=3,
+        rng=rng,
+    )
+    spectra = load_default_spectra(project_root=project_root, config=config)
+    if not spectra:
+        raise RuntimeError("No stellar spectra available for sampling.")
+    spectrum_names = sorted(spectra.keys())
+    pressure_bar = sample_pressure_grid(
+        num_levels=int(config["sampling"]["num_levels"]),
+        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
+        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
+    )
+    result: list[RunSpecification] = []
+    physics_defaults = static_conditioning_defaults(config)
+    for run_idx in range(total_runs):
+        gravity = _scale_unit_interval(
+            design[run_idx, 0],
+            *[float(x) for x in config["sampling"]["gravity_range_cm_s2"]],
+        )
+        metallicity = _scale_unit_interval(
+            design[run_idx, 1],
+            *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
+        )
+        c_to_o = _scale_unit_interval(
+            design[run_idx, 2],
+            *[float(x) for x in config["sampling"]["c_to_o_range"]],
+        )
+        temperature_k = sample_temperature_profile(pressure_bar, config=config, rng=rng)
+        kzz = sample_kzz_profile(pressure_bar, config=config, rng=rng)
+        spectrum_name = spectrum_names[int(rng.integers(0, len(spectrum_names)))]
+        template = spectra[spectrum_name]
+        spectrum = SpectrumRecord(
+            name=f"{template.name}_run{run_idx:05d}",
+            wavelength_nm=np.asarray(template.wavelength_nm, dtype=np.float64),
+            flux_erg_cm2_s_nm=np.asarray(template.flux_erg_cm2_s_nm, dtype=np.float64),
+            metadata={**template.metadata, "template_name": template.name},
+        )
+        initial_ymix = sample_initial_ymix(
+            pressure_bar,
+            config=config,
             rng=rng,
+            metallicity_log10=metallicity,
+            c_to_o=c_to_o,
         )
-    except RothSamplingError as exc:
-        raise SamplingError(str(exc)) from exc
-
-    gravity_cfg = config["gravity_sampler"]
-    kzz_cfg = config["kzz_sampler"]
-    run_specs: list[RunSpec] = []
-    for offset, profile in enumerate(selected_profiles):
-        abundances, metallicity_log10, c_to_o = sample_abundances(
-            config["abundance_sampler"],
-            rng,
-        )
-        gravity_cm_s2 = sample_gravity(gravity_cfg, rng)
-        kzz_cm2_s, kzz_params = sample_kzz_profile(pressure_bar, kzz_cfg, rng)
-        run_specs.append(
-            RunSpec(
-                run_id=start_run_id + offset,
-                pressure_bar=pressure_bar.copy(),
-                temperature_k=profile.interpolated_temperature_k.copy(),
-                kzz_cm2_s=kzz_cm2_s,
-                gravity_cm_s2=gravity_cm_s2,
-                metallicity_log10=metallicity_log10,
-                c_to_o=c_to_o,
-                abundances=abundances,
-                tp_params={},
-                kzz_params=kzz_params,
-                source_tag="roth",
-                source_file=profile.source_relpath,
-                source_metadata={
-                    "source_is_roth": 1.0,
-                    "source_Teq": float(profile.metadata["Teq"]),
-                    "source_LogMet": float(profile.metadata["LogMet"]),
-                    "source_LogDrag": float(profile.metadata["LogDrag"]),
-                    "source_Mstar": float(profile.metadata["Mstar"]),
-                    "source_Rp": float(profile.metadata["Rp"]),
-                    "source_logG": float(profile.metadata["logG"]),
-                    "source_TiOVO": 1.0 if bool(profile.metadata["TiOVO"]) else 0.0,
-                    "source_lon_deg": float(profile.lon_deg),
-                    "source_lat_deg": float(profile.lat_deg),
-                    "source_planet_mass_jup": float(profile.planet_mass_jup),
-                    "source_native_pressure_min_bar": float(profile.native_pressure_min_bar),
-                    "source_native_pressure_max_bar": float(profile.native_pressure_max_bar),
-                    "source_extrapolated_top": 1.0 if profile.extrapolated_top else 0.0,
-                    "source_extrapolated_bottom": 1.0 if profile.extrapolated_bottom else 0.0,
-                },
+        globals_map = {
+            "gravity_cm_s2": float(gravity),
+            "metallicity_log10": float(metallicity),
+            "c_to_o": float(c_to_o),
+            **{key: float(value) for key, value in physics_defaults.items()},
+        }
+        result.append(
+            RunSpecification(
+                run_id=f"run_{run_idx:05d}",
+                pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
+                temperature_k=np.asarray(temperature_k, dtype=np.float64),
+                kzz_cm2_s=np.asarray(kzz, dtype=np.float64),
+                initial_ymix=np.asarray(initial_ymix, dtype=np.float64),
+                time_s=sample_time_grid(config=config, rng=rng),
+                globals=globals_map,
+                spectrum=spectrum,
+                metadata={"spectrum_name": spectrum.name},
             )
         )
-    return run_specs
-
-
-def build_run_specs(config: dict[str, Any]) -> list[RunSpec]:
-    """Create deterministic analytic and Roth-derived run specifications."""
-    generation = config["generation"]
-    seed = int(generation["random_seed"])
-    analytic_rng = np.random.default_rng(seed)
-    roth_rng = np.random.default_rng(seed + 1)
-    analytic_specs = build_analytic_run_specs(config, rng=analytic_rng)
-    roth_specs = build_roth_run_specs(
-        config,
-        start_run_id=len(analytic_specs),
-        rng=roth_rng,
-    )
-    return [*analytic_specs, *roth_specs]
+    return result

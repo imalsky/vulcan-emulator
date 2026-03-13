@@ -1,895 +1,950 @@
-"""VULCAN subprocess execution and raw trajectory extraction.
-
-Manages the lifecycle of individual VULCAN chemistry runs:
-
-1. **Preflight and runtime checks**: Validates the VULCAN source tree,
-   checks configured species against ``chem_funs.py``, and runs a one-shot
-   smoke test.
-2. **Worker isolation**: Each process gets its own copy of the VULCAN source
-   tree to avoid file conflicts during parallel execution.
-3. **Config generation**: Patches ``vulcan_cfg.py`` with sampled parameters
-   (P, T, Kzz, gravity, abundances, physics toggles) via regex replacement.
-4. **Execution**: Runs VULCAN as a subprocess with timeout enforcement.
-5. **Extraction**: Loads the ``.vul`` pickle output, converts number densities
-   to mixing ratios (``ymix = n_i / sum(n)``), deduplicates time steps, and
-   writes the validated trajectory into a standardized HDF5 layout.
-
-Current physics coverage: non-photochemical VULCAN thermochemistry plus
-configurable transport, boundary conditions, condensation/settling, cold-trap,
-and selected solver/runtime toggles. Photochemistry and ion chemistry remain
-intentionally disabled in this emulator branch (see ``spec.md`` for the full
-coverage map and all exposed toggles).
-"""
-
 from __future__ import annotations
 
-import ast
-import logging
-import os
+import concurrent.futures
+import json
 import pickle
 import re
 import shutil
 import subprocess
-import sys
-import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
-from tqdm import tqdm
 
-from config_utils import SUPPORTED_ATM_BASES
-from sampling import RunSpec
+from .path_utils import ensure_dir, resolve_path
+from .provenance import manifest_for_files
+from .sampling import RunSpecification, sample_run_specifications
+from .spectrum import write_vulcan_spectrum_txt
 
-logger = logging.getLogger(__name__)
-
-
-class VulcanRuntimeError(RuntimeError):
-    """Raised when a VULCAN run or extraction step fails."""
-
-
-@dataclass(frozen=True)
-class BoundaryConditionSettings:
-    """Explicit boundary-condition settings passed through to generated VULCAN configs."""
-
-    use_topflux: bool
-    use_botflux: bool
-    top_BC_flux_file: str
-    bot_BC_flux_file: str
-    use_fix_sp_bot: dict[str, float]
+_SOLAR_ELEMENT_ABUNDANCES = {
+    "O_H": 5.37e-4,
+    "C_H": 2.95e-4,
+    "N_H": 7.08e-5,
+    "S_H": 1.41e-5,
+    "He_H": 8.38e-2,
+}
 
 
 @dataclass(frozen=True)
-class SpeciesSelection:
-    """Ordered species lists used for model state and supervised outputs."""
-
-    state_species: tuple[str, ...]
-    output_species: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class WorkerSettings:
-    """Immutable worker/runtime settings shared across VULCAN tasks."""
-
-    vulcan_source: str
-    worker_root: str
-    raw_root: str
-    species: SpeciesSelection
-    boundary_conditions: BoundaryConditionSettings | None
-    use_eddy_diffusion: bool
-    use_molecular_diffusion: bool
-    use_upwind_molecular_diffusion: bool
-    use_condensation: bool
-    use_settling: bool
-    use_initial_cold_trap: bool
-    use_sat_surface_h2o: bool
-    use_lowT_limit_rates: bool
-    use_adaptive_rtol: bool
-    ini_mix: str
-    atm_base: str
-    save_evo_frq: int
-    keep_vulcan_outputs_debug: bool
-    run_timeout_seconds: int
-    num_workers: int
-    runtime: float
-    dt_min: float
-    dt_max: float
-    count_max: int
-    trun_min: float
-    count_min: int
-    max_trajectory_snapshots: int
+class GeneratedRawDataset:
+    raw_root: Path
+    run_files: list[Path]
+    manifest_path: Path | None = None
+    coverage_path: Path | None = None
 
 
-@dataclass(frozen=True)
-class RunResult:
-    """Result record for one successfully extracted run."""
-
-    run_id: int
-    run_file: str
-
-
-_WORKER_CACHE: dict[str, Any] = {}
-
-
-def _load_available_species(vulcan_source: Path) -> list[str]:
-    """Parse the bundled VULCAN species list from ``chem_funs.py``."""
-    chem_funs_path = vulcan_source / "chem_funs.py"
-    if not chem_funs_path.is_file():
-        raise VulcanRuntimeError(
-            "VULCAN runtime is missing chem_funs.py, which is required to validate "
-            f"configured species: {chem_funs_path}"
-        )
-
-    text = chem_funs_path.read_text(encoding="utf-8")
-    try:
-        tree = ast.parse(text, filename=str(chem_funs_path))
-    except SyntaxError as exc:
-        raise VulcanRuntimeError(
-            f"Failed to parse VULCAN chemistry file: {chem_funs_path}."
-        ) from exc
-
-    parsed: Any | None = None
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "spec_list":
-                    parsed = ast.literal_eval(node.value)
-                    break
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == "spec_list":
-                parsed = ast.literal_eval(node.value)
-        if parsed is not None:
-            break
-
-    if parsed is None:
-        raise VulcanRuntimeError(
-            "Failed to parse VULCAN species list from chem_funs.py. Expected a top-level "
-            f"spec_list assignment in {chem_funs_path}."
-        )
-
-    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
-        raise VulcanRuntimeError(
-            f"Invalid VULCAN species list in {chem_funs_path}; expected a list[str]."
-        )
-    return parsed
+def patch_python_assignments(text: str, assignments: dict[str, Any]) -> str:
+    updated = text
+    for name, value in assignments.items():
+        replacement = f"{name} = {value!r}"
+        pattern = re.compile(rf"^\s*{re.escape(name)}\s*=.*$", re.MULTILINE)
+        if pattern.search(updated):
+            updated = pattern.sub(replacement, updated, count=1)
+        else:
+            if not updated.endswith("\n"):
+                updated += "\n"
+            updated += replacement + "\n"
+    return updated
 
 
-def validate_species_available(
-    vulcan_source: Path,
-    *,
-    state_species: tuple[str, ...],
-    output_species: tuple[str, ...],
-) -> None:
-    """Fail fast when configured species are not present in the VULCAN network."""
-    available = set(_load_available_species(vulcan_source))
-    missing_state = [species for species in state_species if species not in available]
-    missing_output = [species for species in output_species if species not in available]
-    if missing_state or missing_output:
-        parts: list[str] = []
-        if missing_state:
-            parts.append(f"state_species missing={missing_state}")
-        if missing_output:
-            parts.append(f"output_species missing={missing_output}")
-        joined = "; ".join(parts)
-        raise VulcanRuntimeError(
-            "Configured species are not available in the bundled VULCAN chemistry network: "
-            f"{joined}. Update data_spec state/output species or regenerate the chemistry network."
-        )
+def _requested_run_count(config: dict[str, Any], num_runs: int | None) -> int:
+    return int(config["generation"]["num_runs"] if num_runs is None else num_runs)
 
 
-def resolve_boundary_conditions(
+def _generation_worker_count(config: dict[str, Any], total_runs: int) -> int:
+    configured = int(config["generation"]["parallel_workers"])
+    return max(1, min(configured, total_runs))
+
+
+def _prepare_generation_directory(
     config: dict[str, Any],
-    vulcan_source: Path,
-) -> BoundaryConditionSettings | None:
-    """Resolve and validate optional boundary-condition settings against the VULCAN tree."""
-    if not bool(config["physics_toggles"]["use_boundary_conditions"]):
-        return None
-
-    boundary_cfg = config.get("boundary_conditions")
-    if not isinstance(boundary_cfg, dict):
-        raise VulcanRuntimeError(
-            "physics_toggles.use_boundary_conditions=true requires a top-level "
-            "'boundary_conditions' section."
-        )
-
-    use_topflux = bool(boundary_cfg["use_topflux"])
-    use_botflux = bool(boundary_cfg["use_botflux"])
-    top_file = str(boundary_cfg["top_BC_flux_file"])
-    bot_file = str(boundary_cfg["bot_BC_flux_file"])
-    fixed_bottom = {
-        str(species_name): float(value)
-        for species_name, value in dict(boundary_cfg["use_fix_sp_bot"]).items()
-    }
-
-    if not use_topflux and not use_botflux and not fixed_bottom:
-        raise VulcanRuntimeError(
-            "Boundary conditions are enabled, but no top flux, bottom flux, or fixed bottom "
-            "mixing ratios were configured."
-        )
-
-    if use_topflux and not (vulcan_source / top_file).is_file():
-        raise VulcanRuntimeError(
-            "Configured boundary condition file does not exist: "
-            f"{vulcan_source / top_file}"
-        )
-    if use_botflux and not (vulcan_source / bot_file).is_file():
-        raise VulcanRuntimeError(
-            "Configured boundary condition file does not exist: "
-            f"{vulcan_source / bot_file}"
-        )
-
-    return BoundaryConditionSettings(
-        use_topflux=use_topflux,
-        use_botflux=use_botflux,
-        top_BC_flux_file=top_file,
-        bot_BC_flux_file=bot_file,
-        use_fix_sp_bot=fixed_bottom,
-    )
-
-
-def _build_preflight_run_spec() -> RunSpec:
-    """Return a tiny deterministic run spec for runtime smoke validation."""
-    pressure_bar = np.logspace(3.0, -8.0, 16, dtype=np.float64)
-    temperature_k = np.full(pressure_bar.shape, 1400.0, dtype=np.float64)
-    kzz_cm2_s = np.full(pressure_bar.shape, 1.0e10, dtype=np.float64)
-    return RunSpec(
-        run_id=-1,
-        pressure_bar=pressure_bar,
-        temperature_k=temperature_k,
-        kzz_cm2_s=kzz_cm2_s,
-        gravity_cm_s2=1.0e3,
-        metallicity_log10=0.0,
-        c_to_o=0.55,
-        abundances={
-            "O_H": 5.37e-4,
-            "C_H": 2.95e-4,
-            "N_H": 7.08e-5,
-            "S_H": 1.41e-5,
-            "He_H": 8.38e-2,
-            "fastchem_met_scale": 1.0,
-        },
-        tp_params={},
-        kzz_params={},
-    )
-
-
-def _run_preflight_smoke(
     *,
-    vulcan_source: Path,
-    settings: WorkerSettings,
-    timeout_seconds: int,
-) -> None:
-    """Run a one-shot VULCAN smoke test inside an isolated worker copy."""
-    preflight_spec = _build_preflight_run_spec()
-
-    with tempfile.TemporaryDirectory(prefix="vulcan_preflight_") as tmpdir_name:
-        tmpdir = Path(tmpdir_name)
-        worker_dir = tmpdir / "worker"
-        shutil.copytree(vulcan_source, worker_dir)
-
-        generated_atm_dir = worker_dir / "atm" / "generated"
-        generated_atm_dir.mkdir(parents=True, exist_ok=True)
-        atm_relpath = "atm/generated/preflight_profile.txt"
-        _write_generated_atm_file(preflight_spec, generated_atm_dir / "preflight_profile.txt")
-
-        baseline_cfg = (worker_dir / "vulcan_cfg.py").read_text(encoding="utf-8")
-        smoke_settings = replace(
-            settings,
-            vulcan_source=str(vulcan_source),
-            worker_root=str(tmpdir),
-            raw_root=str(tmpdir / "raw"),
-            save_evo_frq=1,
-            keep_vulcan_outputs_debug=False,
-            run_timeout_seconds=timeout_seconds,
-            num_workers=1,
-            runtime=1.0e-8,
-            dt_min=1.0e-14,
-            dt_max=1.0e-8,
-            count_max=1,
-            trun_min=1.0,
-            count_min=10,
+    project_root: Path,
+    num_runs: int | None,
+) -> tuple[Path, Path, list[Path] | None]:
+    """Prepare the raw-run directory and honour overwrite/reuse semantics."""
+    raw_root = resolve_path(config["paths"]["raw_root"], project_root)
+    runs_dir = ensure_dir(raw_root / "runs")
+    requested_runs = _requested_run_count(config, num_runs)
+    existing_files = sorted(runs_dir.glob("run_*.h5"))
+    if bool(config["generation"]["overwrite"]):
+        for path in existing_files:
+            path.unlink()
+        return raw_root, runs_dir, None
+    if existing_files:
+        if bool(config["generation"]["reuse_raw_if_present"]) and len(existing_files) == requested_runs:
+            return raw_root, runs_dir, existing_files
+        raise RuntimeError(
+            f"Found {len(existing_files)} existing raw runs under {runs_dir}. "
+            "Set generation.overwrite=true or align generation.num_runs with the existing dataset."
         )
-        smoke_cfg = _apply_run_config(
-            baseline_cfg=baseline_cfg,
-            run_spec=preflight_spec,
-            settings=smoke_settings,
-            atm_relpath=atm_relpath,
-            out_name="preflight_smoke.vul",
-        )
-        smoke_cfg = _replace_assignment(smoke_cfg, "save_evolution", False)
-        (worker_dir / "vulcan_cfg.py").write_text(smoke_cfg, encoding="utf-8")
+    return raw_root, runs_dir, None
 
-        try:
-            completed = subprocess.run(
-                [sys.executable, "vulcan.py", "-n"],
-                cwd=worker_dir,
-                text=True,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise VulcanRuntimeError(
-                "VULCAN preflight failed: smoke execution timed out after "
-                f"{timeout_seconds} seconds."
-            ) from exc
-        if completed.returncode != 0:
-            stderr_tail = (completed.stderr or "")[-4000:]
-            stdout_tail = (completed.stdout or "")[-4000:]
-            raise VulcanRuntimeError(
-                "VULCAN preflight failed: smoke execution did not complete cleanly "
-                f"(exit code {completed.returncode}).\n"
-                f"STDOUT tail:\n{stdout_tail}\n"
-                f"STDERR tail:\n{stderr_tail}"
-            )
 
-        output_file = worker_dir / "output" / "preflight_smoke.vul"
-        if not output_file.is_file():
-            raise VulcanRuntimeError(
-                "VULCAN preflight failed: smoke execution did not produce the expected output "
-                f"file {output_file}."
-            )
+def _coverage_fraction(low: float, high: float, observed_low: float, observed_high: float) -> float:
+    span = max(high - low, 1.0e-12)
+    return float(np.clip((observed_high - observed_low) / span, 0.0, 1.0))
 
-def preflight_vulcan_source(
-    vulcan_source: Path,
+
+def _sampling_coverage_payload(
     *,
-    settings: WorkerSettings,
-    timeout_seconds: int = 120,
-) -> None:
-    """Verify VULCAN runtime prerequisites without auto-install behavior."""
-    fastchem_binary = vulcan_source / "fastchem_vulcan" / "fastchem"
-    required_paths = [
-        vulcan_source,
-        vulcan_source / "vulcan.py",
-        vulcan_source / "vulcan_cfg.py",
-        vulcan_source / "fastchem_vulcan",
+    config: dict[str, Any],
+    specs: list[RunSpecification],
+    run_files: list[Path],
+    mode: str,
+) -> dict[str, Any]:
+    """Summarize the realized dataset coverage against the configured ranges."""
+    gravity = np.asarray([spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64)
+    metallicity = np.asarray([spec.globals["metallicity_log10"] for spec in specs], dtype=np.float64)
+    c_to_o = np.asarray([spec.globals["c_to_o"] for spec in specs], dtype=np.float64)
+    temperature_rows: list[np.ndarray] = []
+    log10_kzz_rows: list[np.ndarray] = []
+    pressure_rows: list[np.ndarray] = []
+    time_step_rows: list[np.ndarray] = []
+    for path in run_files:
+        with h5py.File(path, "r") as handle:
+            temperature_rows.append(np.asarray(handle["inputs/temperature_k"], dtype=np.float64))
+            pressure_rows.append(np.asarray(handle["inputs/pressure_bar"], dtype=np.float64))
+            log10_kzz_rows.append(np.log10(np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64)))
+            time_s = np.asarray(handle["trajectory/time_s"], dtype=np.float64)
+            if time_s.size > 1:
+                time_step_rows.append(np.log10(np.diff(time_s)))
+    temperature = np.concatenate(temperature_rows, axis=0)
+    log10_kzz = np.concatenate(log10_kzz_rows, axis=0)
+    pressure = np.concatenate(pressure_rows, axis=0)
+    time_step_log10 = np.concatenate(time_step_rows, axis=0) if time_step_rows else np.zeros((0,), dtype=np.float64)
+    gravity_range = [float(x) for x in config["sampling"]["gravity_range_cm_s2"]]
+    metallicity_range = [float(x) for x in config["sampling"]["metallicity_log10_range"]]
+    c_to_o_range = [float(x) for x in config["sampling"]["c_to_o_range"]]
+    temperature_range = [float(x) for x in config["sampling"]["temperature_range_k"]]
+    kzz_value = float(config["sampling"]["kzz_cm2_s"])
+    log10_kzz_value = float(np.log10(max(kzz_value, 1.0e-30)))
+    kzz_range = [log10_kzz_value, log10_kzz_value]
+    time_range = [
+        float(config["sampling"]["time_step_log10_min_s"]),
+        float(config["sampling"]["time_step_log10_max_s"]),
     ]
-    missing = [str(path) for path in required_paths if not path.exists()]
-    if missing:
-        raise VulcanRuntimeError(
-            "VULCAN preflight failed. Missing required runtime paths: "
-            f"{missing}. Install/build VULCAN before running --gen."
-        )
-    if not fastchem_binary.is_file():
-        raise VulcanRuntimeError(
-            "VULCAN preflight failed. Missing compiled FastChem binary: "
-            f"{fastchem_binary}. Build FastChem inside VULCAN before running --gen."
-        )
-    if not os.access(fastchem_binary, os.X_OK):
-        raise VulcanRuntimeError(
-            "VULCAN preflight failed. FastChem binary is not executable: "
-            f"{fastchem_binary}. Fix permissions or rebuild FastChem before running --gen."
-        )
-
-    _run_preflight_smoke(
-        vulcan_source=vulcan_source,
-        settings=settings,
-        timeout_seconds=timeout_seconds,
-    )
-
-
-def _py_literal(value: Any) -> str:
-    """Render one Python literal exactly as it should appear in ``vulcan_cfg.py``."""
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    return repr(value)
-
-
-def _replace_assignment(text: str, key: str, value: Any) -> str:
-    """Replace one top-level assignment in a copied ``vulcan_cfg.py`` file."""
-    pattern = re.compile(rf"^(\s*{re.escape(key)}\s*=).*$", re.MULTILINE)
-    replacement = rf"\1 {_py_literal(value)}"
-    replaced, count = pattern.subn(replacement, text)
-    if count == 0:
-        raise VulcanRuntimeError(f"Failed to set '{key}' in generated vulcan_cfg.py")
-    return replaced
-
-def _ensure_worker_context(settings: WorkerSettings) -> dict[str, Any]:
-    """Create or reuse the per-process copied VULCAN worker tree."""
-    cache_key = "context"
-    existing = _WORKER_CACHE.get(cache_key)
-    if existing is not None:
-        return existing
-
-    pid = os.getpid()
-    source = Path(settings.vulcan_source)
-    worker_root = Path(settings.worker_root)
-    worker_root.mkdir(parents=True, exist_ok=True)
-    worker_dir = worker_root / f"worker_{pid}"
-
-    if worker_dir.exists():
-        shutil.rmtree(worker_dir)
-    shutil.copytree(source, worker_dir)
-
-    baseline_cfg_path = worker_dir / "vulcan_cfg.py"
-    baseline_cfg_text = baseline_cfg_path.read_text(encoding="utf-8")
-
-    generated_atm_dir = worker_dir / "atm" / "generated"
-    generated_atm_dir.mkdir(parents=True, exist_ok=True)
-
-    context = {
-        "worker_dir": worker_dir,
-        "baseline_cfg_text": baseline_cfg_text,
-        "generated_atm_dir": generated_atm_dir,
-    }
-    _WORKER_CACHE[cache_key] = context
-    return context
-
-
-def _write_generated_atm_file(run_spec: RunSpec, atm_file: Path) -> None:
-    """Write one sampled atmosphere profile in the VULCAN text input format."""
-    pressure_dyn_cm2 = run_spec.pressure_bar * 1.0e6
-    with atm_file.open("w", encoding="utf-8") as handle:
-        handle.write("#(dyne/cm2) (K) (cm2/s)\n")
-        handle.write("Pressure\tTemp\tKzz\n")
-        for p_dyn, temp, kzz in zip(
-            pressure_dyn_cm2,
-            run_spec.temperature_k,
-            run_spec.kzz_cm2_s,
-            strict=True,
-        ):
-            handle.write(f"{p_dyn:.6E}\t{temp:.6f}\t{kzz:.6E}\n")
-
-
-def _apply_run_config(
-    baseline_cfg: str,
-    run_spec: RunSpec,
-    settings: WorkerSettings,
-    atm_relpath: str,
-    out_name: str,
-) -> str:
-    """Apply one sampled run configuration to the copied VULCAN config template."""
-    cfg = baseline_cfg
-    replacements: dict[str, Any] = {
-        "use_lowT_limit_rates": bool(settings.use_lowT_limit_rates),
-        "use_photo": False,
-        "use_ion": False,
-        "use_live_plot": False,
-        "use_live_flux": False,
-        "use_plot_end": False,
-        "use_plot_evo": False,
-        "use_save_movie": False,
-        "use_flux_movie": False,
-        "use_print_prog": False,
-        "output_humanread": False,
-        "save_evolution": True,
-        "save_evo_frq": int(settings.save_evo_frq),
-        "runtime": float(settings.runtime),
-        "dt_min": float(settings.dt_min),
-        "dt_max": float(settings.dt_max),
-        "count_max": int(settings.count_max),
-        "trun_min": float(settings.trun_min),
-        "count_min": int(settings.count_min),
-        "ini_mix": str(settings.ini_mix),
-        "use_ini_cold_trap": bool(settings.use_initial_cold_trap),
-        "atm_base": str(settings.atm_base),
-        "use_Kzz": bool(settings.use_eddy_diffusion),
-        "use_moldiff": bool(settings.use_molecular_diffusion),
-        "use_vm_mol": bool(settings.use_upwind_molecular_diffusion),
-        "use_vz": False,
-        "atm_type": "file",
-        "Kzz_prof": "file",
-        "vz_prof": "const",
-        "const_vz": 0.0,
-        "atm_file": atm_relpath,
-        "out_name": out_name,
-        "output_dir": "output/",
-        "plot_dir": "plot/",
-        "movie_dir": "plot/movie/",
-        "use_solar": False,
-        "use_topflux": False,
-        "use_botflux": False,
-        "use_fix_sp_bot": {},
-        "use_sat_surfaceH2O": bool(settings.use_sat_surface_h2o),
-        "use_condense": bool(settings.use_condensation),
-        "use_settling": bool(settings.use_settling),
-        "use_adapt_rtol": bool(settings.use_adaptive_rtol),
-        "nz": int(run_spec.pressure_bar.size),
-        "P_b": float(np.max(run_spec.pressure_bar) * 1.0e6),
-        "P_t": float(np.min(run_spec.pressure_bar) * 1.0e6),
-        "gs": float(run_spec.gravity_cm_s2),
-        "O_H": float(run_spec.abundances["O_H"]),
-        "C_H": float(run_spec.abundances["C_H"]),
-        "N_H": float(run_spec.abundances["N_H"]),
-        "S_H": float(run_spec.abundances["S_H"]),
-        "He_H": float(run_spec.abundances["He_H"]),
-        "fastchem_met_scale": float(run_spec.abundances["fastchem_met_scale"]),
-    }
-
-    if settings.boundary_conditions is not None:
-        replacements["use_topflux"] = bool(settings.boundary_conditions.use_topflux)
-        replacements["use_botflux"] = bool(settings.boundary_conditions.use_botflux)
-        replacements["top_BC_flux_file"] = settings.boundary_conditions.top_BC_flux_file
-        replacements["bot_BC_flux_file"] = settings.boundary_conditions.bot_BC_flux_file
-        replacements["use_fix_sp_bot"] = dict(settings.boundary_conditions.use_fix_sp_bot)
-
-    for key, value in replacements.items():
-        cfg = _replace_assignment(cfg, key, value)
-    return cfg
-
-
-def _deduplicate_strictly_increasing(
-    times: np.ndarray,
-    states: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Keep the first state and subsequent strictly increasing saved times only."""
-    if times.ndim != 1 or states.ndim != 3:
-        raise VulcanRuntimeError("Invalid trajectory ranks in VULCAN output.")
-    if states.shape[0] != times.size:
-        raise VulcanRuntimeError("Trajectory time/state length mismatch in VULCAN output.")
-
-    keep_indices = [0]
-    last_time = float(times[0])
-    for idx in range(1, times.size):
-        candidate = float(times[idx])
-        if candidate > last_time:
-            keep_indices.append(idx)
-            last_time = candidate
-    keep = np.asarray(keep_indices, dtype=np.int64)
-    return times[keep], states[keep]
-
-
-def _subsample_logspace(
-    times: np.ndarray,
-    states: np.ndarray,
-    n_keep: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Subsample a trajectory to approximately *n_keep* log-spaced snapshots.
-
-    Always retains the first (t=0) and last time points.  Interior points are
-    chosen as the nearest saved snapshots to log-uniformly spaced target times
-    between the first positive time and the final time.
-    """
-    if times.size <= n_keep:
-        return times, states
-
-    # Always keep index 0 (t=0) and the last index.
-    selected = {0, times.size - 1}
-
-    # Find the first positive time for log-spacing.
-    pos_mask = times > 0.0
-    if not np.any(pos_mask):
-        return times, states
-    first_pos_idx = int(np.argmax(pos_mask))
-    t_min = float(times[first_pos_idx])
-    t_max = float(times[-1])
-    if t_min >= t_max:
-        return times, states
-
-    # Generate log-spaced target times; subtract 2 for the guaranteed endpoints.
-    n_interior = max(n_keep - 2, 1)
-    targets = np.logspace(np.log10(t_min), np.log10(t_max), n_interior)
-
-    # For each target, pick the nearest saved snapshot.
-    for t in targets:
-        idx = int(np.searchsorted(times, t, side="left"))
-        idx = min(idx, times.size - 1)
-        # Check left neighbor too.
-        if idx > 0 and abs(times[idx - 1] - t) < abs(times[idx] - t):
-            idx = idx - 1
-        selected.add(idx)
-
-    keep = np.sort(np.array(list(selected), dtype=np.int64))
-    return times[keep], states[keep]
-
-
-def _extract_run_payload(output_file: Path, run_spec: RunSpec, settings: WorkerSettings) -> dict[str, Any]:
-    """Extract the raw full-trajectory payload required by the transition-model pipeline."""
-    with output_file.open("rb") as handle:
-        data = pickle.load(handle)  # noqa: S301 - trusted, self-generated VULCAN artifact
-
-    try:
-        variable = data["variable"]
-    except (KeyError, TypeError) as exc:
-        raise VulcanRuntimeError("Invalid .vul structure: missing 'variable' dictionary.") from exc
-    if not isinstance(variable, dict):
-        raise VulcanRuntimeError("Invalid .vul structure: 'variable' is not a dictionary.")
-
-    try:
-        species = list(variable["species"])
-    except KeyError as exc:
-        raise VulcanRuntimeError("Invalid .vul structure: missing 'species' in variable dictionary.") from exc
-    if not species:
-        raise VulcanRuntimeError("Invalid .vul structure: empty species list.")
-
-    state_species = list(settings.species.state_species)
-    output_species = list(settings.species.output_species)
-    missing_state = [sp for sp in state_species if sp not in species]
-    missing_output = [sp for sp in output_species if sp not in species]
-    if missing_state or missing_output:
-        parts: list[str] = []
-        if missing_state:
-            parts.append(f"state_species={missing_state}")
-        if missing_output:
-            parts.append(f"output_species={missing_output}")
-        raise VulcanRuntimeError(
-            f"Configured species missing in run {run_spec.run_id}: {'; '.join(parts)}"
-        )
-
-    try:
-        y_ini = np.asarray(variable["y_ini"], dtype=np.float64)
-        y_time = np.asarray(variable["y_time"], dtype=np.float64)
-        t_time = np.asarray(variable["t_time"], dtype=np.float64)
-    except KeyError as exc:
-        raise VulcanRuntimeError(
-            f"Invalid .vul structure: missing field {exc} in variable dictionary."
-        ) from exc
-    if y_ini.ndim != 2:
-        raise VulcanRuntimeError("Invalid y_ini shape in .vul output.")
-    if y_time.ndim != 3 or t_time.ndim != 1:
-        raise VulcanRuntimeError(
-            "save_evolution output missing or malformed (expected y_time[t,z,s], t_time[t])."
-        )
-    if y_time.shape[0] != t_time.shape[0]:
-        raise VulcanRuntimeError("Inconsistent y_time/t_time lengths in .vul output.")
-    if y_ini.shape[0] != run_spec.pressure_bar.size:
-        raise VulcanRuntimeError("y_ini vertical dimension does not match the sampled atmosphere.")
-    if y_ini.shape[1] != len(species):
-        raise VulcanRuntimeError("y_ini species dimension does not match the VULCAN species list.")
-    if y_time.shape[1:] != y_ini.shape:
-        raise VulcanRuntimeError("y_time state shape does not match y_ini shape.")
-
-    states = np.concatenate([y_ini[None, ...], y_time], axis=0)
-    times = np.concatenate([np.array([0.0], dtype=np.float64), t_time], axis=0)
-    times, states = _deduplicate_strictly_increasing(times, states)
-    if settings.max_trajectory_snapshots > 0:
-        times, states = _subsample_logspace(times, states, settings.max_trajectory_snapshots)
-    if times.size < 2:
-        raise VulcanRuntimeError(
-            "VULCAN output does not contain at least one positive saved time after deduplication."
-        )
-    if float(times[0]) != 0.0:
-        raise VulcanRuntimeError("Extracted trajectory must start at t=0.")
-
-    # Convert number densities to mixing ratios: ymix_i = n_i / sum(n_all)
-    row_sums = np.sum(states, axis=2, keepdims=True)
-    if np.any(~np.isfinite(row_sums)) or np.any(row_sums <= 0.0):
-        raise VulcanRuntimeError("Encountered non-positive or non-finite total number density.")
-    ymix = states / row_sums
-
-    state_indices = np.asarray([species.index(sp) for sp in state_species], dtype=np.int64)
-    output_indices = np.asarray([species.index(sp) for sp in output_species], dtype=np.int64)
-    ymix_state = np.take(ymix, state_indices, axis=2)
-    ymix_output = np.take(ymix, output_indices, axis=2)
-
-    arrays_to_check = [
-        run_spec.pressure_bar,
-        run_spec.temperature_k,
-        run_spec.kzz_cm2_s,
-        times,
-        ymix_state,
-        ymix_output,
-    ]
-    if any(np.any(~np.isfinite(array)) for array in arrays_to_check):
-        raise VulcanRuntimeError("Non-finite values detected in extracted run payload.")
-
     return {
-        "pressure_bar": np.asarray(run_spec.pressure_bar, dtype=np.float64),
-        "temperature_k": np.asarray(run_spec.temperature_k, dtype=np.float64),
-        "kzz_cm2_s": np.asarray(run_spec.kzz_cm2_s, dtype=np.float64),
-        "time_s": np.asarray(times, dtype=np.float64),
-        "ymix_state": np.asarray(ymix_state, dtype=np.float64),
-        "ymix_output": np.asarray(ymix_output, dtype=np.float64),
-        "state_species": state_species,
-        "output_species": output_species,
-        "use_eddy_diffusion": float(settings.use_eddy_diffusion),
-        "use_molecular_diffusion": float(settings.use_molecular_diffusion),
-        "use_upwind_molecular_diffusion": float(settings.use_upwind_molecular_diffusion),
-        "use_boundary_conditions": float(settings.boundary_conditions is not None),
-        "use_condensation": float(settings.use_condensation),
-        "use_settling": float(settings.use_settling),
-        "use_initial_cold_trap": float(settings.use_initial_cold_trap),
-        "use_sat_surface_h2o": float(settings.use_sat_surface_h2o),
-        "use_lowT_limit_rates": float(settings.use_lowT_limit_rates),
-        "use_adaptive_rtol": float(settings.use_adaptive_rtol),
-        "atm_base": str(settings.atm_base),
+        "mode": mode,
+        "num_runs": len(specs),
+        "configured_ranges": {
+            "gravity_cm_s2": gravity_range,
+            "metallicity_log10": metallicity_range,
+            "c_to_o": c_to_o_range,
+            "temperature_k": temperature_range,
+            "log10_kzz_cm2_s": kzz_range,
+            "log10_adjacent_dt_s": time_range,
+            "pressure_bar": [
+                float(config["sampling"]["pressure_top_bar"]),
+                float(config["sampling"]["pressure_bottom_bar"]),
+            ],
+        },
+        "realized_summary": {
+            "gravity_cm_s2": {
+                "min": float(np.min(gravity)),
+                "max": float(np.max(gravity)),
+                "coverage_fraction": _coverage_fraction(*gravity_range, float(np.min(gravity)), float(np.max(gravity))),
+            },
+            "metallicity_log10": {
+                "min": float(np.min(metallicity)),
+                "max": float(np.max(metallicity)),
+                "coverage_fraction": _coverage_fraction(
+                    *metallicity_range,
+                    float(np.min(metallicity)),
+                    float(np.max(metallicity)),
+                ),
+            },
+            "c_to_o": {
+                "min": float(np.min(c_to_o)),
+                "max": float(np.max(c_to_o)),
+                "coverage_fraction": _coverage_fraction(*c_to_o_range, float(np.min(c_to_o)), float(np.max(c_to_o))),
+            },
+            "temperature_k": {
+                "min": float(np.min(temperature)),
+                "max": float(np.max(temperature)),
+                "coverage_fraction": _coverage_fraction(
+                    *temperature_range,
+                    float(np.min(temperature)),
+                    float(np.max(temperature)),
+                ),
+            },
+            "log10_kzz_cm2_s": {
+                "min": float(np.min(log10_kzz)),
+                "max": float(np.max(log10_kzz)),
+                "coverage_fraction": _coverage_fraction(*kzz_range, float(np.min(log10_kzz)), float(np.max(log10_kzz))),
+            },
+            "log10_adjacent_dt_s": {
+                "min": float(np.min(time_step_log10)) if time_step_log10.size else None,
+                "max": float(np.max(time_step_log10)) if time_step_log10.size else None,
+                "coverage_fraction": (
+                    _coverage_fraction(*time_range, float(np.min(time_step_log10)), float(np.max(time_step_log10)))
+                    if time_step_log10.size
+                    else None
+                ),
+            },
+            "pressure_bar": {
+                "min": float(np.min(pressure)),
+                "max": float(np.max(pressure)),
+            },
+        },
     }
 
 
-def _write_run_hdf5(run_path: Path, run_spec: RunSpec, payload: dict[str, Any]) -> None:
-    """Persist one extracted full trajectory into the raw HDF5 contract layout."""
-    run_path.parent.mkdir(parents=True, exist_ok=True)
-    str_dtype = h5py.string_dtype(encoding="utf-8")
+def _write_generation_metadata(
+    *,
+    raw_root: Path,
+    run_files: list[Path],
+    specs: list[RunSpecification],
+    config: dict[str, Any],
+    mode: str,
+) -> tuple[Path, Path]:
+    """Persist the raw-run manifest and parameter-space coverage summary."""
+    manifest_path = raw_root / "generation_manifest.json"
+    coverage_path = raw_root / "sampling_coverage.json"
+    manifest_payload = {
+        "mode": mode,
+        "run_files": manifest_for_files(run_files),
+    }
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
+    coverage_path.write_text(
+        json.dumps(
+            _sampling_coverage_payload(config=config, specs=specs, run_files=run_files, mode=mode),
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path, coverage_path
 
-    with h5py.File(run_path, "w") as handle:
-        handle.attrs["run_id"] = int(run_spec.run_id)
 
+def _sulfur_enabled(config: dict[str, Any]) -> bool:
+    species = list(config["data_spec"]["state_species"]) + list(config["data_spec"]["output_species"])
+    return any("S" in name for name in species)
+
+
+def _vulcan_atom_list(config: dict[str, Any]) -> list[str]:
+    atoms = ["H", "O", "C", "N", "He"]
+    if _sulfur_enabled(config):
+        atoms.append("S")
+    return atoms
+
+
+def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
+    metal_scale = 10.0 ** float(spec.globals["metallicity_log10"])
+    oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
+    return {
+        "O_H": float(oxygen_h),
+        "C_H": float(oxygen_h * spec.globals["c_to_o"]),
+        "N_H": float(_SOLAR_ELEMENT_ABUNDANCES["N_H"] * metal_scale),
+        "S_H": float(_SOLAR_ELEMENT_ABUNDANCES["S_H"] * metal_scale),
+        "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
+        "fastchem_met_scale": float(metal_scale),
+    }
+
+
+def _write_tp_profile(path: Path, spec: RunSpecification) -> Path:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("# Pressure(bar) Temperature(K) Kzz(cm2/s)\n")
+        handle.write("Pressure Temp Kzz\n")
+        for p, t, kzz in zip(spec.pressure_bar, spec.temperature_k, spec.kzz_cm2_s):
+            handle.write(f"{p:.8e} {t:.8f} {kzz:.8e}\n")
+    return path
+
+
+def write_raw_run_hdf5(
+    path: Path,
+    *,
+    spec: RunSpecification,
+    ymix_state: np.ndarray,
+    ymix_output: np.ndarray | None = None,
+    output_species: list[str] | None = None,
+) -> Path:
+    ensure_dir(path.parent)
+    output_species = list(output_species or spec.metadata.get("output_species", spec.metadata["state_species"]))
+    ymix_output_array = np.asarray(ymix_output if ymix_output is not None else ymix_state, dtype=np.float64)
+    with h5py.File(path, "w") as handle:
         inputs = handle.create_group("inputs")
-        inputs.create_dataset("pressure_bar", data=payload["pressure_bar"])
-        inputs.create_dataset("temperature_k", data=payload["temperature_k"])
-        inputs.create_dataset("kzz_cm2_s", data=payload["kzz_cm2_s"])
+        inputs.create_dataset("pressure_bar", data=np.asarray(spec.pressure_bar, dtype=np.float64))
+        inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
+        inputs.create_dataset("kzz_cm2_s", data=np.asarray(spec.kzz_cm2_s, dtype=np.float64))
         inputs.create_dataset(
             "state_species",
-            data=np.asarray(payload["state_species"], dtype=str_dtype),
+            data=np.asarray(spec.metadata["state_species"], dtype="S"),
         )
         inputs.create_dataset(
             "output_species",
-            data=np.asarray(payload["output_species"], dtype=str_dtype),
+            data=np.asarray(output_species, dtype="S"),
         )
-
         globals_group = handle.create_group("globals")
-        globals_group.create_dataset("gravity_cm_s2", data=np.float64(run_spec.gravity_cm_s2))
-        globals_group.create_dataset(
-            "metallicity_log10",
-            data=np.float64(run_spec.metallicity_log10),
-        )
-        globals_group.create_dataset("c_to_o", data=np.float64(run_spec.c_to_o))
-        for key in (
-            "use_eddy_diffusion",
-            "use_molecular_diffusion",
-            "use_upwind_molecular_diffusion",
-            "use_boundary_conditions",
-            "use_condensation",
-            "use_settling",
-            "use_initial_cold_trap",
-            "use_sat_surface_h2o",
-            "use_lowT_limit_rates",
-            "use_adaptive_rtol",
-        ):
-            globals_group.create_dataset(key, data=np.float64(payload[key]))
-        for atm_base_name in SUPPORTED_ATM_BASES:
-            globals_group.create_dataset(
-                f"atm_base_{atm_base_name}",
-                data=np.float64(1.0 if payload["atm_base"] == atm_base_name else 0.0),
-            )
-
+        for key, value in sorted(spec.globals.items()):
+            globals_group.create_dataset(key, data=float(value))
         trajectory = handle.create_group("trajectory")
-        trajectory.create_dataset("time_s", data=payload["time_s"])
-        trajectory.create_dataset("ymix_state", data=payload["ymix_state"])
-        trajectory.create_dataset("ymix_output", data=payload["ymix_output"])
-
-        sampler = handle.create_group("sampler")
-        sampler.create_dataset("source_kind", data=np.asarray(run_spec.source_tag, dtype=str_dtype))
-        if run_spec.source_file is not None:
-            sampler.create_dataset("source_file", data=np.asarray(run_spec.source_file, dtype=str_dtype))
-        for key, value in run_spec.tp_params.items():
-            sampler.create_dataset(f"tp_{key}", data=np.float64(value))
-        for key, value in run_spec.kzz_params.items():
-            sampler.create_dataset(f"kzz_{key}", data=np.float64(value))
-        for key, value in run_spec.source_metadata.items():
-            sampler.create_dataset(key, data=np.float64(value))
-
-
-def _run_single(spec: RunSpec, settings: WorkerSettings) -> RunResult:
-    """Execute one sampled VULCAN run end-to-end inside one worker copy."""
-    context = _ensure_worker_context(settings)
-    worker_dir: Path = context["worker_dir"]
-    baseline_cfg: str = context["baseline_cfg_text"]
-    generated_atm_dir: Path = context["generated_atm_dir"]
-
-    atm_filename = f"run_{spec.run_id:06d}.txt"
-    atm_relpath = f"atm/generated/{atm_filename}"
-    out_name = f"run_{spec.run_id:06d}.vul"
-
-    atm_path = generated_atm_dir / atm_filename
-    _write_generated_atm_file(spec, atm_path)
-
-    cfg_text = _apply_run_config(
-        baseline_cfg=baseline_cfg,
-        run_spec=spec,
-        settings=settings,
-        atm_relpath=atm_relpath,
-        out_name=out_name,
-    )
-    (worker_dir / "vulcan_cfg.py").write_text(cfg_text, encoding="utf-8")
-
-    try:
-        completed = subprocess.run(
-            [sys.executable, "vulcan.py", "-n"],
-            cwd=worker_dir,
-            text=True,
-            capture_output=True,
-            timeout=int(settings.run_timeout_seconds),
-            check=False,
+        trajectory.create_dataset("time_s", data=np.asarray(spec.time_s, dtype=np.float64))
+        trajectory.create_dataset("ymix_state", data=np.asarray(ymix_state, dtype=np.float64))
+        trajectory.create_dataset("ymix_output", data=ymix_output_array)
+        spectrum = handle.create_group("spectrum")
+        spectrum.create_dataset("name", data=np.bytes_(spec.spectrum.name))
+        spectrum.create_dataset(
+            "wavelength_nm",
+            data=np.asarray(spec.spectrum.wavelength_nm, dtype=np.float64),
         )
-    except subprocess.TimeoutExpired as exc:
-        raise VulcanRuntimeError(
-            f"VULCAN run timed out for run_id={spec.run_id} after "
-            f"{settings.run_timeout_seconds} seconds."
-        ) from exc
-    if completed.returncode != 0:
-        stderr_tail = (completed.stderr or "")[-4000:]
-        stdout_tail = (completed.stdout or "")[-4000:]
-        raise VulcanRuntimeError(
-            f"VULCAN run failed for run_id={spec.run_id} with exit code {completed.returncode}.\n"
-            f"STDOUT tail:\n{stdout_tail}\nSTDERR tail:\n{stderr_tail}"
+        spectrum.create_dataset(
+            "flux_erg_cm2_s_nm",
+            data=np.asarray(spec.spectrum.flux_erg_cm2_s_nm, dtype=np.float64),
         )
-
-    output_file = worker_dir / "output" / out_name
-    if not output_file.is_file():
-        raise VulcanRuntimeError(f"Expected VULCAN output file not found: {output_file}")
-
-    payload = _extract_run_payload(output_file, spec, settings)
-    run_file = Path(settings.raw_root) / f"run_{spec.run_id:06d}.h5"
-    _write_run_hdf5(run_file, spec, payload)
-
-    if not settings.keep_vulcan_outputs_debug:
-        output_file.unlink(missing_ok=True)
-
-    return RunResult(run_id=spec.run_id, run_file=str(run_file))
+    return path
 
 
-def run_vulcan_jobs(
-    run_specs: list[RunSpec],
+def _laplacian_vertical(x: np.ndarray) -> np.ndarray:
+    lap = np.zeros_like(x)
+    lap[1:-1] = x[:-2] - 2.0 * x[1:-1] + x[2:]
+    lap[0] = x[1] - x[0]
+    lap[-1] = x[-2] - x[-1]
+    return lap
+
+
+def _uv_profile(
+    state: np.ndarray,
     *,
-    settings: WorkerSettings,
-) -> list[RunResult]:
-    """Run all VULCAN jobs, dropping failed trajectories when others succeed."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    species_index: dict[str, int],
+    spectrum: np.ndarray,
+    wavelength_nm: np.ndarray,
+) -> np.ndarray:
+    uv_mask = wavelength_nm <= 300.0
+    if not np.any(uv_mask):
+        base_uv = 1.0
+    else:
+        uv_flux = float(np.trapezoid(spectrum[uv_mask], wavelength_nm[uv_mask]))
+        total_flux = float(np.trapezoid(spectrum, wavelength_nm))
+        base_uv = max(uv_flux / max(total_flux, 1.0e-30), 1.0e-4)
+    h2o = state[:, species_index["H2O"]]
+    h2s = state[:, species_index["H2S"]]
+    so2 = state[:, species_index["SO2"]]
+    absorber = h2o + 20.0 * h2s + 10.0 * so2
+    tau = np.cumsum(absorber[::-1])[::-1] * 50.0
+    return base_uv * np.exp(-np.clip(tau, 0.0, 30.0))
 
-    if not run_specs:
-        raise VulcanRuntimeError("No run specs provided to VULCAN runner.")
-    if int(settings.num_workers) <= 0:
-        raise VulcanRuntimeError("settings.num_workers must be > 0.")
-    raw_root = Path(settings.raw_root)
-    raw_root.mkdir(parents=True, exist_ok=True)
 
-    results: list[RunResult] = []
-    errors: list[str] = []
-    try:
-        if int(settings.num_workers) == 1:
-            for spec in tqdm(run_specs, desc="VULCAN runs", unit="run"):
-                try:
-                    results.append(_run_single(spec, settings))
-                except Exception as exc:
-                    errors.append(f"run_{spec.run_id:06d}: {exc}")
-            if errors:
-                if not results:
-                    raise VulcanRuntimeError(
-                        "All VULCAN runs failed; cannot continue to preprocessing.\n"
-                        + "\n".join(errors)
-                    )
-                logger.warning(
-                    "Dropping %d/%d failed VULCAN runs. Successful runs: %d.\n%s",
-                    len(errors),
-                    len(run_specs),
-                    len(results),
-                    "\n".join(errors),
-                )
-            return sorted(results, key=lambda item: item.run_id)
+def _synthetic_tendencies(
+    state: np.ndarray,
+    *,
+    spec: RunSpecification,
+    species_index: dict[str, int],
+) -> np.ndarray:
+    p = np.asarray(spec.pressure_bar, dtype=np.float64)
+    t = np.asarray(spec.temperature_k, dtype=np.float64)
+    uv = _uv_profile(
+        state,
+        species_index=species_index,
+        spectrum=spec.spectrum.flux_erg_cm2_s_nm,
+        wavelength_nm=spec.spectrum.wavelength_nm,
+    )
+    oxygen = state[:, species_index["H2O"]] + state[:, species_index["CO2"]]
+    oxidants = state[:, species_index["O"]] + state[:, species_index["OH"]] + 1.0e-4 * oxygen
+    tend = np.zeros_like(state)
+    temp_factor = np.exp((t - 1100.0) / 500.0)
+    temp_factor = np.clip(temp_factor, 0.2, 10.0)
+    pressure_factor = np.clip((p / np.median(p)) ** 0.1, 0.5, 2.0)
 
-        # Fan out runs across worker processes; each worker gets an isolated VULCAN tree copy.
-        with ProcessPoolExecutor(max_workers=int(settings.num_workers)) as pool:
-            futures = {pool.submit(_run_single, spec, settings): spec.run_id for spec in run_specs}
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="VULCAN runs",
-                unit="run",
-            ):
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    errors.append(f"run_{futures[future]:06d}: {exc}")
-        if errors:
-            if not results:
-                raise VulcanRuntimeError(
-                    "All VULCAN runs failed; cannot continue to preprocessing.\n"
-                    + "\n".join(errors)
-                )
-            logger.warning(
-                "Dropping %d/%d failed VULCAN runs. Successful runs: %d.\n%s",
-                len(errors),
-                len(run_specs),
-                len(results),
-                "\n".join(errors),
+    # Radical chemistry needed to keep sulfur oxidation closer to Markovian.
+    r_h2o = 2.5e-8 * (1.0 + 8.0 * uv) * state[:, species_index["H2O"]]
+    tend[:, species_index["H2O"]] -= r_h2o
+    tend[:, species_index["OH"]] += 0.7 * r_h2o
+    tend[:, species_index["H"]] += 0.7 * r_h2o
+    tend[:, species_index["O"]] += 0.3 * r_h2o
+
+    r_o_to_oh = 1.0e-8 * pressure_factor * state[:, species_index["O"]] * state[:, species_index["H2"]]
+    tend[:, species_index["O"]] -= r_o_to_oh
+    tend[:, species_index["OH"]] += r_o_to_oh
+    tend[:, species_index["H"]] += 0.5 * r_o_to_oh
+
+    r_oh_to_h2o = 1.1e-8 * pressure_factor * state[:, species_index["OH"]] * state[:, species_index["H2"]]
+    tend[:, species_index["OH"]] -= r_oh_to_h2o
+    tend[:, species_index["H2O"]] += 0.8 * r_oh_to_h2o
+    tend[:, species_index["H"]] += 0.2 * r_oh_to_h2o
+
+    r_h_oh = 8.0e-9 * pressure_factor * state[:, species_index["H"]] * state[:, species_index["OH"]]
+    tend[:, species_index["H"]] -= r_h_oh
+    tend[:, species_index["OH"]] -= r_h_oh
+    tend[:, species_index["H2O"]] += r_h_oh
+
+    # Carbon chemistry.
+    r_ch4 = 3.0e-8 * temp_factor * (1.0 + 6.0 * uv) * state[:, species_index["CH4"]]
+    tend[:, species_index["CH4"]] -= r_ch4
+    tend[:, species_index["CO"]] += 0.65 * r_ch4
+    tend[:, species_index["CO2"]] += 0.20 * r_ch4 * oxygen / np.clip(oxygen + 1.0e-12, 1.0e-12, None)
+    tend[:, species_index["H2O"]] -= 0.05 * r_ch4
+    tend[:, species_index["H"]] += 0.15 * r_ch4
+
+    r_co = 1.2e-8 * (1.0 + 0.5 * temp_factor) * oxidants * state[:, species_index["CO"]]
+    tend[:, species_index["CO"]] -= r_co
+    tend[:, species_index["CO2"]] += r_co
+    tend[:, species_index["OH"]] -= 0.6 * r_co
+    tend[:, species_index["O"]] -= 0.4 * r_co
+    tend[:, species_index["H"]] += 0.2 * r_co
+
+    # Nitrogen chemistry.
+    r_nh3 = 1.5e-8 * temp_factor * (1.0 + 2.0 * uv) * state[:, species_index["NH3"]]
+    tend[:, species_index["NH3"]] -= r_nh3
+    tend[:, species_index["N2"]] += 0.5 * r_nh3
+    tend[:, species_index["H"]] += 0.5 * r_nh3
+
+    # Sulfur photochemistry.
+    r_h2s = 4.0e-8 * pressure_factor * (1.0 + 10.0 * uv) * state[:, species_index["H2S"]]
+    tend[:, species_index["H2S"]] -= r_h2s
+    tend[:, species_index["SH"]] += 0.65 * r_h2s
+    tend[:, species_index["S"]] += 0.25 * r_h2s
+    tend[:, species_index["H"]] += 0.75 * r_h2s
+    tend[:, species_index["SO"]] += 0.10 * r_h2s * oxidants / np.clip(oxidants + 1.0e-12, 1.0e-12, None)
+
+    r_h2s_oh = 1.4e-8 * state[:, species_index["OH"]] * state[:, species_index["H2S"]]
+    tend[:, species_index["H2S"]] -= r_h2s_oh
+    tend[:, species_index["OH"]] -= r_h2s_oh
+    tend[:, species_index["SH"]] += r_h2s_oh
+    tend[:, species_index["H2O"]] += r_h2s_oh
+
+    r_sh = 2.2e-8 * (1.0 + 6.0 * uv) * state[:, species_index["SH"]]
+    tend[:, species_index["SH"]] -= r_sh
+    tend[:, species_index["S"]] += 0.55 * r_sh
+    tend[:, species_index["S2"]] += 0.15 * r_sh
+    tend[:, species_index["SO"]] += 0.30 * r_sh * oxidants / np.clip(oxidants + 1.0e-12, 1.0e-12, None)
+    tend[:, species_index["H"]] += 0.85 * r_sh
+
+    r_s_to_so = 1.8e-8 * oxidants * (1.0 + 3.0 * uv) * state[:, species_index["S"]]
+    tend[:, species_index["S"]] -= r_s_to_so
+    tend[:, species_index["SO"]] += r_s_to_so
+    tend[:, species_index["O"]] -= 0.7 * r_s_to_so
+    tend[:, species_index["OH"]] -= 0.3 * r_s_to_so
+
+    r_s2 = 8.0e-9 * np.sqrt(np.clip(state[:, species_index["S"]], 1.0e-30, None)) * state[:, species_index["S"]]
+    tend[:, species_index["S"]] -= r_s2
+    tend[:, species_index["S2"]] += r_s2
+
+    r_so2 = 1.6e-8 * oxidants * state[:, species_index["SO"]]
+    tend[:, species_index["SO"]] -= r_so2
+    tend[:, species_index["SO2"]] += r_so2
+    tend[:, species_index["O"]] -= 0.5 * r_so2
+    tend[:, species_index["OH"]] -= 0.5 * r_so2
+    tend[:, species_index["H"]] += 0.3 * r_so2
+
+    # Mild oxidation of reduced sulfur back from SO2 at depth.
+    r_back = 2.0e-9 * pressure_factor * state[:, species_index["SO2"]]
+    tend[:, species_index["SO2"]] -= r_back
+    tend[:, species_index["SO"]] += r_back
+
+    # Vertical mixing.
+    diffusion_species = [
+        "H",
+        "O",
+        "OH",
+        "H2O",
+        "CO",
+        "CO2",
+        "CH4",
+        "NH3",
+        "H2S",
+        "SH",
+        "S",
+        "SO",
+        "SO2",
+        "S2",
+    ]
+    mix_strength = np.clip(spec.kzz_cm2_s / max(np.max(spec.kzz_cm2_s), 1.0), 0.0, 1.0)
+    for name in diffusion_species:
+        i = species_index[name]
+        tend[:, i] += 2.0e-7 * mix_strength * _laplacian_vertical(state[:, i])
+
+    return tend
+
+
+def _renormalize_state(
+    state: np.ndarray,
+    *,
+    species_index: dict[str, int],
+    reservoir_split: np.ndarray,
+) -> np.ndarray:
+    clipped = np.clip(state, 1.0e-30, None)
+    heavy_indices = [i for name, i in species_index.items() if name not in {"H2", "He"}]
+    heavy_sum = np.sum(clipped[:, heavy_indices], axis=1)
+    heavy_scale = np.where(heavy_sum > 0.995, 0.995 / heavy_sum, 1.0)
+    clipped[:, heavy_indices] *= heavy_scale[:, None]
+    heavy_sum = np.sum(clipped[:, heavy_indices], axis=1)
+    reservoir = np.clip(1.0 - heavy_sum, 1.0e-5, 1.0)
+    clipped[:, species_index["H2"]] = reservoir * reservoir_split
+    clipped[:, species_index["He"]] = reservoir * (1.0 - reservoir_split)
+    clipped /= np.sum(clipped, axis=1, keepdims=True)
+    return clipped
+
+
+def simulate_synthetic_trajectory(spec: RunSpecification) -> np.ndarray:
+    species_order = list(spec.metadata["state_species"])
+    idx = {name: i for i, name in enumerate(species_order)}
+    state = np.asarray(spec.initial_ymix, dtype=np.float64).copy()
+    reservoir_split = state[:, idx["H2"]] / np.clip(
+        state[:, idx["H2"]] + state[:, idx["He"]],
+        1.0e-12,
+        None,
+    )
+    times = np.asarray(spec.time_s, dtype=np.float64)
+    trajectory = np.zeros((times.size, *state.shape), dtype=np.float64)
+    trajectory[0] = state
+    for step in range(times.size - 1):
+        dt_total = float(times[step + 1] - times[step])
+        substeps = int(max(1, min(32, np.ceil(dt_total / 1.0e4))))
+        dt = dt_total / substeps
+        for _ in range(substeps):
+            tend = _synthetic_tendencies(state, spec=spec, species_index=idx)
+            state = _renormalize_state(
+                state + dt * tend,
+                species_index=idx,
+                reservoir_split=reservoir_split,
             )
-        return sorted(results, key=lambda item: item.run_id)
-    finally:
-        _cleanup_worker_dirs(settings)
+        trajectory[step + 1] = state
+    return trajectory
 
 
-def _cleanup_worker_dirs(settings: WorkerSettings) -> None:
-    """Remove copied worker trees unless debug retention is enabled."""
-    if settings.keep_vulcan_outputs_debug:
-        return
-    _WORKER_CACHE.clear()
-    worker_root = Path(settings.worker_root)
-    if not worker_root.is_dir():
-        return
-    try:
+def _slice_output_trajectory(
+    trajectory: np.ndarray,
+    *,
+    state_species: list[str],
+    output_species: list[str],
+) -> np.ndarray:
+    indices = [state_species.index(name) for name in output_species]
+    return np.asarray(trajectory[..., indices], dtype=np.float64)
+
+
+def _generate_single_synthetic_run(
+    spec: RunSpecification,
+    *,
+    runs_dir: Path,
+    output_species: list[str],
+) -> Path:
+    trajectory = simulate_synthetic_trajectory(spec)
+    output_trajectory = _slice_output_trajectory(
+        trajectory,
+        state_species=list(spec.metadata["state_species"]),
+        output_species=output_species,
+    )
+    h5_path = runs_dir / f"{spec.run_id}.h5"
+    write_raw_run_hdf5(
+        h5_path,
+        spec=spec,
+        ymix_state=trajectory,
+        ymix_output=output_trajectory,
+        output_species=output_species,
+    )
+    return h5_path
+
+
+def generate_synthetic_raw_runs(
+    config: dict[str, Any],
+    *,
+    project_root: Path,
+    num_runs: int | None = None,
+) -> GeneratedRawDataset:
+    raw_root, runs_dir, reusable_files = _prepare_generation_directory(
+        config,
+        project_root=project_root,
+        num_runs=num_runs,
+    )
+    if reusable_files is not None:
+        manifest_path = raw_root / "generation_manifest.json"
+        coverage_path = raw_root / "sampling_coverage.json"
+        return GeneratedRawDataset(
+            raw_root=raw_root,
+            run_files=reusable_files,
+            manifest_path=manifest_path if manifest_path.exists() else None,
+            coverage_path=coverage_path if coverage_path.exists() else None,
+        )
+    specs = sample_run_specifications(
+        config=config,
+        project_root=project_root,
+        num_runs=num_runs,
+        seed=int(config["generation"]["seed"]),
+    )
+    state_species = list(config["data_spec"]["state_species"])
+    output_species = list(config["data_spec"]["output_species"])
+    prepared_specs: list[RunSpecification] = []
+    for spec in specs:
+        prepared_specs.append(
+            RunSpecification(
+            run_id=spec.run_id,
+            pressure_bar=spec.pressure_bar,
+            temperature_k=spec.temperature_k,
+            kzz_cm2_s=spec.kzz_cm2_s,
+            initial_ymix=spec.initial_ymix,
+            time_s=spec.time_s,
+            globals=spec.globals,
+            spectrum=spec.spectrum,
+            metadata={
+                **spec.metadata,
+                "state_species": state_species,
+                "output_species": output_species,
+            },
+        )
+        )
+    worker_count = _generation_worker_count(config, len(prepared_specs))
+    run_files: list[Path] = []
+    if worker_count == 1:
+        for spec in prepared_specs:
+            run_files.append(
+                _generate_single_synthetic_run(
+                    spec,
+                    runs_dir=runs_dir,
+                    output_species=output_species,
+                )
+            )
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    _generate_single_synthetic_run,
+                    spec,
+                    runs_dir=runs_dir,
+                    output_species=output_species,
+                )
+                for spec in prepared_specs
+            ]
+            for future in futures:
+                run_files.append(future.result())
+    run_files = sorted(run_files)
+    manifest_path, coverage_path = _write_generation_metadata(
+        raw_root=raw_root,
+        run_files=run_files,
+        specs=prepared_specs,
+        config=config,
+        mode="synthetic",
+    )
+    return GeneratedRawDataset(
+        raw_root=raw_root,
+        run_files=run_files,
+        manifest_path=manifest_path,
+        coverage_path=coverage_path,
+    )
+
+
+def _copy_vulcan_source(source_root: Path, worker_root: Path) -> None:
+    if worker_root.exists():
         shutil.rmtree(worker_root)
-    except OSError as exc:
-        logger.warning("Worker cleanup of %s failed: %s", worker_root, exc)
+    shutil.copytree(source_root, worker_root)
+
+
+def _write_worker_inputs(worker_root: Path, spec: RunSpecification) -> tuple[Path, Path]:
+    atm_dir = ensure_dir(worker_root / "atm")
+    stellar_dir = ensure_dir(atm_dir / "stellar_flux")
+    tp_file = _write_tp_profile(atm_dir / f"{spec.run_id}_tp.txt", spec)
+    spectrum_file = write_vulcan_spectrum_txt(
+        spec.spectrum,
+        stellar_dir / f"{spec.spectrum.name}.txt",
+    )
+    return tp_file, spectrum_file
+
+
+def _patch_vulcan_cfg(
+    cfg_file: Path,
+    *,
+    spec: RunSpecification,
+    config: dict[str, Any],
+    tp_file: Path,
+    spectrum_file: Path,
+) -> None:
+    text = cfg_file.read_text(encoding="utf-8")
+    runtime = config["vulcan_runtime"]
+    spectrum_cfg = config["stellar_spectrum"]
+    element_abundances = _element_abundances_from_spec(spec)
+    assignments = dict(runtime.get("cfg_assignments", {}))
+    assignments.update(
+        {
+            "atom_list": _vulcan_atom_list(config),
+            "use_photo": bool(config["physics_toggles"]["use_photochemistry"]),
+            "use_ion": bool(config["physics_toggles"]["use_ion_chemistry"]),
+            "use_Kzz": bool(config["physics_toggles"]["use_eddy_diffusion"]),
+            "use_moldiff": bool(config["physics_toggles"]["use_molecular_diffusion"]),
+            "use_vm_mol": bool(config["physics_toggles"]["use_upwind_molecular_diffusion"]),
+            "use_topflux": bool(config["physics_toggles"]["use_boundary_conditions"]),
+            "use_botflux": bool(config["physics_toggles"]["use_boundary_conditions"]),
+            "use_condense": bool(config["physics_toggles"]["use_condensation"]),
+            "use_settling": bool(config["physics_toggles"]["use_settling"]),
+            "use_ini_cold_trap": bool(config["physics_toggles"]["use_initial_cold_trap"]),
+            "use_sat_surfaceH2O": bool(config["physics_toggles"]["use_sat_surface_h2o"]),
+            "use_lowT_limit_rates": bool(config["physics_toggles"]["use_lowT_limit_rates"]),
+            "use_adapt_rtol": bool(config["physics_toggles"]["use_adaptive_rtol"]),
+            "ini_mix": "EQ",
+            "use_solar": False,
+            "network": str(runtime["chemistry_file"]),
+            "atm_file": str(tp_file.relative_to(cfg_file.parent)),
+            "sflux_file": str(spectrum_file.relative_to(cfg_file.parent)),
+            "atm_base": str(runtime["atm_base"]),
+            "atm_type": "file",
+            "Kzz_prof": "file",
+            "T_cross_sp": list(runtime["t_cross_sp"]),
+            "nz": int(spec.pressure_bar.size),
+            "P_b": float(np.max(spec.pressure_bar) * 1.0e6),
+            "P_t": float(np.min(spec.pressure_bar) * 1.0e6),
+            "gs": float(spec.globals["gravity_cm_s2"]),
+            "r_star": float(spectrum_cfg["radius_rsun"]),
+            "orbit_radius": float(spectrum_cfg["semi_major_axis_au"]),
+            "sl_angle": float(np.deg2rad(spectrum_cfg["zenith_angle_deg"])),
+            "f_diurnal": float(spectrum_cfg["diurnal_factor"]),
+            "save_evolution": True,
+            "save_evo_frq": 1,
+            "use_live_plot": False,
+            "use_live_flux": False,
+            "use_plot_end": False,
+            "use_plot_evo": False,
+            "use_save_movie": False,
+            "use_flux_movie": False,
+            "output_humanread": False,
+            "plot_TP": False,
+            "use_print_prog": False,
+            "out_name": f"{spec.run_id}.vul",
+            **element_abundances,
+        }
+    )
+    cfg_file.write_text(patch_python_assignments(text, assignments), encoding="utf-8")
+
+
+def _trusted_unpickle(path: Path) -> Any:
+    with path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def _fetch(container: Any, *keys: str) -> Any:
+    current = container
+    for key in keys:
+        if isinstance(current, dict):
+            current = current[key]
+        else:
+            current = getattr(current, key)
+    return current
+
+
+def _decode_species_list(values: Any) -> list[str]:
+    result: list[str] = []
+    for item in values:
+        if isinstance(item, bytes):
+            result.append(item.decode("utf-8"))
+        else:
+            result.append(str(item))
+    return result
+
+
+def convert_vulcan_output_to_hdf5(
+    vulcan_output_path: Path,
+    *,
+    output_h5_path: Path,
+    spec: RunSpecification,
+    config: dict[str, Any],
+) -> Path:
+    data = _trusted_unpickle(vulcan_output_path)
+    species = _decode_species_list(_fetch(data, "variable", "species"))
+    pressure_bar = np.asarray(_fetch(data, "atm", "pco"), dtype=np.float64) / 1.0e6
+    temperature_k = np.asarray(_fetch(data, "atm", "Tco"), dtype=np.float64)
+    kzz_raw = np.asarray(_fetch(data, "atm", "Kzz"), dtype=np.float64)
+    if kzz_raw.ndim == 1 and kzz_raw.size == pressure_bar.size - 1:
+        kzz_cm2_s = np.concatenate([[kzz_raw[0]], 0.5 * (kzz_raw[:-1] + kzz_raw[1:]), [kzz_raw[-1]]])
+    else:
+        kzz_cm2_s = np.asarray(kzz_raw, dtype=np.float64)
+    if "ymix_time" in _fetch(data, "variable"):
+        ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
+    elif "y_time" in _fetch(data, "variable") and "n_0" in _fetch(data, "atm"):
+        y_time = np.asarray(_fetch(data, "variable", "y_time"), dtype=np.float64)
+        n0 = np.asarray(_fetch(data, "atm", "n_0"), dtype=np.float64)
+        ymix_time = y_time / n0[None, :, None]
+    else:
+        raise ValueError("VULCAN output is missing both ymix_time and the y_time/n_0 fallback.")
+    time_s = np.asarray(_fetch(data, "variable", "t_time"), dtype=np.float64)
+    if ymix_time.shape[0] != time_s.size:
+        raise ValueError("VULCAN output does not contain a consistent time-history trajectory.")
+    state_species = list(config["data_spec"]["state_species"])
+    output_species = list(config["data_spec"]["output_species"])
+    state_indices = [species.index(name) for name in state_species]
+    output_indices = [species.index(name) for name in output_species]
+    ymix_state = ymix_time[..., state_indices]
+    ymix_output = ymix_time[..., output_indices]
+    converted_spec = RunSpecification(
+        run_id=spec.run_id,
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        kzz_cm2_s=kzz_cm2_s,
+        initial_ymix=ymix_state[0],
+        time_s=time_s,
+        globals=spec.globals,
+        spectrum=spec.spectrum,
+        metadata={
+            **spec.metadata,
+            "state_species": state_species,
+            "output_species": list(config["data_spec"]["output_species"]),
+        },
+    )
+    return write_raw_run_hdf5(
+        output_h5_path,
+        spec=converted_spec,
+        ymix_state=ymix_state,
+        ymix_output=ymix_output,
+        output_species=output_species,
+    )
+
+
+def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tuple[Path, Path]:
+    source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
+    if not source_root.exists():
+        raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
+    chemistry_file = source_root / str(config["vulcan_runtime"]["chemistry_file"])
+    if not chemistry_file.exists():
+        raise FileNotFoundError(f"Configured chemistry file does not exist: {chemistry_file}")
+    cfg_file = source_root / str(config["vulcan_runtime"]["cfg_file"])
+    if not cfg_file.exists():
+        raise FileNotFoundError(f"Configured VULCAN cfg file does not exist: {cfg_file}")
+    return source_root, chemistry_file
+
+
+def _run_single_vulcan_spec(
+    spec: RunSpecification,
+    *,
+    source_root: Path,
+    worker_base: Path,
+    runs_dir: Path,
+    config: dict[str, Any],
+) -> Path:
+    worker_root = worker_base / spec.run_id
+    _copy_vulcan_source(source_root, worker_root)
+    tp_file, spectrum_file = _write_worker_inputs(worker_root, spec)
+    cfg_file = worker_root / config["vulcan_runtime"]["cfg_file"]
+    _patch_vulcan_cfg(
+        cfg_file,
+        spec=spec,
+        config=config,
+        tp_file=tp_file,
+        spectrum_file=spectrum_file,
+    )
+    python_executable = str(config["vulcan_runtime"]["python_executable"])
+    if bool(config["vulcan_runtime"]["regenerate_chem_funs"]):
+        subprocess.run(
+            [python_executable, "make_chem_funs.py"],
+            cwd=worker_root,
+            check=True,
+        )
+        vulcan_cmd = [python_executable, "vulcan.py", "-n"]
+    else:
+        vulcan_cmd = [python_executable, "vulcan.py"]
+    subprocess.run(vulcan_cmd, cwd=worker_root, check=True)
+
+    output_candidates = sorted((worker_root / "output").glob("*.vul"))
+    if not output_candidates:
+        raise FileNotFoundError(f"No VULCAN output file found for run {spec.run_id} under {worker_root / 'output'}.")
+    output_h5 = runs_dir / f"{spec.run_id}.h5"
+    return convert_vulcan_output_to_hdf5(
+        output_candidates[-1],
+        output_h5_path=output_h5,
+        spec=spec,
+        config=config,
+    )
+
+
+def run_vulcan_generation(
+    config: dict[str, Any],
+    *,
+    project_root: Path,
+    num_runs: int | None = None,
+) -> GeneratedRawDataset:
+    raw_root, runs_dir, reusable_files = _prepare_generation_directory(
+        config,
+        project_root=project_root,
+        num_runs=num_runs,
+    )
+    if reusable_files is not None:
+        manifest_path = raw_root / "generation_manifest.json"
+        coverage_path = raw_root / "sampling_coverage.json"
+        return GeneratedRawDataset(
+            raw_root=raw_root,
+            run_files=reusable_files,
+            manifest_path=manifest_path if manifest_path.exists() else None,
+            coverage_path=coverage_path if coverage_path.exists() else None,
+        )
+    source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
+    specs = sample_run_specifications(
+        config=config,
+        project_root=project_root,
+        num_runs=num_runs,
+        seed=int(config["generation"]["seed"]),
+    )
+    worker_base = resolve_path(config["vulcan_runtime"]["worker_root"], project_root)
+    prepared_specs: list[RunSpecification] = []
+    for spec in specs:
+        prepared_specs.append(
+            RunSpecification(
+            run_id=spec.run_id,
+            pressure_bar=spec.pressure_bar,
+            temperature_k=spec.temperature_k,
+            kzz_cm2_s=spec.kzz_cm2_s,
+            initial_ymix=spec.initial_ymix,
+            time_s=spec.time_s,
+            globals=spec.globals,
+            spectrum=spec.spectrum,
+            metadata={
+                **spec.metadata,
+                "state_species": list(config["data_spec"]["state_species"]),
+                "output_species": list(config["data_spec"]["output_species"]),
+            },
+        )
+        )
+    worker_count = _generation_worker_count(config, len(prepared_specs))
+    run_files: list[Path] = []
+    if worker_count == 1:
+        for spec in prepared_specs:
+            run_files.append(
+                _run_single_vulcan_spec(
+                    spec,
+                    source_root=source_root,
+                    worker_base=worker_base,
+                    runs_dir=runs_dir,
+                    config=config,
+                )
+            )
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    _run_single_vulcan_spec,
+                    spec,
+                    source_root=source_root,
+                    worker_base=worker_base,
+                    runs_dir=runs_dir,
+                    config=config,
+                )
+                for spec in prepared_specs
+            ]
+            for future in futures:
+                run_files.append(future.result())
+    run_files = sorted(run_files)
+    manifest_path, coverage_path = _write_generation_metadata(
+        raw_root=raw_root,
+        run_files=run_files,
+        specs=prepared_specs,
+        config=config,
+        mode="vulcan",
+    )
+    return GeneratedRawDataset(
+        raw_root=raw_root,
+        run_files=run_files,
+        manifest_path=manifest_path,
+        coverage_path=coverage_path,
+    )
+
+
+def generate_raw_dataset(
+    config: dict[str, Any],
+    *,
+    project_root: Path,
+    num_runs: int | None = None,
+) -> GeneratedRawDataset:
+    mode = str(config["generation"]["mode"]).lower()
+    if mode == "synthetic":
+        return generate_synthetic_raw_runs(config, project_root=project_root, num_runs=num_runs)
+    if mode == "vulcan":
+        return run_vulcan_generation(config, project_root=project_root, num_runs=num_runs)
+    raise ValueError(f"Unsupported generation mode: {mode}")

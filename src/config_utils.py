@@ -1,41 +1,14 @@
-"""Configuration loading and strict validation.
-
-Implements fail-fast validation for all 13+ config sections.  Every numeric
-field is type-checked (rejecting booleans as integers), every range is
-validated, and cross-section consistency is enforced (e.g., target
-normalization must match anchor normalization, d_model must be divisible
-by nhead, AMP requires CUDA).
-
-The base-10 log convention is explicitly enforced: all log-scale parameters
-must use ``log10_`` prefixes, and normalization methods that would double-log
-already-transformed values are rejected.
-"""
-
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import torch
-
-from roth_sampling import (
-    ROTH_COLUMN_FILTER_KEYS,
-    ROTH_FILTER_KEYS,
-    ROTH_OPTIONAL_FILTER_KEYS,
-)
-
-SUPPORTED_DTYPE_NAMES = {"float16", "bfloat16", "float32", "float64", "none"}
-TORCH_DTYPE_MAP = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-    "float64": torch.float64,
-}
 
 SUPPORTED_ATM_BASES = ("H2", "N2", "O2", "CO2", "H2O")
-SUPPORTED_CONDITIONING_TOGGLES = (
+SUPPORTED_PHYSICS_TOGGLES = (
+    "use_photochemistry",
+    "use_ion_chemistry",
     "use_eddy_diffusion",
     "use_molecular_diffusion",
     "use_upwind_molecular_diffusion",
@@ -47,49 +20,91 @@ SUPPORTED_CONDITIONING_TOGGLES = (
     "use_lowT_limit_rates",
     "use_adaptive_rtol",
 )
-CORE_GLOBAL_INPUTS = (
-    "gravity_cm_s2",
-    "metallicity_log10",
-    "c_to_o",
-    "log10_dt_s",
-)
+CORE_GLOBAL_INPUTS = ("gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s")
 OPTIONAL_GLOBAL_INPUTS = (
-    *SUPPORTED_CONDITIONING_TOGGLES,
+    *SUPPORTED_PHYSICS_TOGGLES,
     *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
 )
-SUPPORTED_GLOBAL_INPUTS = (*CORE_GLOBAL_INPUTS, *OPTIONAL_GLOBAL_INPUTS)
-
-
-@dataclass(frozen=True)
-class PrecisionConfig:
-    """Resolved precision policy with strict compatibility checks."""
-
-    input_dtype: torch.dtype
-    stats_dtype: torch.dtype
-    model_dtype: torch.dtype
-    forward_dtype: torch.dtype
-    loss_dtype: torch.dtype
-    optimizer_state_dtype: torch.dtype
-    amp_dtype: torch.dtype | None
-    use_amp: bool
+DEFAULT_REQUIRED_GLOBAL_INPUTS = (*CORE_GLOBAL_INPUTS, *OPTIONAL_GLOBAL_INPUTS)
+DEFAULT_STATE_SPECIES = (
+    "H2",
+    "He",
+    "H",
+    "O",
+    "OH",
+    "H2O",
+    "CO",
+    "CO2",
+    "CH4",
+    "N2",
+    "NH3",
+    "H2S",
+    "SH",
+    "S",
+    "SO",
+    "SO2",
+    "S2",
+)
+_ALLOWED_SPECTRUM_ENCODERS = {"autoencoder", "linear", "none"}
+_ALLOWED_EQ_ANCHOR_SOURCES = {"trajectory", "flat"}
+_ALLOWED_EQ_ANCHOR_SPLITS = {"train", "val", "test"}
 
 
 class ConfigValidationError(ValueError):
-    """Raised when configuration violates required contract."""
+    """Raised when a configuration file violates the required contract."""
+
+
+def _require_keys(mapping: dict[str, Any], keys: tuple[str, ...] | list[str], scope: str) -> None:
+    missing = [key for key in keys if key not in mapping]
+    if missing:
+        raise ConfigValidationError(f"Missing required keys in {scope}: {missing}")
+
+
+def _as_bool(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigValidationError(f"{field} must be a boolean.")
+    return value
+
+
+def _as_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigValidationError(f"{field} must be an integer.")
+    return int(value)
+
+
+def _as_float(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigValidationError(f"{field} must be numeric.")
+    return float(value)
+
+
+def _as_nonempty_str(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigValidationError(f"{field} must be a non-empty string.")
+    return value.strip()
+
+
+def _as_string_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ConfigValidationError(f"{field} must be a non-empty list.")
+    result = [_as_nonempty_str(item, field) for item in value]
+    if len(set(result)) != len(result):
+        raise ConfigValidationError(f"{field} contains duplicate entries.")
+    return result
 
 
 def static_conditioning_defaults(config: dict[str, Any]) -> dict[str, float]:
-    """Return dataset-wide conditioning values derived from config settings."""
     physics = config["physics_toggles"]
     runtime = config["vulcan_runtime"]
-    defaults = {
-        name: float(bool(physics[name]))
-        for name in SUPPORTED_CONDITIONING_TOGGLES
-    }
-    atm_base = str(runtime["atm_base"])
+    defaults = {name: float(bool(physics[name])) for name in SUPPORTED_PHYSICS_TOGGLES}
+    atm_base = _as_nonempty_str(runtime["atm_base"], "vulcan_runtime.atm_base")
+    if atm_base not in SUPPORTED_ATM_BASES:
+        raise ConfigValidationError(
+            f"vulcan_runtime.atm_base must be one of {SUPPORTED_ATM_BASES}, got {atm_base!r}."
+        )
     defaults.update(
         {
-            f"atm_base_{name}": 1.0 if atm_base == name else 0.0
+            f"atm_base_{name}": 1.0 if name == atm_base else 0.0
             for name in SUPPORTED_ATM_BASES
         }
     )
@@ -102,1092 +117,470 @@ def resolve_conditioning_inputs(
     config: dict[str, Any],
     required_global_inputs: list[str],
 ) -> dict[str, float]:
-    """Resolve all non-time conditioning inputs for one run/sample."""
-    resolved: dict[str, float] = {}
     defaults = static_conditioning_defaults(config)
+    resolved: dict[str, float] = {}
     for name in required_global_inputs:
         if name == "log10_dt_s":
             continue
         if name in raw_global_inputs:
             resolved[name] = float(raw_global_inputs[name])
-            continue
-        if name in defaults:
+        elif name in defaults:
             resolved[name] = float(defaults[name])
-            continue
-        raise ConfigValidationError(
-            f"Missing required conditioning input '{name}' in raw run globals."
-        )
+        else:
+            raise ConfigValidationError(
+                f"Missing required conditioning input {name!r} in raw globals."
+            )
     return resolved
 
 
-def _require_keys(container: dict[str, Any], required: set[str], scope: str) -> None:
-    """Require a fixed key set in one config mapping."""
-    missing = sorted(required - set(container.keys()))
-    if missing:
-        raise ConfigValidationError(f"Missing required keys in {scope}: {missing}")
+def global_static_feature_order(config: dict[str, Any]) -> list[str]:
+    return [
+        name
+        for name in config["data_spec"]["required_global_inputs"]
+        if name != "log10_dt_s"
+    ]
 
 
-def _reject_extra_keys(container: dict[str, Any], allowed: set[str], scope: str) -> None:
-    """Reject unexpected keys in one config mapping."""
-    extras = sorted(set(container.keys()) - allowed)
-    if extras:
-        raise ConfigValidationError(f"Unexpected keys in {scope}: {extras}")
+def global_feature_order(config: dict[str, Any]) -> list[str]:
+    return list(config["data_spec"]["required_global_inputs"])
 
 
-def _as_float(value: Any, field: str) -> float:
-    """Parse one scalar as float while rejecting booleans."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigValidationError(f"'{field}' must be numeric.")
-    return float(value)
+def load_and_validate_config(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
 
+    _require_keys(
+        config,
+        [
+            "paths",
+            "data_spec",
+            "physics_toggles",
+            "vulcan_runtime",
+            "sampling",
+            "stellar_spectrum",
+            "generation",
+            "trajectory_sampling",
+            "preprocessing",
+            "normalization",
+            "training",
+        ],
+        "root",
+    )
 
-def _as_int(value: Any, field: str) -> int:
-    """Parse one scalar as int while rejecting booleans."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigValidationError(f"'{field}' must be an integer.")
-    return int(value)
+    paths = config["paths"]
+    _require_keys(
+        paths,
+        [
+            "raw_root",
+            "processed_root",
+            "checkpoints_root",
+            "jax_export_root",
+            "vulcan_source_root",
+        ],
+        "paths",
+    )
+    for key in paths:
+        paths[key] = _as_nonempty_str(paths[key], f"paths.{key}")
 
+    data_spec = config["data_spec"]
+    state_species = _as_string_list(
+        data_spec.get("state_species", list(DEFAULT_STATE_SPECIES)),
+        "data_spec.state_species",
+    )
+    output_species = _as_string_list(
+        data_spec.get("output_species", list(state_species)),
+        "data_spec.output_species",
+    )
+    required_global_inputs = _as_string_list(
+        data_spec.get("required_global_inputs", list(DEFAULT_REQUIRED_GLOBAL_INPUTS)),
+        "data_spec.required_global_inputs",
+    )
+    if "log10_dt_s" not in required_global_inputs:
+        raise ConfigValidationError("data_spec.required_global_inputs must contain 'log10_dt_s'.")
+    data_spec["state_species"] = state_species
+    data_spec["output_species"] = output_species
+    data_spec["required_global_inputs"] = required_global_inputs
 
-def _as_bool(value: Any, field: str) -> bool:
-    """Parse one scalar as bool with no implicit coercion."""
-    if not isinstance(value, bool):
-        raise ConfigValidationError(f"'{field}' must be a boolean.")
-    return bool(value)
+    physics = config["physics_toggles"]
+    for name in SUPPORTED_PHYSICS_TOGGLES:
+        physics[name] = _as_bool(physics.get(name, False), f"physics_toggles.{name}")
 
-
-def _parse_dtype_name(value: Any, field: str, *, allow_none: bool = False) -> torch.dtype | None:
-    """Resolve one configured dtype string to a Torch dtype."""
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigValidationError(f"'{field}' must be a non-empty string.")
-    lowered = value.strip().lower()
-    if lowered not in SUPPORTED_DTYPE_NAMES:
+    runtime = config["vulcan_runtime"]
+    _require_keys(
+        runtime,
+        [
+            "python_executable",
+            "cfg_file",
+            "chemistry_file",
+            "worker_root",
+            "regenerate_chem_funs",
+            "atm_base",
+            "t_cross_sp",
+            "cfg_assignments",
+        ],
+        "vulcan_runtime",
+    )
+    runtime["python_executable"] = _as_nonempty_str(
+        runtime["python_executable"], "vulcan_runtime.python_executable"
+    )
+    runtime["cfg_file"] = _as_nonempty_str(runtime["cfg_file"], "vulcan_runtime.cfg_file")
+    runtime["chemistry_file"] = _as_nonempty_str(
+        runtime["chemistry_file"], "vulcan_runtime.chemistry_file"
+    )
+    runtime["worker_root"] = _as_nonempty_str(runtime["worker_root"], "vulcan_runtime.worker_root")
+    runtime["regenerate_chem_funs"] = _as_bool(
+        runtime["regenerate_chem_funs"], "vulcan_runtime.regenerate_chem_funs"
+    )
+    runtime["atm_base"] = _as_nonempty_str(runtime["atm_base"], "vulcan_runtime.atm_base")
+    if runtime["atm_base"] not in SUPPORTED_ATM_BASES:
         raise ConfigValidationError(
-            f"Unsupported dtype for '{field}': {value}. Supported: {sorted(SUPPORTED_DTYPE_NAMES)}"
+            f"vulcan_runtime.atm_base must be one of {SUPPORTED_ATM_BASES}, got {runtime['atm_base']!r}."
         )
-    if lowered == "none":
-        if not allow_none:
-            raise ConfigValidationError(f"'{field}' cannot be 'none'.")
-        return None
-    return TORCH_DTYPE_MAP[lowered]
+    runtime["t_cross_sp"] = _as_string_list(runtime["t_cross_sp"], "vulcan_runtime.t_cross_sp")
+    if not isinstance(runtime["cfg_assignments"], dict):
+        raise ConfigValidationError("vulcan_runtime.cfg_assignments must be a mapping.")
 
+    sampling = config["sampling"]
+    _require_keys(
+        sampling,
+        [
+            "num_levels",
+            "pressure_top_bar",
+            "pressure_bottom_bar",
+            "temperature_range_k",
+            "gravity_range_cm_s2",
+            "metallicity_log10_range",
+            "c_to_o_range",
+            "kzz_cm2_s",
+            "num_time_steps",
+            "time_step_log10_min_s",
+            "time_step_log10_max_s",
+        ],
+        "sampling",
+    )
+    sampling["num_levels"] = _as_int(sampling["num_levels"], "sampling.num_levels")
+    sampling["num_time_steps"] = _as_int(
+        sampling["num_time_steps"], "sampling.num_time_steps"
+    )
+    if sampling["num_levels"] < 4:
+        raise ConfigValidationError("sampling.num_levels must be >= 4.")
+    if sampling["num_time_steps"] < 3:
+        raise ConfigValidationError("sampling.num_time_steps must be >= 3.")
+    sampling["pressure_top_bar"] = _as_float(
+        sampling["pressure_top_bar"], "sampling.pressure_top_bar"
+    )
+    sampling["pressure_bottom_bar"] = _as_float(
+        sampling["pressure_bottom_bar"], "sampling.pressure_bottom_bar"
+    )
+    if sampling["pressure_top_bar"] <= 0.0 or sampling["pressure_bottom_bar"] <= 0.0:
+        raise ConfigValidationError("Pressure bounds must be positive.")
+    if sampling["pressure_top_bar"] >= sampling["pressure_bottom_bar"]:
+        raise ConfigValidationError("pressure_top_bar must be smaller than pressure_bottom_bar.")
+    for key in (
+        "temperature_range_k",
+        "gravity_range_cm_s2",
+        "metallicity_log10_range",
+        "c_to_o_range",
+    ):
+        values = sampling[key]
+        if not isinstance(values, list) or len(values) != 2:
+            raise ConfigValidationError(f"sampling.{key} must be a length-2 list.")
+        low = _as_float(values[0], f"sampling.{key}[0]")
+        high = _as_float(values[1], f"sampling.{key}[1]")
+        if not low < high:
+            raise ConfigValidationError(f"sampling.{key} must be strictly increasing.")
+        sampling[key] = [low, high]
+    sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
+    if sampling["kzz_cm2_s"] <= 0.0:
+        raise ConfigValidationError("sampling.kzz_cm2_s must be positive.")
+    sampling["time_step_log10_min_s"] = _as_float(
+        sampling["time_step_log10_min_s"], "sampling.time_step_log10_min_s"
+    )
+    sampling["time_step_log10_max_s"] = _as_float(
+        sampling["time_step_log10_max_s"], "sampling.time_step_log10_max_s"
+    )
+    if not sampling["time_step_log10_min_s"] < sampling["time_step_log10_max_s"]:
+        raise ConfigValidationError(
+            "sampling.time_step_log10_min_s must be smaller than sampling.time_step_log10_max_s."
+        )
 
-def resolve_precision(config: dict[str, Any]) -> PrecisionConfig:
-    """Resolve and validate configured precision policy."""
-    precision = config["precision"]
+    spectrum = config["stellar_spectrum"]
+    _require_keys(
+        spectrum,
+        [
+            "enabled",
+            "template_name",
+            "template_file",
+            "num_bins",
+            "wavelength_min_nm",
+            "wavelength_max_nm",
+            "encoder_mode",
+            "latent_dim",
+            "hidden_dim",
+            "teff_k",
+            "radius_rsun",
+            "semi_major_axis_au",
+            "zenith_angle_deg",
+            "diurnal_factor",
+        ],
+        "stellar_spectrum",
+    )
+    spectrum["enabled"] = _as_bool(spectrum["enabled"], "stellar_spectrum.enabled")
+    spectrum["template_name"] = _as_nonempty_str(
+        spectrum["template_name"], "stellar_spectrum.template_name"
+    )
+    spectrum["template_file"] = _as_nonempty_str(
+        spectrum["template_file"], "stellar_spectrum.template_file"
+    )
+    spectrum["num_bins"] = _as_int(spectrum["num_bins"], "stellar_spectrum.num_bins")
+    spectrum["latent_dim"] = _as_int(spectrum["latent_dim"], "stellar_spectrum.latent_dim")
+    spectrum["hidden_dim"] = _as_int(spectrum["hidden_dim"], "stellar_spectrum.hidden_dim")
+    if spectrum["num_bins"] < 8:
+        raise ConfigValidationError("stellar_spectrum.num_bins must be >= 8.")
+    if spectrum["latent_dim"] < 1 or spectrum["latent_dim"] > spectrum["num_bins"]:
+        raise ConfigValidationError(
+            "stellar_spectrum.latent_dim must lie in [1, num_bins]."
+        )
+    spectrum["wavelength_min_nm"] = _as_float(
+        spectrum["wavelength_min_nm"], "stellar_spectrum.wavelength_min_nm"
+    )
+    spectrum["wavelength_max_nm"] = _as_float(
+        spectrum["wavelength_max_nm"], "stellar_spectrum.wavelength_max_nm"
+    )
+    if spectrum["wavelength_min_nm"] >= spectrum["wavelength_max_nm"]:
+        raise ConfigValidationError(
+            "stellar_spectrum.wavelength_min_nm must be smaller than wavelength_max_nm."
+        )
+    spectrum["encoder_mode"] = _as_nonempty_str(
+        spectrum["encoder_mode"], "stellar_spectrum.encoder_mode"
+    ).lower()
+    if spectrum["encoder_mode"] not in _ALLOWED_SPECTRUM_ENCODERS:
+        raise ConfigValidationError(
+            f"stellar_spectrum.encoder_mode must be one of {_ALLOWED_SPECTRUM_ENCODERS}."
+        )
+    for key in ("teff_k", "radius_rsun", "semi_major_axis_au", "diurnal_factor"):
+        spectrum[key] = _as_float(spectrum[key], f"stellar_spectrum.{key}")
+        if spectrum[key] <= 0.0:
+            raise ConfigValidationError(f"stellar_spectrum.{key} must be positive.")
+    spectrum["zenith_angle_deg"] = _as_float(
+        spectrum["zenith_angle_deg"], "stellar_spectrum.zenith_angle_deg"
+    )
+    if spectrum["zenith_angle_deg"] < 0.0 or spectrum["zenith_angle_deg"] >= 90.0:
+        raise ConfigValidationError("stellar_spectrum.zenith_angle_deg must lie in [0, 90).")
+
+    generation = config["generation"]
+    _require_keys(
+        generation,
+        ["mode", "num_runs", "seed", "overwrite", "reuse_raw_if_present", "parallel_workers"],
+        "generation",
+    )
+    generation["mode"] = _as_nonempty_str(generation["mode"], "generation.mode").lower()
+    if generation["mode"] not in {"synthetic", "vulcan"}:
+        raise ConfigValidationError("generation.mode must be 'synthetic' or 'vulcan'.")
+    generation["num_runs"] = _as_int(generation["num_runs"], "generation.num_runs")
+    generation["seed"] = _as_int(generation["seed"], "generation.seed")
+    generation["overwrite"] = _as_bool(generation["overwrite"], "generation.overwrite")
+    generation["reuse_raw_if_present"] = _as_bool(
+        generation["reuse_raw_if_present"], "generation.reuse_raw_if_present"
+    )
+    generation["parallel_workers"] = _as_int(
+        generation["parallel_workers"], "generation.parallel_workers"
+    )
+    if generation["num_runs"] < 1:
+        raise ConfigValidationError("generation.num_runs must be >= 1.")
+    if generation["parallel_workers"] < 1:
+        raise ConfigValidationError("generation.parallel_workers must be >= 1.")
+
+    traj = config["trajectory_sampling"]
+    _require_keys(
+        traj,
+        ["dt_min_s", "dt_max_s", "min_future_saved_steps", "num_logdt_bins"],
+        "trajectory_sampling",
+    )
+    traj["dt_min_s"] = _as_float(traj["dt_min_s"], "trajectory_sampling.dt_min_s")
+    traj["dt_max_s"] = _as_float(traj["dt_max_s"], "trajectory_sampling.dt_max_s")
+    traj["min_future_saved_steps"] = _as_int(
+        traj["min_future_saved_steps"], "trajectory_sampling.min_future_saved_steps"
+    )
+    traj["num_logdt_bins"] = _as_int(
+        traj["num_logdt_bins"], "trajectory_sampling.num_logdt_bins"
+    )
+    if traj["dt_min_s"] <= 0.0 or traj["dt_max_s"] <= 0.0:
+        raise ConfigValidationError("trajectory_sampling dt bounds must be positive.")
+    if traj["dt_min_s"] >= traj["dt_max_s"]:
+        raise ConfigValidationError("trajectory_sampling.dt_min_s must be < dt_max_s.")
+    if traj["min_future_saved_steps"] < 1:
+        raise ConfigValidationError("min_future_saved_steps must be >= 1.")
+    if traj["num_logdt_bins"] < 1:
+        raise ConfigValidationError("trajectory_sampling.num_logdt_bins must be >= 1.")
+
+    inference = config.get("inference", {})
+    if inference is None:
+        inference = {}
+    if not isinstance(inference, dict):
+        raise ConfigValidationError("inference must be a mapping.")
+    eq_anchor = inference.get("equilibrium_anchor", {})
+    if eq_anchor is None:
+        eq_anchor = {}
+    if not isinstance(eq_anchor, dict):
+        raise ConfigValidationError("inference.equilibrium_anchor must be a mapping.")
+    eq_source = _as_nonempty_str(
+        eq_anchor.get("source", "trajectory"),
+        "inference.equilibrium_anchor.source",
+    ).lower()
+    if eq_source not in _ALLOWED_EQ_ANCHOR_SOURCES:
+        raise ConfigValidationError(
+            f"inference.equilibrium_anchor.source must be one of {_ALLOWED_EQ_ANCHOR_SOURCES}."
+        )
+    eq_split = _as_nonempty_str(
+        eq_anchor.get("split", "train"),
+        "inference.equilibrium_anchor.split",
+    ).lower()
+    if eq_split not in _ALLOWED_EQ_ANCHOR_SPLITS:
+        raise ConfigValidationError(
+            f"inference.equilibrium_anchor.split must be one of {_ALLOWED_EQ_ANCHOR_SPLITS}."
+        )
+    eq_run_id = eq_anchor.get("run_id")
+    if eq_run_id is not None:
+        eq_run_id = _as_nonempty_str(
+            eq_run_id,
+            "inference.equilibrium_anchor.run_id",
+        )
+    eq_step_index = eq_anchor.get("step_index")
+    if eq_step_index is not None:
+        eq_step_index = _as_int(
+            eq_step_index,
+            "inference.equilibrium_anchor.step_index",
+        )
+        if eq_step_index < 0:
+            raise ConfigValidationError("inference.equilibrium_anchor.step_index must be >= 0.")
+    else:
+        eq_step_index = 0
+    eq_anchor["source"] = eq_source
+    eq_anchor["split"] = eq_split
+    eq_anchor["run_id"] = eq_run_id
+    eq_anchor["step_index"] = eq_step_index
+    inference["equilibrium_anchor"] = eq_anchor
+    config["inference"] = inference
+
+    prep = config["preprocessing"]
+    _require_keys(prep, ["train_fraction", "val_fraction", "test_fraction", "seed"], "preprocessing")
+    for key in ("train_fraction", "val_fraction", "test_fraction"):
+        prep[key] = _as_float(prep[key], f"preprocessing.{key}")
+        if prep[key] <= 0.0:
+            raise ConfigValidationError(f"preprocessing.{key} must be positive.")
+    total_fraction = prep["train_fraction"] + prep["val_fraction"] + prep["test_fraction"]
+    if abs(total_fraction - 1.0) > 1.0e-6:
+        raise ConfigValidationError("preprocessing fractions must sum to 1.")
+    prep["seed"] = _as_int(prep["seed"], "preprocessing.seed")
+
+    norm = config["normalization"]
+    _require_keys(norm, ["state_floor", "spectrum_floor", "sequence_methods"], "normalization")
+    norm["state_floor"] = _as_float(norm["state_floor"], "normalization.state_floor")
+    norm["spectrum_floor"] = _as_float(norm["spectrum_floor"], "normalization.spectrum_floor")
+    if norm["state_floor"] <= 0.0 or norm["spectrum_floor"] <= 0.0:
+        raise ConfigValidationError("normalization floors must be positive.")
+    if not isinstance(norm["sequence_methods"], dict):
+        raise ConfigValidationError("normalization.sequence_methods must be a mapping.")
+    expected_sequence_methods = {"pressure_bar", "temperature_k", "kzz_cm2_s"}
+    if set(norm["sequence_methods"].keys()) != expected_sequence_methods:
+        raise ConfigValidationError(
+            "normalization.sequence_methods must define exactly pressure_bar, temperature_k, and kzz_cm2_s."
+        )
+    for key, method in norm["sequence_methods"].items():
+        method_name = _as_nonempty_str(method, f"normalization.sequence_methods.{key}").lower()
+        if method_name not in {"standard", "log-standard", "none"}:
+            raise ConfigValidationError(
+                f"Unsupported normalization method for {key}: {method_name}."
+            )
+        norm["sequence_methods"][key] = method_name
+
     training = config["training"]
     _require_keys(
-        precision,
-        {
-            "input_dtype",
-            "stats_accumulation_dtype",
-            "model_dtype",
-            "forward_dtype",
-            "loss_dtype",
-            "optimizer_state_dtype",
-            "amp_autocast_dtype",
-        },
-        "precision",
-    )
-
-    input_dtype = _parse_dtype_name(precision["input_dtype"], "precision.input_dtype")
-    stats_dtype = _parse_dtype_name(
-        precision["stats_accumulation_dtype"],
-        "precision.stats_accumulation_dtype",
-    )
-    model_dtype = _parse_dtype_name(precision["model_dtype"], "precision.model_dtype")
-    forward_dtype = _parse_dtype_name(precision["forward_dtype"], "precision.forward_dtype")
-    loss_dtype = _parse_dtype_name(precision["loss_dtype"], "precision.loss_dtype")
-    optimizer_dtype = _parse_dtype_name(
-        precision["optimizer_state_dtype"],
-        "precision.optimizer_state_dtype",
-    )
-    amp_dtype = _parse_dtype_name(
-        precision["amp_autocast_dtype"],
-        "precision.amp_autocast_dtype",
-        allow_none=True,
-    )
-
-    use_amp = _as_bool(training["use_amp"], "training.use_amp")
-    device = str(training["device"]).lower()
-
-    if stats_dtype not in (torch.float32, torch.float64):
-        raise ConfigValidationError(
-            "precision.stats_accumulation_dtype must be float32 or float64."
-        )
-    if forward_dtype != model_dtype:
-        raise ConfigValidationError("precision.forward_dtype must match precision.model_dtype.")
-    if optimizer_dtype != model_dtype:
-        raise ConfigValidationError(
-            "precision.optimizer_state_dtype must match precision.model_dtype."
-        )
-
-    if use_amp:
-        if device != "cuda":
-            raise ConfigValidationError("training.use_amp=true requires training.device='cuda'.")
-        if amp_dtype not in (torch.float16, torch.bfloat16):
-            raise ConfigValidationError(
-                "precision.amp_autocast_dtype must be float16 or bfloat16 when AMP is enabled."
-            )
-        if model_dtype != torch.float32:
-            raise ConfigValidationError("AMP requires precision.model_dtype='float32'.")
-    else:
-        if amp_dtype is not None:
-            raise ConfigValidationError(
-                "precision.amp_autocast_dtype must be 'none' when AMP is disabled."
-            )
-
-    return PrecisionConfig(
-        input_dtype=input_dtype,
-        stats_dtype=stats_dtype,
-        model_dtype=model_dtype,
-        forward_dtype=forward_dtype,
-        loss_dtype=loss_dtype,
-        optimizer_state_dtype=optimizer_dtype,
-        amp_dtype=amp_dtype,
-        use_amp=use_amp,
-    )
-
-
-def _validate_relative_path_values(paths_cfg: dict[str, Any]) -> None:
-    """Require all configured path values to be relative non-empty strings."""
-    for key, value in paths_cfg.items():
-        if not isinstance(value, str) or not value:
-            raise ConfigValidationError(f"paths.{key} must be a non-empty string.")
-        if Path(value).is_absolute():
-            raise ConfigValidationError(f"paths.{key} must be relative, got: {value}")
-
-
-def _validate_paths(paths_cfg: dict[str, Any]) -> None:
-    """Validate the top-level `paths` section against the project contract."""
-    allowed = {
-        "project_root",
-        "vulcan_source_path",
-        "data_root",
-        "raw_root",
-        "processed_root",
-        "models_root",
-        "logs_root",
-    }
-    _require_keys(paths_cfg, allowed, "paths")
-    _reject_extra_keys(paths_cfg, allowed, "paths")
-    _validate_relative_path_values(paths_cfg)
-    if str(paths_cfg["project_root"]) != ".":
-        raise ConfigValidationError("paths.project_root must be '.'.")
-
-
-def _validate_distribution_spec(spec: dict[str, Any], scope: str) -> None:
-    """Validate one scalar sampling distribution specification."""
-    if not isinstance(spec, dict):
-        raise ConfigValidationError(f"{scope} must be a mapping.")
-
-    _require_keys(spec, {"distribution"}, scope)
-    distribution = str(spec["distribution"]).lower()
-    if distribution == "uniform":
-        _require_keys(spec, {"distribution", "min", "max"}, scope)
-        lower = _as_float(spec["min"], f"{scope}.min")
-        upper = _as_float(spec["max"], f"{scope}.max")
-        if upper <= lower:
-            raise ConfigValidationError(f"{scope} uniform bounds must satisfy min < max.")
-        return
-
-    if distribution == "normal":
-        _require_keys(spec, {"distribution", "mean", "std"}, scope)
-        _ = _as_float(spec["mean"], f"{scope}.mean")
-        if _as_float(spec["std"], f"{scope}.std") <= 0.0:
-            raise ConfigValidationError(f"{scope}.std must be > 0.")
-        if "min" in spec and "max" in spec:
-            lower = _as_float(spec["min"], f"{scope}.min")
-            upper = _as_float(spec["max"], f"{scope}.max")
-            if upper <= lower:
-                raise ConfigValidationError(f"{scope} clamp bounds must satisfy min < max.")
-        elif "min" in spec:
-            _ = _as_float(spec["min"], f"{scope}.min")
-        elif "max" in spec:
-            _ = _as_float(spec["max"], f"{scope}.max")
-        return
-
-    raise ConfigValidationError(f"Unsupported distribution for {scope}: {distribution}")
-
-
-def _validate_generation(cfg: dict[str, Any]) -> None:
-    """Validate generation-stage controls and output-path settings."""
-    allowed = {
-        "num_runs",
-        "num_workers",
-        "split_ratios",
-        "random_seed",
-        "keep_vulcan_outputs_debug",
-        "run_timeout_seconds",
-        "manifest_filename",
-        "split_filename",
-        "worker_root",
-        "save_evo_frq",
-        "max_trajectory_snapshots",
-    }
-    _require_keys(cfg, allowed, "generation")
-    _reject_extra_keys(cfg, allowed, "generation")
-
-    if _as_int(cfg["num_runs"], "generation.num_runs") <= 0:
-        raise ConfigValidationError("generation.num_runs must be > 0.")
-    if _as_int(cfg["num_workers"], "generation.num_workers") <= 0:
-        raise ConfigValidationError("generation.num_workers must be > 0.")
-    _ = _as_int(cfg["random_seed"], "generation.random_seed")
-    _ = _as_bool(cfg["keep_vulcan_outputs_debug"], "generation.keep_vulcan_outputs_debug")
-    if _as_int(cfg["run_timeout_seconds"], "generation.run_timeout_seconds") <= 0:
-        raise ConfigValidationError("generation.run_timeout_seconds must be > 0.")
-    if _as_int(cfg["save_evo_frq"], "generation.save_evo_frq") <= 0:
-        raise ConfigValidationError("generation.save_evo_frq must be > 0.")
-    max_snap = _as_int(cfg["max_trajectory_snapshots"], "generation.max_trajectory_snapshots")
-    if max_snap < 0:
-        raise ConfigValidationError("generation.max_trajectory_snapshots must be >= 0 (0 = no limit).")
-    if max_snap == 1:
-        raise ConfigValidationError(
-            "generation.max_trajectory_snapshots must be 0 or >= 2 so each run keeps "
-            "t=0 plus at least one future state."
-        )
-
-    for path_key in ("worker_root", "manifest_filename", "split_filename"):
-        value = cfg[path_key]
-        if not isinstance(value, str) or not value:
-            raise ConfigValidationError(f"generation.{path_key} must be a non-empty string path.")
-        if Path(value).is_absolute():
-            raise ConfigValidationError(f"generation.{path_key} must be relative, got: {value}")
-
-    ratios = cfg["split_ratios"]
-    _require_keys(ratios, {"train", "val", "test"}, "generation.split_ratios")
-    train = _as_float(ratios["train"], "generation.split_ratios.train")
-    val = _as_float(ratios["val"], "generation.split_ratios.val")
-    test = _as_float(ratios["test"], "generation.split_ratios.test")
-    if min(train, val, test) <= 0.0:
-        raise ConfigValidationError("Split ratios must all be > 0.")
-    if abs((train + val + test) - 1.0) > 1e-9:
-        raise ConfigValidationError("Split ratios must sum to 1.0.")
-
-
-def _validate_trajectory_sampling(cfg: dict[str, Any]) -> None:
-    """Validate log-uniform all-pairs transition sampling controls."""
-    allowed = {
-        "mode",
-        "dt_min_s",
-        "dt_max_s",
-        "min_future_saved_steps",
-    }
-    _require_keys(
-        cfg,
-        allowed,
-        "trajectory_sampling",
-    )
-    _reject_extra_keys(cfg, allowed, "trajectory_sampling")
-    if str(cfg["mode"]) != "log_uniform_all_pairs":
-        raise ConfigValidationError(
-            "trajectory_sampling.mode must be 'log_uniform_all_pairs'."
-        )
-
-    dt_min_s = _as_float(cfg["dt_min_s"], "trajectory_sampling.dt_min_s")
-    dt_max_s = _as_float(cfg["dt_max_s"], "trajectory_sampling.dt_max_s")
-    if dt_min_s <= 0.0:
-        raise ConfigValidationError("trajectory_sampling.dt_min_s must be > 0.")
-    if dt_max_s <= dt_min_s:
-        raise ConfigValidationError("trajectory_sampling.dt_max_s must be > dt_min_s.")
-
-    if _as_int(
-        cfg["min_future_saved_steps"],
-        "trajectory_sampling.min_future_saved_steps",
-    ) < 1:
-        raise ConfigValidationError(
-            "trajectory_sampling.min_future_saved_steps must be >= 1."
-        )
-
-
-def _validate_live_sampling(cfg: dict[str, Any]) -> None:
-    """Validate per-epoch/eval live-sampling budgets."""
-    allowed = {
-        "train_pairs_per_run_per_epoch",
-        "eval_pairs_per_run",
-    }
-    _require_keys(
-        cfg,
-        allowed,
-        "training.live_sampling",
-    )
-    _reject_extra_keys(cfg, allowed, "training.live_sampling")
-    if _as_int(
-        cfg["train_pairs_per_run_per_epoch"],
-        "training.live_sampling.train_pairs_per_run_per_epoch",
-    ) <= 0:
-        raise ConfigValidationError(
-            "training.live_sampling.train_pairs_per_run_per_epoch must be > 0."
-        )
-    if _as_int(cfg["eval_pairs_per_run"], "training.live_sampling.eval_pairs_per_run") <= 0:
-        raise ConfigValidationError("training.live_sampling.eval_pairs_per_run must be > 0.")
-
-
-def _validate_vulcan_runtime(cfg: dict[str, Any]) -> None:
-    """Validate the explicit VULCAN runtime override section."""
-    _require_keys(
-        cfg,
-        {
-            "runtime",
-            "dt_min",
-            "dt_max",
-            "count_max",
-            "trun_min",
-            "count_min",
-            "ini_mix",
-            "atm_base",
-        },
-        "vulcan_runtime",
-    )
-    runtime = _as_float(cfg["runtime"], "vulcan_runtime.runtime")
-    dt_min = _as_float(cfg["dt_min"], "vulcan_runtime.dt_min")
-    dt_max = _as_float(cfg["dt_max"], "vulcan_runtime.dt_max")
-    if runtime <= 0.0:
-        raise ConfigValidationError("vulcan_runtime.runtime must be > 0.")
-    if dt_min <= 0.0 or dt_max <= dt_min:
-        raise ConfigValidationError(
-            "vulcan_runtime.dt_* must satisfy 0 < dt_min < dt_max."
-        )
-    if _as_int(cfg["count_max"], "vulcan_runtime.count_max") <= 0:
-        raise ConfigValidationError("vulcan_runtime.count_max must be > 0.")
-    if _as_float(cfg["trun_min"], "vulcan_runtime.trun_min") < 0.0:
-        raise ConfigValidationError("vulcan_runtime.trun_min must be >= 0.")
-    if _as_int(cfg["count_min"], "vulcan_runtime.count_min") < 0:
-        raise ConfigValidationError("vulcan_runtime.count_min must be >= 0.")
-
-    ini_mix = str(cfg["ini_mix"])
-    if ini_mix != "EQ":
-        raise ConfigValidationError(
-            "vulcan_runtime.ini_mix must be 'EQ' in this codebase. Other initialization modes "
-            "need additional input artifacts that are not wired into the generator."
-        )
-
-    atm_base = str(cfg["atm_base"])
-    if atm_base not in set(SUPPORTED_ATM_BASES):
-        raise ConfigValidationError(
-            "vulcan_runtime.atm_base must be one of {'H2','N2','O2','CO2','H2O'}."
-        )
-
-
-def _validate_tp_sampler(tp_cfg: dict[str, Any]) -> None:
-    """Validate TP-profile sampling controls and physical bounds."""
-    _require_keys(
-        tp_cfg,
-        {
-            "pressure_grid",
-            "temperature_limits_k",
-            "max_sampling_attempts",
-            "adiabatic_gradient",
-            "convective_adjustment_probability",
-            "log10_kappa_ir",
-            "kappa_pressure_power_exponent",
-            "log10_gamma1",
-            "log10_gamma2",
-            "alpha_partition",
-            "t_int",
-            "t_irr",
-            "temperature_shift",
-        },
-        "tp_sampler",
-    )
-    grid = tp_cfg["pressure_grid"]
-    _require_keys(grid, {"nz", "p_top_bar", "p_bottom_bar"}, "tp_sampler.pressure_grid")
-    if _as_int(grid["nz"], "tp_sampler.pressure_grid.nz") <= 1:
-        raise ConfigValidationError("tp_sampler.pressure_grid.nz must be > 1.")
-    p_top = _as_float(grid["p_top_bar"], "tp_sampler.pressure_grid.p_top_bar")
-    p_bottom = _as_float(grid["p_bottom_bar"], "tp_sampler.pressure_grid.p_bottom_bar")
-    if p_top <= 0.0 or p_bottom <= 0.0 or p_bottom <= p_top:
-        raise ConfigValidationError("Pressure bounds must satisfy 0 < p_top < p_bottom.")
-
-    temp_limits = tp_cfg["temperature_limits_k"]
-    _require_keys(temp_limits, {"min", "max"}, "tp_sampler.temperature_limits_k")
-    t_min = _as_float(temp_limits["min"], "tp_sampler.temperature_limits_k.min")
-    t_max = _as_float(temp_limits["max"], "tp_sampler.temperature_limits_k.max")
-    if t_min <= 0.0 or t_max <= t_min:
-        raise ConfigValidationError("Invalid temperature limits.")
-
-    if _as_int(tp_cfg["max_sampling_attempts"], "tp_sampler.max_sampling_attempts") <= 0:
-        raise ConfigValidationError("tp_sampler.max_sampling_attempts must be > 0.")
-    if _as_float(tp_cfg["adiabatic_gradient"], "tp_sampler.adiabatic_gradient") <= 0.0:
-        raise ConfigValidationError("tp_sampler.adiabatic_gradient must be > 0.")
-
-    prob = _as_float(
-        tp_cfg["convective_adjustment_probability"],
-        "tp_sampler.convective_adjustment_probability",
-    )
-    if not (0.0 <= prob <= 1.0):
-        raise ConfigValidationError("convective_adjustment_probability must be in [0,1].")
-
-    for key in (
-        "log10_kappa_ir",
-        "kappa_pressure_power_exponent",
-        "log10_gamma1",
-        "log10_gamma2",
-        "alpha_partition",
-        "t_int",
-        "t_irr",
-        "temperature_shift",
-    ):
-        _validate_distribution_spec(tp_cfg[key], f"tp_sampler.{key}")
-
-    alpha_cfg = tp_cfg["alpha_partition"]
-    if "min" not in alpha_cfg or "max" not in alpha_cfg:
-        raise ConfigValidationError(
-            "tp_sampler.alpha_partition must define explicit min/max bounds within [0,1]."
-        )
-    alpha_min = _as_float(alpha_cfg["min"], "tp_sampler.alpha_partition.min")
-    alpha_max = _as_float(alpha_cfg["max"], "tp_sampler.alpha_partition.max")
-    if alpha_min < 0.0 or alpha_max > 1.0:
-        raise ConfigValidationError("tp_sampler.alpha_partition bounds must stay within [0,1].")
-
-
-def _validate_gravity_sampler(gravity_cfg: dict[str, Any]) -> None:
-    """Validate the gravity sampling strategy for one run family."""
-    _require_keys(gravity_cfg, {"distribution"}, "gravity_sampler")
-    distribution = str(gravity_cfg["distribution"]).lower()
-    if distribution == "uniform":
-        _require_keys(gravity_cfg, {"distribution", "min_cm_s2", "max_cm_s2"}, "gravity_sampler")
-        g_min = _as_float(gravity_cfg["min_cm_s2"], "gravity_sampler.min_cm_s2")
-        g_max = _as_float(gravity_cfg["max_cm_s2"], "gravity_sampler.max_cm_s2")
-        if g_min <= 0.0 or g_max <= g_min:
-            raise ConfigValidationError(
-                "gravity_sampler uniform bounds must satisfy 0 < min < max."
-            )
-        return
-    if distribution == "fixed":
-        _require_keys(gravity_cfg, {"distribution", "value_cm_s2"}, "gravity_sampler")
-        value = _as_float(gravity_cfg["value_cm_s2"], "gravity_sampler.value_cm_s2")
-        if value <= 0.0:
-            raise ConfigValidationError("gravity_sampler.value_cm_s2 must be > 0.")
-        return
-    raise ConfigValidationError(
-        "gravity_sampler.distribution must be one of {'uniform', 'fixed'}."
-    )
-
-
-def _validate_kzz_sampler(kzz_cfg: dict[str, Any]) -> None:
-    """Validate the configured Kzz profile family and clipping limits."""
-    _require_keys(
-        kzz_cfg,
-        {
-            "mode",
-            "log10_kzz_at_1bar_min",
-            "log10_kzz_at_1bar_max",
-            "beta_min",
-            "beta_max",
-            "kzz_floor_cm2_s",
-            "kzz_cap_cm2_s",
-            "pressure_unit_for_profile",
-        },
-        "kzz_sampler",
-    )
-    if str(kzz_cfg["mode"]) != "power_law_profile":
-        raise ConfigValidationError("kzz_sampler.mode must be 'power_law_profile'.")
-    if str(kzz_cfg["pressure_unit_for_profile"]) != "bar":
-        raise ConfigValidationError("kzz_sampler.pressure_unit_for_profile must be 'bar'.")
-
-    lo = _as_float(kzz_cfg["log10_kzz_at_1bar_min"], "kzz_sampler.log10_kzz_at_1bar_min")
-    hi = _as_float(kzz_cfg["log10_kzz_at_1bar_max"], "kzz_sampler.log10_kzz_at_1bar_max")
-    if hi <= lo:
-        raise ConfigValidationError("Invalid Kzz@1bar log10 range.")
-    beta_lo = _as_float(kzz_cfg["beta_min"], "kzz_sampler.beta_min")
-    beta_hi = _as_float(kzz_cfg["beta_max"], "kzz_sampler.beta_max")
-    if beta_hi <= beta_lo:
-        raise ConfigValidationError("Invalid kzz beta range.")
-    floor = _as_float(kzz_cfg["kzz_floor_cm2_s"], "kzz_sampler.kzz_floor_cm2_s")
-    cap = _as_float(kzz_cfg["kzz_cap_cm2_s"], "kzz_sampler.kzz_cap_cm2_s")
-    if floor <= 0.0 or cap <= floor:
-        raise ConfigValidationError("Kzz floor/cap must satisfy 0 < floor < cap.")
-
-
-def _validate_abundance_sampler(abund_cfg: dict[str, Any]) -> None:
-    """Validate elemental abundance sampling and solar reference values."""
-    _require_keys(
-        abund_cfg,
-        {
-            "metallicity_mode",
-            "log10_metallicity_min",
-            "log10_metallicity_max",
-            "c_to_o_min",
-            "c_to_o_max",
-            "solar_abundances",
-        },
-        "abundance_sampler",
-    )
-    if str(abund_cfg["metallicity_mode"]) != "log10_scale":
-        raise ConfigValidationError("abundance_sampler.metallicity_mode must be 'log10_scale'.")
-    lo = _as_float(abund_cfg["log10_metallicity_min"], "abundance_sampler.log10_metallicity_min")
-    hi = _as_float(abund_cfg["log10_metallicity_max"], "abundance_sampler.log10_metallicity_max")
-    if hi <= lo:
-        raise ConfigValidationError("Invalid metallicity range.")
-    co_lo = _as_float(abund_cfg["c_to_o_min"], "abundance_sampler.c_to_o_min")
-    co_hi = _as_float(abund_cfg["c_to_o_max"], "abundance_sampler.c_to_o_max")
-    if co_hi <= co_lo or co_lo <= 0.0:
-        raise ConfigValidationError("Invalid C/O range.")
-
-    solar = abund_cfg["solar_abundances"]
-    _require_keys(solar, {"O_H", "N_H", "He_H", "S_H"}, "abundance_sampler.solar_abundances")
-    for key, value in solar.items():
-        if _as_float(value, f"abundance_sampler.solar_abundances.{key}") <= 0.0:
-            raise ConfigValidationError(f"Solar abundance {key} must be > 0.")
-
-
-def _validate_numeric_allowlist(values: Any, field: str) -> list[float]:
-    """Validate one numeric allow-list, permitting an empty list."""
-    if not isinstance(values, list):
-        raise ConfigValidationError(f"{field} must be a list.")
-    parsed: list[float] = []
-    for idx, value in enumerate(values):
-        parsed.append(_as_float(value, f"{field}[{idx}]"))
-    return parsed
-
-
-def _validate_bool_allowlist(values: Any, field: str) -> list[bool]:
-    """Validate one boolean allow-list, permitting an empty list."""
-    if not isinstance(values, list):
-        raise ConfigValidationError(f"{field} must be a list.")
-    parsed: list[bool] = []
-    for idx, value in enumerate(values):
-        if not isinstance(value, bool):
-            raise ConfigValidationError(f"{field}[{idx}] must be a boolean.")
-        parsed.append(bool(value))
-    return parsed
-
-
-def _validate_roth_sampler(roth_cfg: dict[str, Any]) -> None:
-    """Validate Roth PT-grid controls and allow-list filters."""
-    allowed = {
-        "enabled",
-        "num_profiles",
-        "data_glob",
-        "source_globals_mode",
-        "filters",
-        "column_filters",
-        "interpolation",
-    }
-    _require_keys(roth_cfg, allowed, "roth_sampler")
-    _reject_extra_keys(roth_cfg, allowed, "roth_sampler")
-
-    enabled = _as_bool(roth_cfg["enabled"], "roth_sampler.enabled")
-    num_profiles = _as_int(roth_cfg["num_profiles"], "roth_sampler.num_profiles")
-    if num_profiles < 0:
-        raise ConfigValidationError("roth_sampler.num_profiles must be >= 0.")
-    if not enabled and num_profiles > 0:
-        raise ConfigValidationError(
-            "roth_sampler.num_profiles must be 0 when roth_sampler.enabled is false."
-        )
-    data_glob = roth_cfg["data_glob"]
-    if not isinstance(data_glob, str) or not data_glob:
-        raise ConfigValidationError("roth_sampler.data_glob must be a non-empty string.")
-    if Path(data_glob).is_absolute():
-        raise ConfigValidationError("roth_sampler.data_glob must be relative.")
-    if str(roth_cfg["source_globals_mode"]) != "pt_only":
-        raise ConfigValidationError("roth_sampler.source_globals_mode must be 'pt_only'.")
-
-    filters = roth_cfg["filters"]
-    required_filters = set((*ROTH_FILTER_KEYS, *ROTH_OPTIONAL_FILTER_KEYS))
-    if not isinstance(filters, dict):
-        raise ConfigValidationError("roth_sampler.filters must be a mapping.")
-    _require_keys(filters, required_filters, "roth_sampler.filters")
-    _reject_extra_keys(filters, required_filters, "roth_sampler.filters")
-    for key in ROTH_FILTER_KEYS:
-        field = f"roth_sampler.filters.{key}"
-        if key == "TiOVO":
-            _validate_bool_allowlist(filters[key], field)
-        else:
-            _validate_numeric_allowlist(filters[key], field)
-    _validate_numeric_allowlist(
-        filters["planet_mass_jup"],
-        "roth_sampler.filters.planet_mass_jup",
-    )
-
-    column_filters = roth_cfg["column_filters"]
-    if not isinstance(column_filters, dict):
-        raise ConfigValidationError("roth_sampler.column_filters must be a mapping.")
-    _require_keys(column_filters, set(ROTH_COLUMN_FILTER_KEYS), "roth_sampler.column_filters")
-    _reject_extra_keys(column_filters, set(ROTH_COLUMN_FILTER_KEYS), "roth_sampler.column_filters")
-    for key in ROTH_COLUMN_FILTER_KEYS:
-        _validate_numeric_allowlist(column_filters[key], f"roth_sampler.column_filters.{key}")
-
-    interpolation = roth_cfg["interpolation"]
-    if not isinstance(interpolation, dict):
-        raise ConfigValidationError("roth_sampler.interpolation must be a mapping.")
-    _require_keys(
-        interpolation,
-        {"method", "min_source_levels"},
-        "roth_sampler.interpolation",
-    )
-    _reject_extra_keys(
-        interpolation,
-        {"method", "min_source_levels"},
-        "roth_sampler.interpolation",
-    )
-    if (
-        str(interpolation["method"])
-        != "pchip_log_pressure_linear_extrapolation"
-    ):
-        raise ConfigValidationError(
-            "roth_sampler.interpolation.method must be "
-            "'pchip_log_pressure_linear_extrapolation'."
-        )
-    if (
-        _as_int(
-            interpolation["min_source_levels"],
-            "roth_sampler.interpolation.min_source_levels",
-        )
-        < 2
-    ):
-        raise ConfigValidationError(
-            "roth_sampler.interpolation.min_source_levels must be >= 2."
-        )
-
-
-def _validate_species_list(species: Any, field: str) -> list[str]:
-    """Validate one ordered species-name list."""
-    if not isinstance(species, list) or not species:
-        raise ConfigValidationError(f"{field} must be a non-empty list of species names.")
-    if any((not isinstance(item, str) or not item.strip()) for item in species):
-        raise ConfigValidationError(f"{field} contains an invalid species name.")
-    if len(set(species)) != len(species):
-        raise ConfigValidationError(f"{field} contains duplicate species names.")
-    return [str(item) for item in species]
-
-
-def _validate_data_spec(data_spec: dict[str, Any]) -> None:
-    """Validate the explicit transition-model input/output feature contract."""
-    _require_keys(
-        data_spec,
-        {
-            "state_species",
-            "output_species",
-            "required_input_profiles",
-            "required_global_inputs",
-            "required_state_inputs",
-            "time_input_transform",
-            "strict_non_finite",
-        },
-        "data_spec",
-    )
-
-    state_species = _validate_species_list(data_spec["state_species"], "data_spec.state_species")
-    output_species = _validate_species_list(data_spec["output_species"], "data_spec.output_species")
-    missing_output = [species for species in output_species if species not in state_species]
-    if missing_output:
-        raise ConfigValidationError(
-            "data_spec.output_species must be a subset of data_spec.state_species; missing "
-            f"{missing_output}."
-        )
-
-    if str(data_spec["time_input_transform"]) != "log10_dt_seconds":
-        raise ConfigValidationError(
-            "data_spec.time_input_transform must be 'log10_dt_seconds'."
-        )
-    _ = _as_bool(data_spec["strict_non_finite"], "data_spec.strict_non_finite")
-
-    expected_inputs = ["pressure_bar", "temperature_k", "kzz_cm2_s"]
-    if list(data_spec["required_input_profiles"]) != expected_inputs:
-        raise ConfigValidationError(
-            f"data_spec.required_input_profiles must equal {expected_inputs}."
-        )
-    required_globals = list(data_spec["required_global_inputs"])
-    expected_prefix = list(CORE_GLOBAL_INPUTS)
-    if required_globals[: len(expected_prefix)] != expected_prefix:
-        raise ConfigValidationError(
-            "data_spec.required_global_inputs must begin with "
-            f"{expected_prefix}."
-        )
-    if any(name not in SUPPORTED_GLOBAL_INPUTS for name in required_globals):
-        invalid = sorted(set(required_globals) - set(SUPPORTED_GLOBAL_INPUTS))
-        raise ConfigValidationError(
-            "data_spec.required_global_inputs contains unsupported entries: "
-            f"{invalid}."
-        )
-    canonical = [name for name in SUPPORTED_GLOBAL_INPUTS if name in required_globals]
-    if required_globals != canonical:
-        raise ConfigValidationError(
-            "data_spec.required_global_inputs must follow the canonical ordering "
-            f"{canonical}."
-        )
-    if list(data_spec["required_state_inputs"]) != ["anchor_ymix"]:
-        raise ConfigValidationError(
-            "data_spec.required_state_inputs must equal ['anchor_ymix']."
-        )
-
-
-def _validate_normalization(norm_cfg: dict[str, Any], data_spec: dict[str, Any]) -> None:
-    """Validate explicit normalization methods for all feature groups."""
-    _require_keys(
-        norm_cfg,
-        {"epsilon", "sequence_methods", "global_methods", "target_method"},
-        "normalization",
-    )
-    if _as_float(norm_cfg["epsilon"], "normalization.epsilon") <= 0.0:
-        raise ConfigValidationError("normalization.epsilon must be > 0.")
-
-    allowed = {"standard", "log-standard", "log-min-max", "none"}
-
-    sequence_methods = norm_cfg["sequence_methods"]
-    if not isinstance(sequence_methods, dict) or not sequence_methods:
-        raise ConfigValidationError("normalization.sequence_methods must be a non-empty mapping.")
-    required_sequence = {"pressure_bar", "temperature_k", "kzz_cm2_s", "anchor_ymix"}
-    if set(sequence_methods) != required_sequence:
-        raise ConfigValidationError(
-            "normalization.sequence_methods must define exactly keys "
-            f"{sorted(required_sequence)}, got {sorted(sequence_methods)}."
-        )
-    for key, method in sequence_methods.items():
-        if method not in allowed:
-            raise ConfigValidationError(
-                f"Unsupported normalization.sequence_methods.{key}: {method}."
-            )
-    if sequence_methods["anchor_ymix"] != "log-standard":
-        raise ConfigValidationError(
-            "normalization.sequence_methods.anchor_ymix must be 'log-standard'."
-        )
-
-    global_methods = norm_cfg["global_methods"]
-    if not isinstance(global_methods, dict) or not global_methods:
-        raise ConfigValidationError("normalization.global_methods must be a non-empty mapping.")
-    required_globals = list(data_spec["required_global_inputs"])
-    if list(global_methods.keys()) != required_globals:
-        raise ConfigValidationError(
-            "normalization.global_methods must define exactly keys "
-            f"{required_globals}, got {list(global_methods.keys())}."
-        )
-    for key, method in global_methods.items():
-        if method not in allowed:
-            raise ConfigValidationError(
-                f"Unsupported normalization.global_methods.{key}: {method}."
-            )
-    if global_methods["metallicity_log10"] not in {"standard", "none"}:
-        raise ConfigValidationError(
-            "normalization.global_methods.metallicity_log10 cannot use log-based methods "
-            "because metallicity_log10 is already base-10 transformed."
-        )
-    if global_methods["log10_dt_s"] not in {"standard", "none"}:
-        raise ConfigValidationError(
-            "normalization.global_methods.log10_dt_s cannot use log-based methods because "
-            "time_input_transform already produces log10_dt_s."
-        )
-
-    target_method = str(norm_cfg["target_method"])
-    if target_method not in allowed:
-        raise ConfigValidationError("Unsupported normalization.target_method.")
-    if target_method != "log-standard":
-        raise ConfigValidationError("normalization.target_method must be 'log-standard'.")
-    if target_method != str(sequence_methods["anchor_ymix"]):
-        raise ConfigValidationError(
-            "normalization.target_method must match normalization.sequence_methods.anchor_ymix "
-            "so residual training occurs in one shared normalized state space."
-        )
-
-
-def _validate_training(training: dict[str, Any]) -> None:
-    """Validate training hyperparameters, model shape, and live-sampling policy."""
-    allowed = {
-        "device",
-        "batch_size",
-        "epochs",
-        "learning_rate",
-        "min_lr",
-        "warmup_epochs",
-        "weight_decay",
-        "gradient_clip",
-        "use_amp",
-        "seed",
-        "live_sampling",
-        "model",
-        "output_folder",
-        "loss",
-    }
-    _require_keys(training, allowed, "training")
-    _reject_extra_keys(training, allowed, "training")
-
-    device = str(training["device"]).lower()
-    if device != "cuda":
-        raise ConfigValidationError("training.device must be 'cuda' for live-sampling training.")
-    if _as_int(training["batch_size"], "training.batch_size") <= 0:
-        raise ConfigValidationError("training.batch_size must be > 0.")
-    epochs = _as_int(training["epochs"], "training.epochs")
-    if epochs <= 0:
-        raise ConfigValidationError("training.epochs must be > 0.")
-    warmup = _as_int(training["warmup_epochs"], "training.warmup_epochs")
-    if warmup < 0 or warmup > epochs:
-        raise ConfigValidationError("training.warmup_epochs must be in [0, epochs].")
-
-    lr = _as_float(training["learning_rate"], "training.learning_rate")
-    min_lr = _as_float(training["min_lr"], "training.min_lr")
-    if lr <= 0.0 or min_lr <= 0.0 or min_lr > lr:
-        raise ConfigValidationError("training.min_lr must be >0 and <= training.learning_rate.")
-    if _as_float(training["weight_decay"], "training.weight_decay") < 0.0:
-        raise ConfigValidationError("training.weight_decay must be >= 0.")
-    if _as_float(training["gradient_clip"], "training.gradient_clip") <= 0.0:
-        raise ConfigValidationError("training.gradient_clip must be > 0.")
-    _ = _as_int(training["seed"], "training.seed")
-    _ = _as_bool(training["use_amp"], "training.use_amp")
-    _validate_live_sampling(training["live_sampling"])
-
-    model_cfg = training["model"]
-    allowed_model = {
-        "d_model",
-        "nhead",
-        "num_layers",
-        "dim_feedforward",
-        "dropout",
-        "film_clamp",
-        "output_head_divisor",
-        "max_sequence_length",
-        "conditioning_hidden_dim",
-    }
-    _require_keys(model_cfg, allowed_model, "training.model")
-    _reject_extra_keys(model_cfg, allowed_model, "training.model")
-    d_model = _as_int(model_cfg["d_model"], "training.model.d_model")
-    if d_model <= 0:
-        raise ConfigValidationError("training.model.d_model must be > 0.")
-    nhead = _as_int(model_cfg["nhead"], "training.model.nhead")
-    if nhead <= 0:
-        raise ConfigValidationError("training.model.nhead must be > 0.")
-    if d_model % 2 != 0:
-        raise ConfigValidationError("training.model.d_model must be even.")
-    if d_model % nhead != 0:
-        raise ConfigValidationError(
-            "training.model.d_model must be divisible by training.model.nhead."
-        )
-    if _as_int(model_cfg["num_layers"], "training.model.num_layers") <= 0:
-        raise ConfigValidationError("training.model.num_layers must be > 0.")
-    if _as_int(model_cfg["dim_feedforward"], "training.model.dim_feedforward") <= 0:
-        raise ConfigValidationError("training.model.dim_feedforward must be > 0.")
-    dropout = _as_float(model_cfg["dropout"], "training.model.dropout")
-    if not (0.0 <= dropout <= 1.0):
-        raise ConfigValidationError("training.model.dropout must be in [0, 1].")
-    if _as_float(model_cfg["film_clamp"], "training.model.film_clamp") <= 0.0:
-        raise ConfigValidationError("training.model.film_clamp must be > 0.")
-    if _as_int(model_cfg["output_head_divisor"], "training.model.output_head_divisor") <= 0:
-        raise ConfigValidationError("training.model.output_head_divisor must be > 0.")
-    if _as_int(model_cfg["max_sequence_length"], "training.model.max_sequence_length") <= 0:
-        raise ConfigValidationError("training.model.max_sequence_length must be > 0.")
-    if _as_int(model_cfg["conditioning_hidden_dim"], "training.model.conditioning_hidden_dim") <= 0:
-        raise ConfigValidationError(
-            "training.model.conditioning_hidden_dim must be > 0."
-        )
-    output_folder = training["output_folder"]
-    if not isinstance(output_folder, str) or not output_folder:
-        raise ConfigValidationError("training.output_folder must be a non-empty relative path.")
-    if Path(output_folder).is_absolute():
-        raise ConfigValidationError("training.output_folder must be relative.")
-
-    loss_cfg = training["loss"]
-    allowed_loss = {"lambda_z", "lambda_phys"}
-    _require_keys(loss_cfg, allowed_loss, "training.loss")
-    _reject_extra_keys(loss_cfg, allowed_loss, "training.loss")
-    lambda_z = _as_float(loss_cfg["lambda_z"], "training.loss.lambda_z")
-    lambda_phys = _as_float(loss_cfg["lambda_phys"], "training.loss.lambda_phys")
-    if lambda_z < 0.0:
-        raise ConfigValidationError("training.loss.lambda_z must be >= 0.")
-    if lambda_phys < 0.0:
-        raise ConfigValidationError("training.loss.lambda_phys must be >= 0.")
-
-
-def _validate_physics_toggles(physics: dict[str, Any]) -> None:
-    """Validate supported VULCAN on/off physics and solver toggles."""
-    _require_keys(
-        physics,
-        {
-            "use_photochemistry",
-            "use_ion_chemistry",
-            "use_eddy_diffusion",
-            "use_molecular_diffusion",
-            "use_upwind_molecular_diffusion",
-            "use_boundary_conditions",
-            "use_condensation",
-            "use_settling",
-            "use_initial_cold_trap",
-            "use_sat_surface_h2o",
-            "use_lowT_limit_rates",
-            "use_adaptive_rtol",
-        },
-        "physics_toggles",
-    )
-    for key in (
-        "use_photochemistry",
-        "use_ion_chemistry",
-        "use_eddy_diffusion",
-        "use_molecular_diffusion",
-        "use_upwind_molecular_diffusion",
-        "use_boundary_conditions",
-        "use_condensation",
-        "use_settling",
-        "use_initial_cold_trap",
-        "use_sat_surface_h2o",
-        "use_lowT_limit_rates",
-        "use_adaptive_rtol",
-    ):
-        _ = _as_bool(physics[key], f"physics_toggles.{key}")
-
-    if physics["use_photochemistry"]:
-        raise ConfigValidationError(
-            "Photochemistry is intentionally not wired in this emulator. Set use_photochemistry=false."
-        )
-    if physics["use_ion_chemistry"]:
-        raise ConfigValidationError(
-            "Ion chemistry is intentionally not wired in this emulator. Set use_ion_chemistry=false."
-        )
-    if physics["use_settling"] and not physics["use_condensation"]:
-        raise ConfigValidationError(
-            "physics_toggles.use_settling=true requires physics_toggles.use_condensation=true."
-        )
-    if physics["use_upwind_molecular_diffusion"] and not physics["use_molecular_diffusion"]:
-        raise ConfigValidationError(
-            "physics_toggles.use_upwind_molecular_diffusion=true requires "
-            "physics_toggles.use_molecular_diffusion=true."
-        )
-
-
-def _validate_boundary_conditions(
-    boundary_cfg: dict[str, Any] | None,
-    *,
-    required: bool,
-) -> None:
-    """Validate boundary-condition settings when that subsystem is enabled."""
-    if boundary_cfg is None:
-        if required:
-            raise ConfigValidationError(
-                "physics_toggles.use_boundary_conditions=true requires a top-level "
-                "'boundary_conditions' section."
-            )
-        return
-
-    _require_keys(
-        boundary_cfg,
-        {
-            "use_topflux",
-            "use_botflux",
-            "top_BC_flux_file",
-            "bot_BC_flux_file",
-            "use_fix_sp_bot",
-        },
-        "boundary_conditions",
-    )
-
-    use_topflux = _as_bool(boundary_cfg["use_topflux"], "boundary_conditions.use_topflux")
-    use_botflux = _as_bool(boundary_cfg["use_botflux"], "boundary_conditions.use_botflux")
-    for field_name in ("top_BC_flux_file", "bot_BC_flux_file"):
-        value = boundary_cfg[field_name]
-        if not isinstance(value, str) or not value:
-            raise ConfigValidationError(
-                f"boundary_conditions.{field_name} must be a non-empty string."
-            )
-        if Path(value).is_absolute():
-            raise ConfigValidationError(f"boundary_conditions.{field_name} must be relative.")
-
-    fixed_bottom = boundary_cfg["use_fix_sp_bot"]
-    if not isinstance(fixed_bottom, dict):
-        raise ConfigValidationError("boundary_conditions.use_fix_sp_bot must be a mapping.")
-    for species_name, value in fixed_bottom.items():
-        if not isinstance(species_name, str) or not species_name.strip():
-            raise ConfigValidationError(
-                "boundary_conditions.use_fix_sp_bot keys must be non-empty species names."
-            )
-        ratio = _as_float(value, f"boundary_conditions.use_fix_sp_bot.{species_name}")
-        if not (0.0 <= ratio <= 1.0):
-            raise ConfigValidationError(
-                f"boundary_conditions.use_fix_sp_bot.{species_name} must be in [0, 1]."
-            )
-
-    if required and not use_topflux and not use_botflux and not fixed_bottom:
-        raise ConfigValidationError(
-            "boundary_conditions are enabled, but no top flux, bottom flux, or fixed bottom "
-            "mixing ratios were configured."
-        )
-
-
-def _validate_log10_convention(config: dict[str, Any]) -> None:
-    """Require the project-wide base-10 naming convention for log controls."""
-    required_log10_keys = {
-        "tp_sampler.log10_kappa_ir",
-        "tp_sampler.log10_gamma1",
-        "tp_sampler.log10_gamma2",
-        "kzz_sampler.log10_kzz_at_1bar_min",
-        "kzz_sampler.log10_kzz_at_1bar_max",
-        "abundance_sampler.log10_metallicity_min",
-        "abundance_sampler.log10_metallicity_max",
-    }
-    missing: list[str] = []
-    for dotted in required_log10_keys:
-        section, key = dotted.split(".", 1)
-        if key not in config[section]:
-            missing.append(dotted)
-    if missing:
-        raise ConfigValidationError(
-            f"Base-10 log convention violated; missing required keys: {sorted(missing)}"
-        )
-
-
-
-def _validate_cross_section_contracts(config: dict[str, Any]) -> None:
-    """Validate relationships that span multiple config sections."""
-    trajectory_sampling = config["trajectory_sampling"]
-    vulcan_runtime = config["vulcan_runtime"]
-
-    dt_min_s = float(trajectory_sampling["dt_min_s"])
-    dt_max_s = float(trajectory_sampling["dt_max_s"])
-    runtime = float(vulcan_runtime["runtime"])
-
-    if dt_min_s >= runtime:
-        raise ConfigValidationError(
-            "trajectory_sampling.dt_min_s must be < vulcan_runtime.runtime."
-        )
-    if dt_max_s > runtime:
-        raise ConfigValidationError(
-            "trajectory_sampling.dt_max_s must be <= vulcan_runtime.runtime."
-        )
-
-
-def load_and_validate_config(path: Path) -> dict[str, Any]:
-    """Load JSON config and validate all required contract rules."""
-    if not path.is_file():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with path.open("r", encoding="utf-8") as handle:
-        try:
-            config = json.load(handle)
-        except json.JSONDecodeError as exc:
-            raise ConfigValidationError(f"Invalid JSON config: {exc}") from exc
-
-    required_top = {
-        "paths",
-        "generation",
-        "trajectory_sampling",
-        "vulcan_runtime",
-        "tp_sampler",
-        "roth_sampler",
-        "gravity_sampler",
-        "kzz_sampler",
-        "abundance_sampler",
-        "physics_toggles",
-        "data_spec",
-        "normalization",
-        "precision",
+        training,
+        [
+            "seed",
+            "batch_size",
+            "epochs",
+            "learning_rate",
+            "min_lr",
+            "warmup_epochs",
+            "weight_decay",
+            "gradient_clip",
+            "live_sampling",
+            "model",
+            "loss",
+        ],
         "training",
-    }
-    _require_keys(config, required_top, "root")
-
-    _validate_paths(config["paths"])
-    _validate_generation(config["generation"])
-    _validate_trajectory_sampling(config["trajectory_sampling"])
-    _validate_vulcan_runtime(config["vulcan_runtime"])
-    _validate_tp_sampler(config["tp_sampler"])
-    _validate_roth_sampler(config["roth_sampler"])
-    _validate_gravity_sampler(config["gravity_sampler"])
-    _validate_kzz_sampler(config["kzz_sampler"])
-    _validate_abundance_sampler(config["abundance_sampler"])
-    _validate_data_spec(config["data_spec"])
-    _validate_normalization(config["normalization"], config["data_spec"])
-    _validate_training(config["training"])
-    _validate_physics_toggles(config["physics_toggles"])
-    _validate_boundary_conditions(
-        config.get("boundary_conditions"),
-        required=bool(config["physics_toggles"]["use_boundary_conditions"]),
     )
-    _validate_log10_convention(config)
-    _validate_cross_section_contracts(config)
-    _ = resolve_precision(config)
+    for key in ("seed", "batch_size", "epochs", "warmup_epochs"):
+        training[key] = _as_int(training[key], f"training.{key}")
+    for key in ("learning_rate", "min_lr", "weight_decay", "gradient_clip"):
+        training[key] = _as_float(training[key], f"training.{key}")
+    if training["batch_size"] < 1 or training["epochs"] < 1:
+        raise ConfigValidationError("training.batch_size and training.epochs must be >= 1.")
+    if training["learning_rate"] <= 0.0 or training["min_lr"] <= 0.0:
+        raise ConfigValidationError("Learning rates must be positive.")
+    if training["min_lr"] > training["learning_rate"]:
+        raise ConfigValidationError("training.min_lr cannot exceed training.learning_rate.")
+    if training["gradient_clip"] <= 0.0:
+        raise ConfigValidationError("training.gradient_clip must be positive.")
+
+    live = training["live_sampling"]
+    _require_keys(live, ["train_pairs_per_run_per_epoch", "eval_pairs_per_run"], "training.live_sampling")
+    live["train_pairs_per_run_per_epoch"] = _as_int(
+        live["train_pairs_per_run_per_epoch"], "training.live_sampling.train_pairs_per_run_per_epoch"
+    )
+    live["eval_pairs_per_run"] = _as_int(
+        live["eval_pairs_per_run"], "training.live_sampling.eval_pairs_per_run"
+    )
+    if live["train_pairs_per_run_per_epoch"] < 1 or live["eval_pairs_per_run"] < 1:
+        raise ConfigValidationError("live sampling budgets must be >= 1.")
+
+    model = training["model"]
+    _require_keys(
+        model,
+        [
+            "d_model",
+            "nhead",
+            "num_layers",
+            "dim_feedforward",
+            "conditioning_hidden_dim",
+            "film_clamp",
+            "output_head_divisor",
+        ],
+        "training.model",
+    )
+    for key in ("d_model", "nhead", "num_layers", "dim_feedforward", "conditioning_hidden_dim", "output_head_divisor"):
+        model[key] = _as_int(model[key], f"training.model.{key}")
+    model["film_clamp"] = _as_float(model["film_clamp"], "training.model.film_clamp")
+    if model["d_model"] < 8 or model["nhead"] < 1 or model["num_layers"] < 1:
+        raise ConfigValidationError("training.model dimensions are too small.")
+    if model["d_model"] % model["nhead"] != 0:
+        raise ConfigValidationError("training.model.d_model must be divisible by nhead.")
+    if model["dim_feedforward"] < model["d_model"]:
+        raise ConfigValidationError("dim_feedforward must be >= d_model.")
+    if model["output_head_divisor"] < 1:
+        raise ConfigValidationError("output_head_divisor must be >= 1.")
+
+    loss = training["loss"]
+    _require_keys(loss, ["lambda_z", "lambda_phys", "lambda_spectrum"], "training.loss")
+    for key in ("lambda_z", "lambda_phys", "lambda_spectrum"):
+        loss[key] = _as_float(loss[key], f"training.loss.{key}")
+        if loss[key] < 0.0:
+            raise ConfigValidationError(f"training.loss.{key} must be non-negative.")
+
+    config["data_spec"]["state_dim"] = len(state_species)
+    config["data_spec"]["target_dim"] = len(output_species)
+    config["data_spec"]["sequence_static_feature_order"] = [
+        "pressure_bar",
+        "temperature_k",
+        "kzz_cm2_s",
+    ]
+    config["data_spec"]["global_static_feature_order"] = global_static_feature_order(config)
+    config["data_spec"]["global_feature_order"] = global_feature_order(config)
+    config["data_spec"]["dt_feature_index"] = config["data_spec"]["global_feature_order"].index(
+        "log10_dt_s"
+    )
     return config

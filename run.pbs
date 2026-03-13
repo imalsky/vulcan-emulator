@@ -2,26 +2,15 @@
 #PBS -N vulcan_emulator
 #PBS -q gpu_long
 #PBS -W group_list=s2458
-#PBS -l select=1:ncpus=70:ngpus=1:mem=400gb:model=gh200
+#PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -m abe
 
-# Required in the HPC conda env used for this job:
-#   torch, numpy, scipy, h5py, tqdm
-# Required only if fastchem_vulcan/fastchem is missing and you want this script to build it:
-#   make, g++
-# Required for the current bundled VULCAN runtime:
-#   matplotlib
-# Optional VULCAN extras only if you rebuild chem_funs.py or use image utilities:
-#   sympy, Pillow
-# Current config/config.json sets training.device="cuda", and live sampling expects a GPU.
-
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
-cd "${PROJECT_ROOT}"
-export VULCAN_EMULATOR_PROJECT_ROOT="${PROJECT_ROOT}"
+cd -P "${PROJECT_ROOT}"
 
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
@@ -47,264 +36,149 @@ if [ "${rc}" -ne 0 ]; then
   exit 2
 fi
 
-export VULCAN_EMULATOR_CONDA_ENV="${CONDA_ENV}"
-
 CONFIG_PATH="${CONFIG_PATH:-config/config.json}"
-TRAIN_LOG="${TRAIN_LOG:-}"
-BUILD_FASTCHEM_IF_MISSING="${BUILD_FASTCHEM_IF_MISSING:-1}"
-RUN_MODE="${RUN_MODE:-pipeline}"
-HYPERPARAM_TRIALS="${HYPERPARAM_TRIALS:-12}"
-HYPERPARAM_TRIAL_EPOCHS="${HYPERPARAM_TRIAL_EPOCHS:-20}"
-HYPERPARAM_OVERWRITE="${HYPERPARAM_OVERWRITE:-0}"
-export RUN_MODE
-DID_STANDARD_TRAIN=0
-DID_HYPERPARAM=0
+RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
+REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
+ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
+GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
+GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
+TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
-export KMP_DUPLICATE_LIB_OK=TRUE
-export MPLBACKEND="${MPLBACKEND:-Agg}"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-${PROJECT_ROOT}/.mplconfig}"
-export PYTHONUNBUFFERED=1
-export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
-mkdir -p "${MPLCONFIGDIR}"
-
-if [ "${CONFIG_PATH#/}" != "${CONFIG_PATH}" ]; then
-  echo "ERROR: CONFIG_PATH must be relative because src/main.py rejects absolute config paths."
-  exit 1
+if [ -n "${PBS_JOBID:-}" ]; then
+  echo "PBS_JOBID: ${PBS_JOBID}"
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: No visible NVIDIA GPU in this PBS job."
+    exit 1
+  fi
 fi
+
 if [ ! -f "${CONFIG_PATH}" ]; then
   echo "ERROR: config not found: ${CONFIG_PATH}"
   exit 1
 fi
-if [ ! -f "${PROJECT_ROOT}/src/main.py" ]; then
-  echo "ERROR: src/main.py not found under ${PROJECT_ROOT}"
-  exit 1
-fi
-if [ ! -f "${PROJECT_ROOT}/src/hyperparam_testing.py" ]; then
-  echo "ERROR: src/hyperparam_testing.py not found under ${PROJECT_ROOT}"
-  exit 1
-fi
-if [ "${RUN_MODE}" != "pipeline" ] && [ "${RUN_MODE}" != "train" ] && [ "${RUN_MODE}" != "hyperparam" ]; then
-  echo "ERROR: RUN_MODE must be 'pipeline', 'train', or 'hyperparam', got: ${RUN_MODE}"
+if [ ! -d "${PROJECT_ROOT}/src" ]; then
+  echo "ERROR: source directory not found: ${PROJECT_ROOT}/src"
   exit 1
 fi
 
-mapfile -t CONFIG_INFO < <(python - "${CONFIG_PATH}" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-project_root = Path(os.path.normpath(os.environ["VULCAN_EMULATOR_PROJECT_ROOT"]))
-config_path = Path(os.path.normpath(str(project_root / sys.argv[1])))
-with config_path.open("r", encoding="utf-8") as handle:
-    config = json.load(handle)
-
-print(config_path)
-print(Path(os.path.normpath(str(project_root / config["paths"]["vulcan_source_path"]))))
-print(Path(os.path.normpath(str(project_root / config["paths"]["logs_root"]))))
-print(
-    Path(
-        os.path.normpath(
-            str(project_root / config["paths"]["models_root"] / config["training"]["output_folder"])
-        )
-    )
-)
-print(str(config["training"]["device"]).lower())
-print(Path(os.path.normpath(str(project_root / config["paths"]["models_root"] / "hyperparam_testing"))))
-PY
-)
-
-CONFIG_ABS="${CONFIG_INFO[0]}"
-VULCAN_SOURCE="${CONFIG_INFO[1]}"
-LOGS_ROOT="${CONFIG_INFO[2]}"
-RUN_DIR="${CONFIG_INFO[3]}"
-TRAIN_DEVICE="${CONFIG_INFO[4]}"
-HYPERPARAM_ROOT="${CONFIG_INFO[5]}"
-export TRAIN_DEVICE
-
-if [ -n "${VULCAN_SOURCE_OVERRIDE:-}" ]; then
-  VULCAN_SOURCE="${VULCAN_SOURCE_OVERRIDE}"
-  export VULCAN_EMULATOR_VULCAN_SOURCE="${VULCAN_SOURCE}"
-else
-  VULCAN_SOURCE="${CONFIG_INFO[1]}"
-  unset VULCAN_EMULATOR_VULCAN_SOURCE || true
-fi
-
-if [ -z "${TRAIN_LOG}" ]; then
-  TRAIN_LOG="${LOGS_ROOT}/${RUN_MODE}_${PBS_JOBID:-manual}.log"
-fi
-
-mkdir -p "${LOGS_ROOT}" "$(dirname "${TRAIN_LOG}")"
-
-echo "PBS_JOBID: ${PBS_JOBID:-manual}"
-echo "Host: $(hostname)"
-echo "Project root: ${PROJECT_ROOT}"
-echo "Config: ${CONFIG_ABS}"
-echo "VULCAN source: ${VULCAN_SOURCE}"
-if [ "${VULCAN_SOURCE}" != "${CONFIG_INFO[1]}" ]; then
-  echo "VULCAN source override active (config requested ${CONFIG_INFO[1]})"
-fi
-echo "Run mode: ${RUN_MODE}"
-echo "Training device from config: ${TRAIN_DEVICE}"
-
-if [ "${RUN_MODE}" != "hyperparam" ]; then
-  for required_path in \
-    "${VULCAN_SOURCE}" \
-    "${VULCAN_SOURCE}/vulcan.py" \
-    "${VULCAN_SOURCE}/vulcan_cfg.py" \
-    "${VULCAN_SOURCE}/chem_funs.py" \
-    "${VULCAN_SOURCE}/fastchem_vulcan"; do
-    if [ ! -e "${required_path}" ]; then
-      echo "ERROR: missing VULCAN runtime path: ${required_path}"
-      exit 1
-    fi
-  done
-  if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ] && [ "${BUILD_FASTCHEM_IF_MISSING}" = "1" ]; then
-    if ! command -v make >/dev/null 2>&1; then
-      echo "ERROR: FastChem binary is missing and 'make' is unavailable to build it."
-      exit 1
-    fi
-    echo "Stage: building FastChem in ${VULCAN_SOURCE}/fastchem_vulcan"
-    make -C "${VULCAN_SOURCE}/fastchem_vulcan"
-  fi
-  if [ ! -x "${VULCAN_SOURCE}/fastchem_vulcan/fastchem" ]; then
-    echo "ERROR: missing executable FastChem binary: ${VULCAN_SOURCE}/fastchem_vulcan/fastchem"
-    exit 1
-  fi
-fi
-if [ "${RUN_MODE}" = "hyperparam" ]; then
-  echo "Hyperparameter mode skips VULCAN/FastChem preflight."
-fi
-
+echo "Runtime preflight on host: $(hostname)"
 if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
   echo "Allocated nodes:"
   sort -u "${PBS_NODEFILE}" || true
 fi
 
-if [ "${TRAIN_DEVICE}" = "cuda" ]; then
-  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
-    echo "ERROR: training.device='cuda' but no visible NVIDIA GPU is available."
-    exit 1
-  fi
-fi
-
-if ! python - "${CONFIG_PATH}" <<'PY'
-import importlib
-import json
+if ! python - <<'PY'
 import os
 import sys
-from pathlib import Path
 
-config_path = Path(sys.argv[1])
-with config_path.open("r", encoding="utf-8") as handle:
-    config = json.load(handle)
+ok = True
+jax_backend = "unknown"
 
-required = ["torch", "numpy", "scipy", "h5py", "tqdm"]
-if os.environ.get("RUN_MODE") != "hyperparam":
-    required.append("matplotlib")
+try:
+    import jax
+    jax_backend = str(jax.default_backend()).lower()
+    print(f"jax={jax.__version__} backend={jax_backend}")
+    print(f"jax devices: {jax.devices()}")
+except Exception as exc:
+    print(f"jax import error: {exc!r}")
+    ok = False
 
-missing: list[str] = []
-for name in required:
+for module_name in ("numpy", "h5py", "scipy"):
     try:
-        module = importlib.import_module(name)
-        version = getattr(module, "__version__", "unknown")
-        print(f"{name}=={version}")
-    except Exception as exc:  # pragma: no cover - batch preflight only
-        missing.append(f"{name}: {exc}")
+        module = __import__(module_name)
+        print(f"{module_name}={module.__version__}")
+    except Exception as exc:
+        print(f"{module_name} import error: {exc!r}")
+        ok = False
 
-if missing:
-    print("Missing required Python packages for vulcan-emulator:", file=sys.stderr)
-    for item in missing:
-        print(f"  - {item}", file=sys.stderr)
-    raise SystemExit(1)
+if os.environ.get("REQUIRE_JAX_GPU", "0") == "1" and jax_backend not in {"gpu", "cuda", "rocm", "metal"}:
+    print(f"ERROR: REQUIRE_JAX_GPU=1 but jax backend is '{jax_backend}'", file=sys.stderr)
+    ok = False
 
-import torch
-
-if os.environ.get("TRAIN_DEVICE") == "cuda" and not torch.cuda.is_available():
-    print(
-        "training.device='cuda' requested but torch.cuda.is_available() is False.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
+print(f"python executable: {sys.executable}")
+raise SystemExit(0 if ok else 1)
 PY
 then
-  echo "ERROR: Python runtime preflight failed."
+  echo "ERROR: runtime preflight failed."
   exit 1
 fi
 
-ensure_optuna() {
-  if ! python - <<'PY'
-import optuna
-print(optuna.__version__)
-PY
-  then
-    echo "Stage: installing optuna"
-    python -m pip install --user optuna
-    python - <<'PY'
-import optuna
-print(optuna.__version__)
-PY
+GPU_MONITOR_PID=""
+if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
+  : > "${GPU_MONITOR_LOG}"
+  (
+    while true; do
+      {
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+        nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+        nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true
+      } >> "${GPU_MONITOR_LOG}" 2>&1
+      sleep "${GPU_MONITOR_INTERVAL_SEC}"
+    done
+  ) &
+  GPU_MONITOR_PID=$!
+  echo "GPU monitor enabled: ${GPU_MONITOR_LOG} (pid=${GPU_MONITOR_PID})"
+fi
+
+cleanup() {
+  if [ -n "${GPU_MONITOR_PID}" ]; then
+    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
   fi
 }
+trap cleanup EXIT
 
-run_hyperparam_search() {
-  echo "Hyperparameter search settings:"
-  echo "  trials: ${HYPERPARAM_TRIALS}"
-  echo "  trial epochs: ${HYPERPARAM_TRIAL_EPOCHS}"
-  echo "  overwrite: ${HYPERPARAM_OVERWRITE}"
-  echo "  output root: ${HYPERPARAM_ROOT}"
+mkdir -p "$(dirname "${TRAIN_LOG}")"
+: > "${TRAIN_LOG}"
 
-  HYPERPARAM_ARGS=(
-    --config "${CONFIG_PATH}"
-    --trials "${HYPERPARAM_TRIALS}"
-    --trial-epochs "${HYPERPARAM_TRIAL_EPOCHS}"
+echo "Stage: dataset generation check (RUN_GEN_IF_MISSING=${RUN_GEN_IF_MISSING})"
+if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
+  mapfile -t DATA_CFG < <(python - "${CONFIG_PATH}" <<'PY'
+from pathlib import Path
+import sys
+from src.config_utils import load_and_validate_config
+from src.path_utils import resolve_path
+
+config_path = Path(sys.argv[1]).resolve()
+cfg = load_and_validate_config(config_path)
+project_root = Path.cwd()
+print(resolve_path(cfg["paths"]["raw_root"], project_root) / "runs")
+print(int(cfg["generation"]["num_runs"]))
+PY
   )
-  if [ "${HYPERPARAM_OVERWRITE}" = "1" ]; then
-    HYPERPARAM_ARGS+=(--overwrite)
+  RAW_RUN_DIR="${DATA_CFG[0]}"
+  EXPECTED_RUNS="${DATA_CFG[1]}"
+  RUN_COUNT=0
+  if [ -d "${RAW_RUN_DIR}" ]; then
+    RUN_COUNT="$(find "${RAW_RUN_DIR}" -maxdepth 1 -type f -name 'run_*.h5' | wc -l | tr -d ' ')"
   fi
-  ensure_optuna
-  DID_HYPERPARAM=1
-  python -u src/hyperparam_testing.py "${HYPERPARAM_ARGS[@]}" 2>&1 | tee -a "${TRAIN_LOG}"
-}
-
-if [ "${RUN_MODE}" = "pipeline" ]; then
-  echo "Execution control:"
-  echo "  Default: regenerate data, then run standard training."
-  echo "  Hyperparameter search wiring is left in place below but disabled by default."
-  echo "Training log file: ${TRAIN_LOG}"
-  : > "${TRAIN_LOG}"
-
-  # Comment out this line if you want to skip generation.
-  python -u src/main.py --gen --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
-
-  # Uncomment this line to run hyperparameter search instead of standard training.
-  # run_hyperparam_search
-
-  # Standard full run on the regenerated data.
-  DID_STANDARD_TRAIN=1
-  python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
-elif [ "${RUN_MODE}" = "train" ]; then
-  echo "Execution control:"
-  echo "  Standard training-only mode."
-  echo "Training log file: ${TRAIN_LOG}"
-  : > "${TRAIN_LOG}"
-  DID_STANDARD_TRAIN=1
-  python -u src/main.py --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
-else
-  echo "Execution control:"
-  echo "  Hyperparameter-search-only mode."
-  echo "Training log file: ${TRAIN_LOG}"
-  : > "${TRAIN_LOG}"
-  run_hyperparam_search
+  if [ "${RUN_COUNT}" -eq 0 ]; then
+    echo "Stage: generating raw runs"
+    python -u -m src.main --config "${CONFIG_PATH}" gen 2>&1 | tee -a "${TRAIN_LOG}"
+  elif [ "${RUN_COUNT}" -ne "${EXPECTED_RUNS}" ]; then
+    echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} files in ${RAW_RUN_DIR}, expected ${EXPECTED_RUNS}."
+    echo "Set generation.overwrite=true and regenerate, or align generation.num_runs with the existing dataset."
+    exit 1
+  else
+    echo "Stage: raw dataset already present (${RUN_COUNT} runs), skipping generation"
+  fi
 fi
 
-echo "Completed successfully."
-if [ "${DID_STANDARD_TRAIN}" = "1" ] && [ -f "${RUN_DIR}/best.pt" ]; then
-  echo "Best checkpoint: ${RUN_DIR}/best.pt"
-fi
-if [ "${DID_HYPERPARAM}" = "1" ] && [ -f "${HYPERPARAM_ROOT}/best_model/best.pt" ]; then
-  echo "Best checkpoint: ${HYPERPARAM_ROOT}/best_model/best.pt"
-fi
+echo "Stage: preprocessing"
+python -u -m src.main --config "${CONFIG_PATH}" preprocess 2>&1 | tee -a "${TRAIN_LOG}"
+
+echo "Stage: training"
+echo "Training log file: ${TRAIN_LOG}"
+python -u -m src.main --config "${CONFIG_PATH}" train 2>&1 | tee -a "${TRAIN_LOG}"
+
+echo "Done. Artifacts written under the configured models/ directory."

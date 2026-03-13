@@ -1,128 +1,111 @@
-# Config Reference
+# Config reference
 
-Short reference for the current `config/config.json` schema. For the full
-pipeline contract, see [`spec.md`](../spec.md).
+The shipped config is:
 
-## `trajectory_sampling`
+- `config.json`: VULCAN-oriented photochemical configuration for
+  WASP-39b-like use with the Frances stellar spectrum and the sulfur-enabled 2025
+  SNCHO network
 
-This section now defines the valid transition-candidate space only.
+Important sections:
 
-Required keys:
+## `data_spec`
 
-- `mode`
-- `dt_min_s`
-- `dt_max_s`
-- `min_future_saved_steps`
+- `state_species`: ordered input/output chemistry basis
+- `output_species`: usually the same as `state_species`
+- `required_global_inputs`: ordered list used to build the global conditioning vector
 
-Notes:
+## `physics_toggles`
 
-- `mode` must be `"log_uniform_all_pairs"`
-- `pairs_per_run` is no longer a valid config key
-- rollout/autoregressive config knobs are not part of the current contract
+Boolean toggles that are both persisted into raw runs and injected into the surrogate
+conditioning vector. `use_photochemistry` is expected to be `true` for the main use case.
+
+## `vulcan_runtime`
+
+Settings for an external VULCAN checkout:
+
+- `python_executable`
+- `cfg_file`
+- `chemistry_file`
+- `worker_root`
+- `regenerate_chem_funs`
+- `atm_base`
+- `t_cross_sp`
+- `cfg_assignments`
+
+The VULCAN-backed workflow is strict: if the configured checkout or chemistry file is
+missing, generation fails instead of silently falling back to synthetic data. The
+configured stellar spectrum file is also required; no analytic spectrum fallback is used.
+`t_cross_sp` should only include species supported by the target VULCAN checkout.
+
+For smoke tests or local debugging, switch `generation.mode` from `"vulcan"` to
+`"synthetic"` in the same config.
+
+## `sampling`
+
+Controls the pressure grid, T profile, Kzz profile, time sampling, and the scalar
+parameter space that the raw-run generator covers. The shipped WASP-39b config uses a
+Latin-hypercube design over gravity, metallicity, and C/O so the sampled dataset spans
+the configured envelope instead of clustering randomly.
+
+For now Kzz is configured as a single constant profile value:
+
+- `kzz_cm2_s`: positive scalar eddy-diffusion coefficient applied at every pressure level
+
+## `stellar_spectrum`
+
+Controls the fixed spectrum grid and the internal spectrum encoder:
+
+- `template_file`
+- `num_bins`
+- `wavelength_min_nm`
+- `wavelength_max_nm`
+- `encoder_mode`: `"autoencoder"`, `"linear"`, or `"none"`
+- `latent_dim`
+- `hidden_dim`
+- `zenith_angle_deg`
+- `diurnal_factor`
+
+`template_file` should point to a VULCAN-format stellar surface-flux file. The default
+WASP-39b config uses `../VULCAN-master/atm/stellar_flux/sflux-wasp39-frances.txt`.
 
 ## `generation`
 
-Notes:
+- `num_runs`
+- `overwrite`
+- `reuse_raw_if_present`
+- `parallel_workers`
 
-- `shard_size` is no longer a valid config key because processed pair shards were removed
-- `failure_policy` is no longer a valid config key; `--gen` always drops failed VULCAN runs when any usable runs survive
-- `max_trajectory_snapshots` must be `0` or `>= 2`; `0` means no cap
+Generation writes `generation_manifest.json` and `sampling_coverage.json` under
+`paths.raw_root` so the realized parameter-space coverage is auditable.
 
-## `roth_sampler`
+## `trajectory_sampling`
 
-This section adds Roth GCM PT columns as an additive TP source during `--gen`.
+Defines valid `(anchor, target)` transitions using realized dt and minimum saved-step gaps.
 
-Required keys:
+- `dt_min_s`
+- `dt_max_s`
+- `min_future_saved_steps`
+- `num_logdt_bins`
 
-- `enabled`
-- `num_profiles`
-- `data_glob`
-- `source_globals_mode`
-- `filters`
-- `column_filters`
-- `interpolation`
+Train and eval row selection both use weighted, stratified sampling across these
+`log10_dt_s` bins.
 
-Notes:
+## `inference.equilibrium_anchor`
 
-- `source_globals_mode` must currently be `"pt_only"`
-- `filters` are allow-lists, not ranges
-- deleting one value from a filter list excludes that Roth subset
-- `roth/roth-grid/` is local data and is git-ignored
+Controls the anchor state used by `PhysicalSpaceStandaloneModel.equilibrium()`.
+
+- `source`: `"trajectory"` or `"flat"`
+- `split`: processed split to read when `source = "trajectory"`
+- `run_id`: optional processed run ID; defaults to the first run in the chosen split
+- `step_index`: saved-step index; defaults to `0`, so equilibrium inference grabs the
+  first trajectory profile and otherwise snaps to the closest valid saved step in that run
+
+If the processed split is unavailable at inference time, `"trajectory"` falls back to the
+flat H2/He anchor.
 
 ## `training.live_sampling`
-
-This section controls live pair sampling during training and fixed eval-pair
-selection during validation/test.
-
-Required keys:
 
 - `train_pairs_per_run_per_epoch`
 - `eval_pairs_per_run`
 
-Notes:
-
-- train pairs are resampled every epoch
-- val/test pairs are sampled once deterministically from `training.seed`
-- changing these budgets does not require rerunning `--gen`
-
-## `training`
-
-Relevant current keys:
-
-- `device`
-- `batch_size`
-- `epochs`
-- `learning_rate`
-- `min_lr`
-- `warmup_epochs`
-- `weight_decay`
-- `gradient_clip`
-- `use_amp`
-- `seed`
-- `live_sampling`
-- `model`
-- `loss`
-- `output_folder`
-
-Notes:
-
-- `device` must be `"cuda"`
-- `gpu_preload`, `num_workers`, and `training.data_loading` are legacy keys and are rejected
-- `training.model.dropout` must be within `[0, 1]`
-- `training.loss` is required and must define exactly `lambda_z` and `lambda_phys`
-- `training.loss.lambda_z` and `training.loss.lambda_phys` must be `>= 0`
-
-## `normalization`
-
-Notes:
-
-- `normalization.sequence_methods.anchor_ymix` must be `"log-standard"`
-- `normalization.target_method` must be `"log-standard"`
-
-## Processed Data
-
-`--gen` writes normalized trajectory splits under `data/processed`:
-
-- `static_inputs.npy`
-- `state_ymix.npy`
-- `global_inputs.npy`
-- `time_s.npy`
-- `valid_steps_mask.npy`
-- `run_ids.npy`
-- `metadata.json`
-
-There are no processed pair shards anymore.
-
-## Provenance
-
-Processed-data provenance depends on:
-
-- raw run files
-- split assignments
-- normalization metadata
-- candidate-validity config
-
-Processed-data provenance does not depend on:
-
-- `training.live_sampling.train_pairs_per_run_per_epoch`
-- `training.live_sampling.eval_pairs_per_run`
+These affect training and evaluation behavior but do not change the processed tensors.
