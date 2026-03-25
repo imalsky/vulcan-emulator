@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .config_utils import static_conditioning_defaults
+from .config_utils import is_equilibrium, static_conditioning_defaults
 from .roth_sampling import load_roth_profiles
 from .spectrum import (
     SpectrumRecord,
@@ -29,12 +29,12 @@ class RunSpecification:
     run_id: str
     pressure_bar: np.ndarray
     temperature_k: np.ndarray
-    kzz_cm2_s: np.ndarray
-    initial_ymix: np.ndarray
-    time_s: np.ndarray
     globals: dict[str, float]
-    spectrum: SpectrumRecord
     metadata: dict[str, Any]
+    kzz_cm2_s: np.ndarray | None = None
+    initial_ymix: np.ndarray | None = None
+    time_s: np.ndarray | None = None
+    spectrum: SpectrumRecord | None = None
 
 
 def sample_pressure_grid(
@@ -257,21 +257,36 @@ def sample_run_specifications(
     project_root: Path,
     num_runs: int | None = None,
     seed: int | None = None,
+    include_initial_ymix: bool = True,
+    include_time_grid: bool = True,
 ) -> list[RunSpecification]:
     """Sample the atmospheric configurations used to generate raw runs."""
     rng = np.random.default_rng(
         int(config["generation"]["seed"] if seed is None else seed)
     )
     total_runs = int(config["generation"]["num_runs"] if num_runs is None else num_runs)
-    design = _latin_hypercube_unit_samples(
-        num_samples=total_runs,
-        num_dimensions=3,
-        rng=rng,
-    )
-    spectra = load_default_spectra(project_root=project_root, config=config)
-    if not spectra:
-        raise RuntimeError("No stellar spectra available for sampling.")
-    spectrum_names = sorted(spectra.keys())
+    equilibrium = is_equilibrium(config)
+
+    if equilibrium:
+        # LHC over (metallicity, C/O, S/O) — 3 dimensions, no gravity.
+        design = _latin_hypercube_unit_samples(
+            num_samples=total_runs, num_dimensions=3, rng=rng,
+        )
+    else:
+        # LHC over (gravity, metallicity, C/O, S/O) — 4 dimensions.
+        design = _latin_hypercube_unit_samples(
+            num_samples=total_runs, num_dimensions=4, rng=rng,
+        )
+
+    # Spectrum loading only needed for transition models.
+    spectra: dict[str, SpectrumRecord] | None = None
+    spectrum_names: list[str] | None = None
+    if not equilibrium:
+        spectra = load_default_spectra(project_root=project_root, config=config)
+        if not spectra:
+            raise RuntimeError("No stellar spectra available for sampling.")
+        spectrum_names = sorted(spectra.keys())
+
     pressure_bar = sample_pressure_grid(
         num_levels=int(config["sampling"]["num_levels"]),
         pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
@@ -280,52 +295,97 @@ def sample_run_specifications(
     result: list[RunSpecification] = []
     physics_defaults = static_conditioning_defaults(config)
     for run_idx in range(total_runs):
-        gravity = _scale_unit_interval(
-            design[run_idx, 0],
-            *[float(x) for x in config["sampling"]["gravity_range_cm_s2"]],
-        )
-        metallicity = _scale_unit_interval(
-            design[run_idx, 1],
-            *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
-        )
-        c_to_o = _scale_unit_interval(
-            design[run_idx, 2],
-            *[float(x) for x in config["sampling"]["c_to_o_range"]],
-        )
-        temperature_k = sample_temperature_profile(pressure_bar, config=config, rng=rng)
-        kzz = sample_kzz_profile(pressure_bar, config=config, rng=rng)
-        spectrum_name = spectrum_names[int(rng.integers(0, len(spectrum_names)))]
-        template = spectra[spectrum_name]
-        spectrum = SpectrumRecord(
-            name=f"{template.name}_run{run_idx:05d}",
-            wavelength_nm=np.asarray(template.wavelength_nm, dtype=np.float64),
-            flux_erg_cm2_s_nm=np.asarray(template.flux_erg_cm2_s_nm, dtype=np.float64),
-            metadata={**template.metadata, "template_name": template.name},
-        )
-        initial_ymix = sample_initial_ymix(
-            pressure_bar,
-            config=config,
-            rng=rng,
-            metallicity_log10=metallicity,
-            c_to_o=c_to_o,
-        )
-        globals_map = {
-            "gravity_cm_s2": float(gravity),
-            "metallicity_log10": float(metallicity),
-            "c_to_o": float(c_to_o),
-            **{key: float(value) for key, value in physics_defaults.items()},
-        }
-        result.append(
-            RunSpecification(
-                run_id=f"run_{run_idx:05d}",
-                pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
-                temperature_k=np.asarray(temperature_k, dtype=np.float64),
-                kzz_cm2_s=np.asarray(kzz, dtype=np.float64),
-                initial_ymix=np.asarray(initial_ymix, dtype=np.float64),
-                time_s=sample_time_grid(config=config, rng=rng),
-                globals=globals_map,
-                spectrum=spectrum,
-                metadata={"spectrum_name": spectrum.name},
+        if equilibrium:
+            metallicity = _scale_unit_interval(
+                design[run_idx, 0],
+                *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
             )
-        )
+            c_to_o = _scale_unit_interval(
+                design[run_idx, 1],
+                *[float(x) for x in config["sampling"]["c_to_o_range"]],
+            )
+            s_to_o = _scale_unit_interval(
+                design[run_idx, 2],
+                *[float(x) for x in config["sampling"]["s_to_o_range"]],
+            )
+        else:
+            gravity = _scale_unit_interval(
+                design[run_idx, 0],
+                *[float(x) for x in config["sampling"]["gravity_range_cm_s2"]],
+            )
+            metallicity = _scale_unit_interval(
+                design[run_idx, 1],
+                *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
+            )
+            c_to_o = _scale_unit_interval(
+                design[run_idx, 2],
+                *[float(x) for x in config["sampling"]["c_to_o_range"]],
+            )
+            s_to_o = _scale_unit_interval(
+                design[run_idx, 3],
+                *[float(x) for x in config["sampling"]["s_to_o_range"]],
+            )
+
+        temperature_k = sample_temperature_profile(pressure_bar, config=config, rng=rng)
+
+        if equilibrium:
+            globals_map: dict[str, float] = {
+                "metallicity_log10": float(metallicity),
+                "c_to_o": float(c_to_o),
+                "s_to_o": float(s_to_o),
+            }
+            result.append(
+                RunSpecification(
+                    run_id=f"run_{run_idx:05d}",
+                    pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
+                    temperature_k=np.asarray(temperature_k, dtype=np.float64),
+                    globals=globals_map,
+                    metadata={},
+                )
+            )
+        else:
+            kzz = sample_kzz_profile(pressure_bar, config=config, rng=rng)
+            assert spectra is not None and spectrum_names is not None
+            spectrum_name = spectrum_names[int(rng.integers(0, len(spectrum_names)))]
+            template = spectra[spectrum_name]
+            spectrum = SpectrumRecord(
+                name=f"{template.name}_run{run_idx:05d}",
+                wavelength_nm=np.asarray(template.wavelength_nm, dtype=np.float64),
+                flux_erg_cm2_s_nm=np.asarray(template.flux_erg_cm2_s_nm, dtype=np.float64),
+                metadata={**template.metadata, "template_name": template.name},
+            )
+            if include_initial_ymix:
+                initial_ymix = sample_initial_ymix(
+                    pressure_bar,
+                    config=config,
+                    rng=rng,
+                    metallicity_log10=metallicity,
+                    c_to_o=c_to_o,
+                )
+            else:
+                initial_ymix = np.empty((0, 0), dtype=np.float64)
+            if include_time_grid:
+                time_s = sample_time_grid(config=config, rng=rng)
+            else:
+                time_s = np.empty((0,), dtype=np.float64)
+            globals_map = {
+                "gravity_cm_s2": float(gravity),
+                "metallicity_log10": float(metallicity),
+                "c_to_o": float(c_to_o),
+                "s_to_o": float(s_to_o),
+                **{key: float(value) for key, value in physics_defaults.items()},
+            }
+            result.append(
+                RunSpecification(
+                    run_id=f"run_{run_idx:05d}",
+                    pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
+                    temperature_k=np.asarray(temperature_k, dtype=np.float64),
+                    globals=globals_map,
+                    metadata={"spectrum_name": spectrum.name},
+                    kzz_cm2_s=np.asarray(kzz, dtype=np.float64),
+                    initial_ymix=np.asarray(initial_ymix, dtype=np.float64),
+                    time_s=np.asarray(time_s, dtype=np.float64),
+                    spectrum=spectrum,
+                )
+            )
     return result

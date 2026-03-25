@@ -70,6 +70,8 @@ WASP-39b config uses `../VULCAN-master/atm/stellar_flux/sflux-wasp39-frances.txt
 
 ## `generation`
 
+- `mode`: `"synthetic"` or `"vulcan"` source generation
+- `target_mode`: `"equilibrium_only"` or `"trajectory"` supervision target
 - `num_runs`
 - `overwrite`
 - `reuse_raw_if_present`
@@ -77,6 +79,13 @@ WASP-39b config uses `../VULCAN-master/atm/stellar_flux/sflux-wasp39-frances.txt
 
 Generation writes `generation_manifest.json` and `sampling_coverage.json` under
 `paths.raw_root` so the realized parameter-space coverage is auditable.
+
+`target_mode = "equilibrium_only"` keeps the same surrogate architecture and public API,
+but trains on a two-step shell from a flat H2/He anchor to the exact FastChem
+equilibrium profile. When `generation.mode = "vulcan"`, this path skips `vulcan.py`
+entirely, copies only the FastChem runtime subset, and runs FastChem directly on the
+sampled P-T profile and elemental abundances. `target_mode = "trajectory"` keeps the
+full transition-learning path and prepends the exact FastChem state at `t = 0`.
 
 ## `trajectory_sampling`
 
@@ -99,6 +108,10 @@ Controls the anchor state used by `PhysicalSpaceStandaloneModel.equilibrium()`.
 - `run_id`: optional processed run ID; defaults to the first run in the chosen split
 - `step_index`: saved-step index; defaults to `0`, so equilibrium inference grabs the
   first trajectory profile and otherwise snaps to the closest valid saved step in that run
+
+When `generation.target_mode = "equilibrium_only"`, the default anchor source is
+`"flat"`. When `generation.target_mode = "trajectory"`, the default source is
+`"trajectory"`.
 
 If the processed split is unavailable at inference time, `"trajectory"` falls back to the
 flat H2/He anchor.

@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from src.config_utils import effective_transition_sampling
 from src.data_loader import build_batch_from_rows, load_processed_dataset
 from src.export_jax import load_export_bundle
 from src.inference import load_physical_space_model
@@ -22,12 +23,13 @@ def _prepare_batch(tiny_config):
     preprocess_raw_dataset(tiny_config, project_root=tiny_config["_project_root"])
     splits, normalization, contract = load_processed_dataset(tiny_config["paths"]["processed_root"])
     train = splits["train"]
+    transition_sampling = effective_transition_sampling(tiny_config)
     candidate_table = build_candidate_table(
         train.time_s,
         train.valid_steps_mask,
-        dt_min_s=float(tiny_config["trajectory_sampling"]["dt_min_s"]),
-        dt_max_s=float(tiny_config["trajectory_sampling"]["dt_max_s"]),
-        min_future_saved_steps=int(tiny_config["trajectory_sampling"]["min_future_saved_steps"]),
+        dt_min_s=float(transition_sampling["dt_min_s"]),
+        dt_max_s=float(transition_sampling["dt_max_s"]),
+        min_future_saved_steps=int(transition_sampling["min_future_saved_steps"]),
         log10_dt_stats={
             "mean": float(normalization["log10_dt_s"]["mean"][0]),
             "std": float(normalization["log10_dt_s"]["std"][0]),

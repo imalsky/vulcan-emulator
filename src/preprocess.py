@@ -8,13 +8,17 @@ from typing import Any
 import h5py
 import numpy as np
 
-from .config_utils import resolve_conditioning_inputs
+from .config_utils import (
+    effective_transition_sampling,
+    is_equilibrium,
+    resolve_conditioning_inputs,
+)
 from .path_utils import ensure_dir, resolve_path
 from .provenance import fingerprint_payload, manifest_for_files
 from .spectrum import SpectrumRecord, fixed_wavelength_grid, resample_spectrum
 from .transition_sampling import fit_log10_dt_normalization
 
-PROCESSED_DATA_VERSION = 3
+PROCESSED_DATA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -26,10 +30,22 @@ class RawRun:
     time_s: np.ndarray
     ymix_state: np.ndarray
     ymix_output: np.ndarray
+    reference_ymix_state: np.ndarray
+    target_mode: str
     globals: dict[str, float]
     spectrum_name: str
     spectrum_wavelength_nm: np.ndarray
     spectrum_flux_erg_cm2_s_nm: np.ndarray
+
+
+@dataclass(frozen=True)
+class RawEquilibriumRun:
+    """Simplified raw run for equilibrium-only models (no trajectory/spectrum)."""
+    run_id: str
+    pressure_bar: np.ndarray
+    temperature_k: np.ndarray
+    equilibrium_ymix: np.ndarray
+    globals: dict[str, float]
 
 
 def _decode_species(values: np.ndarray) -> list[str]:
@@ -208,6 +224,8 @@ def load_raw_run(
         kzz_cm2_s = np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64)
         stored_state_species = _decode_species(np.asarray(handle["inputs/state_species"]))
         stored_output_species = _decode_species(np.asarray(handle["inputs/output_species"]))
+        reference_ymix_state = np.asarray(handle["inputs/reference_ymix_state"], dtype=np.float64)
+        target_mode = handle["inputs/target_mode"][()].decode("utf-8")
         time_s = np.asarray(handle["trajectory/time_s"], dtype=np.float64)
         ymix_state = np.asarray(handle["trajectory/ymix_state"], dtype=np.float64)
         ymix_output = np.asarray(handle["trajectory/ymix_output"], dtype=np.float64)
@@ -231,11 +249,14 @@ def load_raw_run(
         raise ValueError(f"{raw_file}: ymix_state time dimension does not match time_s.")
     if ymix_output.shape[0] != time_s.size:
         raise ValueError(f"{raw_file}: ymix_output time dimension does not match time_s.")
+    if reference_ymix_state.shape[0] != pressure_bar.size:
+        raise ValueError(f"{raw_file}: reference_ymix_state vertical dimension does not match pressure grid.")
 
     state_indices = [stored_state_species.index(name) for name in requested_state_species]
     output_indices = [stored_output_species.index(name) for name in requested_output_species]
     ymix_state = ymix_state[..., state_indices]
     ymix_output = ymix_output[..., output_indices]
+    reference_ymix_state = reference_ymix_state[..., state_indices]
     resampled_spectrum = resample_spectrum(
         SpectrumRecord(
             name=spectrum_name,
@@ -252,6 +273,8 @@ def load_raw_run(
         time_s=time_s,
         ymix_state=ymix_state,
         ymix_output=ymix_output,
+        reference_ymix_state=reference_ymix_state,
+        target_mode=target_mode,
         globals=globals_map,
         spectrum_name=spectrum_name,
         spectrum_wavelength_nm=np.asarray(spectrum_grid_nm, dtype=np.float64),
@@ -326,6 +349,7 @@ def _normalization_payload(
         ],
         axis=0,
     )
+    transition_sampling = effective_transition_sampling(config)
 
     dt_stats = fit_log10_dt_normalization(
         time_s=np.stack(
@@ -339,9 +363,9 @@ def _normalization_payload(
             ],
             axis=0,
         ),
-        dt_min_s=float(config["trajectory_sampling"]["dt_min_s"]),
-        dt_max_s=float(config["trajectory_sampling"]["dt_max_s"]),
-        min_future_saved_steps=int(config["trajectory_sampling"]["min_future_saved_steps"]),
+        dt_min_s=float(transition_sampling["dt_min_s"]),
+        dt_max_s=float(transition_sampling["dt_max_s"]),
+        min_future_saved_steps=int(transition_sampling["min_future_saved_steps"]),
     )
 
     sequence_methods = config["normalization"]["sequence_methods"]
@@ -378,12 +402,202 @@ def _apply_sequence_static_normalization(x: np.ndarray, payload: dict[str, Any])
     return np.concatenate(parts, axis=-1)
 
 
+def load_raw_equilibrium_run(
+    raw_file: str | Path,
+    *,
+    config: dict[str, Any],
+) -> RawEquilibriumRun:
+    """Load one raw equilibrium HDF5 run."""
+    requested_output_species = list(config["data_spec"]["output_species"])
+    with h5py.File(raw_file, "r") as handle:
+        pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
+        temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
+        stored_output_species = _decode_species(np.asarray(handle["inputs/output_species"]))
+        equilibrium_ymix = np.asarray(handle["equilibrium/ymix"], dtype=np.float64)
+        globals_map = {
+            key: float(np.asarray(handle[f"globals/{key}"]))
+            for key in handle["globals"].keys()
+        }
+    if not np.all(np.isfinite(pressure_bar)):
+        raise ValueError(f"{raw_file}: non-finite pressure values detected.")
+    if not np.all(np.isfinite(temperature_k)):
+        raise ValueError(f"{raw_file}: non-finite temperature values detected.")
+    output_indices = [stored_output_species.index(name) for name in requested_output_species]
+    equilibrium_ymix = equilibrium_ymix[:, output_indices]
+    return RawEquilibriumRun(
+        run_id=Path(raw_file).stem,
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        equilibrium_ymix=equilibrium_ymix,
+        globals=globals_map,
+    )
+
+
+def _equilibrium_normalization_payload(
+    train_runs: list[RawEquilibriumRun],
+    *,
+    config: dict[str, Any],
+    global_static_order: list[str],
+) -> dict[str, Any]:
+    """Fit normalization statistics for the equilibrium model."""
+    state_floor = float(config["normalization"]["state_floor"])
+    sequence_methods = config["normalization"]["sequence_methods"]
+
+    sequence_static = np.concatenate(
+        [np.stack([run.pressure_bar, run.temperature_k], axis=-1) for run in train_runs],
+        axis=0,
+    )
+    target_values = np.concatenate(
+        [run.equilibrium_ymix for run in train_runs],
+        axis=0,
+    )
+    global_static = np.stack(
+        [
+            np.array([run.globals[name] for name in global_static_order], dtype=np.float64)
+            for run in train_runs
+        ],
+        axis=0,
+    )
+
+    feature_names = list(sequence_methods.keys())
+    sequence_blocks = []
+    for i, name in enumerate(feature_names):
+        method = sequence_methods[name]
+        feature = sequence_static[:, i : i + 1]
+        if method == "standard":
+            sequence_blocks.append(_fit_standard(feature))
+        elif method == "log-standard":
+            sequence_blocks.append(_fit_log_standard(feature, floor=1.0e-30))
+        elif method == "none":
+            sequence_blocks.append(_fit_none(feature))
+        else:
+            raise ValueError(f"Unsupported sequence normalization method: {method}")
+
+    return {
+        "sequence_static": {
+            "feature_order": feature_names,
+            "blocks": sequence_blocks,
+        },
+        "target": _fit_log_standard(target_values, floor=state_floor),
+        "global_static": _fit_mixed_block(global_static, _global_methods(global_static_order)),
+    }
+
+
+def preprocess_equilibrium_dataset(
+    config: dict[str, Any],
+    *,
+    project_root: Path,
+) -> dict[str, Any]:
+    """Convert raw equilibrium runs into training tensors (no trajectory/spectrum)."""
+    raw_root = resolve_path(config["paths"]["raw_root"], project_root)
+    processed_root = resolve_path(config["paths"]["processed_root"], project_root)
+    ensure_dir(processed_root)
+    raw_run_files = sorted((raw_root / "runs").glob("run_*.h5"))
+    if not raw_run_files:
+        raise FileNotFoundError(f"No raw run files found under {raw_root / 'runs'}.")
+
+    raw_runs = [load_raw_equilibrium_run(path, config=config) for path in raw_run_files]
+    split_indices = _split_indices(len(raw_runs), config=config)
+    train_runs = [raw_runs[i] for i in split_indices["train"]]
+    global_static_order = list(config["data_spec"]["global_static_feature_order"])
+    normalization = _equilibrium_normalization_payload(
+        train_runs, config=config, global_static_order=global_static_order,
+    )
+    sequence_feature_order = list(config["data_spec"]["sequence_static_feature_order"])
+
+    for split_name, indices in split_indices.items():
+        split_dir = ensure_dir(processed_root / split_name)
+        runs = [raw_runs[i] for i in indices]
+        nz = runs[0].pressure_bar.size
+        target_dim = runs[0].equilibrium_ymix.shape[-1]
+        n_seq_features = len(sequence_feature_order)
+
+        sequence_inputs = np.zeros((len(runs), nz, n_seq_features), dtype=np.float32)
+        target_outputs = np.zeros((len(runs), nz, target_dim), dtype=np.float32)
+        global_inputs = np.zeros((len(runs), len(global_static_order)), dtype=np.float32)
+        run_ids: list[str] = []
+
+        for idx, run in enumerate(runs):
+            static = np.stack([run.pressure_bar, run.temperature_k], axis=-1)
+            sequence_inputs[idx] = _apply_sequence_static_normalization(
+                static, normalization["sequence_static"]
+            ).astype(np.float32)
+            target_outputs[idx] = apply_block(
+                run.equilibrium_ymix, normalization["target"]
+            ).astype(np.float32)
+            global_vector = np.array(
+                [run.globals[name] for name in global_static_order], dtype=np.float64,
+            )
+            global_inputs[idx] = apply_mixed_block(
+                global_vector[None, :], normalization["global_static"]
+            )[0].astype(np.float32)
+            run_ids.append(run.run_id)
+
+        metadata = {
+            "processed_data_version": PROCESSED_DATA_VERSION,
+            "model_type": "equilibrium",
+            "split": split_name,
+            "num_runs": len(runs),
+            "num_levels": nz,
+            "sequence_feature_order": sequence_feature_order,
+            "output_species_order": list(config["data_spec"]["output_species"]),
+            "global_static_feature_order": global_static_order,
+        }
+        np.save(split_dir / "sequence_inputs.npy", sequence_inputs)
+        np.save(split_dir / "target_outputs.npy", target_outputs)
+        np.save(split_dir / "global_inputs.npy", global_inputs)
+        (split_dir / "run_ids.json").write_text(
+            json.dumps(run_ids, indent=2) + "\n", encoding="utf-8",
+        )
+        (split_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8",
+        )
+
+    data_contract = {
+        "processed_data_version": PROCESSED_DATA_VERSION,
+        "model_type": "equilibrium",
+        "state_species_order": list(config["data_spec"]["state_species"]),
+        "output_species_order": list(config["data_spec"]["output_species"]),
+        "sequence_static_feature_order": sequence_feature_order,
+        "global_static_feature_order": global_static_order,
+        "sequence_dim": n_seq_features,
+        "target_dim": len(config["data_spec"]["output_species"]),
+        "global_dim": len(global_static_order),
+    }
+    (processed_root / "normalization.json").write_text(
+        json.dumps(normalization, indent=2) + "\n", encoding="utf-8",
+    )
+    (processed_root / "data_contract.json").write_text(
+        json.dumps(data_contract, indent=2) + "\n", encoding="utf-8",
+    )
+    (processed_root / "splits.json").write_text(
+        json.dumps(split_indices, indent=2) + "\n", encoding="utf-8",
+    )
+    processed_manifest = {
+        "raw_files": manifest_for_files(raw_run_files),
+        "splits": split_indices,
+        "model_type": "equilibrium",
+        "normalization_fingerprint": fingerprint_payload(normalization),
+    }
+    (processed_root / "processed_manifest.json").write_text(
+        json.dumps(processed_manifest, indent=2) + "\n", encoding="utf-8",
+    )
+    return {
+        "processed_root": str(processed_root),
+        "normalization": normalization,
+        "data_contract": data_contract,
+        "splits": split_indices,
+    }
+
+
 def preprocess_raw_dataset(
     config: dict[str, Any],
     *,
     project_root: Path,
 ) -> dict[str, Any]:
-    """Convert raw VULCAN/synthetic trajectories into the training tensors."""
+    """Convert raw runs into training tensors. Dispatches by model type."""
+    if is_equilibrium(config):
+        return preprocess_equilibrium_dataset(config, project_root=project_root)
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     ensure_dir(processed_root)
@@ -399,6 +613,10 @@ def preprocess_raw_dataset(
     raw_runs = [load_raw_run(path, config=config, spectrum_grid_nm=spectrum_grid_nm) for path in raw_run_files]
     split_indices = _split_indices(len(raw_runs), config=config)
     train_runs = [raw_runs[i] for i in split_indices["train"]]
+    target_modes = {run.target_mode for run in raw_runs}
+    if len(target_modes) != 1:
+        raise ValueError(f"Raw dataset mixes multiple target modes: {sorted(target_modes)}.")
+    target_mode = target_modes.pop()
     global_static_order = list(config["data_spec"]["global_static_feature_order"])
     normalization = _normalization_payload(
         train_runs,
@@ -444,6 +662,7 @@ def preprocess_raw_dataset(
         metadata = {
             "processed_data_version": PROCESSED_DATA_VERSION,
             "split": split_name,
+            "target_mode": target_mode,
             "num_runs": len(runs),
             "num_levels": nz,
             "max_steps": int(max_steps),
@@ -467,6 +686,7 @@ def preprocess_raw_dataset(
 
     data_contract = {
         "processed_data_version": PROCESSED_DATA_VERSION,
+        "target_mode": target_mode,
         "state_species_order": list(config["data_spec"]["state_species"]),
         "output_species_order": list(config["data_spec"]["output_species"]),
         "sequence_static_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
@@ -493,6 +713,7 @@ def preprocess_raw_dataset(
     processed_manifest = {
         "raw_files": manifest_for_files(raw_run_files),
         "splits": split_indices,
+        "target_mode": target_mode,
         "normalization_fingerprint": fingerprint_payload(normalization),
     }
     (processed_root / "processed_manifest.json").write_text(

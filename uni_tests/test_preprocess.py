@@ -4,6 +4,7 @@ import copy
 
 import numpy as np
 
+from src.config_utils import effective_transition_sampling
 from src.data_loader import build_batch_from_rows, load_processed_dataset
 from src.preprocess import preprocess_raw_dataset
 from src.transition_sampling import build_candidate_table
@@ -21,12 +22,13 @@ def test_preprocess_and_live_batch(tiny_config):
     assert len(normalization["state"]["mean"]) == len(tiny_config["data_spec"]["state_species"])
 
     train = splits["train"]
+    transition_sampling = effective_transition_sampling(tiny_config)
     candidate_table = build_candidate_table(
         train.time_s,
         train.valid_steps_mask,
-        dt_min_s=float(tiny_config["trajectory_sampling"]["dt_min_s"]),
-        dt_max_s=float(tiny_config["trajectory_sampling"]["dt_max_s"]),
-        min_future_saved_steps=int(tiny_config["trajectory_sampling"]["min_future_saved_steps"]),
+        dt_min_s=float(transition_sampling["dt_min_s"]),
+        dt_max_s=float(transition_sampling["dt_max_s"]),
+        min_future_saved_steps=int(transition_sampling["min_future_saved_steps"]),
         log10_dt_stats={
             "mean": float(normalization["log10_dt_s"]["mean"][0]),
             "std": float(normalization["log10_dt_s"]["std"][0]),
@@ -47,12 +49,13 @@ def test_preprocess_respects_distinct_output_species(tiny_config):
 
     splits, normalization, contract = load_processed_dataset(config["paths"]["processed_root"])
     train = splits["train"]
+    transition_sampling = effective_transition_sampling(config)
     candidate_table = build_candidate_table(
         train.time_s,
         train.valid_steps_mask,
-        dt_min_s=float(config["trajectory_sampling"]["dt_min_s"]),
-        dt_max_s=float(config["trajectory_sampling"]["dt_max_s"]),
-        min_future_saved_steps=int(config["trajectory_sampling"]["min_future_saved_steps"]),
+        dt_min_s=float(transition_sampling["dt_min_s"]),
+        dt_max_s=float(transition_sampling["dt_max_s"]),
+        min_future_saved_steps=int(transition_sampling["min_future_saved_steps"]),
         log10_dt_stats={
             "mean": float(normalization["log10_dt_s"]["mean"][0]),
             "std": float(normalization["log10_dt_s"]["std"][0]),
@@ -63,3 +66,4 @@ def test_preprocess_respects_distinct_output_species(tiny_config):
     assert batch["sequence"].shape[-1] == 3 + len(config["data_spec"]["state_species"])
     assert batch["target"].shape[-1] == len(config["data_spec"]["output_species"])
     assert contract["target_dim"] == len(config["data_spec"]["output_species"])
+    assert contract["target_mode"] == config["generation"]["target_mode"]

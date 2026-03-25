@@ -7,11 +7,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .data_loader import iter_batches, load_processed_dataset
+from .config_utils import effective_transition_sampling, is_equilibrium
+from .data_loader import (
+    EquilibriumSplit,
+    iter_batches,
+    iter_equilibrium_batches,
+    load_equilibrium_dataset,
+    load_processed_dataset,
+)
 from .export_jax import export_checkpoint_payload
 from .jax_model import apply_model
 from .live_sampling import sample_eval_rows, sample_train_rows
@@ -204,15 +215,26 @@ def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
 def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     contract_path = processed_root / "data_contract.json"
+    equilibrium = is_equilibrium(config)
     if contract_path.exists():
         try:
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
             version_ok = int(contract.get("processed_data_version", -1)) == PROCESSED_DATA_VERSION
-            required_files_ok = all(
-                (processed_root / split / "state_trajectories.npy").exists()
-                for split in ("train", "val", "test")
-            )
-            if version_ok and required_files_ok:
+            if equilibrium:
+                mode_ok = contract.get("model_type") == "equilibrium"
+                required_files_ok = all(
+                    (processed_root / split / "target_outputs.npy").exists()
+                    for split in ("train", "val", "test")
+                )
+            else:
+                mode_ok = str(contract.get("target_mode", "")).lower() == str(
+                    config["generation"]["target_mode"]
+                ).lower()
+                required_files_ok = all(
+                    (processed_root / split / "state_trajectories.npy").exists()
+                    for split in ("train", "val", "test")
+                )
+            if version_ok and mode_ok and required_files_ok:
                 return processed_root
         except (OSError, ValueError, TypeError):
             pass
@@ -253,11 +275,206 @@ def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def make_equilibrium_train_eval_functions(
+    *,
+    dims,
+    normalization: dict[str, Any],
+    loss_cfg: dict[str, float],
+    gradient_clip: float,
+    weight_decay: float,
+):
+    """Build JIT-compiled train/eval functions for the equilibrium model."""
+    target_mean, target_std = _state_stats(normalization)
+    dummy_spectrum = jnp.zeros((1, 0), dtype=jnp.float32)
+
+    @jax.jit
+    def train_step(params, opt_state, batch, learning_rate):
+        def loss_fn(model_params):
+            batch_size = batch["sequence"].shape[0]
+            spectrum = jnp.zeros((batch_size, 0), dtype=jnp.float32)
+            pred, _aux = apply_model(
+                model_params, batch["sequence"], batch["global_inputs"], spectrum, dims,
+            )
+            mse_norm = jnp.mean((pred - batch["target"]) ** 2)
+            pred_log10 = pred * target_std + target_mean
+            target_log10 = batch["target"] * target_std + target_mean
+            mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
+            total = (
+                float(loss_cfg["lambda_z"]) * mse_norm
+                + float(loss_cfg["lambda_phys"]) * mse_log10
+            )
+            metrics = {
+                "combined_loss": total,
+                "mse_norm": mse_norm,
+                "mse_log10": mse_log10,
+            }
+            return total, metrics
+
+        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        grads = _clip_tree(grads, gradient_clip)
+        new_params, new_opt_state = _adamw_update(
+            params, grads, opt_state,
+            learning_rate=learning_rate, weight_decay=weight_decay,
+        )
+        return new_params, new_opt_state, metrics
+
+    @jax.jit
+    def eval_step(params, batch):
+        batch_size = batch["sequence"].shape[0]
+        spectrum = jnp.zeros((batch_size, 0), dtype=jnp.float32)
+        pred, _aux = apply_model(
+            params, batch["sequence"], batch["global_inputs"], spectrum, dims,
+        )
+        mse_norm = jnp.mean((pred - batch["target"]) ** 2)
+        pred_log10 = pred * target_std + target_mean
+        target_log10 = batch["target"] * target_std + target_mean
+        mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
+        total = (
+            float(loss_cfg["lambda_z"]) * mse_norm
+            + float(loss_cfg["lambda_phys"]) * mse_log10
+        )
+        return {
+            "combined_loss": total,
+            "mse_norm": mse_norm,
+            "mse_log10": mse_log10,
+        }
+
+    return train_step, eval_step
+
+
+def train_equilibrium_model(
+    config: dict[str, Any],
+    *,
+    project_root: Path,
+) -> TrainingArtifacts:
+    """Train the equilibrium chemistry emulator."""
+    processed_root = _ensure_processed(config, project_root=project_root)
+    splits, normalization, contract = load_equilibrium_dataset(processed_root)
+
+    train_split = splits["train"]
+    val_split = splits["val"]
+    test_split = splits.get("test", val_split)
+
+    dims, params = initialize_model(config, contract, seed=int(config["training"]["seed"]))
+    LOGGER.info("Initialized equilibrium model with %d parameters.", count_parameters(params))
+    opt_state = _init_adamw_state(params)
+    train_step, eval_step = make_equilibrium_train_eval_functions(
+        dims=dims,
+        normalization=normalization,
+        loss_cfg=config["training"]["loss"],
+        gradient_clip=float(config["training"]["gradient_clip"]),
+        weight_decay=float(config["training"]["weight_decay"]),
+    )
+
+    checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
+    export_root = resolve_path(config["paths"]["jax_export_root"], project_root)
+    ensure_dir(checkpoints_root)
+    ensure_dir(export_root)
+
+    batch_size = int(config["training"]["batch_size"])
+    epochs = int(config["training"]["epochs"])
+    history: list[dict[str, Any]] = []
+    best_payload: dict[str, Any] | None = None
+    best_val = float("inf")
+    global_step = 0
+
+    # Estimate total steps for LR schedule.
+    steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
+    warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
+    total_steps = epochs * steps_per_epoch
+
+    rng = np.random.default_rng(int(config["training"]["seed"]))
+
+    for epoch in range(epochs):
+        train_batches = iter_equilibrium_batches(train_split, batch_size=batch_size, rng=rng)
+        train_metrics_epoch: list[dict[str, float]] = []
+
+        for batch in train_batches:
+            lr = _learning_rate_schedule(
+                step=global_step, total_steps=total_steps,
+                base_lr=float(config["training"]["learning_rate"]),
+                min_lr=float(config["training"]["min_lr"]),
+                warmup_steps=warmup_steps,
+            )
+            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+            params, opt_state, metrics = train_step(
+                params, opt_state, device_batch, jnp.asarray(lr, dtype=jnp.float32),
+            )
+            train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            global_step += 1
+
+        # Validation.
+        val_batches = iter_equilibrium_batches(val_split, batch_size=batch_size, rng=rng)
+        val_metrics_epoch: list[dict[str, float]] = []
+        for batch in val_batches:
+            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+            metrics = eval_step(params, device_batch)
+            val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+
+        train_summary = _mean_metrics(train_metrics_epoch)
+        val_summary = _mean_metrics(val_metrics_epoch)
+        record = {"epoch": epoch + 1, "train": train_summary, "val": val_summary}
+        history.append(record)
+        LOGGER.info(
+            "Epoch %d/%d train=%.6e val=%.6e",
+            epoch + 1, epochs, train_summary["combined_loss"], val_summary["combined_loss"],
+        )
+
+        current_payload = _checkpoint_payload(
+            params=params, dims=dims, config=config,
+            normalization=normalization, data_contract=contract,
+            metrics={"epoch": epoch + 1, "train": train_summary, "val": val_summary},
+            history=history,
+        )
+        _write_checkpoint(checkpoints_root / "last.pt", current_payload)
+        if val_summary["combined_loss"] < best_val:
+            best_val = val_summary["combined_loss"]
+            best_payload = current_payload
+            _write_checkpoint(checkpoints_root / "best.pt", current_payload)
+
+    if best_payload is None:
+        raise RuntimeError("Training completed without producing a best checkpoint.")
+
+    # Test evaluation.
+    best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
+    test_batches = iter_equilibrium_batches(test_split, batch_size=batch_size, rng=rng)
+    test_metrics_epoch: list[dict[str, float]] = []
+    for batch in test_batches:
+        device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+        metrics = eval_step(best_params, device_batch)
+        test_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+
+    final_metrics = {
+        "best_val_combined_loss": float(best_val),
+        "test": _mean_metrics(test_metrics_epoch),
+        "num_train_runs": train_split.num_runs,
+        "num_val_runs": val_split.num_runs,
+        "num_test_runs": test_split.num_runs,
+        "parameter_count": int(count_parameters(best_params)),
+    }
+    (checkpoints_root / "history.json").write_text(
+        json.dumps(history, indent=2) + "\n", encoding="utf-8",
+    )
+    (checkpoints_root / "metrics.json").write_text(
+        json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8",
+    )
+    export_checkpoint_payload(best_payload, export_root)
+
+    return TrainingArtifacts(
+        checkpoint_path=checkpoints_root / "best.pt",
+        export_root=export_root,
+        history_path=checkpoints_root / "history.json",
+        metrics_path=checkpoints_root / "metrics.json",
+    )
+
+
 def train_model(
     config: dict[str, Any],
     *,
     project_root: Path,
 ) -> TrainingArtifacts:
+    if is_equilibrium(config):
+        return train_equilibrium_model(config, project_root=project_root)
     processed_root = _ensure_processed(config, project_root=project_root)
     splits, normalization, contract = load_processed_dataset(processed_root)
 
@@ -269,10 +486,11 @@ def train_model(
         "mean": float(normalization["log10_dt_s"]["mean"][0]),
         "std": float(normalization["log10_dt_s"]["std"][0]),
     }
+    transition_sampling = effective_transition_sampling(config)
     candidate_common = {
-        "dt_min_s": float(config["trajectory_sampling"]["dt_min_s"]),
-        "dt_max_s": float(config["trajectory_sampling"]["dt_max_s"]),
-        "min_future_saved_steps": int(config["trajectory_sampling"]["min_future_saved_steps"]),
+        "dt_min_s": float(transition_sampling["dt_min_s"]),
+        "dt_max_s": float(transition_sampling["dt_max_s"]),
+        "min_future_saved_steps": int(transition_sampling["min_future_saved_steps"]),
         "log10_dt_stats": dt_stats,
     }
     train_candidates = build_candidate_table(train_split.time_s, train_split.valid_steps_mask, **candidate_common)
@@ -299,13 +517,13 @@ def train_model(
     val_rows = sample_eval_rows(
         val_candidates,
         pairs_per_run=eval_pairs,
-        num_logdt_bins=int(config["trajectory_sampling"]["num_logdt_bins"]),
+        num_logdt_bins=int(transition_sampling["num_logdt_bins"]),
         seed=int(config["training"]["seed"]) + 1,
     )
     test_rows = sample_eval_rows(
         test_candidates,
         pairs_per_run=eval_pairs,
-        num_logdt_bins=int(config["trajectory_sampling"]["num_logdt_bins"]),
+        num_logdt_bins=int(transition_sampling["num_logdt_bins"]),
         seed=int(config["training"]["seed"]) + 2,
     )
 
@@ -318,7 +536,7 @@ def train_model(
         train_rows = sample_train_rows(
             train_candidates,
             pairs_per_run=int(config["training"]["live_sampling"]["train_pairs_per_run_per_epoch"]),
-            num_logdt_bins=int(config["trajectory_sampling"]["num_logdt_bins"]),
+            num_logdt_bins=int(transition_sampling["num_logdt_bins"]),
             seed=int(config["training"]["seed"]),
             epoch=epoch,
         )

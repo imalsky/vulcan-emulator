@@ -28,6 +28,21 @@ class ProcessedSplit:
         return int(self.sequence_inputs.shape[0])
 
 
+@dataclass(frozen=True)
+class EquilibriumSplit:
+    """Processed split for equilibrium models (no trajectory/spectrum)."""
+    name: str
+    sequence_inputs: np.ndarray   # [num_runs, nz, 2] (P, T)
+    target_outputs: np.ndarray    # [num_runs, nz, target_dim]
+    global_inputs: np.ndarray     # [num_runs, global_dim]
+    run_ids: list[str]
+    metadata: dict[str, Any]
+
+    @property
+    def num_runs(self) -> int:
+        return int(self.sequence_inputs.shape[0])
+
+
 def load_processed_split(split_dir: str | Path) -> ProcessedSplit:
     split_path = Path(split_dir)
     metadata = json.loads((split_path / "metadata.json").read_text(encoding="utf-8"))
@@ -46,10 +61,40 @@ def load_processed_split(split_dir: str | Path) -> ProcessedSplit:
     )
 
 
+def load_equilibrium_split(split_dir: str | Path) -> EquilibriumSplit:
+    """Load a processed equilibrium split (no trajectory/spectrum arrays)."""
+    split_path = Path(split_dir)
+    metadata = json.loads((split_path / "metadata.json").read_text(encoding="utf-8"))
+    run_ids = json.loads((split_path / "run_ids.json").read_text(encoding="utf-8"))
+    return EquilibriumSplit(
+        name=split_path.name,
+        sequence_inputs=np.load(split_path / "sequence_inputs.npy"),
+        target_outputs=np.load(split_path / "target_outputs.npy"),
+        global_inputs=np.load(split_path / "global_inputs.npy"),
+        run_ids=list(run_ids),
+        metadata=metadata,
+    )
+
+
 def load_processed_dataset(processed_root: str | Path) -> tuple[dict[str, ProcessedSplit], dict[str, Any], dict[str, Any]]:
     root = Path(processed_root)
     splits = {
         name: load_processed_split(root / name)
+        for name in ("train", "val", "test")
+        if (root / name / "metadata.json").exists()
+    }
+    normalization = json.loads((root / "normalization.json").read_text(encoding="utf-8"))
+    contract = json.loads((root / "data_contract.json").read_text(encoding="utf-8"))
+    return splits, normalization, contract
+
+
+def load_equilibrium_dataset(
+    processed_root: str | Path,
+) -> tuple[dict[str, EquilibriumSplit], dict[str, Any], dict[str, Any]]:
+    """Load all equilibrium splits, normalization, and data contract."""
+    root = Path(processed_root)
+    splits = {
+        name: load_equilibrium_split(root / name)
         for name in ("train", "val", "test")
         if (root / name / "metadata.json").exists()
     }
@@ -106,4 +151,33 @@ def iter_batches(
     for start in range(0, rows.size, int(batch_size)):
         stop = min(start + int(batch_size), rows.size)
         batches.append(build_batch_from_rows(split, candidate_table, rows[start:stop]))
+    return batches
+
+
+def build_equilibrium_batch(
+    split: EquilibriumSplit,
+    indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build a batch for the equilibrium model (no anchor/dt/spectrum)."""
+    idx = np.asarray(indices, dtype=np.int32)
+    return {
+        "sequence": split.sequence_inputs[idx].astype(np.float32),
+        "global_inputs": split.global_inputs[idx].astype(np.float32),
+        "target": split.target_outputs[idx].astype(np.float32),
+    }
+
+
+def iter_equilibrium_batches(
+    split: EquilibriumSplit,
+    *,
+    batch_size: int,
+    rng: np.random.Generator,
+) -> list[dict[str, np.ndarray]]:
+    """Yield shuffled batches for equilibrium training."""
+    indices = np.arange(split.num_runs, dtype=np.int32)
+    rng.shuffle(indices)
+    batches: list[dict[str, np.ndarray]] = []
+    for start in range(0, indices.size, int(batch_size)):
+        stop = min(start + int(batch_size), indices.size)
+        batches.append(build_equilibrium_batch(split, indices[start:stop]))
     return batches

@@ -49,6 +49,7 @@
       "gravity_cm_s2",
       "metallicity_log10",
       "c_to_o",
+      "s_to_o",
       "log10_dt_s",
       "use_photochemistry",
       "use_ion_chemistry",
@@ -119,6 +120,10 @@
       0.25,
       1.1
     ],
+    "s_to_o_range": [
+      0.005,
+      0.1
+    ],
     "kzz_cm2_s": 100000000.0,
     "num_time_steps": 24,
     "time_step_log10_min_s": 1.0,
@@ -142,6 +147,7 @@
   },
   "generation": {
     "mode": "vulcan",
+    "target_mode": "equilibrium_only",
     "num_runs": 128,
     "seed": 7,
     "overwrite": false,
@@ -156,7 +162,7 @@
   },
   "inference": {
     "equilibrium_anchor": {
-      "source": "trajectory",
+      "source": "flat",
       "split": "train",
       "run_id": null,
       "step_index": 0

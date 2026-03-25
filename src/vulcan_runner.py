@@ -13,6 +13,8 @@ from typing import Any
 import h5py
 import numpy as np
 
+from .anchor_states import build_flat_h2_he_anchor
+from .config_utils import is_equilibrium
 from .path_utils import ensure_dir, resolve_path
 from .provenance import manifest_for_files
 from .sampling import RunSpecification, sample_run_specifications
@@ -24,6 +26,23 @@ _SOLAR_ELEMENT_ABUNDANCES = {
     "N_H": 7.08e-5,
     "S_H": 1.41e-5,
     "He_H": 8.38e-2,
+}
+_FASTCHEM_METALLICITY_SCALED_ELEMENTS = {
+    "C",
+    "N",
+    "O",
+    "S",
+    "P",
+    "Si",
+    "Ti",
+    "V",
+    "Cl",
+    "K",
+    "Na",
+    "Mg",
+    "F",
+    "Ca",
+    "Fe",
 }
 
 
@@ -58,6 +77,10 @@ def _generation_worker_count(config: dict[str, Any], total_runs: int) -> int:
     return max(1, min(configured, total_runs))
 
 
+def _target_mode(config: dict[str, Any]) -> str:
+    return str(config["generation"]["target_mode"]).lower()
+
+
 def _prepare_generation_directory(
     config: dict[str, Any],
     *,
@@ -75,6 +98,22 @@ def _prepare_generation_directory(
         return raw_root, runs_dir, None
     if existing_files:
         if bool(config["generation"]["reuse_raw_if_present"]) and len(existing_files) == requested_runs:
+            manifest_path = raw_root / "generation_manifest.json"
+            if not manifest_path.exists():
+                raise RuntimeError(
+                    "Existing raw runs cannot be safely reused because generation_manifest.json is missing. "
+                    "Set generation.overwrite=true to regenerate them."
+                )
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_mode = str(manifest_payload.get("mode", "")).lower()
+            manifest_target_mode = str(manifest_payload.get("target_mode", "")).lower()
+            current_mode = str(config["generation"]["mode"]).lower()
+            current_target_mode = _target_mode(config)
+            if manifest_mode != current_mode or manifest_target_mode != current_target_mode:
+                raise RuntimeError(
+                    "Existing raw runs were generated with a different generation mode or target_mode. "
+                    "Set generation.overwrite=true to regenerate a compatible dataset."
+                )
             return raw_root, runs_dir, existing_files
         raise RuntimeError(
             f"Found {len(existing_files)} existing raw runs under {runs_dir}. "
@@ -96,79 +135,94 @@ def _sampling_coverage_payload(
     mode: str,
 ) -> dict[str, Any]:
     """Summarize the realized dataset coverage against the configured ranges."""
-    gravity = np.asarray([spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64)
+    equilibrium = is_equilibrium(config)
     metallicity = np.asarray([spec.globals["metallicity_log10"] for spec in specs], dtype=np.float64)
     c_to_o = np.asarray([spec.globals["c_to_o"] for spec in specs], dtype=np.float64)
+    s_to_o = np.asarray([spec.globals.get("s_to_o", 0.026) for spec in specs], dtype=np.float64)
     temperature_rows: list[np.ndarray] = []
-    log10_kzz_rows: list[np.ndarray] = []
     pressure_rows: list[np.ndarray] = []
-    time_step_rows: list[np.ndarray] = []
     for path in run_files:
         with h5py.File(path, "r") as handle:
             temperature_rows.append(np.asarray(handle["inputs/temperature_k"], dtype=np.float64))
             pressure_rows.append(np.asarray(handle["inputs/pressure_bar"], dtype=np.float64))
-            log10_kzz_rows.append(np.log10(np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64)))
-            time_s = np.asarray(handle["trajectory/time_s"], dtype=np.float64)
-            if time_s.size > 1:
-                time_step_rows.append(np.log10(np.diff(time_s)))
     temperature = np.concatenate(temperature_rows, axis=0)
-    log10_kzz = np.concatenate(log10_kzz_rows, axis=0)
     pressure = np.concatenate(pressure_rows, axis=0)
-    time_step_log10 = np.concatenate(time_step_rows, axis=0) if time_step_rows else np.zeros((0,), dtype=np.float64)
-    gravity_range = [float(x) for x in config["sampling"]["gravity_range_cm_s2"]]
     metallicity_range = [float(x) for x in config["sampling"]["metallicity_log10_range"]]
     c_to_o_range = [float(x) for x in config["sampling"]["c_to_o_range"]]
+    s_to_o_range = [float(x) for x in config["sampling"]["s_to_o_range"]]
     temperature_range = [float(x) for x in config["sampling"]["temperature_range_k"]]
-    kzz_value = float(config["sampling"]["kzz_cm2_s"])
-    log10_kzz_value = float(np.log10(max(kzz_value, 1.0e-30)))
-    kzz_range = [log10_kzz_value, log10_kzz_value]
-    time_range = [
-        float(config["sampling"]["time_step_log10_min_s"]),
-        float(config["sampling"]["time_step_log10_max_s"]),
-    ]
-    return {
-        "mode": mode,
-        "num_runs": len(specs),
-        "configured_ranges": {
+
+    configured_ranges: dict[str, Any] = {
+        "metallicity_log10": metallicity_range,
+        "c_to_o": c_to_o_range,
+        "s_to_o": s_to_o_range,
+        "temperature_k": temperature_range,
+        "pressure_bar": [
+            float(config["sampling"]["pressure_top_bar"]),
+            float(config["sampling"]["pressure_bottom_bar"]),
+        ],
+    }
+    realized: dict[str, Any] = {
+        "metallicity_log10": {
+            "min": float(np.min(metallicity)),
+            "max": float(np.max(metallicity)),
+            "coverage_fraction": _coverage_fraction(
+                *metallicity_range, float(np.min(metallicity)), float(np.max(metallicity)),
+            ),
+        },
+        "c_to_o": {
+            "min": float(np.min(c_to_o)),
+            "max": float(np.max(c_to_o)),
+            "coverage_fraction": _coverage_fraction(*c_to_o_range, float(np.min(c_to_o)), float(np.max(c_to_o))),
+        },
+        "s_to_o": {
+            "min": float(np.min(s_to_o)),
+            "max": float(np.max(s_to_o)),
+            "coverage_fraction": _coverage_fraction(*s_to_o_range, float(np.min(s_to_o)), float(np.max(s_to_o))),
+        },
+        "temperature_k": {
+            "min": float(np.min(temperature)),
+            "max": float(np.max(temperature)),
+            "coverage_fraction": _coverage_fraction(
+                *temperature_range, float(np.min(temperature)), float(np.max(temperature)),
+            ),
+        },
+        "pressure_bar": {
+            "min": float(np.min(pressure)),
+            "max": float(np.max(pressure)),
+        },
+    }
+
+    if not equilibrium:
+        gravity = np.asarray([spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64)
+        log10_kzz_rows: list[np.ndarray] = []
+        time_step_rows: list[np.ndarray] = []
+        for path in run_files:
+            with h5py.File(path, "r") as handle:
+                log10_kzz_rows.append(np.log10(np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64)))
+                time_s = np.asarray(handle["trajectory/time_s"], dtype=np.float64)
+                if time_s.size > 1:
+                    time_step_rows.append(np.log10(np.diff(time_s)))
+        log10_kzz = np.concatenate(log10_kzz_rows, axis=0)
+        time_step_log10 = np.concatenate(time_step_rows, axis=0) if time_step_rows else np.zeros((0,), dtype=np.float64)
+        gravity_range = [float(x) for x in config["sampling"]["gravity_range_cm_s2"]]
+        kzz_value = float(config["sampling"]["kzz_cm2_s"])
+        log10_kzz_value = float(np.log10(max(kzz_value, 1.0e-30)))
+        kzz_range = [log10_kzz_value, log10_kzz_value]
+        time_range = [
+            float(config["sampling"]["time_step_log10_min_s"]),
+            float(config["sampling"]["time_step_log10_max_s"]),
+        ]
+        configured_ranges.update({
             "gravity_cm_s2": gravity_range,
-            "metallicity_log10": metallicity_range,
-            "c_to_o": c_to_o_range,
-            "temperature_k": temperature_range,
             "log10_kzz_cm2_s": kzz_range,
             "log10_adjacent_dt_s": time_range,
-            "pressure_bar": [
-                float(config["sampling"]["pressure_top_bar"]),
-                float(config["sampling"]["pressure_bottom_bar"]),
-            ],
-        },
-        "realized_summary": {
+        })
+        realized.update({
             "gravity_cm_s2": {
                 "min": float(np.min(gravity)),
                 "max": float(np.max(gravity)),
                 "coverage_fraction": _coverage_fraction(*gravity_range, float(np.min(gravity)), float(np.max(gravity))),
-            },
-            "metallicity_log10": {
-                "min": float(np.min(metallicity)),
-                "max": float(np.max(metallicity)),
-                "coverage_fraction": _coverage_fraction(
-                    *metallicity_range,
-                    float(np.min(metallicity)),
-                    float(np.max(metallicity)),
-                ),
-            },
-            "c_to_o": {
-                "min": float(np.min(c_to_o)),
-                "max": float(np.max(c_to_o)),
-                "coverage_fraction": _coverage_fraction(*c_to_o_range, float(np.min(c_to_o)), float(np.max(c_to_o))),
-            },
-            "temperature_k": {
-                "min": float(np.min(temperature)),
-                "max": float(np.max(temperature)),
-                "coverage_fraction": _coverage_fraction(
-                    *temperature_range,
-                    float(np.min(temperature)),
-                    float(np.max(temperature)),
-                ),
             },
             "log10_kzz_cm2_s": {
                 "min": float(np.min(log10_kzz)),
@@ -184,11 +238,15 @@ def _sampling_coverage_payload(
                     else None
                 ),
             },
-            "pressure_bar": {
-                "min": float(np.min(pressure)),
-                "max": float(np.max(pressure)),
-            },
-        },
+        })
+
+    return {
+        "mode": mode,
+        "target_mode": _target_mode(config),
+        "model_type": "equilibrium" if equilibrium else "transition",
+        "num_runs": len(specs),
+        "configured_ranges": configured_ranges,
+        "realized_summary": realized,
     }
 
 
@@ -205,6 +263,7 @@ def _write_generation_metadata(
     coverage_path = raw_root / "sampling_coverage.json"
     manifest_payload = {
         "mode": mode,
+        "target_mode": _target_mode(config),
         "run_files": manifest_for_files(run_files),
     }
     manifest_path.write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
@@ -234,11 +293,16 @@ def _vulcan_atom_list(config: dict[str, Any]) -> list[str]:
 def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
     metal_scale = 10.0 ** float(spec.globals["metallicity_log10"])
     oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
+    s_to_o = spec.globals.get("s_to_o")
+    if s_to_o is not None:
+        sulfur_h = float(oxygen_h * s_to_o)
+    else:
+        sulfur_h = float(_SOLAR_ELEMENT_ABUNDANCES["S_H"] * metal_scale)
     return {
         "O_H": float(oxygen_h),
         "C_H": float(oxygen_h * spec.globals["c_to_o"]),
         "N_H": float(_SOLAR_ELEMENT_ABUNDANCES["N_H"] * metal_scale),
-        "S_H": float(_SOLAR_ELEMENT_ABUNDANCES["S_H"] * metal_scale),
+        "S_H": sulfur_h,
         "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
         "fastchem_met_scale": float(metal_scale),
     }
@@ -254,22 +318,55 @@ def _write_tp_profile(path: Path, spec: RunSpecification) -> Path:
     return path
 
 
+def write_equilibrium_hdf5(
+    path: Path,
+    *,
+    spec: RunSpecification,
+    equilibrium_ymix: np.ndarray,
+    state_species: list[str],
+    output_species: list[str],
+) -> Path:
+    """Write a simplified HDF5 for equilibrium-only runs (no trajectory/spectrum)."""
+    ensure_dir(path.parent)
+    with h5py.File(path, "w") as handle:
+        inputs = handle.create_group("inputs")
+        inputs.create_dataset("pressure_bar", data=np.asarray(spec.pressure_bar, dtype=np.float64))
+        inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
+        inputs.create_dataset("state_species", data=np.asarray(state_species, dtype="S"))
+        inputs.create_dataset("output_species", data=np.asarray(output_species, dtype="S"))
+        inputs.create_dataset("target_mode", data=np.bytes_("equilibrium"))
+        globals_group = handle.create_group("globals")
+        for key, value in sorted(spec.globals.items()):
+            globals_group.create_dataset(key, data=float(value))
+        eq_group = handle.create_group("equilibrium")
+        eq_group.create_dataset("ymix", data=np.asarray(equilibrium_ymix, dtype=np.float64))
+    return path
+
+
 def write_raw_run_hdf5(
     path: Path,
     *,
     spec: RunSpecification,
     ymix_state: np.ndarray,
     ymix_output: np.ndarray | None = None,
+    reference_ymix_state: np.ndarray | None = None,
     output_species: list[str] | None = None,
+    target_mode: str = "trajectory",
 ) -> Path:
     ensure_dir(path.parent)
     output_species = list(output_species or spec.metadata.get("output_species", spec.metadata["state_species"]))
     ymix_output_array = np.asarray(ymix_output if ymix_output is not None else ymix_state, dtype=np.float64)
+    initial = spec.initial_ymix
+    reference_state_array = np.asarray(
+        reference_ymix_state if reference_ymix_state is not None else (initial if initial is not None else ymix_state[0]),
+        dtype=np.float64,
+    )
     with h5py.File(path, "w") as handle:
         inputs = handle.create_group("inputs")
         inputs.create_dataset("pressure_bar", data=np.asarray(spec.pressure_bar, dtype=np.float64))
         inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
-        inputs.create_dataset("kzz_cm2_s", data=np.asarray(spec.kzz_cm2_s, dtype=np.float64))
+        if spec.kzz_cm2_s is not None:
+            inputs.create_dataset("kzz_cm2_s", data=np.asarray(spec.kzz_cm2_s, dtype=np.float64))
         inputs.create_dataset(
             "state_species",
             data=np.asarray(spec.metadata["state_species"], dtype="S"),
@@ -278,23 +375,27 @@ def write_raw_run_hdf5(
             "output_species",
             data=np.asarray(output_species, dtype="S"),
         )
+        inputs.create_dataset("reference_ymix_state", data=reference_state_array)
+        inputs.create_dataset("target_mode", data=np.bytes_(str(target_mode)))
         globals_group = handle.create_group("globals")
         for key, value in sorted(spec.globals.items()):
             globals_group.create_dataset(key, data=float(value))
         trajectory = handle.create_group("trajectory")
-        trajectory.create_dataset("time_s", data=np.asarray(spec.time_s, dtype=np.float64))
+        time_s = spec.time_s if spec.time_s is not None else np.array([0.0], dtype=np.float64)
+        trajectory.create_dataset("time_s", data=np.asarray(time_s, dtype=np.float64))
         trajectory.create_dataset("ymix_state", data=np.asarray(ymix_state, dtype=np.float64))
         trajectory.create_dataset("ymix_output", data=ymix_output_array)
-        spectrum = handle.create_group("spectrum")
-        spectrum.create_dataset("name", data=np.bytes_(spec.spectrum.name))
-        spectrum.create_dataset(
-            "wavelength_nm",
-            data=np.asarray(spec.spectrum.wavelength_nm, dtype=np.float64),
-        )
-        spectrum.create_dataset(
-            "flux_erg_cm2_s_nm",
-            data=np.asarray(spec.spectrum.flux_erg_cm2_s_nm, dtype=np.float64),
-        )
+        if spec.spectrum is not None:
+            spectrum = handle.create_group("spectrum")
+            spectrum.create_dataset("name", data=np.bytes_(spec.spectrum.name))
+            spectrum.create_dataset(
+                "wavelength_nm",
+                data=np.asarray(spec.spectrum.wavelength_nm, dtype=np.float64),
+            )
+            spectrum.create_dataset(
+                "flux_erg_cm2_s_nm",
+                data=np.asarray(spec.spectrum.flux_erg_cm2_s_nm, dtype=np.float64),
+            )
     return path
 
 
@@ -516,25 +617,108 @@ def _slice_output_trajectory(
     return np.asarray(trajectory[..., indices], dtype=np.float64)
 
 
+def _build_reference_equilibrium_shell(
+    *,
+    reference_ymix_state: np.ndarray,
+    state_species: list[str],
+    output_species: list[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    flat_anchor = build_flat_h2_he_anchor(
+        state_species,
+        nz=int(reference_ymix_state.shape[0]),
+    )
+    reference_output = _slice_output_trajectory(
+        reference_ymix_state[None, :, :],
+        state_species=state_species,
+        output_species=output_species,
+    )[0]
+    flat_output = _slice_output_trajectory(
+        flat_anchor[None, :, :],
+        state_species=state_species,
+        output_species=output_species,
+    )[0]
+    time_s = np.asarray([0.0, 1.0], dtype=np.float64)
+    ymix_state = np.stack([flat_anchor, reference_ymix_state], axis=0)
+    ymix_output = np.stack([flat_output, reference_output], axis=0)
+    return time_s, ymix_state, ymix_output
+
+
+def _prepend_reference_state(
+    *,
+    time_s: np.ndarray,
+    ymix_state: np.ndarray,
+    ymix_output: np.ndarray,
+    reference_ymix_state: np.ndarray,
+    reference_ymix_output: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if time_s.size == 0:
+        return (
+            np.asarray([0.0], dtype=np.float64),
+            reference_ymix_state[None, :, :],
+            reference_ymix_output[None, :, :],
+        )
+    if np.isclose(float(time_s[0]), 0.0) and np.allclose(
+        ymix_state[0],
+        reference_ymix_state,
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        return time_s, ymix_state, ymix_output
+    if np.isclose(float(time_s[0]), 0.0):
+        updated_state = np.asarray(ymix_state, dtype=np.float64).copy()
+        updated_output = np.asarray(ymix_output, dtype=np.float64).copy()
+        updated_state[0] = reference_ymix_state
+        updated_output[0] = reference_ymix_output
+        return np.asarray(time_s, dtype=np.float64), updated_state, updated_output
+    return (
+        np.concatenate([np.asarray([0.0], dtype=np.float64), np.asarray(time_s, dtype=np.float64)]),
+        np.concatenate([reference_ymix_state[None, :, :], np.asarray(ymix_state, dtype=np.float64)], axis=0),
+        np.concatenate([reference_ymix_output[None, :, :], np.asarray(ymix_output, dtype=np.float64)], axis=0),
+    )
+
+
 def _generate_single_synthetic_run(
     spec: RunSpecification,
     *,
     runs_dir: Path,
     output_species: list[str],
+    target_mode: str,
 ) -> Path:
-    trajectory = simulate_synthetic_trajectory(spec)
-    output_trajectory = _slice_output_trajectory(
-        trajectory,
-        state_species=list(spec.metadata["state_species"]),
-        output_species=output_species,
-    )
+    state_species = list(spec.metadata["state_species"])
+    reference_ymix_state = np.asarray(spec.initial_ymix, dtype=np.float64)
+    if target_mode == "equilibrium_only":
+        time_s, trajectory, output_trajectory = _build_reference_equilibrium_shell(
+            reference_ymix_state=reference_ymix_state,
+            state_species=state_species,
+            output_species=output_species,
+        )
+        spec = RunSpecification(
+            run_id=spec.run_id,
+            pressure_bar=spec.pressure_bar,
+            temperature_k=spec.temperature_k,
+            kzz_cm2_s=spec.kzz_cm2_s,
+            initial_ymix=spec.initial_ymix,
+            time_s=time_s,
+            globals=spec.globals,
+            spectrum=spec.spectrum,
+            metadata=spec.metadata,
+        )
+    else:
+        trajectory = simulate_synthetic_trajectory(spec)
+        output_trajectory = _slice_output_trajectory(
+            trajectory,
+            state_species=state_species,
+            output_species=output_species,
+        )
     h5_path = runs_dir / f"{spec.run_id}.h5"
     write_raw_run_hdf5(
         h5_path,
         spec=spec,
         ymix_state=trajectory,
         ymix_output=output_trajectory,
+        reference_ymix_state=reference_ymix_state,
         output_species=output_species,
+        target_mode=target_mode,
     )
     return h5_path
 
@@ -567,6 +751,7 @@ def generate_synthetic_raw_runs(
     )
     state_species = list(config["data_spec"]["state_species"])
     output_species = list(config["data_spec"]["output_species"])
+    target_mode = _target_mode(config)
     prepared_specs: list[RunSpecification] = []
     for spec in specs:
         prepared_specs.append(
@@ -595,6 +780,7 @@ def generate_synthetic_raw_runs(
                     spec,
                     runs_dir=runs_dir,
                     output_species=output_species,
+                    target_mode=target_mode,
                 )
             )
     else:
@@ -605,6 +791,7 @@ def generate_synthetic_raw_runs(
                     spec,
                     runs_dir=runs_dir,
                     output_species=output_species,
+                    target_mode=target_mode,
                 )
                 for spec in prepared_specs
             ]
@@ -632,6 +819,22 @@ def _copy_vulcan_source(source_root: Path, worker_root: Path) -> None:
     shutil.copytree(source_root, worker_root)
 
 
+def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
+    if worker_root.exists():
+        shutil.rmtree(worker_root)
+    worker_root.mkdir(parents=True, exist_ok=True)
+    fastchem_root = worker_root / "fastchem_vulcan"
+    ensure_dir(fastchem_root)
+    shutil.copy2(source_root / "fastchem_vulcan" / "fastchem", fastchem_root / "fastchem")
+    shutil.copytree(source_root / "fastchem_vulcan" / "input", fastchem_root / "input")
+    shutil.copytree(
+        source_root / "fastchem_vulcan" / "fastchem_src" / "chem_input",
+        fastchem_root / "fastchem_src" / "chem_input",
+    )
+    ensure_dir(fastchem_root / "output")
+    return fastchem_root
+
+
 def _write_worker_inputs(worker_root: Path, spec: RunSpecification) -> tuple[Path, Path]:
     atm_dir = ensure_dir(worker_root / "atm")
     stellar_dir = ensure_dir(atm_dir / "stellar_flux")
@@ -641,6 +844,54 @@ def _write_worker_inputs(worker_root: Path, spec: RunSpecification) -> tuple[Pat
         stellar_dir / f"{spec.spectrum.name}.txt",
     )
     return tp_file, spectrum_file
+
+
+def _write_fastchem_tp_profile(fastchem_root: Path, spec: RunSpecification) -> Path:
+    tp_dir = ensure_dir(fastchem_root / "input" / "vulcan_TP")
+    tp_path = tp_dir / "vulcan_TP.dat"
+    with tp_path.open("w", encoding="utf-8") as handle:
+        handle.write("#p (bar)    T (K)\n")
+        for pressure_bar, temperature_k in zip(spec.pressure_bar, spec.temperature_k):
+            handle.write(f"{pressure_bar:.8e}\t{temperature_k:.8f}\n")
+    return tp_path
+
+
+def _write_fastchem_element_abundances(
+    fastchem_root: Path,
+    *,
+    spec: RunSpecification,
+    config: dict[str, Any],
+) -> Path:
+    input_dir = fastchem_root / "input"
+    physics = config.get("physics_toggles", {})
+    use_ion = bool(physics.get("use_ion_chemistry", False))
+    parameters_name = "parameters_ion.dat" if use_ion else "parameters_wo_ion.dat"
+    shutil.copyfile(input_dir / parameters_name, input_dir / "parameters.dat")
+
+    element_abundances = _element_abundances_from_spec(spec)
+    non_h_atoms = {atom for atom in _vulcan_atom_list(config) if atom != "H"}
+    metallicity_offset = float(np.log10(element_abundances["fastchem_met_scale"]))
+    solar_file = input_dir / "solar_element_abundances.dat"
+    output_lines: list[str] = []
+    with solar_file.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if not raw_line.strip() or raw_line.startswith("#"):
+                output_lines.append(raw_line)
+                continue
+            parts = raw_line.split()
+            species_name = parts[0].strip()
+            if species_name in non_h_atoms:
+                abundance_h = element_abundances.get(f"{species_name}_H")
+                if abundance_h is None:
+                    raise ValueError(f"Missing elemental abundance for {species_name} in FastChem setup.")
+                output_lines.append(f"{species_name}\t{12.0 + np.log10(float(abundance_h)):.4f}\n")
+            elif species_name in _FASTCHEM_METALLICITY_SCALED_ELEMENTS:
+                output_lines.append(f"{species_name}\t{float(parts[1]) + metallicity_offset:.4f}\n")
+            else:
+                output_lines.append(raw_line)
+    abundance_path = input_dir / "element_abundances_vulcan.dat"
+    abundance_path.write_text("".join(output_lines), encoding="utf-8")
+    return abundance_path
 
 
 def _patch_vulcan_cfg(
@@ -743,6 +994,12 @@ def convert_vulcan_output_to_hdf5(
     species = _decode_species_list(_fetch(data, "variable", "species"))
     pressure_bar = np.asarray(_fetch(data, "atm", "pco"), dtype=np.float64) / 1.0e6
     temperature_k = np.asarray(_fetch(data, "atm", "Tco"), dtype=np.float64)
+    if "y_ini" not in _fetch(data, "variable") or "n_0" not in _fetch(data, "atm"):
+        raise ValueError("VULCAN output is missing variable.y_ini or atm.n_0 required for exact FastChem extraction.")
+    y_ini = np.asarray(_fetch(data, "variable", "y_ini"), dtype=np.float64)
+    n0 = np.asarray(_fetch(data, "atm", "n_0"), dtype=np.float64)
+    if y_ini.shape[0] != n0.size:
+        raise ValueError("VULCAN output contains inconsistent y_ini and atm.n_0 shapes.")
     kzz_raw = np.asarray(_fetch(data, "atm", "Kzz"), dtype=np.float64)
     if kzz_raw.ndim == 1 and kzz_raw.size == pressure_bar.size - 1:
         kzz_cm2_s = np.concatenate([[kzz_raw[0]], 0.5 * (kzz_raw[:-1] + kzz_raw[1:]), [kzz_raw[-1]]])
@@ -763,14 +1020,32 @@ def convert_vulcan_output_to_hdf5(
     output_species = list(config["data_spec"]["output_species"])
     state_indices = [species.index(name) for name in state_species]
     output_indices = [species.index(name) for name in output_species]
+    reference_ymix_full = y_ini / np.clip(n0[:, None], 1.0e-30, None)
+    reference_ymix_state = reference_ymix_full[:, state_indices]
+    reference_ymix_output = reference_ymix_full[:, output_indices]
     ymix_state = ymix_time[..., state_indices]
     ymix_output = ymix_time[..., output_indices]
+    target_mode = _target_mode(config)
+    if target_mode == "equilibrium_only":
+        time_s, ymix_state, ymix_output = _build_reference_equilibrium_shell(
+            reference_ymix_state=reference_ymix_state,
+            state_species=state_species,
+            output_species=output_species,
+        )
+    else:
+        time_s, ymix_state, ymix_output = _prepend_reference_state(
+            time_s=time_s,
+            ymix_state=ymix_state,
+            ymix_output=ymix_output,
+            reference_ymix_state=reference_ymix_state,
+            reference_ymix_output=reference_ymix_output,
+        )
     converted_spec = RunSpecification(
         run_id=spec.run_id,
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
-        initial_ymix=ymix_state[0],
+        initial_ymix=reference_ymix_state,
         time_s=time_s,
         globals=spec.globals,
         spectrum=spec.spectrum,
@@ -785,7 +1060,75 @@ def convert_vulcan_output_to_hdf5(
         spec=converted_spec,
         ymix_state=ymix_state,
         ymix_output=ymix_output,
+        reference_ymix_state=reference_ymix_state,
         output_species=output_species,
+        target_mode=target_mode,
+    )
+
+
+def convert_fastchem_output_to_hdf5(
+    fastchem_output_path: Path,
+    *,
+    output_h5_path: Path,
+    spec: RunSpecification,
+    config: dict[str, Any],
+) -> Path:
+    fc = np.genfromtxt(fastchem_output_path, names=True, dtype=None, encoding=None)
+    if fc.dtype.names is None:
+        raise ValueError(f"FastChem output at {fastchem_output_path} does not contain a named header.")
+    state_species = list(config["data_spec"]["state_species"])
+    output_species = list(config["data_spec"]["output_species"])
+    requested_species = list(dict.fromkeys([*state_species, *output_species]))
+    missing = [name for name in requested_species if name not in fc.dtype.names]
+    if missing:
+        raise ValueError(f"FastChem output is missing requested species: {missing}")
+    reference_ymix_state = np.column_stack([np.asarray(fc[name], dtype=np.float64) for name in state_species])
+    if reference_ymix_state.shape[0] != spec.pressure_bar.size:
+        raise ValueError(
+            "FastChem output row count does not match the configured pressure grid size."
+        )
+
+    if is_equilibrium(config):
+        # Simplified equilibrium format: direct mapping, no trajectory shell.
+        equilibrium_ymix = np.column_stack(
+            [np.asarray(fc[name], dtype=np.float64) for name in output_species]
+        )
+        return write_equilibrium_hdf5(
+            output_h5_path,
+            spec=spec,
+            equilibrium_ymix=equilibrium_ymix,
+            state_species=state_species,
+            output_species=output_species,
+        )
+
+    time_s, ymix_state, ymix_output = _build_reference_equilibrium_shell(
+        reference_ymix_state=reference_ymix_state,
+        state_species=state_species,
+        output_species=output_species,
+    )
+    converted_spec = RunSpecification(
+        run_id=spec.run_id,
+        pressure_bar=np.asarray(spec.pressure_bar, dtype=np.float64),
+        temperature_k=np.asarray(spec.temperature_k, dtype=np.float64),
+        globals=spec.globals,
+        metadata={
+            **spec.metadata,
+            "state_species": state_species,
+            "output_species": output_species,
+        },
+        kzz_cm2_s=np.asarray(spec.kzz_cm2_s, dtype=np.float64) if spec.kzz_cm2_s is not None else None,
+        initial_ymix=reference_ymix_state,
+        time_s=time_s,
+        spectrum=spec.spectrum,
+    )
+    return write_raw_run_hdf5(
+        output_h5_path,
+        spec=converted_spec,
+        ymix_state=ymix_state,
+        ymix_output=ymix_output,
+        reference_ymix_state=reference_ymix_state,
+        output_species=output_species,
+        target_mode="equilibrium_only",
     )
 
 
@@ -793,6 +1136,23 @@ def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tu
     source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
     if not source_root.exists():
         raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
+    if is_equilibrium(config) or _target_mode(config) == "equilibrium_only":
+        fastchem_root = source_root / "fastchem_vulcan"
+        if not fastchem_root.exists():
+            raise FileNotFoundError(f"Configured FastChem runtime does not exist: {fastchem_root}")
+        fastchem_binary = fastchem_root / "fastchem"
+        if not fastchem_binary.exists():
+            raise FileNotFoundError(f"Configured FastChem binary does not exist: {fastchem_binary}")
+        fastchem_input = fastchem_root / "input" / "config.input"
+        if not fastchem_input.exists():
+            raise FileNotFoundError(f"Configured FastChem input config does not exist: {fastchem_input}")
+        chemical_elements = fastchem_root / "fastchem_src" / "chem_input" / "chemical_elements.dat"
+        if not chemical_elements.exists():
+            raise FileNotFoundError(
+                "Configured FastChem chemical element table does not exist: "
+                f"{chemical_elements}"
+            )
+        return source_root, fastchem_binary
     chemistry_file = source_root / str(config["vulcan_runtime"]["chemistry_file"])
     if not chemistry_file.exists():
         raise FileNotFoundError(f"Configured chemistry file does not exist: {chemistry_file}")
@@ -845,6 +1205,35 @@ def _run_single_vulcan_spec(
     )
 
 
+def _run_single_fastchem_spec(
+    spec: RunSpecification,
+    *,
+    source_root: Path,
+    worker_base: Path,
+    runs_dir: Path,
+    config: dict[str, Any],
+) -> Path:
+    worker_root = worker_base / spec.run_id
+    fastchem_root = _copy_fastchem_runtime(source_root, worker_root)
+    _write_fastchem_element_abundances(
+        fastchem_root,
+        spec=spec,
+        config=config,
+    )
+    _write_fastchem_tp_profile(fastchem_root, spec)
+    subprocess.run(["./fastchem", "input/config.input"], cwd=fastchem_root, check=True)
+    fastchem_output = fastchem_root / "output" / "vulcan_EQ.dat"
+    if not fastchem_output.exists():
+        raise FileNotFoundError(f"No FastChem equilibrium output found for run {spec.run_id} under {fastchem_output}.")
+    output_h5 = runs_dir / f"{spec.run_id}.h5"
+    return convert_fastchem_output_to_hdf5(
+        fastchem_output,
+        output_h5_path=output_h5,
+        spec=spec,
+        config=config,
+    )
+
+
 def run_vulcan_generation(
     config: dict[str, Any],
     *,
@@ -866,38 +1255,47 @@ def run_vulcan_generation(
             coverage_path=coverage_path if coverage_path.exists() else None,
         )
     source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
+    target_mode = _target_mode(config)
+    equilibrium = is_equilibrium(config)
     specs = sample_run_specifications(
         config=config,
         project_root=project_root,
         num_runs=num_runs,
         seed=int(config["generation"]["seed"]),
+        include_initial_ymix=not equilibrium and target_mode != "equilibrium_only",
+        include_time_grid=not equilibrium and target_mode != "equilibrium_only",
     )
-    worker_base = resolve_path(config["vulcan_runtime"]["worker_root"], project_root)
+    worker_root_key = "vulcan_runtime" if "vulcan_runtime" in config else None
+    worker_base = resolve_path(
+        config["vulcan_runtime"]["worker_root"] if worker_root_key else "data/vulcan_workers",
+        project_root,
+    )
     prepared_specs: list[RunSpecification] = []
     for spec in specs:
         prepared_specs.append(
             RunSpecification(
-            run_id=spec.run_id,
-            pressure_bar=spec.pressure_bar,
-            temperature_k=spec.temperature_k,
-            kzz_cm2_s=spec.kzz_cm2_s,
-            initial_ymix=spec.initial_ymix,
-            time_s=spec.time_s,
-            globals=spec.globals,
-            spectrum=spec.spectrum,
-            metadata={
-                **spec.metadata,
-                "state_species": list(config["data_spec"]["state_species"]),
-                "output_species": list(config["data_spec"]["output_species"]),
-            },
-        )
+                run_id=spec.run_id,
+                pressure_bar=spec.pressure_bar,
+                temperature_k=spec.temperature_k,
+                globals=spec.globals,
+                metadata={
+                    **spec.metadata,
+                    "state_species": list(config["data_spec"]["state_species"]),
+                    "output_species": list(config["data_spec"]["output_species"]),
+                },
+                kzz_cm2_s=spec.kzz_cm2_s,
+                initial_ymix=spec.initial_ymix,
+                time_s=spec.time_s,
+                spectrum=spec.spectrum,
+            )
         )
     worker_count = _generation_worker_count(config, len(prepared_specs))
     run_files: list[Path] = []
+    run_single = _run_single_fastchem_spec if (equilibrium or target_mode == "equilibrium_only") else _run_single_vulcan_spec
     if worker_count == 1:
         for spec in prepared_specs:
             run_files.append(
-                _run_single_vulcan_spec(
+                run_single(
                     spec,
                     source_root=source_root,
                     worker_base=worker_base,
@@ -909,7 +1307,7 @@ def run_vulcan_generation(
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [
                 executor.submit(
-                    _run_single_vulcan_spec,
+                    run_single,
                     spec,
                     source_root=source_root,
                     worker_base=worker_base,

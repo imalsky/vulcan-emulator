@@ -20,12 +20,21 @@ SUPPORTED_PHYSICS_TOGGLES = (
     "use_lowT_limit_rates",
     "use_adaptive_rtol",
 )
-CORE_GLOBAL_INPUTS = ("gravity_cm_s2", "metallicity_log10", "c_to_o", "log10_dt_s")
-OPTIONAL_GLOBAL_INPUTS = (
+ALLOWED_MODEL_TYPES = ("equilibrium", "transition")
+
+# Core global inputs vary by model type.
+TRANSITION_CORE_GLOBAL_INPUTS = ("gravity_cm_s2", "metallicity_log10", "c_to_o", "s_to_o", "log10_dt_s")
+EQUILIBRIUM_CORE_GLOBAL_INPUTS = ("metallicity_log10", "c_to_o", "s_to_o")
+
+TRANSITION_OPTIONAL_GLOBAL_INPUTS = (
     *SUPPORTED_PHYSICS_TOGGLES,
     *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
 )
-DEFAULT_REQUIRED_GLOBAL_INPUTS = (*CORE_GLOBAL_INPUTS, *OPTIONAL_GLOBAL_INPUTS)
+
+# Backwards-compatible aliases.
+CORE_GLOBAL_INPUTS = TRANSITION_CORE_GLOBAL_INPUTS
+OPTIONAL_GLOBAL_INPUTS = TRANSITION_OPTIONAL_GLOBAL_INPUTS
+DEFAULT_REQUIRED_GLOBAL_INPUTS = (*TRANSITION_CORE_GLOBAL_INPUTS, *TRANSITION_OPTIONAL_GLOBAL_INPUTS)
 DEFAULT_STATE_SPECIES = (
     "H2",
     "He",
@@ -48,6 +57,25 @@ DEFAULT_STATE_SPECIES = (
 _ALLOWED_SPECTRUM_ENCODERS = {"autoencoder", "linear", "none"}
 _ALLOWED_EQ_ANCHOR_SOURCES = {"trajectory", "flat"}
 _ALLOWED_EQ_ANCHOR_SPLITS = {"train", "val", "test"}
+_ALLOWED_TARGET_MODES = {"equilibrium_only", "trajectory"}
+
+
+def get_model_type(config: dict[str, Any]) -> str:
+    """Return the model type from config, defaulting to 'transition' for backwards compat."""
+    explicit = config.get("model_type")
+    if explicit is not None:
+        mt = str(explicit).lower().strip()
+        if mt not in ALLOWED_MODEL_TYPES:
+            raise ConfigValidationError(
+                f"model_type must be one of {ALLOWED_MODEL_TYPES}, got {mt!r}."
+            )
+        return mt
+    return "transition"
+
+
+def is_equilibrium(config: dict[str, Any]) -> bool:
+    """True when the config describes an equilibrium-only model."""
+    return get_model_type(config) == "equilibrium"
 
 
 class ConfigValidationError(ValueError):
@@ -94,6 +122,8 @@ def _as_string_list(value: Any, field: str) -> list[str]:
 
 
 def static_conditioning_defaults(config: dict[str, Any]) -> dict[str, float]:
+    if is_equilibrium(config):
+        return {}
     physics = config["physics_toggles"]
     runtime = config["vulcan_runtime"]
     defaults = {name: float(bool(physics[name])) for name in SUPPORTED_PHYSICS_TOGGLES}
@@ -142,7 +172,28 @@ def global_static_feature_order(config: dict[str, Any]) -> list[str]:
 
 
 def global_feature_order(config: dict[str, Any]) -> list[str]:
+    """Full global feature vector order (includes dt for transition, not for equilibrium)."""
     return list(config["data_spec"]["required_global_inputs"])
+
+
+def effective_transition_sampling(config: dict[str, Any]) -> dict[str, float | int] | None:
+    """Return the effective transition-sampling settings, or None for equilibrium models."""
+    if is_equilibrium(config):
+        return None
+    traj = config["trajectory_sampling"]
+    if str(config["generation"]["target_mode"]).lower() == "equilibrium_only":
+        return {
+            "dt_min_s": 1.0,
+            "dt_max_s": max(1.0, float(traj["dt_max_s"])),
+            "min_future_saved_steps": 1,
+            "num_logdt_bins": int(traj["num_logdt_bins"]),
+        }
+    return {
+        "dt_min_s": float(traj["dt_min_s"]),
+        "dt_max_s": float(traj["dt_max_s"]),
+        "min_future_saved_steps": int(traj["min_future_saved_steps"]),
+        "num_logdt_bins": int(traj["num_logdt_bins"]),
+    }
 
 
 def load_and_validate_config(path: str | Path) -> dict[str, Any]:
@@ -150,23 +201,23 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
 
-    _require_keys(
-        config,
-        [
-            "paths",
-            "data_spec",
-            "physics_toggles",
-            "vulcan_runtime",
-            "sampling",
-            "stellar_spectrum",
-            "generation",
-            "trajectory_sampling",
-            "preprocessing",
-            "normalization",
-            "training",
-        ],
-        "root",
-    )
+    model_type = get_model_type(config)
+    config["model_type"] = model_type
+    equilibrium = model_type == "equilibrium"
+
+    # Root-level required sections vary by model type.
+    required_root = [
+        "paths",
+        "data_spec",
+        "sampling",
+        "generation",
+        "preprocessing",
+        "normalization",
+        "training",
+    ]
+    if not equilibrium:
+        required_root += ["physics_toggles", "vulcan_runtime", "stellar_spectrum", "trajectory_sampling"]
+    _require_keys(config, required_root, "root")
 
     paths = config["paths"]
     _require_keys(
@@ -192,81 +243,90 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         data_spec.get("output_species", list(state_species)),
         "data_spec.output_species",
     )
+    if equilibrium:
+        default_globals = list(EQUILIBRIUM_CORE_GLOBAL_INPUTS)
+    else:
+        default_globals = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
     required_global_inputs = _as_string_list(
-        data_spec.get("required_global_inputs", list(DEFAULT_REQUIRED_GLOBAL_INPUTS)),
+        data_spec.get("required_global_inputs", default_globals),
         "data_spec.required_global_inputs",
     )
-    if "log10_dt_s" not in required_global_inputs:
+    if not equilibrium and "log10_dt_s" not in required_global_inputs:
         raise ConfigValidationError("data_spec.required_global_inputs must contain 'log10_dt_s'.")
     data_spec["state_species"] = state_species
     data_spec["output_species"] = output_species
     data_spec["required_global_inputs"] = required_global_inputs
 
-    physics = config["physics_toggles"]
-    for name in SUPPORTED_PHYSICS_TOGGLES:
-        physics[name] = _as_bool(physics.get(name, False), f"physics_toggles.{name}")
+    if not equilibrium:
+        physics = config["physics_toggles"]
+        for name in SUPPORTED_PHYSICS_TOGGLES:
+            physics[name] = _as_bool(physics.get(name, False), f"physics_toggles.{name}")
 
-    runtime = config["vulcan_runtime"]
-    _require_keys(
-        runtime,
-        [
-            "python_executable",
-            "cfg_file",
-            "chemistry_file",
-            "worker_root",
-            "regenerate_chem_funs",
-            "atm_base",
-            "t_cross_sp",
-            "cfg_assignments",
-        ],
-        "vulcan_runtime",
-    )
-    runtime["python_executable"] = _as_nonempty_str(
-        runtime["python_executable"], "vulcan_runtime.python_executable"
-    )
-    runtime["cfg_file"] = _as_nonempty_str(runtime["cfg_file"], "vulcan_runtime.cfg_file")
-    runtime["chemistry_file"] = _as_nonempty_str(
-        runtime["chemistry_file"], "vulcan_runtime.chemistry_file"
-    )
-    runtime["worker_root"] = _as_nonempty_str(runtime["worker_root"], "vulcan_runtime.worker_root")
-    runtime["regenerate_chem_funs"] = _as_bool(
-        runtime["regenerate_chem_funs"], "vulcan_runtime.regenerate_chem_funs"
-    )
-    runtime["atm_base"] = _as_nonempty_str(runtime["atm_base"], "vulcan_runtime.atm_base")
-    if runtime["atm_base"] not in SUPPORTED_ATM_BASES:
-        raise ConfigValidationError(
-            f"vulcan_runtime.atm_base must be one of {SUPPORTED_ATM_BASES}, got {runtime['atm_base']!r}."
+    if not equilibrium:
+        runtime = config["vulcan_runtime"]
+        _require_keys(
+            runtime,
+            [
+                "python_executable",
+                "cfg_file",
+                "chemistry_file",
+                "worker_root",
+                "regenerate_chem_funs",
+                "atm_base",
+                "t_cross_sp",
+                "cfg_assignments",
+            ],
+            "vulcan_runtime",
         )
-    runtime["t_cross_sp"] = _as_string_list(runtime["t_cross_sp"], "vulcan_runtime.t_cross_sp")
-    if not isinstance(runtime["cfg_assignments"], dict):
-        raise ConfigValidationError("vulcan_runtime.cfg_assignments must be a mapping.")
+        runtime["python_executable"] = _as_nonempty_str(
+            runtime["python_executable"], "vulcan_runtime.python_executable"
+        )
+        runtime["cfg_file"] = _as_nonempty_str(runtime["cfg_file"], "vulcan_runtime.cfg_file")
+        runtime["chemistry_file"] = _as_nonempty_str(
+            runtime["chemistry_file"], "vulcan_runtime.chemistry_file"
+        )
+        runtime["worker_root"] = _as_nonempty_str(runtime["worker_root"], "vulcan_runtime.worker_root")
+        runtime["regenerate_chem_funs"] = _as_bool(
+            runtime["regenerate_chem_funs"], "vulcan_runtime.regenerate_chem_funs"
+        )
+        runtime["atm_base"] = _as_nonempty_str(runtime["atm_base"], "vulcan_runtime.atm_base")
+        if runtime["atm_base"] not in SUPPORTED_ATM_BASES:
+            raise ConfigValidationError(
+                f"vulcan_runtime.atm_base must be one of {SUPPORTED_ATM_BASES}, got {runtime['atm_base']!r}."
+            )
+        runtime["t_cross_sp"] = _as_string_list(runtime["t_cross_sp"], "vulcan_runtime.t_cross_sp")
+        if not isinstance(runtime["cfg_assignments"], dict):
+            raise ConfigValidationError("vulcan_runtime.cfg_assignments must be a mapping.")
 
     sampling = config["sampling"]
-    _require_keys(
-        sampling,
-        [
-            "num_levels",
-            "pressure_top_bar",
-            "pressure_bottom_bar",
-            "temperature_range_k",
+    required_sampling = [
+        "num_levels",
+        "pressure_top_bar",
+        "pressure_bottom_bar",
+        "temperature_range_k",
+        "metallicity_log10_range",
+        "c_to_o_range",
+        "s_to_o_range",
+    ]
+    if not equilibrium:
+        required_sampling += [
             "gravity_range_cm_s2",
-            "metallicity_log10_range",
-            "c_to_o_range",
             "kzz_cm2_s",
             "num_time_steps",
             "time_step_log10_min_s",
             "time_step_log10_max_s",
-        ],
-        "sampling",
-    )
+        ]
+    _require_keys(sampling, required_sampling, "sampling")
+
     sampling["num_levels"] = _as_int(sampling["num_levels"], "sampling.num_levels")
-    sampling["num_time_steps"] = _as_int(
-        sampling["num_time_steps"], "sampling.num_time_steps"
-    )
     if sampling["num_levels"] < 4:
         raise ConfigValidationError("sampling.num_levels must be >= 4.")
-    if sampling["num_time_steps"] < 3:
-        raise ConfigValidationError("sampling.num_time_steps must be >= 3.")
+    if not equilibrium:
+        sampling["num_time_steps"] = _as_int(
+            sampling["num_time_steps"], "sampling.num_time_steps"
+        )
+        if sampling["num_time_steps"] < 3:
+            raise ConfigValidationError("sampling.num_time_steps must be >= 3.")
     sampling["pressure_top_bar"] = _as_float(
         sampling["pressure_top_bar"], "sampling.pressure_top_bar"
     )
@@ -277,12 +337,11 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("Pressure bounds must be positive.")
     if sampling["pressure_top_bar"] >= sampling["pressure_bottom_bar"]:
         raise ConfigValidationError("pressure_top_bar must be smaller than pressure_bottom_bar.")
-    for key in (
-        "temperature_range_k",
-        "gravity_range_cm_s2",
-        "metallicity_log10_range",
-        "c_to_o_range",
-    ):
+
+    range_keys = ["temperature_range_k", "metallicity_log10_range", "c_to_o_range", "s_to_o_range"]
+    if not equilibrium:
+        range_keys.append("gravity_range_cm_s2")
+    for key in range_keys:
         values = sampling[key]
         if not isinstance(values, list) or len(values) != 2:
             raise ConfigValidationError(f"sampling.{key} must be a length-2 list.")
@@ -291,93 +350,106 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         if not low < high:
             raise ConfigValidationError(f"sampling.{key} must be strictly increasing.")
         sampling[key] = [low, high]
-    sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
-    if sampling["kzz_cm2_s"] <= 0.0:
-        raise ConfigValidationError("sampling.kzz_cm2_s must be positive.")
-    sampling["time_step_log10_min_s"] = _as_float(
-        sampling["time_step_log10_min_s"], "sampling.time_step_log10_min_s"
-    )
-    sampling["time_step_log10_max_s"] = _as_float(
-        sampling["time_step_log10_max_s"], "sampling.time_step_log10_max_s"
-    )
-    if not sampling["time_step_log10_min_s"] < sampling["time_step_log10_max_s"]:
-        raise ConfigValidationError(
-            "sampling.time_step_log10_min_s must be smaller than sampling.time_step_log10_max_s."
-        )
 
-    spectrum = config["stellar_spectrum"]
-    _require_keys(
-        spectrum,
-        [
-            "enabled",
-            "template_name",
-            "template_file",
-            "num_bins",
-            "wavelength_min_nm",
-            "wavelength_max_nm",
-            "encoder_mode",
-            "latent_dim",
-            "hidden_dim",
-            "teff_k",
-            "radius_rsun",
-            "semi_major_axis_au",
-            "zenith_angle_deg",
-            "diurnal_factor",
-        ],
-        "stellar_spectrum",
-    )
-    spectrum["enabled"] = _as_bool(spectrum["enabled"], "stellar_spectrum.enabled")
-    spectrum["template_name"] = _as_nonempty_str(
-        spectrum["template_name"], "stellar_spectrum.template_name"
-    )
-    spectrum["template_file"] = _as_nonempty_str(
-        spectrum["template_file"], "stellar_spectrum.template_file"
-    )
-    spectrum["num_bins"] = _as_int(spectrum["num_bins"], "stellar_spectrum.num_bins")
-    spectrum["latent_dim"] = _as_int(spectrum["latent_dim"], "stellar_spectrum.latent_dim")
-    spectrum["hidden_dim"] = _as_int(spectrum["hidden_dim"], "stellar_spectrum.hidden_dim")
-    if spectrum["num_bins"] < 8:
-        raise ConfigValidationError("stellar_spectrum.num_bins must be >= 8.")
-    if spectrum["latent_dim"] < 1 or spectrum["latent_dim"] > spectrum["num_bins"]:
-        raise ConfigValidationError(
-            "stellar_spectrum.latent_dim must lie in [1, num_bins]."
+    if not equilibrium:
+        sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
+        if sampling["kzz_cm2_s"] <= 0.0:
+            raise ConfigValidationError("sampling.kzz_cm2_s must be positive.")
+        sampling["time_step_log10_min_s"] = _as_float(
+            sampling["time_step_log10_min_s"], "sampling.time_step_log10_min_s"
         )
-    spectrum["wavelength_min_nm"] = _as_float(
-        spectrum["wavelength_min_nm"], "stellar_spectrum.wavelength_min_nm"
-    )
-    spectrum["wavelength_max_nm"] = _as_float(
-        spectrum["wavelength_max_nm"], "stellar_spectrum.wavelength_max_nm"
-    )
-    if spectrum["wavelength_min_nm"] >= spectrum["wavelength_max_nm"]:
-        raise ConfigValidationError(
-            "stellar_spectrum.wavelength_min_nm must be smaller than wavelength_max_nm."
+        sampling["time_step_log10_max_s"] = _as_float(
+            sampling["time_step_log10_max_s"], "sampling.time_step_log10_max_s"
         )
-    spectrum["encoder_mode"] = _as_nonempty_str(
-        spectrum["encoder_mode"], "stellar_spectrum.encoder_mode"
-    ).lower()
-    if spectrum["encoder_mode"] not in _ALLOWED_SPECTRUM_ENCODERS:
-        raise ConfigValidationError(
-            f"stellar_spectrum.encoder_mode must be one of {_ALLOWED_SPECTRUM_ENCODERS}."
+        if not sampling["time_step_log10_min_s"] < sampling["time_step_log10_max_s"]:
+            raise ConfigValidationError(
+                "sampling.time_step_log10_min_s must be smaller than sampling.time_step_log10_max_s."
+            )
+
+    if not equilibrium:
+        spectrum = config["stellar_spectrum"]
+        _require_keys(
+            spectrum,
+            [
+                "enabled",
+                "template_name",
+                "template_file",
+                "num_bins",
+                "wavelength_min_nm",
+                "wavelength_max_nm",
+                "encoder_mode",
+                "latent_dim",
+                "hidden_dim",
+                "teff_k",
+                "radius_rsun",
+                "semi_major_axis_au",
+                "zenith_angle_deg",
+                "diurnal_factor",
+            ],
+            "stellar_spectrum",
         )
-    for key in ("teff_k", "radius_rsun", "semi_major_axis_au", "diurnal_factor"):
-        spectrum[key] = _as_float(spectrum[key], f"stellar_spectrum.{key}")
-        if spectrum[key] <= 0.0:
-            raise ConfigValidationError(f"stellar_spectrum.{key} must be positive.")
-    spectrum["zenith_angle_deg"] = _as_float(
-        spectrum["zenith_angle_deg"], "stellar_spectrum.zenith_angle_deg"
-    )
-    if spectrum["zenith_angle_deg"] < 0.0 or spectrum["zenith_angle_deg"] >= 90.0:
-        raise ConfigValidationError("stellar_spectrum.zenith_angle_deg must lie in [0, 90).")
+        spectrum["enabled"] = _as_bool(spectrum["enabled"], "stellar_spectrum.enabled")
+        spectrum["template_name"] = _as_nonempty_str(
+            spectrum["template_name"], "stellar_spectrum.template_name"
+        )
+        spectrum["template_file"] = _as_nonempty_str(
+            spectrum["template_file"], "stellar_spectrum.template_file"
+        )
+        spectrum["num_bins"] = _as_int(spectrum["num_bins"], "stellar_spectrum.num_bins")
+        spectrum["latent_dim"] = _as_int(spectrum["latent_dim"], "stellar_spectrum.latent_dim")
+        spectrum["hidden_dim"] = _as_int(spectrum["hidden_dim"], "stellar_spectrum.hidden_dim")
+        if spectrum["num_bins"] < 8:
+            raise ConfigValidationError("stellar_spectrum.num_bins must be >= 8.")
+        if spectrum["latent_dim"] < 1 or spectrum["latent_dim"] > spectrum["num_bins"]:
+            raise ConfigValidationError(
+                "stellar_spectrum.latent_dim must lie in [1, num_bins]."
+            )
+        spectrum["wavelength_min_nm"] = _as_float(
+            spectrum["wavelength_min_nm"], "stellar_spectrum.wavelength_min_nm"
+        )
+        spectrum["wavelength_max_nm"] = _as_float(
+            spectrum["wavelength_max_nm"], "stellar_spectrum.wavelength_max_nm"
+        )
+        if spectrum["wavelength_min_nm"] >= spectrum["wavelength_max_nm"]:
+            raise ConfigValidationError(
+                "stellar_spectrum.wavelength_min_nm must be smaller than wavelength_max_nm."
+            )
+        spectrum["encoder_mode"] = _as_nonempty_str(
+            spectrum["encoder_mode"], "stellar_spectrum.encoder_mode"
+        ).lower()
+        if spectrum["encoder_mode"] not in _ALLOWED_SPECTRUM_ENCODERS:
+            raise ConfigValidationError(
+                f"stellar_spectrum.encoder_mode must be one of {_ALLOWED_SPECTRUM_ENCODERS}."
+            )
+        for key in ("teff_k", "radius_rsun", "semi_major_axis_au", "diurnal_factor"):
+            spectrum[key] = _as_float(spectrum[key], f"stellar_spectrum.{key}")
+            if spectrum[key] <= 0.0:
+                raise ConfigValidationError(f"stellar_spectrum.{key} must be positive.")
+        spectrum["zenith_angle_deg"] = _as_float(
+            spectrum["zenith_angle_deg"], "stellar_spectrum.zenith_angle_deg"
+        )
+        if spectrum["zenith_angle_deg"] < 0.0 or spectrum["zenith_angle_deg"] >= 90.0:
+            raise ConfigValidationError("stellar_spectrum.zenith_angle_deg must lie in [0, 90).")
 
     generation = config["generation"]
-    _require_keys(
-        generation,
-        ["mode", "num_runs", "seed", "overwrite", "reuse_raw_if_present", "parallel_workers"],
-        "generation",
-    )
+    gen_required = ["mode", "num_runs", "seed", "overwrite", "reuse_raw_if_present", "parallel_workers"]
+    if not equilibrium:
+        gen_required.append("target_mode")
+    _require_keys(generation, gen_required, "generation")
     generation["mode"] = _as_nonempty_str(generation["mode"], "generation.mode").lower()
     if generation["mode"] not in {"synthetic", "vulcan"}:
         raise ConfigValidationError("generation.mode must be 'synthetic' or 'vulcan'.")
+    if equilibrium:
+        generation["target_mode"] = "equilibrium_only"
+    else:
+        generation["target_mode"] = _as_nonempty_str(
+            generation["target_mode"],
+            "generation.target_mode",
+        ).lower()
+        if generation["target_mode"] not in _ALLOWED_TARGET_MODES:
+            raise ConfigValidationError(
+                f"generation.target_mode must be one of {_ALLOWED_TARGET_MODES}."
+            )
     generation["num_runs"] = _as_int(generation["num_runs"], "generation.num_runs")
     generation["seed"] = _as_int(generation["seed"], "generation.seed")
     generation["overwrite"] = _as_bool(generation["overwrite"], "generation.overwrite")
@@ -392,76 +464,83 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     if generation["parallel_workers"] < 1:
         raise ConfigValidationError("generation.parallel_workers must be >= 1.")
 
-    traj = config["trajectory_sampling"]
-    _require_keys(
-        traj,
-        ["dt_min_s", "dt_max_s", "min_future_saved_steps", "num_logdt_bins"],
-        "trajectory_sampling",
-    )
-    traj["dt_min_s"] = _as_float(traj["dt_min_s"], "trajectory_sampling.dt_min_s")
-    traj["dt_max_s"] = _as_float(traj["dt_max_s"], "trajectory_sampling.dt_max_s")
-    traj["min_future_saved_steps"] = _as_int(
-        traj["min_future_saved_steps"], "trajectory_sampling.min_future_saved_steps"
-    )
-    traj["num_logdt_bins"] = _as_int(
-        traj["num_logdt_bins"], "trajectory_sampling.num_logdt_bins"
-    )
-    if traj["dt_min_s"] <= 0.0 or traj["dt_max_s"] <= 0.0:
-        raise ConfigValidationError("trajectory_sampling dt bounds must be positive.")
-    if traj["dt_min_s"] >= traj["dt_max_s"]:
-        raise ConfigValidationError("trajectory_sampling.dt_min_s must be < dt_max_s.")
-    if traj["min_future_saved_steps"] < 1:
-        raise ConfigValidationError("min_future_saved_steps must be >= 1.")
-    if traj["num_logdt_bins"] < 1:
-        raise ConfigValidationError("trajectory_sampling.num_logdt_bins must be >= 1.")
+    if not equilibrium:
+        traj = config["trajectory_sampling"]
+        _require_keys(
+            traj,
+            ["dt_min_s", "dt_max_s", "min_future_saved_steps", "num_logdt_bins"],
+            "trajectory_sampling",
+        )
+        traj["dt_min_s"] = _as_float(traj["dt_min_s"], "trajectory_sampling.dt_min_s")
+        traj["dt_max_s"] = _as_float(traj["dt_max_s"], "trajectory_sampling.dt_max_s")
+        traj["min_future_saved_steps"] = _as_int(
+            traj["min_future_saved_steps"], "trajectory_sampling.min_future_saved_steps"
+        )
+        traj["num_logdt_bins"] = _as_int(
+            traj["num_logdt_bins"], "trajectory_sampling.num_logdt_bins"
+        )
+        if traj["dt_min_s"] <= 0.0 or traj["dt_max_s"] <= 0.0:
+            raise ConfigValidationError("trajectory_sampling dt bounds must be positive.")
+        if traj["dt_min_s"] >= traj["dt_max_s"]:
+            raise ConfigValidationError("trajectory_sampling.dt_min_s must be < dt_max_s.")
+        if traj["min_future_saved_steps"] < 1:
+            raise ConfigValidationError("min_future_saved_steps must be >= 1.")
+        if traj["num_logdt_bins"] < 1:
+            raise ConfigValidationError("trajectory_sampling.num_logdt_bins must be >= 1.")
 
     inference = config.get("inference", {})
     if inference is None:
         inference = {}
     if not isinstance(inference, dict):
         raise ConfigValidationError("inference must be a mapping.")
-    eq_anchor = inference.get("equilibrium_anchor", {})
-    if eq_anchor is None:
-        eq_anchor = {}
-    if not isinstance(eq_anchor, dict):
-        raise ConfigValidationError("inference.equilibrium_anchor must be a mapping.")
-    eq_source = _as_nonempty_str(
-        eq_anchor.get("source", "trajectory"),
-        "inference.equilibrium_anchor.source",
-    ).lower()
-    if eq_source not in _ALLOWED_EQ_ANCHOR_SOURCES:
-        raise ConfigValidationError(
-            f"inference.equilibrium_anchor.source must be one of {_ALLOWED_EQ_ANCHOR_SOURCES}."
+    if not equilibrium:
+        eq_anchor = inference.get("equilibrium_anchor", {})
+        if eq_anchor is None:
+            eq_anchor = {}
+        if not isinstance(eq_anchor, dict):
+            raise ConfigValidationError("inference.equilibrium_anchor must be a mapping.")
+        default_eq_source = (
+            "flat"
+            if generation["target_mode"] == "equilibrium_only"
+            else "trajectory"
         )
-    eq_split = _as_nonempty_str(
-        eq_anchor.get("split", "train"),
-        "inference.equilibrium_anchor.split",
-    ).lower()
-    if eq_split not in _ALLOWED_EQ_ANCHOR_SPLITS:
-        raise ConfigValidationError(
-            f"inference.equilibrium_anchor.split must be one of {_ALLOWED_EQ_ANCHOR_SPLITS}."
-        )
-    eq_run_id = eq_anchor.get("run_id")
-    if eq_run_id is not None:
-        eq_run_id = _as_nonempty_str(
-            eq_run_id,
-            "inference.equilibrium_anchor.run_id",
-        )
-    eq_step_index = eq_anchor.get("step_index")
-    if eq_step_index is not None:
-        eq_step_index = _as_int(
-            eq_step_index,
-            "inference.equilibrium_anchor.step_index",
-        )
-        if eq_step_index < 0:
-            raise ConfigValidationError("inference.equilibrium_anchor.step_index must be >= 0.")
-    else:
-        eq_step_index = 0
-    eq_anchor["source"] = eq_source
-    eq_anchor["split"] = eq_split
-    eq_anchor["run_id"] = eq_run_id
-    eq_anchor["step_index"] = eq_step_index
-    inference["equilibrium_anchor"] = eq_anchor
+        eq_source = _as_nonempty_str(
+            eq_anchor.get("source", default_eq_source),
+            "inference.equilibrium_anchor.source",
+        ).lower()
+        if eq_source not in _ALLOWED_EQ_ANCHOR_SOURCES:
+            raise ConfigValidationError(
+                f"inference.equilibrium_anchor.source must be one of {_ALLOWED_EQ_ANCHOR_SOURCES}."
+            )
+        eq_split = _as_nonempty_str(
+            eq_anchor.get("split", "train"),
+            "inference.equilibrium_anchor.split",
+        ).lower()
+        if eq_split not in _ALLOWED_EQ_ANCHOR_SPLITS:
+            raise ConfigValidationError(
+                f"inference.equilibrium_anchor.split must be one of {_ALLOWED_EQ_ANCHOR_SPLITS}."
+            )
+        eq_run_id = eq_anchor.get("run_id")
+        if eq_run_id is not None:
+            eq_run_id = _as_nonempty_str(
+                eq_run_id,
+                "inference.equilibrium_anchor.run_id",
+            )
+        eq_step_index = eq_anchor.get("step_index")
+        if eq_step_index is not None:
+            eq_step_index = _as_int(
+                eq_step_index,
+                "inference.equilibrium_anchor.step_index",
+            )
+            if eq_step_index < 0:
+                raise ConfigValidationError("inference.equilibrium_anchor.step_index must be >= 0.")
+        else:
+            eq_step_index = 0
+        eq_anchor["source"] = eq_source
+        eq_anchor["split"] = eq_split
+        eq_anchor["run_id"] = eq_run_id
+        eq_anchor["step_index"] = eq_step_index
+        inference["equilibrium_anchor"] = eq_anchor
     config["inference"] = inference
 
     prep = config["preprocessing"]
@@ -476,17 +555,26 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     prep["seed"] = _as_int(prep["seed"], "preprocessing.seed")
 
     norm = config["normalization"]
-    _require_keys(norm, ["state_floor", "spectrum_floor", "sequence_methods"], "normalization")
+    norm_required = ["state_floor", "sequence_methods"]
+    if not equilibrium:
+        norm_required.append("spectrum_floor")
+    _require_keys(norm, norm_required, "normalization")
     norm["state_floor"] = _as_float(norm["state_floor"], "normalization.state_floor")
-    norm["spectrum_floor"] = _as_float(norm["spectrum_floor"], "normalization.spectrum_floor")
-    if norm["state_floor"] <= 0.0 or norm["spectrum_floor"] <= 0.0:
-        raise ConfigValidationError("normalization floors must be positive.")
+    if norm["state_floor"] <= 0.0:
+        raise ConfigValidationError("normalization.state_floor must be positive.")
+    if not equilibrium:
+        norm["spectrum_floor"] = _as_float(norm["spectrum_floor"], "normalization.spectrum_floor")
+        if norm["spectrum_floor"] <= 0.0:
+            raise ConfigValidationError("normalization.spectrum_floor must be positive.")
     if not isinstance(norm["sequence_methods"], dict):
         raise ConfigValidationError("normalization.sequence_methods must be a mapping.")
-    expected_sequence_methods = {"pressure_bar", "temperature_k", "kzz_cm2_s"}
+    if equilibrium:
+        expected_sequence_methods = {"pressure_bar", "temperature_k"}
+    else:
+        expected_sequence_methods = {"pressure_bar", "temperature_k", "kzz_cm2_s"}
     if set(norm["sequence_methods"].keys()) != expected_sequence_methods:
         raise ConfigValidationError(
-            "normalization.sequence_methods must define exactly pressure_bar, temperature_k, and kzz_cm2_s."
+            f"normalization.sequence_methods must define exactly {expected_sequence_methods}."
         )
     for key, method in norm["sequence_methods"].items():
         method_name = _as_nonempty_str(method, f"normalization.sequence_methods.{key}").lower()
@@ -565,22 +653,34 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("output_head_divisor must be >= 1.")
 
     loss = training["loss"]
-    _require_keys(loss, ["lambda_z", "lambda_phys", "lambda_spectrum"], "training.loss")
-    for key in ("lambda_z", "lambda_phys", "lambda_spectrum"):
+    loss_required = ["lambda_z", "lambda_phys"]
+    if not equilibrium:
+        loss_required.append("lambda_spectrum")
+    _require_keys(loss, loss_required, "training.loss")
+    for key in loss_required:
         loss[key] = _as_float(loss[key], f"training.loss.{key}")
         if loss[key] < 0.0:
             raise ConfigValidationError(f"training.loss.{key} must be non-negative.")
 
     config["data_spec"]["state_dim"] = len(state_species)
     config["data_spec"]["target_dim"] = len(output_species)
-    config["data_spec"]["sequence_static_feature_order"] = [
-        "pressure_bar",
-        "temperature_k",
-        "kzz_cm2_s",
-    ]
+    if equilibrium:
+        config["data_spec"]["sequence_static_feature_order"] = [
+            "pressure_bar",
+            "temperature_k",
+        ]
+    else:
+        config["data_spec"]["sequence_static_feature_order"] = [
+            "pressure_bar",
+            "temperature_k",
+            "kzz_cm2_s",
+        ]
     config["data_spec"]["global_static_feature_order"] = global_static_feature_order(config)
     config["data_spec"]["global_feature_order"] = global_feature_order(config)
-    config["data_spec"]["dt_feature_index"] = config["data_spec"]["global_feature_order"].index(
-        "log10_dt_s"
-    )
+    if not equilibrium:
+        config["data_spec"]["dt_feature_index"] = config["data_spec"]["global_feature_order"].index(
+            "log10_dt_s"
+        )
+    else:
+        config["data_spec"]["dt_feature_index"] = None
     return config

@@ -7,10 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .anchor_states import build_flat_h2_he_anchor
 from .data_loader import load_processed_split
 from .export_jax import load_export_bundle
 from .jax_model import ModelDimensions, apply_model
@@ -140,8 +145,13 @@ class PhysicalSpaceStandaloneModel:
     def _equilibrium_anchor_config(self) -> dict[str, Any]:
         inference_cfg = self.config.get("inference", {})
         eq_anchor_cfg = inference_cfg.get("equilibrium_anchor", {})
+        default_source = (
+            "flat"
+            if str(self.config.get("generation", {}).get("target_mode", "")).lower() == "equilibrium_only"
+            else "trajectory"
+        )
         return {
-            "source": str(eq_anchor_cfg.get("source", "trajectory")).lower(),
+            "source": str(eq_anchor_cfg.get("source", default_source)).lower(),
             "split": str(eq_anchor_cfg.get("split", "train")).lower(),
             "run_id": eq_anchor_cfg.get("run_id"),
             "step_index": eq_anchor_cfg.get("step_index", 0),
@@ -149,15 +159,10 @@ class PhysicalSpaceStandaloneModel:
 
     def _flat_initial_state(self, nz: int) -> np.ndarray:
         """Build an H2/He-dominated flat initial state for the configured species."""
-        species = list(self.contract["state_species_order"])
-        state = np.full((nz, len(species)), 1.0e-12, dtype=np.float64)
-        idx = {name: i for i, name in enumerate(species)}
-        if "H2" in idx:
-            state[:, idx["H2"]] = 0.85
-        if "He" in idx:
-            state[:, idx["He"]] = 0.15
-        state /= np.sum(state, axis=1, keepdims=True)
-        return state
+        return build_flat_h2_he_anchor(
+            list(self.contract["state_species_order"]),
+            nz=int(nz),
+        )
 
     @functools.cached_property
     def equilibrium_anchor_profile(self) -> np.ndarray | None:

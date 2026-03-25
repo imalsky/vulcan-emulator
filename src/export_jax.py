@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
+
 import jax
 import numpy as np
 

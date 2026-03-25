@@ -24,6 +24,10 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
+
 import jax
 import jax.numpy as jnp
 
@@ -140,7 +144,7 @@ def init_model_params(key: jax.Array, dims: ModelDimensions) -> dict[str, Any]:
         spectrum_key_count = 1
     else:
         spectrum_key_count = 0
-    total_key_count = 6 + spectrum_key_count + dims.num_layers * 6
+    total_key_count = 5 + spectrum_key_count + dims.num_layers * 6
     keys = iter(jax.random.split(key, total_key_count))
     params: dict[str, Any] = {
         "sequence_in": _init_linear(next(keys), dims.sequence_dim, dims.d_model),
