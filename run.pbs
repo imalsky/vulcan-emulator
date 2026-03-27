@@ -36,155 +36,25 @@ if [ "${rc}" -ne 0 ]; then
   exit 2
 fi
 
-# Override CONFIG_PATH at submit time to point at a custom config,
-# for example: CONFIG_PATH=config/equilibrium_only_config.json
 CONFIG_PATH="${CONFIG_PATH:-config/equilibrium_only_config.json}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
-ENABLE_PROCESS_MONITOR="${ENABLE_PROCESS_MONITOR:-1}"
-PROCESS_MONITOR_INTERVAL_SEC="${PROCESS_MONITOR_INTERVAL_SEC:-30}"
-PROCESS_MONITOR_LOG="${PROCESS_MONITOR_LOG:-${PROJECT_ROOT}/process_monitor.log}"
-ENABLE_JAX_COMPILE_LOGS="${ENABLE_JAX_COMPILE_LOGS:-1}"
-ENABLE_JAX_SMOKE_TEST="${ENABLE_JAX_SMOKE_TEST:-1}"
-JAX_SMOKE_SIZE="${JAX_SMOKE_SIZE:-2048}"
-DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-0}"
-JAX_RUNTIME_MODE="${JAX_RUNTIME_MODE:-auto}"
-ALLOW_JAX_SITE_FALLBACK="${ALLOW_JAX_SITE_FALLBACK:-1}"
-JAX_SITE_PACKAGES="${JAX_SITE_PACKAGES:-}"
-JAX_OVERLAY_DIR="${JAX_OVERLAY_DIR:-${PROJECT_ROOT}/.jax_overlay_${PBS_JOBID:-manual}}"
-ENABLE_STACK_WATCHDOG="${ENABLE_STACK_WATCHDOG:-1}"
-STACK_WATCHDOG_INTERVAL_SEC="${STACK_WATCHDOG_INTERVAL_SEC:-60}"
-STACK_DUMP_IDLE_SEC="${STACK_DUMP_IDLE_SEC:-300}"
-TRAINING_HEARTBEAT_SEC="${TRAINING_HEARTBEAT_SEC:-60}"
-TRAINING_HEARTBEAT_LOG="${TRAINING_HEARTBEAT_LOG:-${PROJECT_ROOT}/training_heartbeat.log}"
-TRAINING_PROGRESS_FILE="${TRAINING_PROGRESS_FILE:-${PROJECT_ROOT}/training_progress.json}"
-TRAINING_WRAPPER_PID_FILE="${TRAINING_WRAPPER_PID_FILE:-${PROJECT_ROOT}/training_wrapper.pid}"
-ENABLE_XLA_DUMP="${ENABLE_XLA_DUMP:-0}"
-XLA_DUMP_DIR="${XLA_DUMP_DIR:-${PROJECT_ROOT}/xla_dump_${PBS_JOBID:-manual}}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
-GPU_MONITOR_PID=""
-PROCESS_MONITOR_PID=""
-STACK_WATCHDOG_PID=""
-TRAIN_PID=""
-
-cleanup() {
-  if [ -n "${GPU_MONITOR_PID}" ]; then
-    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
-  fi
-  if [ -n "${PROCESS_MONITOR_PID}" ]; then
-    kill "${PROCESS_MONITOR_PID}" >/dev/null 2>&1 || true
-  fi
-  if [ -n "${STACK_WATCHDOG_PID}" ]; then
-    kill "${STACK_WATCHDOG_PID}" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
+DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-0}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
-ORIG_PYTHONPATH="${PYTHONPATH:-}"
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}"
+export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
-export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
-export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-${ENABLE_JAX_COMPILE_LOGS}}"
-export VULCAN_TRAIN_DEBUG="${VULCAN_TRAIN_DEBUG:-1}"
-export TRAINING_HEARTBEAT_LOG
-export TRAINING_PROGRESS_FILE
-export TRAINING_WRAPPER_PID_FILE
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
+export VULCAN_TRAIN_DEBUG="${VULCAN_TRAIN_DEBUG:-1}"
 
-PYTHON_CMD=(python -s)
-
-if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
-  mkdir -p "${XLA_DUMP_DIR}"
-  export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=${XLA_DUMP_DIR}"
-fi
 if [ "${DISABLE_TRITON_GEMM}" = "1" ]; then
   export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false"
-fi
-
-python_run() {
-  "${PYTHON_CMD[@]}" "$@"
-}
-
-link_overlay_entry() {
-  local src="$1"
-  local dst_dir="$2"
-  local base
-  base="$(basename "${src}")"
-  if [ -e "${src}" ] && [ ! -e "${dst_dir}/${base}" ]; then
-    ln -s "${src}" "${dst_dir}/${base}"
-  fi
-}
-
-ENV_JAX_PRESENT=0
-if python_run - <<'PY'
-import importlib.util
-import sys
-
-has_jax = importlib.util.find_spec("jax") is not None
-has_jaxlib = importlib.util.find_spec("jaxlib") is not None
-raise SystemExit(0 if has_jax and has_jaxlib else 1)
-PY
-then
-  ENV_JAX_PRESENT=1
-fi
-
-export JAX_SITE_PACKAGES_ACTIVE=""
-export JAX_RUNTIME_MODE_ACTIVE="strict"
-if [ "${ENV_JAX_PRESENT}" != "1" ]; then
-  if [ "${JAX_RUNTIME_MODE}" = "legacy" ] || { [ "${JAX_RUNTIME_MODE}" = "auto" ] && [ "${ALLOW_JAX_SITE_FALLBACK}" = "1" ]; }; then
-    unset PYTHONNOUSERSITE || true
-    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${ORIG_PYTHONPATH:+:${ORIG_PYTHONPATH}}"
-    export JAX_RUNTIME_MODE_ACTIVE="legacy"
-    PYTHON_CMD=(python)
-    PYTHON_MM="$(python_run - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}")
-PY
-)"
-    AUTO_JAX_SITE="${HOME}/.local/lib/python${PYTHON_MM}/site-packages"
-    if [ -d "${AUTO_JAX_SITE}" ]; then
-      export JAX_SITE_PACKAGES_ACTIVE="${AUTO_JAX_SITE}"
-    fi
-    echo "INFO: conda env '${CONDA_ENV}' does not contain jax/jaxlib; matching run_jax.pbs import behavior via ambient PYTHONPATH and user site-packages"
-  fi
-fi
-
-if [ "${ENV_JAX_PRESENT}" != "1" ] && [ "${JAX_RUNTIME_MODE_ACTIVE}" = "strict" ]; then
-  PYTHON_MM="$(python_run - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}")
-PY
-)"
-  AUTO_JAX_SITE="${HOME}/.local/lib/python${PYTHON_MM}/site-packages"
-  if [ -z "${JAX_SITE_PACKAGES}" ] && [ -d "${AUTO_JAX_SITE}" ]; then
-    JAX_SITE_PACKAGES="${AUTO_JAX_SITE}"
-  fi
-  if [ "${ALLOW_JAX_SITE_FALLBACK}" = "1" ] && [ -n "${JAX_SITE_PACKAGES}" ] && [ -d "${JAX_SITE_PACKAGES}" ]; then
-    if [ -d "${JAX_SITE_PACKAGES}/jax" ] && [ -d "${JAX_SITE_PACKAGES}/jaxlib" ]; then
-      mkdir -p "${JAX_OVERLAY_DIR}"
-      for name in jax jaxlib jax_plugins ml_dtypes opt_einsum absl etils; do
-        link_overlay_entry "${JAX_SITE_PACKAGES}/${name}" "${JAX_OVERLAY_DIR}"
-      done
-      for pattern in jax_cuda*_plugin jax_cuda*_pjrt; do
-        for src in "${JAX_SITE_PACKAGES}"/${pattern}; do
-          [ -e "${src}" ] || continue
-          link_overlay_entry "${src}" "${JAX_OVERLAY_DIR}"
-        done
-      done
-      export PYTHONPATH="${JAX_OVERLAY_DIR}:${PROJECT_ROOT}/src:${PROJECT_ROOT}"
-      export JAX_SITE_PACKAGES_ACTIVE="${JAX_SITE_PACKAGES}"
-      export JAX_RUNTIME_MODE_ACTIVE="overlay"
-      echo "INFO: conda env '${CONDA_ENV}' does not contain jax/jaxlib; using controlled JAX overlay from ${JAX_SITE_PACKAGES}"
-      echo "INFO: JAX overlay directory: ${JAX_OVERLAY_DIR}"
-    fi
-  fi
 fi
 
 if [ -n "${PBS_JOBID:-}" ]; then
@@ -205,119 +75,41 @@ if [ ! -d "${PROJECT_ROOT}/src" ]; then
 fi
 if [ ! -f "${PROJECT_ROOT}/src/models/jax_model.py" ]; then
   echo "ERROR: required source file not found: ${PROJECT_ROOT}/src/models/jax_model.py"
-  echo "The job workspace appears incomplete. Sync the full repo contents before submitting."
   exit 1
 fi
 
-echo "Config path: $(python_run - <<'PY' "${CONFIG_PATH}"
+echo "Config path: $(python - <<'PY' "${CONFIG_PATH}"
 from pathlib import Path
 import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: PYTHONNOUSERSITE=${PYTHONNOUSERSITE:-<unset>} PYTHONPATH=${PYTHONPATH} JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} VULCAN_TRAIN_DEBUG=${VULCAN_TRAIN_DEBUG} ENABLE_JAX_SMOKE_TEST=${ENABLE_JAX_SMOKE_TEST} JAX_SMOKE_SIZE=${JAX_SMOKE_SIZE} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM} JAX_RUNTIME_MODE=${JAX_RUNTIME_MODE} JAX_RUNTIME_MODE_ACTIVE=${JAX_RUNTIME_MODE_ACTIVE} ALLOW_JAX_SITE_FALLBACK=${ALLOW_JAX_SITE_FALLBACK} JAX_SITE_PACKAGES=${JAX_SITE_PACKAGES:-<unset>} JAX_SITE_PACKAGES_ACTIVE=${JAX_SITE_PACKAGES_ACTIVE:-<unset>} ENABLE_STACK_WATCHDOG=${ENABLE_STACK_WATCHDOG} STACK_DUMP_IDLE_SEC=${STACK_DUMP_IDLE_SEC} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
-if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
-  echo "XLA dump dir: ${XLA_DUMP_DIR}"
-fi
-if [ "${ENV_JAX_PRESENT}" != "1" ] && [ "${JAX_RUNTIME_MODE_ACTIVE}" = "strict" ] && [ -z "${JAX_SITE_PACKAGES_ACTIVE}" ]; then
-  echo "ERROR: conda env '${CONDA_ENV}' does not contain jax/jaxlib and no controlled JAX overlay was activated."
-  echo "Set JAX_RUNTIME_MODE=legacy to match run_jax.pbs import behavior, set JAX_SITE_PACKAGES to a known-good site-packages directory, or install JAX into ${CONDA_PREFIX}."
-fi
+echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE} VULCAN_TRAIN_DEBUG=${VULCAN_TRAIN_DEBUG} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM}"
 
 echo "Runtime preflight on host: $(hostname)"
 if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
   echo "Allocated nodes:"
   sort -u "${PBS_NODEFILE}" || true
 fi
-
-if ! python_run - <<'PY'
-import importlib
+if ! python - <<'PY'
 import os
-from pathlib import Path
-import site
 import sys
 
 ok = True
 jax_backend = "unknown"
-conda_prefix = os.environ.get("CONDA_PREFIX")
-user_site = site.getusersitepackages()
-jax_overlay = os.environ.get("JAX_SITE_PACKAGES_ACTIVE")
-runtime_mode = os.environ.get("JAX_RUNTIME_MODE_ACTIVE", "strict")
-
 print(f"python executable: {sys.executable}")
-print(f"conda_prefix={conda_prefix}")
-print(f"jax_site_packages_active={jax_overlay}")
-print(f"jax_runtime_mode_active={runtime_mode}")
-print(f"sys.prefix={sys.prefix}")
-print(f"sys.base_prefix={sys.base_prefix}")
-print(f"site.ENABLE_USER_SITE={site.ENABLE_USER_SITE}")
-print("sys.path:")
-for entry in sys.path:
-    print(f"  - {entry}")
-
-if runtime_mode == "strict" and site.ENABLE_USER_SITE:
-    print("ERROR: site.ENABLE_USER_SITE is True; user site-packages are still enabled.", file=sys.stderr)
-    ok = False
-if runtime_mode == "strict" and user_site:
-    resolved_user_site = Path(user_site).resolve()
-    for entry in sys.path:
-        if not entry:
-            continue
-        try:
-            resolved_entry = Path(entry).resolve()
-        except Exception:
-            continue
-        if str(resolved_entry).startswith(str(resolved_user_site)):
-            print(
-                f"ERROR: sys.path contains user site-packages entry: {resolved_entry}",
-                file=sys.stderr,
-            )
-            ok = False
-
-if not conda_prefix:
-    print("ERROR: CONDA_PREFIX is unset after conda activation.", file=sys.stderr)
-    ok = False
-
 try:
     import jax
+    import jaxlib
+
     jax_backend = str(jax.default_backend()).lower()
-    print(f"jax={jax.__version__} backend={jax_backend}")
-    print(f"jax devices: {jax.devices()}")
+    print(f"jax_backend={jax_backend}")
+    print(f"jax_devices={jax.devices()}")
+    print(f"jax_file={getattr(jax, '__file__', '<namespace>')}")
+    print(f"jaxlib_file={getattr(jaxlib, '__file__', '<namespace>')}")
 except Exception as exc:
-    print(f"jax import error: {exc!r}")
+    print(f"jax_error={exc!r}")
     ok = False
-
-for module_name in ("jax", "jaxlib", "numpy", "h5py"):
-    try:
-        module = importlib.import_module(module_name)
-        module_file = getattr(module, "__file__", "<namespace>")
-        print(f"{module_name}={getattr(module, '__version__', '<unknown>')}")
-        print(f"{module_name}.__file__={module_file}")
-        if module_name in {"jax", "jaxlib", "numpy"} and module_file not in {None, "<namespace>"}:
-            resolved = Path(str(module_file)).resolve()
-            if runtime_mode == "strict" and user_site and str(resolved).startswith(str(Path(user_site).resolve())):
-                print(
-                    f"ERROR: {module_name} resolved from user site-packages: {resolved}",
-                    file=sys.stderr,
-                )
-                ok = False
-            allowed_roots = []
-            if conda_prefix:
-                allowed_roots.append(Path(conda_prefix).resolve())
-            if jax_overlay:
-                allowed_roots.append(Path(jax_overlay).resolve())
-            if runtime_mode == "legacy" and user_site:
-                allowed_roots.append(Path(user_site).resolve())
-            if allowed_roots and not any(str(resolved).startswith(str(root)) for root in allowed_roots):
-                print(
-                    f"ERROR: {module_name} resolved outside allowed roots {allowed_roots}: {resolved}",
-                    file=sys.stderr,
-                )
-                ok = False
-    except Exception as exc:
-        print(f"{module_name} import error: {exc!r}")
-        ok = False
-
 if os.environ.get("REQUIRE_JAX_GPU", "0") == "1" and jax_backend not in {"gpu", "cuda", "rocm", "metal"}:
     print(f"ERROR: REQUIRE_JAX_GPU=1 but jax backend is '{jax_backend}'", file=sys.stderr)
     ok = False
@@ -328,6 +120,7 @@ then
   exit 1
 fi
 
+GPU_MONITOR_PID=""
 if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
   : > "${GPU_MONITOR_LOG}"
   (
@@ -344,93 +137,19 @@ if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
   echo "GPU monitor enabled: ${GPU_MONITOR_LOG} (pid=${GPU_MONITOR_PID})"
 fi
 
-start_process_monitor() {
-  if [ "${ENABLE_PROCESS_MONITOR}" != "1" ]; then
-    return
+cleanup() {
+  if [ -n "${GPU_MONITOR_PID}" ]; then
+    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
   fi
-  mkdir -p "$(dirname "${PROCESS_MONITOR_LOG}")"
-  : > "${PROCESS_MONITOR_LOG}"
-  (
-    while kill -0 "${TRAIN_PID}" >/dev/null 2>&1; do
-      {
-        echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
-        ps -p "${TRAIN_PID}" -o pid,ppid,etime,%cpu,%mem,rss,vsz,nlwp,stat,psr,wchan:32,comm,args
-        ps -L -p "${TRAIN_PID}" -o pid,tid,pcpu,psr,stat,wchan:32,comm --sort=-pcpu | sed -n '1,12p' || true
-        if command -v top >/dev/null 2>&1; then
-          top -b -n 1 -H -p "${TRAIN_PID}" | sed -n '1,20p' || true
-        fi
-        if [ -f "/proc/${TRAIN_PID}/status" ]; then
-          grep -E '^(State|Threads|VmRSS|VmSize|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):' "/proc/${TRAIN_PID}/status" || true
-        fi
-        if [ -f "/proc/${TRAIN_PID}/io" ]; then
-          cat "/proc/${TRAIN_PID}/io" || true
-        fi
-        if [ -f "${TRAIN_LOG}" ]; then
-          echo "train_log_bytes=$(wc -c < "${TRAIN_LOG}" | tr -d ' ')"
-          tail -n 5 "${TRAIN_LOG}" || true
-        fi
-        if [ -f "${TRAINING_PROGRESS_FILE}" ]; then
-          echo "training_progress_file=${TRAINING_PROGRESS_FILE}"
-          echo "training_progress=$(tr -d '\n' < "${TRAINING_PROGRESS_FILE}")"
-        fi
-      } >> "${PROCESS_MONITOR_LOG}" 2>&1
-      sleep "${PROCESS_MONITOR_INTERVAL_SEC}"
-    done
-  ) &
-  PROCESS_MONITOR_PID=$!
-  echo "Process monitor enabled: ${PROCESS_MONITOR_LOG} (pid=${PROCESS_MONITOR_PID})"
 }
-
-start_stack_watchdog() {
-  if [ "${ENABLE_STACK_WATCHDOG}" != "1" ]; then
-    return
-  fi
-  mkdir -p "$(dirname "${PROCESS_MONITOR_LOG}")"
-  (
-    last_size=0
-    last_progress_state=""
-    last_change_epoch="$(date +%s)"
-    while kill -0 "${TRAIN_PID}" >/dev/null 2>&1; do
-      current_epoch="$(date +%s)"
-      current_size=0
-      current_progress_state=""
-      if [ -f "${TRAIN_LOG}" ]; then
-        current_size="$(wc -c < "${TRAIN_LOG}" | tr -d ' ')"
-      fi
-      if [ -f "${TRAINING_PROGRESS_FILE}" ]; then
-        current_progress_state="$(tr -d '\n' < "${TRAINING_PROGRESS_FILE}")"
-      fi
-      if [ "${current_size}" != "${last_size}" ] || [ "${current_progress_state}" != "${last_progress_state}" ]; then
-        last_size="${current_size}"
-        last_progress_state="${current_progress_state}"
-        last_change_epoch="${current_epoch}"
-      elif [ $((current_epoch - last_change_epoch)) -ge "${STACK_DUMP_IDLE_SEC}" ]; then
-        {
-          echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
-          echo "Stack watchdog: no training log growth for ${STACK_DUMP_IDLE_SEC}s; sending SIGUSR1 to training pid ${TRAIN_PID}"
-          if [ -n "${current_progress_state}" ]; then
-            echo "Stack watchdog progress state: ${current_progress_state}"
-          fi
-        } | tee -a "${TRAIN_LOG}" "${PROCESS_MONITOR_LOG}" >/dev/null
-        kill -USR1 "${TRAIN_PID}" >/dev/null 2>&1 || true
-        last_change_epoch="${current_epoch}"
-      fi
-      sleep "${STACK_WATCHDOG_INTERVAL_SEC}"
-    done
-  ) &
-  STACK_WATCHDOG_PID=$!
-  echo "Stack watchdog enabled: idle=${STACK_DUMP_IDLE_SEC}s interval=${STACK_WATCHDOG_INTERVAL_SEC}s (pid=${STACK_WATCHDOG_PID})"
-}
+trap cleanup EXIT
 
 mkdir -p "$(dirname "${TRAIN_LOG}")"
 : > "${TRAIN_LOG}"
-mkdir -p "$(dirname "${TRAINING_PROGRESS_FILE}")"
-mkdir -p "$(dirname "${TRAINING_WRAPPER_PID_FILE}")"
-rm -f "${TRAINING_PROGRESS_FILE}" "${TRAINING_WRAPPER_PID_FILE}"
 
 echo "Stage: dataset generation check (RUN_GEN_IF_MISSING=${RUN_GEN_IF_MISSING})"
 if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
-  DATA_CFG_RAW="$(python_run - "${CONFIG_PATH}" <<'PY'
+  DATA_CFG_RAW="$(python - "${CONFIG_PATH}" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -476,7 +195,7 @@ PY
     echo "Stage: raw dataset already present (${RUN_COUNT} runs), skipping generation"
   elif [ "${RUN_COUNT}" -eq 0 ] && [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
     echo "Stage: generating raw runs"
-    python_run -u -m src.utils --config "${CONFIG_PATH}" --stage generation 2>&1 | tee -a "${TRAIN_LOG}"
+    python -u -m src.utils --config "${CONFIG_PATH}" --stage generation 2>&1 | tee -a "${TRAIN_LOG}"
   else
     echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} per-file runs in ${RAW_RUN_DIR} and ${CONSOLIDATED_COUNT} runs in ${CONSOLIDATED_PATH}, expected ${EXPECTED_RUNS}."
     echo "Set generation.overwrite=true and regenerate, or align generation.num_runs with the existing dataset."
@@ -485,37 +204,26 @@ PY
 fi
 
 echo "Stage: preprocessing"
-python_run -u -m src.utils --config "${CONFIG_PATH}" --stage normalization 2>&1 | tee -a "${TRAIN_LOG}"
+python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization 2>&1 | tee -a "${TRAIN_LOG}"
 
 echo "Stage: training"
 echo "Training log file: ${TRAIN_LOG}"
-echo "Process monitor log: ${PROCESS_MONITOR_LOG}"
-echo "Heartbeat log: ${TRAINING_HEARTBEAT_LOG}"
-echo "Progress file: ${TRAINING_PROGRESS_FILE}"
-echo "Wrapper PID file: ${TRAINING_WRAPPER_PID_FILE}"
-python_run - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
-import os
+python - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
 import importlib
 from pathlib import Path
+import os
 import site
 import sys
 
 import jax
 
 print(f"training_python={sys.executable}")
-print(f"training_conda_prefix={os.environ.get('CONDA_PREFIX', '<unset>')}")
-print(f"training_pythonnouser={os.environ.get('PYTHONNOUSERSITE', '<unset>')}")
-print(f"training_jax_runtime_mode_active={os.environ.get('JAX_RUNTIME_MODE_ACTIVE', '<unset>')}")
-print(f"training_jax_site_packages_active={os.environ.get('JAX_SITE_PACKAGES_ACTIVE', '<unset>')}")
-print(f"training_progress_file={os.environ.get('TRAINING_PROGRESS_FILE', '<unset>')}")
-print(f"training_wrapper_pid_file={os.environ.get('TRAINING_WRAPPER_PID_FILE', '<unset>')}")
 print(f"training_site_enable_user_site={site.ENABLE_USER_SITE}")
 print("training_sys_path:")
 for entry in sys.path:
     print(f"  - {entry}")
 print(f"training_cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
 print(f"training_jax_enable_x64={os.environ.get('JAX_ENABLE_X64', '<unset>')}")
-print(f"training_jax_log_compiles={os.environ.get('JAX_LOG_COMPILES', '<unset>')}")
 print(f"training_xla_flags={os.environ.get('XLA_FLAGS', '<unset>')}")
 print(f"training_jax_backend={jax.default_backend()}")
 print(f"training_jax_devices={jax.devices()}")
@@ -527,160 +235,5 @@ for module_name in ("jax", "jaxlib", "numpy", "h5py"):
     print(f"training_{module_name}={getattr(module, '__version__', '<unknown>')}")
     print(f"training_{module_name}.__file__={module_file}")
 PY
-nvidia-smi 2>&1 | tee -a "${TRAIN_LOG}"
-if [ "${ENABLE_JAX_SMOKE_TEST}" = "1" ]; then
-python_run - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
-import os
-import time
 
-import jax
-import jax.numpy as jnp
-
-size = int(os.environ.get("JAX_SMOKE_SIZE", "2048"))
-device = jax.devices()[0]
-print(f"jax_smoke_device={device}")
-print(f"jax_smoke_size={size}")
-
-@jax.jit
-def smoke_mm(x, y):
-    return x @ y
-
-x = jnp.ones((size, size), dtype=jnp.float32)
-y = jnp.ones((size, size), dtype=jnp.float32)
-t0 = time.time()
-out = smoke_mm(x, y)
-jax.block_until_ready(out)
-t1 = time.time()
-out = smoke_mm(x, y)
-jax.block_until_ready(out)
-t2 = time.time()
-print(f"jax_smoke_first_call_s={t1 - t0:.3f}")
-print(f"jax_smoke_second_call_s={t2 - t1:.3f}")
-print(f"jax_smoke_output_checksum={float(jnp.sum(out)):.6e}")
-PY
-fi
-TRAIN_STAGE_T0="${SECONDS}"
-"${PYTHON_CMD[@]}" -u - "${CONFIG_PATH}" > >(tee -a "${TRAIN_LOG}") 2>&1 <<'PY' &
-from __future__ import annotations
-
-import faulthandler
-import os
-import signal
-import sys
-import threading
-import time
-import traceback
-
-
-def _register_signal_dump(signame: str) -> None:
-    sig = getattr(signal, signame, None)
-    if sig is None:
-        return
-    try:
-        faulthandler.register(sig, file=sys.stderr, all_threads=True, chain=False)
-        print(f"training_wrapper_registered_signal={signame}")
-    except Exception as exc:  # pragma: no cover - debug path
-        print(f"training_wrapper_signal_register_failed {signame}: {exc!r}", file=sys.stderr)
-
-
-def _heartbeat(period_s: int) -> None:
-    t0 = time.monotonic()
-    heartbeat_log = os.environ.get("TRAINING_HEARTBEAT_LOG", "")
-    while True:
-        message = (
-            f"training_wrapper_heartbeat elapsed_s={time.monotonic() - t0:.1f} "
-            f"threads={threading.active_count()} pid={os.getpid()}\n"
-        )
-        if heartbeat_log:
-            try:
-                with open(heartbeat_log, "a", encoding="utf-8") as handle:
-                    handle.write(message)
-            except Exception:
-                sys.stderr.write(message)
-                sys.stderr.flush()
-        else:
-            sys.stderr.write(message)
-            sys.stderr.flush()
-        time.sleep(period_s)
-
-
-def main() -> int:
-    config_path = sys.argv[1]
-    faulthandler.enable(file=sys.stderr, all_threads=True)
-    _register_signal_dump("SIGUSR1")
-    _register_signal_dump("SIGUSR2")
-    heartbeat_period_s = int(os.environ.get("TRAINING_HEARTBEAT_SEC", "60"))
-    threading.Thread(target=_heartbeat, args=(heartbeat_period_s,), daemon=True).start()
-    wrapper_pid_file = os.environ.get("TRAINING_WRAPPER_PID_FILE", "")
-    if wrapper_pid_file:
-        with open(wrapper_pid_file, "w", encoding="utf-8") as handle:
-            handle.write(f"{os.getpid()}\n")
-    print(f"training_wrapper_pid={os.getpid()}")
-    print(f"training_wrapper_ppid={os.getppid()}")
-    print(f"training_wrapper_config={config_path}")
-    print(f"training_wrapper_jax_log_compiles={os.environ.get('JAX_LOG_COMPILES', '<unset>')}")
-    sys.stdout.flush()
-
-    from src.utils.cli import main as cli_main
-
-    print("training_wrapper_imported_cli")
-    sys.stdout.flush()
-    return int(cli_main(["--config", config_path, "--stage", "training"]))
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:  # pragma: no cover - debug path
-        print(f"training_wrapper_exception={exc!r}", file=sys.stderr)
-        traceback.print_exc()
-        raise
-PY
-TRAIN_PID=$!
-echo "Training PID: ${TRAIN_PID}" | tee -a "${TRAIN_LOG}"
-WRAPPER_PID=""
-WRAPPER_PID_DEADLINE=$((SECONDS + 30))
-while [ "${SECONDS}" -lt "${WRAPPER_PID_DEADLINE}" ]; do
-  if [ -f "${TRAINING_WRAPPER_PID_FILE}" ]; then
-    WRAPPER_PID="$(tr -d '[:space:]' < "${TRAINING_WRAPPER_PID_FILE}")"
-    if [ -n "${WRAPPER_PID}" ]; then
-      break
-    fi
-  fi
-  if ! kill -0 "${TRAIN_PID}" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
-if [ -z "${WRAPPER_PID}" ]; then
-  echo "ERROR: training wrapper PID file was not written: ${TRAINING_WRAPPER_PID_FILE}" | tee -a "${TRAIN_LOG}"
-  set +e
-  wait "${TRAIN_PID}"
-  TRAIN_RC=$?
-  set -e
-  echo "Training stage exit code: ${TRAIN_RC}" | tee -a "${TRAIN_LOG}"
-  exit 1
-fi
-echo "Training wrapper PID: ${WRAPPER_PID}" | tee -a "${TRAIN_LOG}"
-if [ "${TRAIN_PID}" != "${WRAPPER_PID}" ]; then
-  echo "ERROR: Training PID mismatch: launcher pid=${TRAIN_PID} wrapper pid=${WRAPPER_PID}" | tee -a "${TRAIN_LOG}"
-  kill "${TRAIN_PID}" >/dev/null 2>&1 || true
-  kill "${WRAPPER_PID}" >/dev/null 2>&1 || true
-  set +e
-  wait "${TRAIN_PID}"
-  set -e
-  exit 1
-fi
-start_process_monitor
-start_stack_watchdog
-set +e
-wait "${TRAIN_PID}"
-TRAIN_RC=$?
-set -e
-echo "Training stage exit code: ${TRAIN_RC}" | tee -a "${TRAIN_LOG}"
-echo "Training stage elapsed seconds: $((SECONDS - TRAIN_STAGE_T0))" | tee -a "${TRAIN_LOG}"
-if [ "${TRAIN_RC}" -ne 0 ]; then
-  exit "${TRAIN_RC}"
-fi
-
-echo "Done. Artifacts written under the configured models/ directory."
+python -u -m src.utils --config "${CONFIG_PATH}" --stage training 2>&1 | tee -a "${TRAIN_LOG}"
