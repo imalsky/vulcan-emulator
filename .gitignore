@@ -51,7 +51,7 @@ data/**/raw/
 data/**/processed/
 data/**/dataset_manifest.json
 data/**/splits.json
-models/
+/models/
 logs/
 
 # Model checkpoints and serialized objects
