@@ -5,29 +5,146 @@ from pathlib import Path
 
 import pytest
 
-from src.config_utils import DEFAULT_STATE_SPECIES, ConfigValidationError, load_and_validate_config
+from src.utils.config import DEFAULT_STATE_SPECIES, ConfigValidationError, load_and_validate_config
 
 
-def test_shipped_config_loads():
+def _load_raw_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_shipped_equilibrium_config_loads():
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "config.json")
-    assert config["physics_toggles"]["use_photochemistry"] is True
+    config = load_and_validate_config(root / "config" / "equilibrium_only_config.json")
+    assert config["task"]["kind"] == "equilibrium_only"
+    assert config["model_type"] == "equilibrium"
     assert config["data_spec"]["state_species"] == list(DEFAULT_STATE_SPECIES)
-    assert "use_photochemistry" in config["data_spec"]["required_global_inputs"]
-    assert "atm_base_H2" in config["data_spec"]["required_global_inputs"]
-    assert config["data_spec"]["dt_feature_index"] == config["data_spec"]["global_feature_order"].index("log10_dt_s")
-    assert float(config["sampling"]["kzz_cm2_s"]) > 0.0
-    assert config["generation"]["target_mode"] == "equilibrium_only"
-    assert config["inference"]["equilibrium_anchor"]["source"] == "flat"
-    assert config["inference"]["equilibrium_anchor"]["split"] == "train"
-    assert config["inference"]["equilibrium_anchor"]["step_index"] == 0
+    assert config["data_spec"]["required_global_inputs"] == ["metallicity_log10", "c_to_o", "s_to_o"]
+    assert config["data_spec"]["dt_feature_index"] is None
+    assert config["temperature_profiles"]["source_mode"] == "mixed"
+    assert config["temperature_profiles"]["analytic_probability"] == pytest.approx(0.5)
+    assert config["temperature_profiles"]["analytic_sampler"]["t_int_k_normal"] == {
+        "mean": 500.0,
+        "std": 20.0,
+    }
+    assert config["temperature_profiles"]["validation"] == {
+        "min_temperature_k": 1.0,
+        "max_temperature_k": 3000.0,
+    }
+    assert config["temperature_profiles"]["analytic_sampler"]["power_law_n_range"] == [0.5, 2.0]
+    assert config["roth_sampler"]["enabled"] is True
+    assert config["roth_sampler"]["data_glob"] == "assets/PTprofiles/*.dat"
+    assert config["training"]["model"]["activation"] == "silu"
+    assert config["training"]["scheduler"] == {
+        "name": "reduce_on_plateau",
+        "factor": 0.5,
+        "patience": 10,
+        "threshold": pytest.approx(1.0e-4),
+    }
 
 
-def test_invalid_target_mode_is_rejected(tmp_path):
+def test_missing_task_specific_section_is_rejected(tmp_path):
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "config.json")
-    config["generation"]["target_mode"] = "bad_mode"
-    config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload.pop("equilibrium_only")
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     with pytest.raises(ConfigValidationError):
         load_and_validate_config(config_path)
+
+
+def test_forbidden_task_specific_section_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["full_vulcan"] = {"unexpected": True}
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_and_validate_config(config_path)
+
+
+def test_invalid_equilibrium_activation_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["equilibrium_only"]["model"]["activation"] = "bad_activation"
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_and_validate_config(config_path)
+
+
+def test_invalid_mixed_temperature_profile_probability_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["temperature_profiles"]["analytic_probability"] = 1.0
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_and_validate_config(config_path)
+
+
+def test_missing_analytic_sampler_for_mixed_temperature_profiles_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["temperature_profiles"].pop("analytic_sampler")
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_and_validate_config(config_path)
+
+
+def test_valid_temperature_profile_filters_are_normalized(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["temperature_profiles"]["filters"] = {
+        "Teq": [1400.0, 1600.0],
+        "LogDrag": 0.0,
+        "TiOVO": False,
+    }
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    validated = load_and_validate_config(config_path)
+    assert validated["temperature_profiles"]["filters"] == {
+        "Teq": (1400.0, 1600.0),
+        "LogDrag": 0.0,
+        "TiOVO": False,
+    }
+
+
+def test_invalid_temperature_profile_filter_key_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["temperature_profiles"]["filters"] = {"phase": ["global_mean", "disk_mean"]}
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_and_validate_config(config_path)
+
+
+def test_invalid_analytic_temperature_sampler_exponent_range_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["temperature_profiles"]["analytic_sampler"]["power_law_n_range"] = [0.0, 0.5]
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_and_validate_config(config_path)
+
+
+def test_invalid_temperature_profile_filter_range_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["temperature_profiles"]["filters"] = {"Teq": [1800.0, 1200.0]}
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_and_validate_config(config_path)
+
+
+def test_explicit_cosine_scheduler_is_preserved(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["training"]["scheduler"] = {"name": "cosine"}
+    config_path = tmp_path / "equilibrium_only_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    validated = load_and_validate_config(config_path)
+    assert validated["training"]["scheduler"] == {"name": "cosine"}

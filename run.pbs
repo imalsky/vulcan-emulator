@@ -2,7 +2,7 @@
 #PBS -N vulcan_emulator
 #PBS -q gpu_long
 #PBS -W group_list=s2458
-#PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
+#PBS -l select=1:ncpus=64:ngpus=1:mem=400gb:model=gh200
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -m abe
@@ -36,13 +36,27 @@ if [ "${rc}" -ne 0 ]; then
   exit 2
 fi
 
-CONFIG_PATH="${CONFIG_PATH:-config/config.json}"
+# Override CONFIG_PATH at submit time to point at a custom config,
+# for example: CONFIG_PATH=config/equilibrium_only_config.json
+CONFIG_PATH="${CONFIG_PATH:-config/equilibrium_only_config.json}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
+GPU_MONITOR_PID=""
+TEMP_CONFIG_PATH=""
+
+cleanup() {
+  if [ -n "${GPU_MONITOR_PID}" ]; then
+    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${TEMP_CONFIG_PATH}" ] && [ -f "${TEMP_CONFIG_PATH}" ]; then
+    rm -f "${TEMP_CONFIG_PATH}"
+  fi
+}
+trap cleanup EXIT
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -72,6 +86,30 @@ if [ ! -d "${PROJECT_ROOT}/src" ]; then
   exit 1
 fi
 
+# Use a runtime-only config copy so the checked-in JSON stays unchanged.
+TEMP_CONFIG_PATH="$(mktemp "${PROJECT_ROOT}/runtime_config.XXXXXX.json")"
+python - "${CONFIG_PATH}" "${TEMP_CONFIG_PATH}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1]).resolve()
+target_path = Path(sys.argv[2]).resolve()
+
+with source_path.open("r", encoding="utf-8") as handle:
+    config = json.load(handle)
+
+config["generation"]["parallel_workers"] = 64
+
+with target_path.open("w", encoding="utf-8") as handle:
+    json.dump(config, handle, indent=2)
+    handle.write("\n")
+PY
+CONFIG_PATH="${TEMP_CONFIG_PATH}"
+echo "Using runtime config: ${CONFIG_PATH} (generation.parallel_workers=64)"
+
 echo "Runtime preflight on host: $(hostname)"
 if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
   echo "Allocated nodes:"
@@ -94,7 +132,7 @@ except Exception as exc:
     print(f"jax import error: {exc!r}")
     ok = False
 
-for module_name in ("numpy", "h5py", "scipy"):
+for module_name in ("numpy", "h5py"):
     try:
         module = __import__(module_name)
         print(f"{module_name}={module.__version__}")
@@ -114,7 +152,6 @@ then
   exit 1
 fi
 
-GPU_MONITOR_PID=""
 if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
   : > "${GPU_MONITOR_LOG}"
   (
@@ -131,13 +168,6 @@ if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
   echo "GPU monitor enabled: ${GPU_MONITOR_LOG} (pid=${GPU_MONITOR_PID})"
 fi
 
-cleanup() {
-  if [ -n "${GPU_MONITOR_PID}" ]; then
-    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
 mkdir -p "$(dirname "${TRAIN_LOG}")"
 : > "${TRAIN_LOG}"
 
@@ -146,8 +176,8 @@ if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
   mapfile -t DATA_CFG < <(python - "${CONFIG_PATH}" <<'PY'
 from pathlib import Path
 import sys
-from src.config_utils import load_and_validate_config
-from src.path_utils import resolve_path
+from src.utils.config import load_and_validate_config
+from src.utils.helpers import resolve_path
 
 config_path = Path(sys.argv[1]).resolve()
 cfg = load_and_validate_config(config_path)
@@ -164,7 +194,7 @@ PY
   fi
   if [ "${RUN_COUNT}" -eq 0 ]; then
     echo "Stage: generating raw runs"
-    python -u -m src.main --config "${CONFIG_PATH}" gen 2>&1 | tee -a "${TRAIN_LOG}"
+    python -u -m src.utils --config "${CONFIG_PATH}" --stage generation 2>&1 | tee -a "${TRAIN_LOG}"
   elif [ "${RUN_COUNT}" -ne "${EXPECTED_RUNS}" ]; then
     echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} files in ${RAW_RUN_DIR}, expected ${EXPECTED_RUNS}."
     echo "Set generation.overwrite=true and regenerate, or align generation.num_runs with the existing dataset."
@@ -175,10 +205,10 @@ PY
 fi
 
 echo "Stage: preprocessing"
-python -u -m src.main --config "${CONFIG_PATH}" preprocess 2>&1 | tee -a "${TRAIN_LOG}"
+python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization 2>&1 | tee -a "${TRAIN_LOG}"
 
 echo "Stage: training"
 echo "Training log file: ${TRAIN_LOG}"
-python -u -m src.main --config "${CONFIG_PATH}" train 2>&1 | tee -a "${TRAIN_LOG}"
+python -u -m src.utils --config "${CONFIG_PATH}" --stage training 2>&1 | tee -a "${TRAIN_LOG}"
 
 echo "Done. Artifacts written under the configured models/ directory."

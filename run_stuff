@@ -1,0 +1,24 @@
+# 0. Activate the conda environment
+conda activate nn
+
+# 1. Generate raw data (equilibrium HDF5 files)
+cd /Users/imalsky/Desktop/VULCAN_Project/vulcan-emulator
+python -m src.utils.cli --config config/equilibrium_only_config.json --stage generation
+
+# 2. Preprocess (fit normalization, produce training tensors)
+python -m src.utils.cli --config config/equilibrium_only_config.json --stage normalization
+
+# 3. Train the model
+python -m src.utils.cli --config config/equilibrium_only_config.json --stage training
+
+# 4. Export to portable NPZ bundle
+python extras/export.py
+
+# 5. Run inference on a random test profile
+python extras/inference_example.py
+
+# 6. Benchmark forward-pass throughput
+python extras/benchmark.py
+
+# 7. Plot one Roth + one analytic PT profile
+python extras/plot_profiles.py

@@ -1,63 +1,52 @@
 # vulcan_emulator_photochem
 
-A clean JAX-first rewrite of the `imalsky/vulcan-emulator` training pipeline aimed at
-photochemical VULCAN trajectories with a compact sulfur extension and explicit stellar
-spectrum conditioning for WASP-39b-like cases.
+JAX-first VULCAN emulator pipeline with one shared data workflow and two explicit tasks:
 
-The shipped model is designed around four requirements:
+- `full_vulcan`: trajectory emulation with `dt`, stellar-spectrum conditioning, and a Transformer.
+- `equilibrium_only`: direct equilibrium prediction with an MLP.
 
-1. photochemistry is a first-class input rather than a disabled validation toggle;
-2. the state vector includes the sulfur carriers and oxidation radicals needed to keep
-   sulfur photochemistry closer to Markovian (`H`, `O`, `OH`, `H2S`, `SH`, `S`, `SO`,
-   `SO2`, `S2`);
-3. a fixed-grid stellar spectrum is part of the conditioning signal, with the shipped
-   WASP-39b config reading the Frances stellar surface-flux file used by VULCAN; and
-4. the exported transition operator is pure JAX and supports both `jax.grad` and
-   `jax.jvp`, so it can be embedded in ExoJAX or any other JAX workflow.
+Both tasks share the same generation, normalization, split, and artifact conventions. The
+active task is selected by `task.kind` in the config.
 
-The codebase supports two generation paths:
+## Shipped Config
 
-- `generation.mode = "vulcan"` runs an external VULCAN checkout, patches `vulcan_cfg.py`,
-  writes atmosphere and stellar-flux inputs, regenerates `chem_funs.py` when requested,
-  and converts the `.vul` pickle output into the raw HDF5 contract expected by preprocessing.
-- `generation.mode = "synthetic"` creates a deterministic sulfur-aware photochemical toy
-  dataset. This exists only so the repository is testable without running a full VULCAN
-  job; the production path is the strict VULCAN-backed workflow.
+- `config/equilibrium_only_config.json`
+
+## CLI
+
+The CLI accepts exactly two parser arguments:
+
+```bash
+python -m src.utils --config config/equilibrium_only_config.json --stage generation
+python -m src.utils --config config/equilibrium_only_config.json --stage normalization
+python -m src.utils --config config/equilibrium_only_config.json --stage training
+```
+
+`--stage normalization` performs the full raw-to-processed step: split creation,
+train-only normalization fitting, and processed tensor writing.
 
 ## Layout
 
-- `config/`: the default project config and a short schema guide.
-- `src/`: JAX model, preprocessing, data loading, VULCAN runner, export, and CLI.
-- `uni_tests/`: smoke tests for config validation, spectrum handling, synthetic generation,
-  preprocessing, JAX autodiff, export, and inference round-trips.
+- `assets/`: immutable external inputs such as Roth/PT libraries and stellar spectra templates.
+- `config/`: canonical JSON configs and schema notes.
+- `data/`: generated raw runs, processed tensors, manifests, and derived spectrum libraries.
+- `models/`: checkpoints and exported model bundles.
+- `src/models/`: model architecture, inference, and export logic.
+- `src/training/`: training loops and live transition sampling.
+- `src/data_generation/`: PT/spectrum loading, raw generation, preprocessing, and dataset I/O.
+- `src/utils/`: config validation, CLI, logging, paths, and provenance helpers.
+- `uni_tests/fixtures/`: tiny tracked fixtures used by tests.
 
-## Typical local workflow
+## Temperature-Profile Handling
 
-```bash
-python -m src.main --config config/config.json gen
-python -m src.main --config config/config.json preprocess
-python -m src.main --config config/config.json train
-```
+`temperature_profiles` controls how the pipeline samples TP inputs. For PT-library `.dat`
+files, each `(lon, lat)` column is treated as a valid 1D starting profile. The profile is
+interpolated onto the emulator/VULCAN pressure grid in log-pressure space, and its source
+metadata is preserved through generation artifacts. The analytic branch uses the exposed
+`temperature_profiles.analytic_sampler` Line/Robinson-style PT parameterization rather than
+the older placeholder logistic profile.
 
-For a local smoke run, keep the same config and temporarily set `generation.mode` to
-`"synthetic"`. For a real VULCAN-backed run, point `paths.vulcan_source_root` at a local
-VULCAN checkout.
+## Asset Policy
 
-## Important notes
-
-This repository does **not** bundle VULCAN itself. It interfaces with an external checkout.
-The default WASP-39b config expects the Frances stellar surface-flux file already present
-in the adjacent `VULCAN-master` tree and writes a `sampling_coverage.json` report for each
-generated dataset so the realized parameter-space coverage can be audited.
-The shipped config requires `stellar_spectrum.template_file` to exist; there is no
-analytic spectrum fallback.
-
-Transition selection is now sampled with weighted, stratified `log10_dt_s` bins for both
-training and evaluation. Eval remains reproducible through a fixed RNG seed, but it no
-longer overweights the shortest transitions by taking the first sorted rows.
-
-Processed datasets now store the normalized anchor-state trajectory and the normalized
-target-species trajectory separately. That keeps the contract correct when
-`output_species` is a strict subset or reordering of `state_species`.
-
-The training and inference code intentionally use only JAX, NumPy, and h5py.
+Production PT libraries and spectra belong under `assets/` and are intentionally not tracked
+in git. Tests use small synthetic fixtures under `uni_tests/fixtures/`.

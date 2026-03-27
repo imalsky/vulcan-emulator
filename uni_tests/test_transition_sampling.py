@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.live_sampling import sample_eval_rows, sample_train_rows
-from src.transition_sampling import CandidateTable
+from src.data_generation.transition_sampling import CandidateTable, sample_eval_rows, sample_train_rows
 
 
 def _candidate_table(dt_s: list[float]) -> CandidateTable:

@@ -4,11 +4,11 @@ import copy
 
 import numpy as np
 
-from src.config_utils import effective_transition_sampling
-from src.data_loader import build_batch_from_rows, load_processed_dataset
-from src.preprocess import preprocess_raw_dataset
-from src.transition_sampling import build_candidate_table
-from src.vulcan_runner import generate_synthetic_raw_runs
+from src.utils.config import effective_transition_sampling
+from src.data_generation.data_loader import build_batch_from_rows, load_processed_dataset
+from src.data_generation.preprocess import preprocess_raw_dataset
+from src.data_generation.transition_sampling import build_candidate_table
+from src.data_generation.generation import generate_synthetic_raw_runs
 
 
 def test_preprocess_and_live_batch(tiny_config):

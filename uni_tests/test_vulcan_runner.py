@@ -8,11 +8,11 @@ import h5py
 import numpy as np
 import pytest
 
-import src.sampling as sampling_module
-import src.vulcan_runner as vulcan_runner_module
-from src.anchor_states import build_flat_h2_he_anchor
-from src.sampling import sample_run_specifications
-from src.vulcan_runner import (
+import src.data_generation.sampling as sampling_module
+import src.data_generation.generation as vulcan_runner_module
+from src.data_generation.sampling import sample_run_specifications
+from src.data_generation.generation import (
+    build_flat_h2_he_anchor,
     _copy_fastchem_runtime,
     _patch_vulcan_cfg,
     convert_fastchem_output_to_hdf5,
@@ -42,15 +42,15 @@ def test_generate_synthetic_raw_runs(tiny_config):
         assert "OH" in species and "H2S" in species and "SO2" in species
         time_s = np.asarray(handle["trajectory/time_s"])
         assert np.all(np.diff(time_s) > 0.0)
-        assert np.allclose(time_s, np.array([0.0, 1.0]))
+        assert time_s.size == int(tiny_config["sampling"]["num_time_steps"])
         ymix = np.asarray(handle["trajectory/ymix_state"])
         assert ymix.shape[0] == time_s.size
         assert np.all(np.isfinite(ymix))
         reference = np.asarray(handle["inputs/reference_ymix_state"])
-        assert np.allclose(ymix[1], reference)
+        assert np.allclose(ymix[0], reference)
         assert handle["inputs/target_mode"][()].decode("utf-8") == tiny_config["generation"]["target_mode"]
         spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
-        assert spectrum.size == tiny_config["stellar_spectrum"]["num_bins"] or spectrum.size > 10
+        assert spectrum.size > 10
 
 
 def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_config):
@@ -156,9 +156,11 @@ def test_convert_fake_vulcan_output_to_hdf5(tmp_path, tiny_config):
 
 
 def test_convert_fake_vulcan_output_to_hdf5_equilibrium_only_shell(tmp_path, tiny_config):
-    specs = sample_run_specifications(config=tiny_config, project_root=tiny_config["_project_root"], num_runs=1, seed=5)
+    config = copy.deepcopy(tiny_config)
+    config["generation"]["target_mode"] = "equilibrium_only"
+    specs = sample_run_specifications(config=config, project_root=config["_project_root"], num_runs=1, seed=5)
     spec = specs[0]
-    species = list(tiny_config["data_spec"]["state_species"])
+    species = list(config["data_spec"]["state_species"])
     nz = spec.pressure_bar.size
     state_dim = len(species)
     reference = np.asarray(spec.initial_ymix, dtype=np.float64)
@@ -192,7 +194,7 @@ def test_convert_fake_vulcan_output_to_hdf5_equilibrium_only_shell(tmp_path, tin
         spectrum=spec.spectrum,
         metadata={**spec.metadata, "state_species": species, "output_species": species},
     )
-    convert_vulcan_output_to_hdf5(vul_path, output_h5_path=out_h5, spec=spec, config=tiny_config)
+    convert_vulcan_output_to_hdf5(vul_path, output_h5_path=out_h5, spec=spec, config=config)
     with h5py.File(out_h5, "r") as handle:
         time_s = np.asarray(handle["trajectory/time_s"])
         ymix = np.asarray(handle["trajectory/ymix_state"])
@@ -204,9 +206,11 @@ def test_convert_fake_vulcan_output_to_hdf5_equilibrium_only_shell(tmp_path, tin
 
 
 def test_convert_fake_fastchem_output_to_hdf5_equilibrium_only_shell(tmp_path, tiny_config):
-    specs = sample_run_specifications(config=tiny_config, project_root=tiny_config["_project_root"], num_runs=1, seed=5)
+    config = copy.deepcopy(tiny_config)
+    config["generation"]["target_mode"] = "equilibrium_only"
+    specs = sample_run_specifications(config=config, project_root=config["_project_root"], num_runs=1, seed=5)
     spec = specs[0]
-    species = list(tiny_config["data_spec"]["state_species"])
+    species = list(config["data_spec"]["state_species"])
     nz = spec.pressure_bar.size
     reference = build_flat_h2_he_anchor(species, nz=nz)
     idx = {name: i for i, name in enumerate(species)}
@@ -226,7 +230,7 @@ def test_convert_fake_fastchem_output_to_hdf5_equilibrium_only_shell(tmp_path, t
         fastchem_output,
         output_h5_path=out_h5,
         spec=spec,
-        config=tiny_config,
+        config=config,
     )
 
     with h5py.File(out_h5, "r") as handle:

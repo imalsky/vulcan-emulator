@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.spectrum import (
+from src.data_generation.spectrum import (
     fixed_wavelength_grid,
     generate_wasp39b_template,
     load_spectrum_manifest,

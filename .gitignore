@@ -40,6 +40,9 @@ venv/
 # macOS
 .DS_Store
 
+# Immutable external assets are user-managed and not tracked.
+assets/**
+
 # Vulcan-emulator generated artifacts (data, models, logs)
 data/*
 data/raw/
@@ -64,8 +67,6 @@ logs/
 *.h5
 *.npy
 *.npz
-roth/roth-grid/
-roth/figures/
 
 # Log files
 *.log

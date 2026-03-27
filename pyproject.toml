@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vulcan-emulator-photochem"
 version = "0.1.0"
-description = "Photochemical VULCAN surrogate with sulfur chemistry, WASP-39b stellar forcing, and JAX export."
+description = "Photochemical VULCAN surrogate with sulfur chemistry and WASP-39b stellar forcing."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
