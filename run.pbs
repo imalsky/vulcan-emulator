@@ -48,10 +48,12 @@ DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
-export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export VULCAN_TRAIN_DEBUG="${VULCAN_TRAIN_DEBUG:-1}"
+export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-1}"
 export TRAINING_PROGRESS_FILE="${TRAINING_PROGRESS_FILE:-${PROJECT_ROOT}/training_progress.txt}"
 
 if [ "${DISABLE_TRITON_GEMM}" = "1" ]; then
@@ -246,7 +248,38 @@ result2 = smoke_fn2(a2, b2)
 jax.block_until_ready(result2)
 t1 = time.monotonic()
 print(f"smoke_test: OK  shape={result2.shape}  jit_compile+run={t1-t0:.2f}s")
-print(f"smoke_test: PASSED — GPU JIT compilation is working")
+
+# Gradient test: mimics train_step (forward + value_and_grad + optimizer-like update)
+print("smoke_test: dispatching value_and_grad test (simulates train_step)...")
+W = jax.random.normal(jax.random.PRNGKey(0), (256, 128), dtype=jnp.float64)
+x_in = jnp.ones((128, 256), dtype=jnp.float64)
+target = jnp.zeros((128, 128), dtype=jnp.float64)
+
+@jax.jit
+def smoke_grad_fn(params, x, y):
+    def loss_fn(p):
+        pred = jnp.dot(x, p)
+        return jnp.mean((pred - y) ** 2)
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    new_params = params - 0.01 * grads  # SGD step
+    return new_params, loss
+
+t0 = time.monotonic()
+W_new, loss_val = smoke_grad_fn(W, x_in, target)
+jax.block_until_ready(W_new)
+t1 = time.monotonic()
+print(f"smoke_test: OK  loss={float(loss_val):.4f}  value_and_grad+run={t1-t0:.2f}s")
+
+# Memory report after smoke tests
+for dev in jax.devices():
+    stats = dev.memory_stats()
+    if stats:
+        peak = stats.get("peak_bytes_in_use", 0) / 1e6
+        current = stats.get("bytes_in_use", 0) / 1e6
+        limit = stats.get("bytes_limit", 0) / 1e6
+        print(f"smoke_test: device={dev}  mem_current={current:.0f}MB  mem_peak={peak:.0f}MB  mem_limit={limit:.0f}MB")
+
+print(f"smoke_test: PASSED — GPU JIT compilation and gradient computation working")
 SMOKE
 then
   echo "ERROR: JAX GPU smoke test failed or timed out after 120s."
