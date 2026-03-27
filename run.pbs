@@ -43,7 +43,7 @@ ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
-DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-0}"
+DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -52,10 +52,12 @@ export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export VULCAN_TRAIN_DEBUG="${VULCAN_TRAIN_DEBUG:-1}"
+export TRAINING_PROGRESS_FILE="${TRAINING_PROGRESS_FILE:-${PROJECT_ROOT}/training_progress.txt}"
 
 if [ "${DISABLE_TRITON_GEMM}" = "1" ]; then
   export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false"
 fi
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_autotune_level=0"
 
 if [ -n "${PBS_JOBID:-}" ]; then
   echo "PBS_JOBID: ${PBS_JOBID}"
@@ -85,6 +87,7 @@ print(Path(sys.argv[1]).resolve())
 PY
 )"
 echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE} VULCAN_TRAIN_DEBUG=${VULCAN_TRAIN_DEBUG} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM}"
+echo "Debug settings: TRAINING_PROGRESS_FILE=${TRAINING_PROGRESS_FILE} XLA_FLAGS=${XLA_FLAGS:-<unset>}"
 
 echo "Runtime preflight on host: $(hostname)"
 if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
@@ -205,6 +208,52 @@ fi
 
 echo "Stage: preprocessing"
 python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization 2>&1 | tee -a "${TRAIN_LOG}"
+
+echo "Stage: JAX GPU smoke test (JIT compile + run on GPU)"
+if ! timeout 120 python -u - <<'SMOKE' 2>&1 | tee -a "${TRAIN_LOG}"
+import time
+import jax
+import jax.numpy as jnp
+
+print(f"smoke_test_backend={jax.default_backend()}")
+print(f"smoke_test_devices={jax.devices()}")
+
+@jax.jit
+def smoke_fn(a, b):
+    return jnp.dot(a, b).sum()
+
+a = jnp.ones((64, 64), dtype=jnp.float64)
+b = jnp.ones((64, 64), dtype=jnp.float64)
+
+print("smoke_test: dispatching JIT-compiled matmul to GPU...")
+t0 = time.monotonic()
+result = smoke_fn(a, b)
+jax.block_until_ready(result)
+t1 = time.monotonic()
+print(f"smoke_test: OK  result={float(result):.1f}  jit_compile+run={t1-t0:.2f}s")
+
+# Larger test closer to real workload shapes
+print("smoke_test: dispatching larger matmul (128x512 @ 512x256)...")
+a2 = jnp.ones((128, 512), dtype=jnp.float64)
+b2 = jnp.ones((512, 256), dtype=jnp.float64)
+
+@jax.jit
+def smoke_fn2(a, b):
+    return jnp.dot(a, b)
+
+t0 = time.monotonic()
+result2 = smoke_fn2(a2, b2)
+jax.block_until_ready(result2)
+t1 = time.monotonic()
+print(f"smoke_test: OK  shape={result2.shape}  jit_compile+run={t1-t0:.2f}s")
+print(f"smoke_test: PASSED — GPU JIT compilation is working")
+SMOKE
+then
+  echo "ERROR: JAX GPU smoke test failed or timed out after 120s."
+  echo "This likely means XLA cannot compile CUDA kernels for this GPU."
+  echo "Check: XLA_FLAGS=${XLA_FLAGS:-<unset>}"
+  exit 1
+fi
 
 echo "Stage: training"
 echo "Training log file: ${TRAIN_LOG}"
