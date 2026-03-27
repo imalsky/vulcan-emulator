@@ -2,7 +2,7 @@
 #PBS -N vulcan_emulator
 #PBS -q gpu_long
 #PBS -W group_list=s2458
-#PBS -l select=1:ncpus=64:ngpus=1:mem=400gb:model=gh200
+#PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -m abe
@@ -42,18 +42,14 @@ CONFIG_PATH="${CONFIG_PATH:-config/equilibrium_only_config.json}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
-GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-5}"
+GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
 GPU_MONITOR_PID=""
-TEMP_CONFIG_PATH=""
 
 cleanup() {
   if [ -n "${GPU_MONITOR_PID}" ]; then
     kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
-  fi
-  if [ -n "${TEMP_CONFIG_PATH}" ] && [ -f "${TEMP_CONFIG_PATH}" ]; then
-    rm -f "${TEMP_CONFIG_PATH}"
   fi
 }
 trap cleanup EXIT
@@ -62,11 +58,6 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
-export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
@@ -92,29 +83,12 @@ if [ ! -f "${PROJECT_ROOT}/src/models/jax_model.py" ]; then
   exit 1
 fi
 
-# Use a runtime-only config copy so the checked-in JSON stays unchanged.
-TEMP_CONFIG_PATH="$(mktemp "${PROJECT_ROOT}/runtime_config.XXXXXX.json")"
-python - "${CONFIG_PATH}" "${TEMP_CONFIG_PATH}" <<'PY'
-from __future__ import annotations
-
-import json
-import sys
+echo "Config path: $(python - <<'PY' "${CONFIG_PATH}"
 from pathlib import Path
-
-source_path = Path(sys.argv[1]).resolve()
-target_path = Path(sys.argv[2]).resolve()
-
-with source_path.open("r", encoding="utf-8") as handle:
-    config = json.load(handle)
-
-config["generation"]["parallel_workers"] = 64
-
-with target_path.open("w", encoding="utf-8") as handle:
-    json.dump(config, handle, indent=2)
-    handle.write("\n")
+import sys
+print(Path(sys.argv[1]).resolve())
 PY
-CONFIG_PATH="${TEMP_CONFIG_PATH}"
-echo "Using runtime config: ${CONFIG_PATH} (generation.parallel_workers=64)"
+)"
 echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC}"
 
 echo "Runtime preflight on host: $(hostname)"

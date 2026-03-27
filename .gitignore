@@ -70,3 +70,6 @@ logs/
 
 # Log files
 *.log
+
+# Generated plot outputs
+plots/
