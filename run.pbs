@@ -44,12 +44,23 @@ REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
+ENABLE_PROCESS_MONITOR="${ENABLE_PROCESS_MONITOR:-1}"
+PROCESS_MONITOR_INTERVAL_SEC="${PROCESS_MONITOR_INTERVAL_SEC:-30}"
+PROCESS_MONITOR_LOG="${PROCESS_MONITOR_LOG:-${PROJECT_ROOT}/process_monitor.log}"
+ENABLE_JAX_COMPILE_LOGS="${ENABLE_JAX_COMPILE_LOGS:-1}"
+ENABLE_XLA_DUMP="${ENABLE_XLA_DUMP:-0}"
+XLA_DUMP_DIR="${XLA_DUMP_DIR:-${PROJECT_ROOT}/xla_dump_${PBS_JOBID:-manual}}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
 GPU_MONITOR_PID=""
+PROCESS_MONITOR_PID=""
+TRAIN_PID=""
 
 cleanup() {
   if [ -n "${GPU_MONITOR_PID}" ]; then
     kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${PROCESS_MONITOR_PID}" ]; then
+    kill "${PROCESS_MONITOR_PID}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -58,8 +69,15 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
+export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-${ENABLE_JAX_COMPILE_LOGS}}"
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
+  mkdir -p "${XLA_DUMP_DIR}"
+  export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=${XLA_DUMP_DIR}"
+fi
 
 if [ -n "${PBS_JOBID:-}" ]; then
   echo "PBS_JOBID: ${PBS_JOBID}"
@@ -89,7 +107,10 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC}"
+echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
+if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
+  echo "XLA dump dir: ${XLA_DUMP_DIR}"
+fi
 
 echo "Runtime preflight on host: $(hostname)"
 if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
@@ -148,6 +169,37 @@ if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
   GPU_MONITOR_PID=$!
   echo "GPU monitor enabled: ${GPU_MONITOR_LOG} (pid=${GPU_MONITOR_PID})"
 fi
+
+start_process_monitor() {
+  if [ "${ENABLE_PROCESS_MONITOR}" != "1" ]; then
+    return
+  fi
+  : > "${PROCESS_MONITOR_LOG}"
+  (
+    while kill -0 "${TRAIN_PID}" >/dev/null 2>&1; do
+      {
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+        ps -p "${TRAIN_PID}" -o pid,ppid,etime,%cpu,%mem,rss,vsz,nlwp,stat,psr,wchan:32,comm,args
+        if command -v top >/dev/null 2>&1; then
+          top -b -n 1 -H -p "${TRAIN_PID}" | sed -n '1,20p' || true
+        fi
+        if [ -f "/proc/${TRAIN_PID}/status" ]; then
+          grep -E '^(State|Threads|VmRSS|VmSize|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):' "/proc/${TRAIN_PID}/status" || true
+        fi
+        if [ -f "/proc/${TRAIN_PID}/io" ]; then
+          cat "/proc/${TRAIN_PID}/io" || true
+        fi
+        if [ -f "${TRAIN_LOG}" ]; then
+          echo "train_log_bytes=$(wc -c < "${TRAIN_LOG}" | tr -d ' ')"
+          tail -n 5 "${TRAIN_LOG}" || true
+        fi
+      } >> "${PROCESS_MONITOR_LOG}" 2>&1
+      sleep "${PROCESS_MONITOR_INTERVAL_SEC}"
+    done
+  ) &
+  PROCESS_MONITOR_PID=$!
+  echo "Process monitor enabled: ${PROCESS_MONITOR_LOG} (pid=${PROCESS_MONITOR_PID})"
+}
 
 mkdir -p "$(dirname "${TRAIN_LOG}")"
 : > "${TRAIN_LOG}"
@@ -213,6 +265,7 @@ python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization 2>&1 | te
 
 echo "Stage: training"
 echo "Training log file: ${TRAIN_LOG}"
+echo "Process monitor log: ${PROCESS_MONITOR_LOG}"
 python - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
 import os
 import sys
@@ -222,10 +275,25 @@ import jax
 print(f"training_python={sys.executable}")
 print(f"training_cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
 print(f"training_jax_enable_x64={os.environ.get('JAX_ENABLE_X64', '<unset>')}")
+print(f"training_jax_log_compiles={os.environ.get('JAX_LOG_COMPILES', '<unset>')}")
+print(f"training_xla_flags={os.environ.get('XLA_FLAGS', '<unset>')}")
 print(f"training_jax_backend={jax.default_backend()}")
 print(f"training_jax_devices={jax.devices()}")
 PY
 nvidia-smi 2>&1 | tee -a "${TRAIN_LOG}"
-python -u -m src.utils --config "${CONFIG_PATH}" --stage training 2>&1 | tee -a "${TRAIN_LOG}"
+TRAIN_STAGE_T0="${SECONDS}"
+python -u -m src.utils --config "${CONFIG_PATH}" --stage training > >(tee -a "${TRAIN_LOG}") 2>&1 &
+TRAIN_PID=$!
+echo "Training PID: ${TRAIN_PID}" | tee -a "${TRAIN_LOG}"
+start_process_monitor
+set +e
+wait "${TRAIN_PID}"
+TRAIN_RC=$?
+set -e
+echo "Training stage exit code: ${TRAIN_RC}" | tee -a "${TRAIN_LOG}"
+echo "Training stage elapsed seconds: $((SECONDS - TRAIN_STAGE_T0))" | tee -a "${TRAIN_LOG}"
+if [ "${TRAIN_RC}" -ne 0 ]; then
+  exit "${TRAIN_RC}"
+fi
 
 echo "Done. Artifacts written under the configured models/ directory."
