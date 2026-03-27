@@ -48,11 +48,18 @@ ENABLE_PROCESS_MONITOR="${ENABLE_PROCESS_MONITOR:-1}"
 PROCESS_MONITOR_INTERVAL_SEC="${PROCESS_MONITOR_INTERVAL_SEC:-30}"
 PROCESS_MONITOR_LOG="${PROCESS_MONITOR_LOG:-${PROJECT_ROOT}/process_monitor.log}"
 ENABLE_JAX_COMPILE_LOGS="${ENABLE_JAX_COMPILE_LOGS:-1}"
+ENABLE_JAX_SMOKE_TEST="${ENABLE_JAX_SMOKE_TEST:-1}"
+JAX_SMOKE_SIZE="${JAX_SMOKE_SIZE:-2048}"
+ENABLE_STACK_WATCHDOG="${ENABLE_STACK_WATCHDOG:-1}"
+STACK_WATCHDOG_INTERVAL_SEC="${STACK_WATCHDOG_INTERVAL_SEC:-60}"
+STACK_DUMP_IDLE_SEC="${STACK_DUMP_IDLE_SEC:-300}"
+TRAINING_HEARTBEAT_SEC="${TRAINING_HEARTBEAT_SEC:-60}"
 ENABLE_XLA_DUMP="${ENABLE_XLA_DUMP:-0}"
 XLA_DUMP_DIR="${XLA_DUMP_DIR:-${PROJECT_ROOT}/xla_dump_${PBS_JOBID:-manual}}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
 GPU_MONITOR_PID=""
 PROCESS_MONITOR_PID=""
+STACK_WATCHDOG_PID=""
 TRAIN_PID=""
 
 cleanup() {
@@ -61,6 +68,9 @@ cleanup() {
   fi
   if [ -n "${PROCESS_MONITOR_PID}" ]; then
     kill "${PROCESS_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${STACK_WATCHDOG_PID}" ]; then
+    kill "${STACK_WATCHDOG_PID}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -107,7 +117,7 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
+echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} ENABLE_JAX_SMOKE_TEST=${ENABLE_JAX_SMOKE_TEST} JAX_SMOKE_SIZE=${JAX_SMOKE_SIZE} ENABLE_STACK_WATCHDOG=${ENABLE_STACK_WATCHDOG} STACK_DUMP_IDLE_SEC=${STACK_DUMP_IDLE_SEC} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
 if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
   echo "XLA dump dir: ${XLA_DUMP_DIR}"
 fi
@@ -174,12 +184,14 @@ start_process_monitor() {
   if [ "${ENABLE_PROCESS_MONITOR}" != "1" ]; then
     return
   fi
+  mkdir -p "$(dirname "${PROCESS_MONITOR_LOG}")"
   : > "${PROCESS_MONITOR_LOG}"
   (
     while kill -0 "${TRAIN_PID}" >/dev/null 2>&1; do
       {
         echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
         ps -p "${TRAIN_PID}" -o pid,ppid,etime,%cpu,%mem,rss,vsz,nlwp,stat,psr,wchan:32,comm,args
+        ps -L -p "${TRAIN_PID}" -o pid,tid,pcpu,psr,stat,wchan:32,comm --sort=-pcpu | sed -n '1,12p' || true
         if command -v top >/dev/null 2>&1; then
           top -b -n 1 -H -p "${TRAIN_PID}" | sed -n '1,20p' || true
         fi
@@ -199,6 +211,38 @@ start_process_monitor() {
   ) &
   PROCESS_MONITOR_PID=$!
   echo "Process monitor enabled: ${PROCESS_MONITOR_LOG} (pid=${PROCESS_MONITOR_PID})"
+}
+
+start_stack_watchdog() {
+  if [ "${ENABLE_STACK_WATCHDOG}" != "1" ]; then
+    return
+  fi
+  mkdir -p "$(dirname "${PROCESS_MONITOR_LOG}")"
+  (
+    last_size=0
+    last_change_epoch="$(date +%s)"
+    while kill -0 "${TRAIN_PID}" >/dev/null 2>&1; do
+      current_epoch="$(date +%s)"
+      current_size=0
+      if [ -f "${TRAIN_LOG}" ]; then
+        current_size="$(wc -c < "${TRAIN_LOG}" | tr -d ' ')"
+      fi
+      if [ "${current_size}" != "${last_size}" ]; then
+        last_size="${current_size}"
+        last_change_epoch="${current_epoch}"
+      elif [ $((current_epoch - last_change_epoch)) -ge "${STACK_DUMP_IDLE_SEC}" ]; then
+        {
+          echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+          echo "Stack watchdog: no training log growth for ${STACK_DUMP_IDLE_SEC}s; sending SIGUSR1 to training pid ${TRAIN_PID}"
+        } | tee -a "${TRAIN_LOG}" "${PROCESS_MONITOR_LOG}" >/dev/null
+        kill -USR1 "${TRAIN_PID}" >/dev/null 2>&1 || true
+        last_change_epoch="${current_epoch}"
+      fi
+      sleep "${STACK_WATCHDOG_INTERVAL_SEC}"
+    done
+  ) &
+  STACK_WATCHDOG_PID=$!
+  echo "Stack watchdog enabled: idle=${STACK_DUMP_IDLE_SEC}s interval=${STACK_WATCHDOG_INTERVAL_SEC}s (pid=${STACK_WATCHDOG_PID})"
 }
 
 mkdir -p "$(dirname "${TRAIN_LOG}")"
@@ -281,11 +325,104 @@ print(f"training_jax_backend={jax.default_backend()}")
 print(f"training_jax_devices={jax.devices()}")
 PY
 nvidia-smi 2>&1 | tee -a "${TRAIN_LOG}"
+if [ "${ENABLE_JAX_SMOKE_TEST}" = "1" ]; then
+python - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
+import os
+import time
+
+import jax
+import jax.numpy as jnp
+
+size = int(os.environ.get("JAX_SMOKE_SIZE", "2048"))
+device = jax.devices()[0]
+print(f"jax_smoke_device={device}")
+print(f"jax_smoke_size={size}")
+
+@jax.jit
+def smoke_mm(x, y):
+    return x @ y
+
+x = jnp.ones((size, size), dtype=jnp.float32)
+y = jnp.ones((size, size), dtype=jnp.float32)
+t0 = time.time()
+out = smoke_mm(x, y)
+jax.block_until_ready(out)
+t1 = time.time()
+out = smoke_mm(x, y)
+jax.block_until_ready(out)
+t2 = time.time()
+print(f"jax_smoke_first_call_s={t1 - t0:.3f}")
+print(f"jax_smoke_second_call_s={t2 - t1:.3f}")
+print(f"jax_smoke_output_checksum={float(jnp.sum(out)):.6e}")
+PY
+fi
 TRAIN_STAGE_T0="${SECONDS}"
-python -u -m src.utils --config "${CONFIG_PATH}" --stage training > >(tee -a "${TRAIN_LOG}") 2>&1 &
+python -u - "${CONFIG_PATH}" > >(tee -a "${TRAIN_LOG}") 2>&1 <<'PY' &
+from __future__ import annotations
+
+import faulthandler
+import os
+import signal
+import sys
+import threading
+import time
+import traceback
+
+
+def _register_signal_dump(signame: str) -> None:
+    sig = getattr(signal, signame, None)
+    if sig is None:
+        return
+    try:
+        faulthandler.register(sig, file=sys.stderr, all_threads=True, chain=False)
+        print(f"training_wrapper_registered_signal={signame}")
+    except Exception as exc:  # pragma: no cover - debug path
+        print(f"training_wrapper_signal_register_failed {signame}: {exc!r}", file=sys.stderr)
+
+
+def _heartbeat(period_s: int) -> None:
+    t0 = time.monotonic()
+    while True:
+        print(
+            f"training_wrapper_heartbeat elapsed_s={time.monotonic() - t0:.1f} "
+            f"threads={threading.active_count()} pid={os.getpid()}",
+            flush=True,
+        )
+        time.sleep(period_s)
+
+
+def main() -> int:
+    config_path = sys.argv[1]
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    _register_signal_dump("SIGUSR1")
+    _register_signal_dump("SIGUSR2")
+    heartbeat_period_s = int(os.environ.get("TRAINING_HEARTBEAT_SEC", "60"))
+    threading.Thread(target=_heartbeat, args=(heartbeat_period_s,), daemon=True).start()
+    print(f"training_wrapper_pid={os.getpid()}")
+    print(f"training_wrapper_ppid={os.getppid()}")
+    print(f"training_wrapper_config={config_path}")
+    print(f"training_wrapper_jax_log_compiles={os.environ.get('JAX_LOG_COMPILES', '<unset>')}")
+    sys.stdout.flush()
+
+    from src.utils.cli import main as cli_main
+
+    print("training_wrapper_imported_cli")
+    sys.stdout.flush()
+    return int(cli_main(["--config", config_path, "--stage", "training"]))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:  # pragma: no cover - debug path
+        print(f"training_wrapper_exception={exc!r}", file=sys.stderr)
+        traceback.print_exc()
+        raise
+PY
 TRAIN_PID=$!
 echo "Training PID: ${TRAIN_PID}" | tee -a "${TRAIN_LOG}"
 start_process_monitor
+start_stack_watchdog
 set +e
 wait "${TRAIN_PID}"
 TRAIN_RC=$?
