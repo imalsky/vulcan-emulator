@@ -182,6 +182,7 @@ if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
 from pathlib import Path
 import json
 import sys
+import h5py
 
 config_path = Path(sys.argv[1]).resolve()
 project_root = Path.cwd()
@@ -192,31 +193,42 @@ if not raw_root.is_absolute():
     raw_root = (project_root / raw_root).resolve()
 print(raw_root / "runs")
 print(int(cfg["generation"]["num_runs"]))
+consolidated_path = raw_root / "runs.h5"
+print(consolidated_path)
+if consolidated_path.exists():
+    with h5py.File(consolidated_path, "r") as handle:
+        print(len(handle.keys()))
+else:
+    print(0)
 PY
   )" || {
     echo "ERROR: failed to inspect config: ${CONFIG_PATH}"
     exit 1
   }
   mapfile -t DATA_CFG <<<"${DATA_CFG_RAW}"
-  if [ "${#DATA_CFG[@]}" -lt 2 ]; then
-    echo "ERROR: config inspection did not return raw_root and num_runs."
+  if [ "${#DATA_CFG[@]}" -lt 4 ]; then
+    echo "ERROR: config inspection did not return raw_root, num_runs, and consolidated metadata."
     exit 1
   fi
   RAW_RUN_DIR="${DATA_CFG[0]}"
   EXPECTED_RUNS="${DATA_CFG[1]}"
+  CONSOLIDATED_PATH="${DATA_CFG[2]}"
+  CONSOLIDATED_COUNT="${DATA_CFG[3]}"
   RUN_COUNT=0
   if [ -d "${RAW_RUN_DIR}" ]; then
     RUN_COUNT="$(find "${RAW_RUN_DIR}" -maxdepth 1 -type f -name 'run_*.h5' | wc -l | tr -d ' ')"
   fi
-  if [ "${RUN_COUNT}" -eq 0 ]; then
+  if [ "${CONSOLIDATED_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
+    echo "Stage: raw dataset already present in consolidated file (${CONSOLIDATED_COUNT} runs), skipping generation"
+  elif [ "${RUN_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
+    echo "Stage: raw dataset already present (${RUN_COUNT} runs), skipping generation"
+  elif [ "${RUN_COUNT}" -eq 0 ] && [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
     echo "Stage: generating raw runs"
     python -u -m src.utils --config "${CONFIG_PATH}" --stage generation 2>&1 | tee -a "${TRAIN_LOG}"
-  elif [ "${RUN_COUNT}" -ne "${EXPECTED_RUNS}" ]; then
-    echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} files in ${RAW_RUN_DIR}, expected ${EXPECTED_RUNS}."
+  else
+    echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} per-file runs in ${RAW_RUN_DIR} and ${CONSOLIDATED_COUNT} runs in ${CONSOLIDATED_PATH}, expected ${EXPECTED_RUNS}."
     echo "Set generation.overwrite=true and regenerate, or align generation.num_runs with the existing dataset."
     exit 1
-  else
-    echo "Stage: raw dataset already present (${RUN_COUNT} runs), skipping generation"
   fi
 fi
 

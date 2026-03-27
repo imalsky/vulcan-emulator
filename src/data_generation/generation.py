@@ -256,8 +256,10 @@ def _sampling_coverage_payload(
     pressure_rows: list[np.ndarray] = []
     for path in run_files:
         with h5py.File(path, "r") as handle:
-            temperature_rows.append(np.asarray(handle["inputs/temperature_k"], dtype=np.float64))
-            pressure_rows.append(np.asarray(handle["inputs/pressure_bar"], dtype=np.float64))
+            sources = [handle] if "inputs" in handle else [handle[run_id] for run_id in sorted(handle.keys())]
+            for source in sources:
+                temperature_rows.append(np.asarray(source["inputs/temperature_k"], dtype=np.float64))
+                pressure_rows.append(np.asarray(source["inputs/pressure_bar"], dtype=np.float64))
     temperature = np.concatenate(temperature_rows, axis=0)
     pressure = np.concatenate(pressure_rows, axis=0)
     metallicity_range = [float(x) for x in config["sampling"]["metallicity_log10_range"]]
@@ -312,10 +314,12 @@ def _sampling_coverage_payload(
         time_step_rows: list[np.ndarray] = []
         for path in run_files:
             with h5py.File(path, "r") as handle:
-                log10_kzz_rows.append(np.log10(np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64)))
-                time_s = np.asarray(handle["trajectory/time_s"], dtype=np.float64)
-                if time_s.size > 1:
-                    time_step_rows.append(np.log10(np.diff(time_s)))
+                sources = [handle] if "inputs" in handle else [handle[run_id] for run_id in sorted(handle.keys())]
+                for source in sources:
+                    log10_kzz_rows.append(np.log10(np.asarray(source["inputs/kzz_cm2_s"], dtype=np.float64)))
+                    time_s = np.asarray(source["trajectory/time_s"], dtype=np.float64)
+                    if time_s.size > 1:
+                        time_step_rows.append(np.log10(np.diff(time_s)))
         log10_kzz = np.concatenate(log10_kzz_rows, axis=0)
         time_step_log10 = np.concatenate(time_step_rows, axis=0) if time_step_rows else np.zeros((0,), dtype=np.float64)
         gravity_range = [float(x) for x in config["sampling"]["gravity_range_cm_s2"]]

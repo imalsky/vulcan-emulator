@@ -101,24 +101,33 @@ def _plot_profiles(
     plt.style.use(str(_STYLE))
     fig, (ax_mix, ax_pt) = plt.subplots(1, 2, figsize=(13, 6), sharey=True)
 
+    import matplotlib.ticker as mticker
+
+    # Reduce number of y-axis ticks (pressure)
+    ax_mix.yaxis.set_major_locator(mticker.LogLocator(base=10, numticks=6))
+    ax_mix.yaxis.set_minor_locator(mticker.NullLocator())
+
+
     colors = plt.cm.tab20(np.linspace(0, 1, len(species)))
     for i, name in enumerate(species):
         c = colors[i]
-        ax_mix.plot(true_log10[:, i], pressure_bar, "-", color=c, lw=1.4, label=name)
-        ax_mix.plot(pred_log10[:, i], pressure_bar, "--", color=c, lw=1.1)
+        ax_mix.plot(10 ** true_log10[:, i], pressure_bar, "-", color=c, lw=1.4, label=name)
+        ax_mix.plot(10 ** pred_log10[:, i], pressure_bar, "--", color=c, lw=1.1)
     ax_mix.set_yscale("log")
+    ax_mix.set_xscale("log")
+    ax_mix.set_xlim(1e-20, 3)
     ax_mix.invert_yaxis()
-    ax_mix.set_xlabel("log$_{10}$ mixing ratio")
+    ax_mix.set_xlabel("Mixing Ratio")
     ax_mix.set_ylabel("Pressure [bar]")
-    ax_mix.set_title("Mixing ratios  (solid = true, dashed = predicted)")
+    #ax_mix.set_title("Mixing ratios  (solid = true, dashed = predicted)")
     ax_mix.legend(fontsize=7, ncol=3, loc="best")
 
     ax_pt.plot(temperature_k, pressure_bar, "k-", lw=1.8)
     ax_pt.set_xlabel("Temperature [K]")
-    ax_pt.set_title("P-T profile")
+    #ax_pt.set_title("P-T profile")
     ax_pt.set_xlim(0, 3000)
 
-    fig.suptitle(f"Run: {run_id}")
+    #fig.suptitle(f"Run: {run_id}")
     fig.tight_layout()
     out_path = output_dir / f"{run_id}_profiles.png"
     fig.savefig(out_path)
