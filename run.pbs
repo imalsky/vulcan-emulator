@@ -51,6 +51,10 @@ ENABLE_JAX_COMPILE_LOGS="${ENABLE_JAX_COMPILE_LOGS:-1}"
 ENABLE_JAX_SMOKE_TEST="${ENABLE_JAX_SMOKE_TEST:-1}"
 JAX_SMOKE_SIZE="${JAX_SMOKE_SIZE:-2048}"
 DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
+JAX_RUNTIME_MODE="${JAX_RUNTIME_MODE:-auto}"
+ALLOW_JAX_SITE_FALLBACK="${ALLOW_JAX_SITE_FALLBACK:-1}"
+JAX_SITE_PACKAGES="${JAX_SITE_PACKAGES:-}"
+JAX_OVERLAY_DIR="${JAX_OVERLAY_DIR:-${PROJECT_ROOT}/.jax_overlay_${PBS_JOBID:-manual}}"
 ENABLE_STACK_WATCHDOG="${ENABLE_STACK_WATCHDOG:-1}"
 STACK_WATCHDOG_INTERVAL_SEC="${STACK_WATCHDOG_INTERVAL_SEC:-60}"
 STACK_DUMP_IDLE_SEC="${STACK_DUMP_IDLE_SEC:-300}"
@@ -78,6 +82,7 @@ cleanup() {
 trap cleanup EXIT
 
 export HDF5_USE_FILE_LOCKING=FALSE
+ORIG_PYTHONPATH="${PYTHONPATH:-}"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}"
 export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
@@ -100,6 +105,83 @@ fi
 python_run() {
   python -s "$@"
 }
+
+link_overlay_entry() {
+  local src="$1"
+  local dst_dir="$2"
+  local base
+  base="$(basename "${src}")"
+  if [ -e "${src}" ] && [ ! -e "${dst_dir}/${base}" ]; then
+    ln -s "${src}" "${dst_dir}/${base}"
+  fi
+}
+
+ENV_JAX_PRESENT=0
+if python_run - <<'PY'
+import importlib.util
+import sys
+
+has_jax = importlib.util.find_spec("jax") is not None
+has_jaxlib = importlib.util.find_spec("jaxlib") is not None
+raise SystemExit(0 if has_jax and has_jaxlib else 1)
+PY
+then
+  ENV_JAX_PRESENT=1
+fi
+
+export JAX_SITE_PACKAGES_ACTIVE=""
+export JAX_RUNTIME_MODE_ACTIVE="strict"
+if [ "${ENV_JAX_PRESENT}" != "1" ]; then
+  if [ "${JAX_RUNTIME_MODE}" = "legacy" ] || { [ "${JAX_RUNTIME_MODE}" = "auto" ] && [ "${ALLOW_JAX_SITE_FALLBACK}" = "1" ]; }; then
+    unset PYTHONNOUSERSITE || true
+    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${ORIG_PYTHONPATH:+:${ORIG_PYTHONPATH}}"
+    export JAX_RUNTIME_MODE_ACTIVE="legacy"
+    python_run() {
+      python "$@"
+    }
+    PYTHON_MM="$(python_run - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+    AUTO_JAX_SITE="${HOME}/.local/lib/python${PYTHON_MM}/site-packages"
+    if [ -d "${AUTO_JAX_SITE}" ]; then
+      export JAX_SITE_PACKAGES_ACTIVE="${AUTO_JAX_SITE}"
+    fi
+    echo "INFO: conda env '${CONDA_ENV}' does not contain jax/jaxlib; matching run_jax.pbs import behavior via ambient PYTHONPATH and user site-packages"
+  fi
+fi
+
+if [ "${ENV_JAX_PRESENT}" != "1" ] && [ "${JAX_RUNTIME_MODE_ACTIVE}" = "strict" ]; then
+  PYTHON_MM="$(python_run - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+  AUTO_JAX_SITE="${HOME}/.local/lib/python${PYTHON_MM}/site-packages"
+  if [ -z "${JAX_SITE_PACKAGES}" ] && [ -d "${AUTO_JAX_SITE}" ]; then
+    JAX_SITE_PACKAGES="${AUTO_JAX_SITE}"
+  fi
+  if [ "${ALLOW_JAX_SITE_FALLBACK}" = "1" ] && [ -n "${JAX_SITE_PACKAGES}" ] && [ -d "${JAX_SITE_PACKAGES}" ]; then
+    if [ -d "${JAX_SITE_PACKAGES}/jax" ] && [ -d "${JAX_SITE_PACKAGES}/jaxlib" ]; then
+      mkdir -p "${JAX_OVERLAY_DIR}"
+      for name in jax jaxlib jax_plugins ml_dtypes opt_einsum absl etils; do
+        link_overlay_entry "${JAX_SITE_PACKAGES}/${name}" "${JAX_OVERLAY_DIR}"
+      done
+      for pattern in jax_cuda*_plugin jax_cuda*_pjrt; do
+        for src in "${JAX_SITE_PACKAGES}"/${pattern}; do
+          [ -e "${src}" ] || continue
+          link_overlay_entry "${src}" "${JAX_OVERLAY_DIR}"
+        done
+      done
+      export PYTHONPATH="${JAX_OVERLAY_DIR}:${PROJECT_ROOT}/src:${PROJECT_ROOT}"
+      export JAX_SITE_PACKAGES_ACTIVE="${JAX_SITE_PACKAGES}"
+      export JAX_RUNTIME_MODE_ACTIVE="overlay"
+      echo "INFO: conda env '${CONDA_ENV}' does not contain jax/jaxlib; using controlled JAX overlay from ${JAX_SITE_PACKAGES}"
+      echo "INFO: JAX overlay directory: ${JAX_OVERLAY_DIR}"
+    fi
+  fi
+fi
 
 if [ -n "${PBS_JOBID:-}" ]; then
   echo "PBS_JOBID: ${PBS_JOBID}"
@@ -129,9 +211,13 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: PYTHONNOUSERSITE=${PYTHONNOUSERSITE} PYTHONPATH=${PYTHONPATH} JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} VULCAN_TRAIN_DEBUG=${VULCAN_TRAIN_DEBUG} ENABLE_JAX_SMOKE_TEST=${ENABLE_JAX_SMOKE_TEST} JAX_SMOKE_SIZE=${JAX_SMOKE_SIZE} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM} ENABLE_STACK_WATCHDOG=${ENABLE_STACK_WATCHDOG} STACK_DUMP_IDLE_SEC=${STACK_DUMP_IDLE_SEC} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
+echo "Launcher defaults: PYTHONNOUSERSITE=${PYTHONNOUSERSITE:-<unset>} PYTHONPATH=${PYTHONPATH} JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} VULCAN_TRAIN_DEBUG=${VULCAN_TRAIN_DEBUG} ENABLE_JAX_SMOKE_TEST=${ENABLE_JAX_SMOKE_TEST} JAX_SMOKE_SIZE=${JAX_SMOKE_SIZE} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM} JAX_RUNTIME_MODE=${JAX_RUNTIME_MODE} JAX_RUNTIME_MODE_ACTIVE=${JAX_RUNTIME_MODE_ACTIVE} ALLOW_JAX_SITE_FALLBACK=${ALLOW_JAX_SITE_FALLBACK} JAX_SITE_PACKAGES=${JAX_SITE_PACKAGES:-<unset>} JAX_SITE_PACKAGES_ACTIVE=${JAX_SITE_PACKAGES_ACTIVE:-<unset>} ENABLE_STACK_WATCHDOG=${ENABLE_STACK_WATCHDOG} STACK_DUMP_IDLE_SEC=${STACK_DUMP_IDLE_SEC} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
 if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
   echo "XLA dump dir: ${XLA_DUMP_DIR}"
+fi
+if [ "${ENV_JAX_PRESENT}" != "1" ] && [ "${JAX_RUNTIME_MODE_ACTIVE}" = "strict" ] && [ -z "${JAX_SITE_PACKAGES_ACTIVE}" ]; then
+  echo "ERROR: conda env '${CONDA_ENV}' does not contain jax/jaxlib and no controlled JAX overlay was activated."
+  echo "Set JAX_RUNTIME_MODE=legacy to match run_jax.pbs import behavior, set JAX_SITE_PACKAGES to a known-good site-packages directory, or install JAX into ${CONDA_PREFIX}."
 fi
 
 echo "Runtime preflight on host: $(hostname)"
@@ -151,9 +237,13 @@ ok = True
 jax_backend = "unknown"
 conda_prefix = os.environ.get("CONDA_PREFIX")
 user_site = site.getusersitepackages()
+jax_overlay = os.environ.get("JAX_SITE_PACKAGES_ACTIVE")
+runtime_mode = os.environ.get("JAX_RUNTIME_MODE_ACTIVE", "strict")
 
 print(f"python executable: {sys.executable}")
 print(f"conda_prefix={conda_prefix}")
+print(f"jax_site_packages_active={jax_overlay}")
+print(f"jax_runtime_mode_active={runtime_mode}")
 print(f"sys.prefix={sys.prefix}")
 print(f"sys.base_prefix={sys.base_prefix}")
 print(f"site.ENABLE_USER_SITE={site.ENABLE_USER_SITE}")
@@ -161,10 +251,10 @@ print("sys.path:")
 for entry in sys.path:
     print(f"  - {entry}")
 
-if site.ENABLE_USER_SITE:
+if runtime_mode == "strict" and site.ENABLE_USER_SITE:
     print("ERROR: site.ENABLE_USER_SITE is True; user site-packages are still enabled.", file=sys.stderr)
     ok = False
-if user_site:
+if runtime_mode == "strict" and user_site:
     resolved_user_site = Path(user_site).resolve()
     for entry in sys.path:
         if not entry:
@@ -201,15 +291,22 @@ for module_name in ("jax", "jaxlib", "numpy", "h5py"):
         print(f"{module_name}.__file__={module_file}")
         if module_name in {"jax", "jaxlib", "numpy"} and module_file not in {None, "<namespace>"}:
             resolved = Path(str(module_file)).resolve()
-            if user_site and str(resolved).startswith(str(Path(user_site).resolve())):
+            if runtime_mode == "strict" and user_site and str(resolved).startswith(str(Path(user_site).resolve())):
                 print(
                     f"ERROR: {module_name} resolved from user site-packages: {resolved}",
                     file=sys.stderr,
                 )
                 ok = False
-            if conda_prefix and not str(resolved).startswith(str(Path(conda_prefix).resolve())):
+            allowed_roots = []
+            if conda_prefix:
+                allowed_roots.append(Path(conda_prefix).resolve())
+            if jax_overlay:
+                allowed_roots.append(Path(jax_overlay).resolve())
+            if runtime_mode == "legacy" and user_site:
+                allowed_roots.append(Path(user_site).resolve())
+            if allowed_roots and not any(str(resolved).startswith(str(root)) for root in allowed_roots):
                 print(
-                    f"ERROR: {module_name} resolved outside CONDA_PREFIX: {resolved}",
+                    f"ERROR: {module_name} resolved outside allowed roots {allowed_roots}: {resolved}",
                     file=sys.stderr,
                 )
                 ok = False
@@ -386,6 +483,8 @@ import jax
 print(f"training_python={sys.executable}")
 print(f"training_conda_prefix={os.environ.get('CONDA_PREFIX', '<unset>')}")
 print(f"training_pythonnouser={os.environ.get('PYTHONNOUSERSITE', '<unset>')}")
+print(f"training_jax_runtime_mode_active={os.environ.get('JAX_RUNTIME_MODE_ACTIVE', '<unset>')}")
+print(f"training_jax_site_packages_active={os.environ.get('JAX_SITE_PACKAGES_ACTIVE', '<unset>')}")
 print(f"training_site_enable_user_site={site.ENABLE_USER_SITE}")
 print("training_sys_path:")
 for entry in sys.path:
