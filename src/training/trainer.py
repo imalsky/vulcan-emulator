@@ -61,6 +61,7 @@ from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
 TRAIN_DEBUG_ENABLED = os.environ.get("VULCAN_TRAIN_DEBUG", "0") == "1"
+TRAINING_PROGRESS_FILE = os.environ.get("TRAINING_PROGRESS_FILE", "").strip()
 
 
 def _device_summary(value: Any) -> str:
@@ -80,6 +81,21 @@ def _device_summary(value: Any) -> str:
     if device_attr is not None:
         return str(device_attr)
     return "<unknown>"
+
+
+def _write_training_progress(phase: str, **metadata: Any) -> None:
+    """Write the latest training phase to a machine-readable progress file."""
+    if not TRAINING_PROGRESS_FILE:
+        return
+    payload = {"timestamp": time.time(), "phase": phase}
+    payload.update(metadata)
+    try:
+        Path(TRAINING_PROGRESS_FILE).write_text(
+            json.dumps(payload, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:  # pragma: no cover - debug path
+        LOGGER.warning("Failed to write training progress phase %s: %s", phase, exc)
 
 
 @dataclass(frozen=True)
@@ -656,6 +672,7 @@ def train_equilibrium_model(
         batch_build_t1 = time.monotonic()
         train_metrics_epoch: list[dict[str, float]] = []
         if TRAIN_DEBUG_ENABLED and epoch == 0:
+            _write_training_progress("epoch1_batch_built", num_batches=len(train_batches))
             LOGGER.warning(
                 "Debug equilibrium epoch 1: built %d train batches in %.3fs",
                 len(train_batches),
@@ -681,20 +698,26 @@ def train_equilibrium_model(
                     batch["target"].shape,
                     _device_summary(first_param_leaf),
                 )
+                _write_training_progress("step1_device_put_start")
                 device_put_t0 = time.monotonic()
                 device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
                 device_put_t1 = time.monotonic()
                 lr_value = jnp.asarray(lr, dtype=jnp.float32)
+                _write_training_progress("step1_dispatch_enter")
                 dispatch_t0 = time.monotonic()
                 params, opt_state, metrics = train_step(
                     params, opt_state, device_batch, lr_value,
                 )
                 dispatch_t1 = time.monotonic()
+                _write_training_progress("step1_dispatch_return")
+                _write_training_progress("step1_block_until_ready_enter")
                 sync_t0 = time.monotonic()
                 jax.block_until_ready(metrics)
                 sync_t1 = time.monotonic()
+                _write_training_progress("step1_block_until_ready_return")
                 metrics_host = {key: float(value) for key, value in metrics.items()}
                 metrics_t1 = time.monotonic()
+                _write_training_progress("step1_metrics_host_done")
                 first_param_leaf = jax.tree_util.tree_leaves(params)[0]
                 LOGGER.warning(
                     "Debug equilibrium step 1 timings: device_put=%.3fs dispatch_return=%.3fs sync=%.3fs host_metrics=%.3fs metric=%.6e param_device=%s batch_device=%s",

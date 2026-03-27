@@ -50,7 +50,7 @@ PROCESS_MONITOR_LOG="${PROCESS_MONITOR_LOG:-${PROJECT_ROOT}/process_monitor.log}
 ENABLE_JAX_COMPILE_LOGS="${ENABLE_JAX_COMPILE_LOGS:-1}"
 ENABLE_JAX_SMOKE_TEST="${ENABLE_JAX_SMOKE_TEST:-1}"
 JAX_SMOKE_SIZE="${JAX_SMOKE_SIZE:-2048}"
-DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
+DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-0}"
 JAX_RUNTIME_MODE="${JAX_RUNTIME_MODE:-auto}"
 ALLOW_JAX_SITE_FALLBACK="${ALLOW_JAX_SITE_FALLBACK:-1}"
 JAX_SITE_PACKAGES="${JAX_SITE_PACKAGES:-}"
@@ -60,6 +60,8 @@ STACK_WATCHDOG_INTERVAL_SEC="${STACK_WATCHDOG_INTERVAL_SEC:-60}"
 STACK_DUMP_IDLE_SEC="${STACK_DUMP_IDLE_SEC:-300}"
 TRAINING_HEARTBEAT_SEC="${TRAINING_HEARTBEAT_SEC:-60}"
 TRAINING_HEARTBEAT_LOG="${TRAINING_HEARTBEAT_LOG:-${PROJECT_ROOT}/training_heartbeat.log}"
+TRAINING_PROGRESS_FILE="${TRAINING_PROGRESS_FILE:-${PROJECT_ROOT}/training_progress.json}"
+TRAINING_WRAPPER_PID_FILE="${TRAINING_WRAPPER_PID_FILE:-${PROJECT_ROOT}/training_wrapper.pid}"
 ENABLE_XLA_DUMP="${ENABLE_XLA_DUMP:-0}"
 XLA_DUMP_DIR="${XLA_DUMP_DIR:-${PROJECT_ROOT}/xla_dump_${PBS_JOBID:-manual}}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
@@ -91,8 +93,12 @@ export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-${ENABLE_JAX_COMPILE_LOGS}}"
 export VULCAN_TRAIN_DEBUG="${VULCAN_TRAIN_DEBUG:-1}"
 export TRAINING_HEARTBEAT_LOG
+export TRAINING_PROGRESS_FILE
+export TRAINING_WRAPPER_PID_FILE
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+PYTHON_CMD=(python -s)
 
 if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
   mkdir -p "${XLA_DUMP_DIR}"
@@ -103,7 +109,7 @@ if [ "${DISABLE_TRITON_GEMM}" = "1" ]; then
 fi
 
 python_run() {
-  python -s "$@"
+  "${PYTHON_CMD[@]}" "$@"
 }
 
 link_overlay_entry() {
@@ -136,9 +142,7 @@ if [ "${ENV_JAX_PRESENT}" != "1" ]; then
     unset PYTHONNOUSERSITE || true
     export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${ORIG_PYTHONPATH:+:${ORIG_PYTHONPATH}}"
     export JAX_RUNTIME_MODE_ACTIVE="legacy"
-    python_run() {
-      python "$@"
-    }
+    PYTHON_CMD=(python)
     PYTHON_MM="$(python_run - <<'PY'
 import sys
 print(f"{sys.version_info.major}.{sys.version_info.minor}")
@@ -365,6 +369,10 @@ start_process_monitor() {
           echo "train_log_bytes=$(wc -c < "${TRAIN_LOG}" | tr -d ' ')"
           tail -n 5 "${TRAIN_LOG}" || true
         fi
+        if [ -f "${TRAINING_PROGRESS_FILE}" ]; then
+          echo "training_progress_file=${TRAINING_PROGRESS_FILE}"
+          echo "training_progress=$(tr -d '\n' < "${TRAINING_PROGRESS_FILE}")"
+        fi
       } >> "${PROCESS_MONITOR_LOG}" 2>&1
       sleep "${PROCESS_MONITOR_INTERVAL_SEC}"
     done
@@ -380,20 +388,29 @@ start_stack_watchdog() {
   mkdir -p "$(dirname "${PROCESS_MONITOR_LOG}")"
   (
     last_size=0
+    last_progress_state=""
     last_change_epoch="$(date +%s)"
     while kill -0 "${TRAIN_PID}" >/dev/null 2>&1; do
       current_epoch="$(date +%s)"
       current_size=0
+      current_progress_state=""
       if [ -f "${TRAIN_LOG}" ]; then
         current_size="$(wc -c < "${TRAIN_LOG}" | tr -d ' ')"
       fi
-      if [ "${current_size}" != "${last_size}" ]; then
+      if [ -f "${TRAINING_PROGRESS_FILE}" ]; then
+        current_progress_state="$(tr -d '\n' < "${TRAINING_PROGRESS_FILE}")"
+      fi
+      if [ "${current_size}" != "${last_size}" ] || [ "${current_progress_state}" != "${last_progress_state}" ]; then
         last_size="${current_size}"
+        last_progress_state="${current_progress_state}"
         last_change_epoch="${current_epoch}"
       elif [ $((current_epoch - last_change_epoch)) -ge "${STACK_DUMP_IDLE_SEC}" ]; then
         {
           echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
           echo "Stack watchdog: no training log growth for ${STACK_DUMP_IDLE_SEC}s; sending SIGUSR1 to training pid ${TRAIN_PID}"
+          if [ -n "${current_progress_state}" ]; then
+            echo "Stack watchdog progress state: ${current_progress_state}"
+          fi
         } | tee -a "${TRAIN_LOG}" "${PROCESS_MONITOR_LOG}" >/dev/null
         kill -USR1 "${TRAIN_PID}" >/dev/null 2>&1 || true
         last_change_epoch="${current_epoch}"
@@ -407,6 +424,9 @@ start_stack_watchdog() {
 
 mkdir -p "$(dirname "${TRAIN_LOG}")"
 : > "${TRAIN_LOG}"
+mkdir -p "$(dirname "${TRAINING_PROGRESS_FILE}")"
+mkdir -p "$(dirname "${TRAINING_WRAPPER_PID_FILE}")"
+rm -f "${TRAINING_PROGRESS_FILE}" "${TRAINING_WRAPPER_PID_FILE}"
 
 echo "Stage: dataset generation check (RUN_GEN_IF_MISSING=${RUN_GEN_IF_MISSING})"
 if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
@@ -471,6 +491,8 @@ echo "Stage: training"
 echo "Training log file: ${TRAIN_LOG}"
 echo "Process monitor log: ${PROCESS_MONITOR_LOG}"
 echo "Heartbeat log: ${TRAINING_HEARTBEAT_LOG}"
+echo "Progress file: ${TRAINING_PROGRESS_FILE}"
+echo "Wrapper PID file: ${TRAINING_WRAPPER_PID_FILE}"
 python_run - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
 import os
 import importlib
@@ -485,6 +507,8 @@ print(f"training_conda_prefix={os.environ.get('CONDA_PREFIX', '<unset>')}")
 print(f"training_pythonnouser={os.environ.get('PYTHONNOUSERSITE', '<unset>')}")
 print(f"training_jax_runtime_mode_active={os.environ.get('JAX_RUNTIME_MODE_ACTIVE', '<unset>')}")
 print(f"training_jax_site_packages_active={os.environ.get('JAX_SITE_PACKAGES_ACTIVE', '<unset>')}")
+print(f"training_progress_file={os.environ.get('TRAINING_PROGRESS_FILE', '<unset>')}")
+print(f"training_wrapper_pid_file={os.environ.get('TRAINING_WRAPPER_PID_FILE', '<unset>')}")
 print(f"training_site_enable_user_site={site.ENABLE_USER_SITE}")
 print("training_sys_path:")
 for entry in sys.path:
@@ -536,7 +560,7 @@ print(f"jax_smoke_output_checksum={float(jnp.sum(out)):.6e}")
 PY
 fi
 TRAIN_STAGE_T0="${SECONDS}"
-python_run -u - "${CONFIG_PATH}" > >(tee -a "${TRAIN_LOG}") 2>&1 <<'PY' &
+"${PYTHON_CMD[@]}" -u - "${CONFIG_PATH}" > >(tee -a "${TRAIN_LOG}") 2>&1 <<'PY' &
 from __future__ import annotations
 
 import faulthandler
@@ -587,6 +611,10 @@ def main() -> int:
     _register_signal_dump("SIGUSR2")
     heartbeat_period_s = int(os.environ.get("TRAINING_HEARTBEAT_SEC", "60"))
     threading.Thread(target=_heartbeat, args=(heartbeat_period_s,), daemon=True).start()
+    wrapper_pid_file = os.environ.get("TRAINING_WRAPPER_PID_FILE", "")
+    if wrapper_pid_file:
+        with open(wrapper_pid_file, "w", encoding="utf-8") as handle:
+            handle.write(f"{os.getpid()}\n")
     print(f"training_wrapper_pid={os.getpid()}")
     print(f"training_wrapper_ppid={os.getppid()}")
     print(f"training_wrapper_config={config_path}")
@@ -610,6 +638,39 @@ if __name__ == "__main__":
 PY
 TRAIN_PID=$!
 echo "Training PID: ${TRAIN_PID}" | tee -a "${TRAIN_LOG}"
+WRAPPER_PID=""
+WRAPPER_PID_DEADLINE=$((SECONDS + 30))
+while [ "${SECONDS}" -lt "${WRAPPER_PID_DEADLINE}" ]; do
+  if [ -f "${TRAINING_WRAPPER_PID_FILE}" ]; then
+    WRAPPER_PID="$(tr -d '[:space:]' < "${TRAINING_WRAPPER_PID_FILE}")"
+    if [ -n "${WRAPPER_PID}" ]; then
+      break
+    fi
+  fi
+  if ! kill -0 "${TRAIN_PID}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+if [ -z "${WRAPPER_PID}" ]; then
+  echo "ERROR: training wrapper PID file was not written: ${TRAINING_WRAPPER_PID_FILE}" | tee -a "${TRAIN_LOG}"
+  set +e
+  wait "${TRAIN_PID}"
+  TRAIN_RC=$?
+  set -e
+  echo "Training stage exit code: ${TRAIN_RC}" | tee -a "${TRAIN_LOG}"
+  exit 1
+fi
+echo "Training wrapper PID: ${WRAPPER_PID}" | tee -a "${TRAIN_LOG}"
+if [ "${TRAIN_PID}" != "${WRAPPER_PID}" ]; then
+  echo "ERROR: Training PID mismatch: launcher pid=${TRAIN_PID} wrapper pid=${WRAPPER_PID}" | tee -a "${TRAIN_LOG}"
+  kill "${TRAIN_PID}" >/dev/null 2>&1 || true
+  kill "${WRAPPER_PID}" >/dev/null 2>&1 || true
+  set +e
+  wait "${TRAIN_PID}"
+  set -e
+  exit 1
+fi
 start_process_monitor
 start_stack_watchdog
 set +e
