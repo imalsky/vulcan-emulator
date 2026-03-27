@@ -157,7 +157,7 @@
   },
   "training": {
     "seed": 123,
-    "batch_size": 128,
+    "batch_size": 4096,
     "epochs": 300,
     "learning_rate": 1e-4,
     "min_lr": 1e-6,
