@@ -126,7 +126,8 @@ def _init_linear(key: jax.Array, in_dim: int, out_dim: int) -> dict[str, jax.Arr
 def _linear(params: dict[str, jax.Array], x: jax.Array) -> jax.Array:
     """Apply a dense affine transform: ``output = x @ W + b``.
 
-    Uses ``jnp.einsum`` to handle arbitrary leading batch dimensions.
+    Flattens any leading batch dimensions so XLA can lower the operation to a
+    single 2-D GEMM on accelerators, then restores the original shape.
 
     Parameters
     ----------
@@ -140,7 +141,10 @@ def _linear(params: dict[str, jax.Array], x: jax.Array) -> jax.Array:
     jax.Array
         Output tensor with last dimension replaced by ``out_dim``.
     """
-    return jnp.einsum("...i,io->...o", x, params["weight"]) + params["bias"]
+    leading_shape = x.shape[:-1]
+    x_2d = x.reshape((-1, x.shape[-1]))
+    y_2d = x_2d @ params["weight"] + params["bias"]
+    return y_2d.reshape(leading_shape + (params["bias"].shape[0],))
 
 
 def _init_layer_norm(dim: int) -> dict[str, jax.Array]:

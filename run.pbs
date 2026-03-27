@@ -54,6 +54,7 @@ ENABLE_STACK_WATCHDOG="${ENABLE_STACK_WATCHDOG:-1}"
 STACK_WATCHDOG_INTERVAL_SEC="${STACK_WATCHDOG_INTERVAL_SEC:-60}"
 STACK_DUMP_IDLE_SEC="${STACK_DUMP_IDLE_SEC:-300}"
 TRAINING_HEARTBEAT_SEC="${TRAINING_HEARTBEAT_SEC:-60}"
+TRAINING_HEARTBEAT_LOG="${TRAINING_HEARTBEAT_LOG:-${PROJECT_ROOT}/training_heartbeat.log}"
 ENABLE_XLA_DUMP="${ENABLE_XLA_DUMP:-0}"
 XLA_DUMP_DIR="${XLA_DUMP_DIR:-${PROJECT_ROOT}/xla_dump_${PBS_JOBID:-manual}}"
 TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
@@ -81,6 +82,8 @@ export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-${ENABLE_JAX_COMPILE_LOGS}}"
+export VULCAN_TRAIN_DEBUG="${VULCAN_TRAIN_DEBUG:-1}"
+export TRAINING_HEARTBEAT_LOG
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
@@ -117,7 +120,7 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} ENABLE_JAX_SMOKE_TEST=${ENABLE_JAX_SMOKE_TEST} JAX_SMOKE_SIZE=${JAX_SMOKE_SIZE} ENABLE_STACK_WATCHDOG=${ENABLE_STACK_WATCHDOG} STACK_DUMP_IDLE_SEC=${STACK_DUMP_IDLE_SEC} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
+echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC} PROCESS_MONITOR_INTERVAL_SEC=${PROCESS_MONITOR_INTERVAL_SEC} JAX_LOG_COMPILES=${JAX_LOG_COMPILES} VULCAN_TRAIN_DEBUG=${VULCAN_TRAIN_DEBUG} ENABLE_JAX_SMOKE_TEST=${ENABLE_JAX_SMOKE_TEST} JAX_SMOKE_SIZE=${JAX_SMOKE_SIZE} ENABLE_STACK_WATCHDOG=${ENABLE_STACK_WATCHDOG} STACK_DUMP_IDLE_SEC=${STACK_DUMP_IDLE_SEC} ENABLE_XLA_DUMP=${ENABLE_XLA_DUMP}"
 if [ "${ENABLE_XLA_DUMP}" = "1" ]; then
   echo "XLA dump dir: ${XLA_DUMP_DIR}"
 fi
@@ -310,6 +313,7 @@ python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization 2>&1 | te
 echo "Stage: training"
 echo "Training log file: ${TRAIN_LOG}"
 echo "Process monitor log: ${PROCESS_MONITOR_LOG}"
+echo "Heartbeat log: ${TRAINING_HEARTBEAT_LOG}"
 python - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
 import os
 import sys
@@ -382,12 +386,22 @@ def _register_signal_dump(signame: str) -> None:
 
 def _heartbeat(period_s: int) -> None:
     t0 = time.monotonic()
+    heartbeat_log = os.environ.get("TRAINING_HEARTBEAT_LOG", "")
     while True:
-        print(
+        message = (
             f"training_wrapper_heartbeat elapsed_s={time.monotonic() - t0:.1f} "
-            f"threads={threading.active_count()} pid={os.getpid()}",
-            flush=True,
+            f"threads={threading.active_count()} pid={os.getpid()}\n"
         )
+        if heartbeat_log:
+            try:
+                with open(heartbeat_log, "a", encoding="utf-8") as handle:
+                    handle.write(message)
+            except Exception:
+                sys.stderr.write(message)
+                sys.stderr.flush()
+        else:
+            sys.stderr.write(message)
+            sys.stderr.flush()
         time.sleep(period_s)
 
 
