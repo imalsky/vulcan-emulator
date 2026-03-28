@@ -157,7 +157,7 @@
   },
   "training": {
     "seed": 123,
-    "batch_size": 4096,
+    "batch_size": 8192,
     "epochs": 300,
     "learning_rate": 1e-4,
     "min_lr": 1e-6,
@@ -181,7 +181,7 @@
   },
   "equilibrium_only": {
     "model": {
-      "activation": "silu",
+      "activation": "relu",
       "d_hidden": 1024,
       "num_hidden_layers": 6,
       "conditioning_hidden_dim": 64,
