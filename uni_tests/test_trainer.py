@@ -4,6 +4,8 @@ import pytest
 
 from src.training.trainer import (
     _cosine_learning_rate_schedule,
+    _epoch_table_header,
+    _format_epoch_row,
     _init_reduce_on_plateau_state,
     _maybe_update_plateau_scheduler,
     _scheduled_learning_rate,
@@ -122,3 +124,33 @@ def test_cosine_scheduler_retains_previous_schedule_shape():
         min_lr=1.0e-5,
         warmup_steps=2,
     ) == pytest.approx(1.0e-5)
+
+
+def test_epoch_table_header_uses_plain_column_names():
+    header = _epoch_table_header()
+
+    assert "Epoch" in header
+    assert "Train Loss" in header
+    assert "Val Loss" in header
+    assert "LR" in header
+    assert "Time" in header
+    assert "INFO" not in header
+
+
+def test_epoch_row_formats_plain_values_without_logger_prefix():
+    row = _format_epoch_row(
+        epoch=12,
+        epochs=300,
+        train_loss=1.23e-2,
+        val_loss=4.56e-2,
+        learning_rate=1.0e-4,
+        epoch_seconds=0.071,
+    )
+
+    assert "12/300" in row
+    assert "1.2300e-02" in row
+    assert "4.5600e-02" in row
+    assert "1.0000e-04" in row
+    assert "0.071s" in row
+    assert "INFO" not in row
+    assert "src.training.trainer" not in row

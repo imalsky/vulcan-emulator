@@ -180,7 +180,7 @@
   },
   "equilibrium_only": {
     "model": {
-      "activation": "relu",
+      "activation": "leaky_relu",
       "d_hidden": 1024,
       "num_hidden_layers": 16,
       "conditioning_hidden_dim": 512,

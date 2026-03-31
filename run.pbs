@@ -12,6 +12,9 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 cd -P "${PROJECT_ROOT}"
 
+LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
+mkdir -p "${LOG_ROOT}"
+
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
 module load miniconda3/gh2
@@ -43,6 +46,7 @@ DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED=1
 export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
@@ -55,7 +59,10 @@ fi
 export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_autotune_level=0"
 
 if [ -n "${PBS_JOBID:-}" ]; then
+  export VULCAN_LIVE_LOG_PATH="${VULCAN_LIVE_LOG_PATH:-${LOG_ROOT}/pbs_${PBS_JOBID}.log}"
+  touch "${VULCAN_LIVE_LOG_PATH}"
   echo "PBS_JOBID: ${PBS_JOBID}"
+  echo "Live log: ${VULCAN_LIVE_LOG_PATH}"
   if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
     echo "ERROR: No visible NVIDIA GPU in this PBS job."
     exit 1

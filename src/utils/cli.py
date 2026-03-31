@@ -84,13 +84,14 @@ def main(argv: list[str] | None = None) -> int:
                     "coverage_path": str(artifact.coverage_path) if artifact.coverage_path is not None else None,
                 },
                 indent=2,
-            )
+            ),
+            flush=True,
         )
         return 0
     if args.stage == "normalization":
         artifact = preprocess_raw_dataset(config, project_root=project_root)
         LOGGER.info("Normalization complete")
-        print(json.dumps(artifact, indent=2))
+        print(json.dumps(artifact, indent=2), flush=True)
         return 0
     if args.stage == "training":
         artifact = train_model(config, project_root=project_root)
@@ -103,17 +104,18 @@ def main(argv: list[str] | None = None) -> int:
                     "metrics_path": str(artifact.metrics_path),
                 },
                 indent=2,
-            )
+            ),
+            flush=True,
         )
         return 0
     if args.stage == "migrate":
         result = migrate_from_config(config, project_root=project_root, dry_run=args.dry_run)
         if result is not None:
             LOGGER.info("Migration complete: %s", result)
-            print(json.dumps({"consolidated_path": str(result)}, indent=2))
+            print(json.dumps({"consolidated_path": str(result)}, indent=2), flush=True)
         else:
             LOGGER.info("Nothing to migrate.")
-            print(json.dumps({"consolidated_path": None}, indent=2))
+            print(json.dumps({"consolidated_path": None}, indent=2), flush=True)
         return 0
     raise ValueError(f"Unhandled stage: {args.stage}")
 

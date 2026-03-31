@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pickle
 import time
 from dataclasses import dataclass
@@ -442,37 +443,45 @@ def _feature_order_matches(contract: dict[str, Any], config: dict[str, Any]) -> 
     )
 
 
-def _format_epoch_log(
+def _epoch_table_header() -> str:
+    """Return the plain-text epoch table header shown in live logs."""
+    return f"{'Epoch':>9}  {'Train Loss':>12}  {'Val Loss':>12}  {'LR':>12}  {'Time':>8}"
+
+
+def _epoch_table_rule() -> str:
+    """Return a separator matching the live epoch table width."""
+    return f"{'-' * 9}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 8}"
+
+
+def _format_epoch_row(
     *,
     epoch: int,
     epochs: int,
-    train_summary: dict[str, float],
-    val_summary: dict[str, float],
+    train_loss: float,
+    val_loss: float,
     learning_rate: float,
     epoch_seconds: float,
-    train_steps: int,
-    val_steps: int,
-    include_spectrum: bool,
 ) -> str:
-    """Format one compact, high-signal epoch log line."""
-    parts = [
-        f"Epoch {epoch:3d}/{epochs:3d}",
-        f"loss {train_summary['combined_loss']:.4e}/{val_summary['combined_loss']:.4e}",
-        f"z {train_summary['mse_norm']:.4e}/{val_summary['mse_norm']:.4e}",
-        f"log10 {train_summary['mse_log10']:.4e}/{val_summary['mse_log10']:.4e}",
-    ]
-    if include_spectrum:
-        parts.append(
-            f"spec {train_summary['spectrum_recon_mse']:.4e}/{val_summary['spectrum_recon_mse']:.4e}"
-        )
-    parts.extend(
-        [
-            f"lr {learning_rate:.4e}",
-            f"steps {train_steps}/{val_steps}",
-            f"{epoch_seconds:.3f}s",
-        ]
+    """Format one plain epoch row without logger prefixes."""
+    epoch_label = f"{epoch}/{epochs}"
+    return (
+        f"{epoch_label:>9}  "
+        f"{train_loss:>12.4e}  "
+        f"{val_loss:>12.4e}  "
+        f"{learning_rate:>12.4e}  "
+        f"{epoch_seconds:>7.3f}s"
     )
-    return " | ".join(parts)
+
+
+def _emit_epoch_table_line(line: str) -> None:
+    """Write one plain-text training-table line to stdout and the live PBS log."""
+    print(line, flush=True)
+    live_log_path = os.environ.get("VULCAN_LIVE_LOG_PATH", "").strip()
+    if not live_log_path:
+        return
+    with Path(live_log_path).expanduser().resolve().open("a", encoding="utf-8") as handle:
+        handle.write(f"{line}\n")
+        handle.flush()
 
 
 def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
@@ -672,6 +681,8 @@ def train_equilibrium_model(
         test_split.num_runs,
         steps_per_epoch,
     )
+    _emit_epoch_table_line(_epoch_table_header())
+    _emit_epoch_table_line(_epoch_table_rule())
 
     rng = np.random.default_rng(int(config["training"]["seed"]))
 
@@ -735,17 +746,14 @@ def train_equilibrium_model(
             "val": val_summary,
         }
         history.append(record)
-        LOGGER.info(
-            _format_epoch_log(
+        _emit_epoch_table_line(
+            _format_epoch_row(
                 epoch=epoch + 1,
                 epochs=epochs,
-                train_summary=train_summary,
-                val_summary=val_summary,
+                train_loss=train_summary["combined_loss"],
+                val_loss=val_summary["combined_loss"],
                 learning_rate=current_lr,
                 epoch_seconds=epoch_dt,
-                train_steps=train_steps,
-                val_steps=val_steps,
-                include_spectrum=False,
             )
         )
 
@@ -852,6 +860,8 @@ def train_full_vulcan_model(
         test_split.num_runs,
         steps_per_epoch,
     )
+    _emit_epoch_table_line(_epoch_table_header())
+    _emit_epoch_table_line(_epoch_table_rule())
 
     rng = np.random.default_rng(int(config["training"]["seed"]))
 
@@ -913,17 +923,14 @@ def train_full_vulcan_model(
             "val": val_summary,
         }
         history.append(record)
-        LOGGER.info(
-            _format_epoch_log(
+        _emit_epoch_table_line(
+            _format_epoch_row(
                 epoch=epoch + 1,
                 epochs=epochs,
-                train_summary=train_summary,
-                val_summary=val_summary,
+                train_loss=train_summary["combined_loss"],
+                val_loss=val_summary["combined_loss"],
                 learning_rate=current_lr,
                 epoch_seconds=epoch_dt,
-                train_steps=train_steps,
-                val_steps=val_steps,
-                include_spectrum=True,
             )
         )
 

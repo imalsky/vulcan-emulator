@@ -213,7 +213,7 @@ The same activation names are supported for both model families:
 - `softplus`
 - `leaky_relu`
 
-Use lowercase strings.
+Use lowercase strings. The default activation for both model families is `leaky_relu`.
 
 ## `full_vulcan.physics_toggles`
 

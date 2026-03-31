@@ -326,7 +326,7 @@ def _validate_equilibrium_model_config(model: dict[str, Any], scope: str) -> dic
         normalized[key] = _as_int(normalized[key], f"{scope}.{key}")
     normalized["film_clamp"] = _as_float(normalized["film_clamp"], f"{scope}.film_clamp")
     normalized["activation"] = _as_nonempty_str(
-        normalized.get("activation", "gelu"),
+        normalized.get("activation", "leaky_relu"),
         f"{scope}.activation",
     ).lower()
     if normalized["activation"] not in _ALLOWED_ACTIVATIONS:
@@ -369,7 +369,7 @@ def _validate_full_vulcan_model_config(model: dict[str, Any], scope: str) -> dic
         normalized[key] = _as_int(normalized[key], f"{scope}.{key}")
     normalized["film_clamp"] = _as_float(normalized["film_clamp"], f"{scope}.film_clamp")
     normalized["activation"] = _as_nonempty_str(
-        normalized.get("activation", "gelu"),
+        normalized.get("activation", "leaky_relu"),
         f"{scope}.activation",
     ).lower()
     if normalized["activation"] not in _ALLOWED_ACTIVATIONS:

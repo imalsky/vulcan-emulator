@@ -220,6 +220,8 @@ Supported activations for both model families:
 - `softplus`
 - `leaky_relu`
 
+Default activation for both model families: `leaky_relu`.
+
 ## Export Bundle
 
 Training checkpoints can be exported to NPZ bundles with baked normalization.
