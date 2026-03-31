@@ -4,8 +4,8 @@
 
 This repository supports exactly two emulator tasks:
 
-- `task.kind = "equilibrium_only"`: FastChem equilibrium chemistry from pressure, temperature, and fixed-order elemental abundances.
-- `task.kind = "full_vulcan"`: final converged VULCAN chemistry from pressure, temperature, Kzz, gravity, elemental abundances, stellar spectrum, and public physics knobs.
+- `task.kind = "equilibrium_only"`: FastChem equilibrium chemistry from pressure, temperature, column-global chemistry ratios, and gravity, with the model FiLM-conditioned on `metallicity_log10`, `c_to_o`, and `s_to_o`.
+- `task.kind = "full_vulcan"`: final converged VULCAN chemistry from pressure, temperature, Kzz, gravity, column-global chemistry ratios, stellar spectrum, and public physics knobs.
 
 There is no timestep control, no live pair sampling, no anchor-state contract, and no trajectory target mode in the supported pipeline.
 
@@ -55,6 +55,8 @@ The fixed FastChem-native elemental input order is internal and not user-configu
 ```
 
 These are hydrogen-normalized number abundances `n_X / n_H`, not total-gas mixing ratios and not relative-to-solar values.
+They remain internal raw-generation inputs for FastChem and VULCAN, not part of
+the supported public learned-conditioning contract.
 
 ## Full-VULCAN Public Knobs
 
@@ -148,7 +150,7 @@ There is no `trajectory/` group and no `inputs/target_mode`.
 Processed artifacts are versioned with:
 
 ```python
-PROCESSED_DATA_VERSION = 9
+PROCESSED_DATA_VERSION = 11
 ```
 
 ### Equilibrium split files
@@ -158,6 +160,9 @@ PROCESSED_DATA_VERSION = 9
 - `global_inputs.npy` `(N, global_dim)`
 - `run_ids.json`
 - `metadata.json`
+
+For equilibrium, `global_inputs.npy` stores the FiLM conditioning globals
+`[metallicity_log10, c_to_o, s_to_o]`.
 
 ### Full-VULCAN split files
 
@@ -169,6 +174,8 @@ PROCESSED_DATA_VERSION = 9
 - `metadata.json`
 
 The processed full-VULCAN contract contains only final-state targets plus spectrum and run metadata.
+For full-VULCAN, `global_inputs.npy` stores
+`[gravity_cm_s2, metallicity_log10, c_to_o, s_to_o, ...public toggles/base flags...]`.
 
 ## Normalization
 
@@ -191,7 +198,9 @@ Config-selected normalization controls are:
 - `normalization.spectrum_floor` for `full_vulcan`
 - `normalization.split`
 
-The elemental channels use the same normalization path as the other positive chemistry features: `log10` plus z-score when configured as `log-standard`.
+The supported learned chemistry globals are the ratio triplet
+`metallicity_log10`, `c_to_o`, and `s_to_o`. Gravity typically uses
+`log-standard`, while the ratio globals typically use `standard`.
 
 ## Model Families
 
@@ -200,13 +209,14 @@ The elemental channels use the same normalization path as the other positive che
 - FiLM-conditioned per-level MLP
 - no neighbor coupling between vertical levels
 - input features per level: pressure and temperature
-- global conditioning: fixed-order elemental abundances
+- global conditioning: derived column chemistry globals `metallicity_log10`, `c_to_o`, and `s_to_o`
+- gravity is accepted by the public wrapper for interface consistency but is not a learned equilibrium feature
 
 ### Full-VULCAN model
 
 - FiLM-conditioned Transformer
 - sequence inputs per level: pressure, temperature, Kzz
-- global conditioning: gravity, fixed-order elemental abundances, public physics toggles, atmosphere-base one-hot
+- global conditioning: gravity, `metallicity_log10`, `c_to_o`, `s_to_o`, public physics toggles, atmosphere-base one-hot
 - separate stellar spectrum input
 
 Supported activations for both model families:
@@ -233,6 +243,8 @@ The bundle API in `src/models/export_bundle.py` exposes:
 - `predict_full_vulcan_profile(...)`
 
 Both accept physical-unit inputs, apply normalization internally, and return physical mixing-ratio outputs.
+For equilibrium bundles, `predict_equilibrium_profile(...)` expects the derived global chemistry inputs
+`metallicity_log10`, `c_to_o`, and `s_to_o`.
 
 ## ExoJAX API
 
@@ -244,10 +256,12 @@ Both accept physical-unit inputs, apply normalization internally, and return phy
 make_equilibrium_vmr_fn(bundle) -> (vmr_fn, species_labels)
 
 vmr_fn(
-    temperatures_k,            # (nz,), top -> bottom
-    pressures_bar,             # (nz,), top -> bottom
-    elemental_abundances_x_h,  # (nz, n_elements), top -> bottom
-    gravity_cm_s2,             # (nz,), top -> bottom
+    temperatures_k,      # (nz,), top -> bottom
+    pressures_bar,       # (nz,), top -> bottom
+    metallicity_log10,   # scalar
+    c_to_o,              # scalar
+    s_to_o,              # scalar
+    gravity_cm_s2,       # (nz,), top -> bottom
 ) -> species_abundances        # (nz, n_species)
 ```
 
@@ -257,12 +271,14 @@ vmr_fn(
 make_full_vulcan_vmr_fn(bundle) -> (vmr_fn, species_labels)
 
 vmr_fn(
-    temperatures_k,            # (nz,), top -> bottom
-    pressures_bar,             # (nz,), top -> bottom
-    elemental_abundances_x_h,  # (nz, n_elements), top -> bottom
-    kzz_cm2_s,                 # (nz,), top -> bottom
-    gravity_cm_s2,             # (nz,), top -> bottom
-    spectrum_flux,             # (spectrum_dim,)
+    temperatures_k,      # (nz,), top -> bottom
+    pressures_bar,       # (nz,), top -> bottom
+    kzz_cm2_s,           # (nz,), top -> bottom
+    metallicity_log10,   # scalar
+    c_to_o,              # scalar
+    s_to_o,              # scalar
+    gravity_cm_s2,       # (nz,), top -> bottom
+    spectrum_flux,       # (spectrum_dim,)
 ) -> species_abundances        # (nz, n_species)
 ```
 
@@ -271,9 +287,10 @@ Contract rules:
 - public layer order is top-to-bottom
 - internal model order is bottom-to-top
 - wrappers reverse inputs and outputs as needed
-- elemental abundances use FastChem-native `n_X / n_H`
+- public chemistry inputs are the column-global ratio scalars `metallicity_log10`, `c_to_o`, and `s_to_o`
 - gravity is required in both APIs
-- current trained models still assume vertically constant elemental-abundance and gravity profiles, so eager wrapper calls reject varying profiles
+- the equilibrium wrapper currently ignores gravity after shape validation
+- the full-VULCAN wrapper still assumes a vertically constant gravity profile, so eager wrapper calls reject varying gravity inputs
 
 ## Extras
 

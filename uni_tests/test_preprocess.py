@@ -18,6 +18,10 @@ def test_preprocess_and_batch(tiny_config):
     assert set(splits.keys()) == {"train", "val", "test"}
     assert contract["target_dim"] == len(tiny_config["data_spec"]["output_species"])
     assert contract["global_static_feature_order"] == tiny_config["data_spec"]["global_static_feature_order"]
+    assert "He_H" not in contract["global_static_feature_order"]
+    assert "metallicity_log10" in contract["global_static_feature_order"]
+    assert "c_to_o" in contract["global_static_feature_order"]
+    assert "s_to_o" in contract["global_static_feature_order"]
 
     train = splits["train"]
     indices = np.arange(min(1, train.num_runs))

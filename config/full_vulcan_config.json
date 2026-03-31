@@ -114,11 +114,9 @@
     },
     "global_methods": {
       "gravity_cm_s2": "log-standard",
-      "He_H": "log-standard",
-      "C_H": "log-standard",
-      "O_H": "log-standard",
-      "N_H": "log-standard",
-      "S_H": "log-standard",
+      "metallicity_log10": "standard",
+      "c_to_o": "standard",
+      "s_to_o": "standard",
       "use_photochemistry": "none",
       "use_ion_chemistry": "none",
       "use_eddy_diffusion": "none",
@@ -145,6 +143,7 @@
     "learning_rate": 3e-4,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
+    "early_stopping_patience": 30,
     "scheduler": {
       "name": "reduce_on_plateau",
       "factor": 0.5,

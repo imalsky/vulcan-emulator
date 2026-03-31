@@ -25,7 +25,7 @@ patch_numpy_asarray_copy()
 import numpy as np
 from src.models.export_bundle import load_exported_model
 
-_EXPECTED_ELEMENT_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
+_EXPECTED_GLOBAL_ORDER = ["metallicity_log10", "c_to_o", "s_to_o"]
 
 # ---------------------------------------------------------------------------
 # 1. Load the model
@@ -35,10 +35,10 @@ _EXPECTED_ELEMENT_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
 # Nothing from the training codebase is needed.
 model = load_exported_model(_ROOT / "models/equilibrium_only_silu/best_exported.npz")
 global_order = list(model.data_contract["global_static_feature_order"])
-if global_order != _EXPECTED_ELEMENT_ORDER:
+if global_order != _EXPECTED_GLOBAL_ORDER:
     raise RuntimeError(
         "extras/standalone_basic.py requires an exported equilibrium bundle with the "
-        f"current explicit elemental-abundance contract {_EXPECTED_ELEMENT_ORDER}, "
+        f"current ratio-global contract {_EXPECTED_GLOBAL_ORDER}, "
         f"but the default bundle stores {global_order}. Regenerate the example bundle "
         "from a checkpoint trained with the current pipeline."
     )
@@ -60,17 +60,15 @@ temperature_k = 800.0 + 1200.0 * (pressure_bar / 100.0) ** 0.08
 # ---------------------------------------------------------------------------
 # predict_equilibrium_profile handles all normalization internally.
 # Inputs are raw physical units in the exported-bundle feature order, and the
-# elemental abundances are FastChem-native hydrogen-normalized abundances n_X/n_H.
+# chemistry globals are the sampled column ratios [M/H], C/O, and S/O.
 # Outputs are log10 mixing ratios by species.
 mixing_ratios_log10 = model.predict_equilibrium_profile(
     pressure_bar=pressure_bar,
     temperature_k=temperature_k,
     global_inputs={
-        "He_H": 8.38e-2,  # solar helium abundance
-        "C_H": 2.95e-4,   # solar carbon abundance
-        "O_H": 5.37e-4,   # solar oxygen abundance
-        "N_H": 7.08e-5,   # solar nitrogen abundance
-        "S_H": 1.41e-5,   # solar sulphur abundance
+        "metallicity_log10": 0.0,  # solar metallicity
+        "c_to_o": 0.549,           # near-solar C/O
+        "s_to_o": 0.0263,          # near-solar S/O
     },
     return_log10=True,  # return log10(mixing ratio); set False for linear
 )

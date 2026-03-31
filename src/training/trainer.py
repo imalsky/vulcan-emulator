@@ -54,7 +54,6 @@ from ..utils.config import is_equilibrium, task_kind
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
-_EARLY_STOPPING_PATIENCE = 30
 
 
 @dataclass(frozen=True)
@@ -476,7 +475,7 @@ def _format_epoch_row(
     )
 
 
-def _should_early_stop(no_improvement_epochs: int, *, patience: int = _EARLY_STOPPING_PATIENCE) -> bool:
+def _should_early_stop(no_improvement_epochs: int, *, patience: int) -> bool:
     """Return True when validation has failed to improve for the full patience window."""
     return no_improvement_epochs >= patience
 
@@ -676,6 +675,7 @@ def train_equilibrium_model(
     no_improvement_epochs = 0
     global_step = 0
     scheduler = config["training"]["scheduler"]
+    early_stopping_patience = int(config["training"]["early_stopping_patience"])
     base_lr = float(config["training"]["learning_rate"])
     min_lr = float(config["training"]["min_lr"])
     plateau_state = (
@@ -793,7 +793,7 @@ def train_equilibrium_model(
             _write_checkpoint(checkpoints_root / "best.pt", current_payload)
         else:
             no_improvement_epochs += 1
-            if _should_early_stop(no_improvement_epochs):
+            if _should_early_stop(no_improvement_epochs, patience=early_stopping_patience):
                 LOGGER.info(
                     "Early stopping at epoch %d after %d epochs without validation improvement. Best epoch: %d.",
                     epoch + 1,
@@ -876,6 +876,7 @@ def train_full_vulcan_model(
     no_improvement_epochs = 0
     global_step = 0
     scheduler = config["training"]["scheduler"]
+    early_stopping_patience = int(config["training"]["early_stopping_patience"])
     base_lr = float(config["training"]["learning_rate"])
     min_lr = float(config["training"]["min_lr"])
     plateau_state = (
@@ -990,7 +991,7 @@ def train_full_vulcan_model(
             _write_checkpoint(checkpoints_root / "best.pt", current_payload)
         else:
             no_improvement_epochs += 1
-            if _should_early_stop(no_improvement_epochs):
+            if _should_early_stop(no_improvement_epochs, patience=early_stopping_patience):
                 LOGGER.info(
                     "Early stopping at epoch %d after %d epochs without validation improvement. Best epoch: %d.",
                     epoch + 1,

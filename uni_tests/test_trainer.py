@@ -158,5 +158,5 @@ def test_epoch_row_formats_plain_values_without_logger_prefix():
 
 
 def test_early_stopping_triggers_after_thirty_non_improving_epochs():
-    assert _should_early_stop(29) is False
-    assert _should_early_stop(30) is True
+    assert _should_early_stop(29, patience=30) is False
+    assert _should_early_stop(30, patience=30) is True

@@ -21,15 +21,13 @@ def test_shipped_equilibrium_config_loads():
     assert config["task"]["kind"] == "equilibrium_only"
     assert config["model_type"] == "equilibrium"
     assert config["data_spec"]["state_species"] == list(DEFAULT_STATE_SPECIES)
-    assert config["data_spec"]["required_global_inputs"] == ["He_H", "C_H", "O_H", "N_H", "S_H"]
+    assert config["data_spec"]["required_global_inputs"] == ["metallicity_log10", "c_to_o", "s_to_o"]
     assert config["data_spec"]["element_input_order"] == ["He_H", "C_H", "O_H", "N_H", "S_H"]
     assert config["normalization"]["target_method"] == "log-standard"
     assert config["normalization"]["global_methods"] == {
-        "He_H": "log-standard",
-        "C_H": "log-standard",
-        "O_H": "log-standard",
-        "N_H": "log-standard",
-        "S_H": "log-standard",
+        "metallicity_log10": "standard",
+        "c_to_o": "standard",
+        "s_to_o": "standard",
     }
     assert config["temperature_profiles"]["source_mode"] == "mixed"
     assert config["temperature_profiles"]["analytic_probability"] == pytest.approx(0.5)
@@ -46,6 +44,7 @@ def test_shipped_equilibrium_config_loads():
     assert config["roth_sampler"]["data_glob"] == "assets/PTprofiles/*.dat"
     assert config["training"]["model"]["activation"] == "leaky_relu"
     assert config["training"]["model"]["dropout_rate"] == pytest.approx(0.05)
+    assert config["training"]["early_stopping_patience"] == 30
     assert config["training"]["scheduler"] == {
         "name": "reduce_on_plateau",
         "factor": 0.5,
@@ -64,11 +63,9 @@ def test_shipped_full_vulcan_config_loads():
     assert config["model_type"] == "full_vulcan"
     assert config["data_spec"]["required_global_inputs"] == [
         "gravity_cm_s2",
-        "He_H",
-        "C_H",
-        "O_H",
-        "N_H",
-        "S_H",
+        "metallicity_log10",
+        "c_to_o",
+        "s_to_o",
         "use_photochemistry",
         "use_ion_chemistry",
         "use_eddy_diffusion",
@@ -85,6 +82,10 @@ def test_shipped_full_vulcan_config_loads():
         "atm_base_CO2",
         "atm_base_H2O",
     ]
+    assert config["normalization"]["global_methods"]["gravity_cm_s2"] == "log-standard"
+    assert config["normalization"]["global_methods"]["metallicity_log10"] == "standard"
+    assert config["normalization"]["global_methods"]["c_to_o"] == "standard"
+    assert config["normalization"]["global_methods"]["s_to_o"] == "standard"
     assert config["vulcan_runtime"]["python_executable"] == "python"
     assert config["vulcan_runtime"]["cfg_file"] == "vulcan_cfg.py"
     assert config["vulcan_runtime"]["worker_root"] == "data/vulcan_workers"
@@ -156,6 +157,22 @@ def test_default_dropout_rate_is_point_zero_five_for_both_model_families(tmp_pat
     assert load_and_validate_config(full_vulcan_path)["training"]["model"]["dropout_rate"] == pytest.approx(0.05)
 
 
+def test_default_early_stopping_patience_is_thirty_for_both_model_families(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+
+    equilibrium = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    equilibrium["training"].pop("early_stopping_patience")
+    equilibrium_path = tmp_path / "equilibrium_default_early_stopping.json"
+    equilibrium_path.write_text(json.dumps(equilibrium, indent=2) + "\n", encoding="utf-8")
+    assert load_and_validate_config(equilibrium_path)["training"]["early_stopping_patience"] == 30
+
+    full_vulcan = _load_raw_json(root / "config" / "full_vulcan_config.json")
+    full_vulcan["training"].pop("early_stopping_patience")
+    full_vulcan_path = tmp_path / "full_vulcan_default_early_stopping.json"
+    full_vulcan_path.write_text(json.dumps(full_vulcan, indent=2) + "\n", encoding="utf-8")
+    assert load_and_validate_config(full_vulcan_path)["training"]["early_stopping_patience"] == 30
+
+
 def test_invalid_dropout_rate_is_rejected(tmp_path):
     root = Path(__file__).resolve().parents[1]
     payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
@@ -163,6 +180,16 @@ def test_invalid_dropout_rate_is_rejected(tmp_path):
     config_path = tmp_path / "invalid_dropout_equilibrium.json"
     config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     with pytest.raises(ConfigValidationError, match="dropout_rate"):
+        load_and_validate_config(config_path)
+
+
+def test_invalid_early_stopping_patience_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["training"]["early_stopping_patience"] = 0
+    config_path = tmp_path / "invalid_early_stopping.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError, match="early_stopping_patience"):
         load_and_validate_config(config_path)
 
 

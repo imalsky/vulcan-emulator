@@ -8,8 +8,8 @@ This mode is the final-state VULCAN path:
 - output target: final converged VULCAN abundances
 - model family: FiLM-conditioned Transformer
 - vertical coupling: yes, through attention over the full column
-- required profile inputs at inference time: pressure, temperature, Kzz, elemental abundances, gravity
-- additional conditioning: public physics toggles and stellar spectrum
+- required inputs at inference time: pressure, temperature, Kzz, `metallicity_log10`, `c_to_o`, `s_to_o`, gravity, stellar spectrum
+- additional conditioning: public physics toggles and atmosphere-base flags
 
 There is no supported timestep-control, anchor-state, or trajectory mode in
 this config.
@@ -67,9 +67,10 @@ These set the atmosphere and transport parameter ranges:
 - `gravity_range_cm_s2`: gravity sampler range
 - `kzz_cm2_s`: eddy-diffusion coefficient used in the sampled columns
 
-As in the equilibrium path, the current generator samples chemistry from
-metallicity, C/O, and S/O and then materializes the fixed internal elemental
-channels.
+As in the equilibrium path, the generator samples chemistry from metallicity,
+C/O, and S/O and then materializes the fixed internal elemental channels for
+VULCAN. The learned conditioning contract, however, uses the ratio globals
+plus gravity and the selected public physics/base controls.
 
 ## `temperature_profiles`
 
@@ -117,8 +118,9 @@ Supported normalization methods are:
 - `log-standard`
 - `none`
 
-Typical chemistry scaling is `log-standard`, which is `log10` followed by
-z-score normalization.
+For the supported ratio-global chemistry contract, `metallicity_log10`,
+`c_to_o`, and `s_to_o` are typically scaled with `standard`, while gravity
+commonly uses `log-standard`.
 
 ## `training`
 
@@ -130,6 +132,7 @@ This controls optimization:
 - `learning_rate`
 - `min_lr`
 - `warmup_epochs`
+- `early_stopping_patience`
 - `scheduler`
 - `weight_decay`
 - `gradient_clip`
@@ -145,6 +148,9 @@ Supported schedulers are:
 
 - `reduce_on_plateau`
 - `cosine`
+
+`early_stopping_patience` stops training after that many consecutive epochs
+without improvement in the validation checkpoint metric. The default is `30`.
 
 ## `full_vulcan.model`
 

@@ -38,6 +38,7 @@ import h5py
 import numpy as np
 
 from ..utils.config import (
+    ELEMENT_INPUT_ORDER,
     is_equilibrium,
     resolve_conditioning_inputs,
     task_kind,
@@ -49,7 +50,8 @@ from ..utils.provenance import fingerprint_payload, manifest_for_files
 from .spectrum import SpectrumRecord, fixed_wavelength_grid, resample_spectrum
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
-PROCESSED_DATA_VERSION = 9
+PROCESSED_DATA_VERSION = 11
+_EQUILIBRIUM_GLOBAL_ORDER = ("metallicity_log10", "c_to_o", "s_to_o")
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,27 @@ def _require_column_constant(
         raise ValueError(f"{run_label}: {name} must be 1-D or 2-D, got shape {arr.shape}.")
     if not is_constant:
         raise ValueError(f"{run_label}: {name} must be vertically constant in the current contract.")
+
+
+def _require_ratio_conditioning_globals(
+    *,
+    globals_map: dict[str, float],
+    run_label: str,
+) -> dict[str, float]:
+    """Return the sampled chemistry globals required by the supported training contract."""
+    missing = [name for name in _EQUILIBRIUM_GLOBAL_ORDER if name not in globals_map]
+    if missing:
+        raise ValueError(
+            f"{run_label}: raw globals are missing required ratio-conditioning inputs "
+            f"{missing}. Regenerate raw data with the current chemistry contract."
+        )
+    resolved = {
+        name: float(globals_map[name])
+        for name in _EQUILIBRIUM_GLOBAL_ORDER
+    }
+    if not np.all(np.isfinite(list(resolved.values()))):
+        raise ValueError(f"{run_label}: non-finite ratio-conditioning globals detected.")
+    return resolved
 
 
 def _fit_standard(arr: np.ndarray) -> dict[str, Any]:
@@ -371,10 +394,10 @@ def load_raw_run(
     _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
     reduced_globals = dict(d["globals_map"])
     reduced_globals.update(
-        {
-            name: float(elemental_profile[0, idx])
-            for idx, name in enumerate(element_order)
-        }
+        _require_ratio_conditioning_globals(
+            globals_map=d["globals_map"],
+            run_label=label,
+        )
     )
     reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
     final_ymix_output = final_ymix_output[:, output_indices]
@@ -583,14 +606,10 @@ def load_raw_equilibrium_run(
         raise ValueError(f"{label}: gravity profile does not match pressure grid.")
     _require_column_constant(elemental_profile, name="elemental_abundances_x_h", run_label=label)
     _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
-    globals_map = dict(globals_map)
-    globals_map.update(
-        {
-            name: float(elemental_profile[0, idx])
-            for idx, name in enumerate(config["data_spec"]["element_input_order"])
-        }
+    globals_map = _require_ratio_conditioning_globals(
+        globals_map=dict(globals_map),
+        run_label=label,
     )
-    globals_map["gravity_cm_s2"] = float(gravity_profile[0])
     output_indices = [stored_output_species.index(name) for name in requested_output_species]
     equilibrium_ymix = equilibrium_ymix[:, output_indices]
     return RawEquilibriumRun(

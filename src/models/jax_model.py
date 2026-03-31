@@ -407,7 +407,7 @@ class EquilibriumMLPDimensions:
     sequence_dim : int
         Per-level input width (P, T).
     global_dim : int
-        Width of the global conditioning vector (elemental abundances).
+        Width of the global conditioning vector (derived equilibrium chemistry globals).
     target_dim : int
         Number of output species per level.
     d_hidden : int

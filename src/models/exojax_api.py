@@ -1,15 +1,16 @@
-"""ExoJAX-facing JAX wrappers for the VULCAN emulator bundles.
+"""ExoJAX-facing JAX wrappers for exported VULCAN emulator bundles.
 
 Two branch-specific factories are provided:
 
     make_equilibrium_vmr_fn(bundle)
     make_full_vulcan_vmr_fn(bundle)
 
-Both return pure JAX callables plus species labels.  The public API uses
-top-to-bottom level order and FastChem-native hydrogen-normalized number
-abundances (``n_X / n_H``).  The currently supported chemistry/gravity
-manifold is column-constant, so eager calls reject vertically varying
-elemental-abundance and gravity profiles.
+Both return pure JAX callables plus species labels. The public API uses
+top-to-bottom level order and column-global chemistry scalars
+(``metallicity_log10``, ``c_to_o``, ``s_to_o``). The raw-generation pipeline
+still materializes explicit elemental-abundance profiles internally for
+FastChem and VULCAN, but those internal solver inputs are not part of the
+supported ExoJAX inference contract.
 """
 
 from __future__ import annotations
@@ -17,35 +18,44 @@ from __future__ import annotations
 from typing import Any
 
 import jax
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
-from ..utils.config import ELEMENT_INPUT_ORDER, static_conditioning_defaults
+from ..utils.config import (
+    DEFAULT_REQUIRED_GLOBAL_INPUTS,
+    EQUILIBRIUM_CONDITIONING_INPUT_ORDER,
+    static_conditioning_defaults,
+)
 from .export_bundle import ExportedJAXModel
 
-ELEMENT_LABELS = list(ELEMENT_INPUT_ORDER)
+EQUILIBRIUM_GLOBAL_LABELS = list(EQUILIBRIUM_CONDITIONING_INPUT_ORDER)
+FULL_VULCAN_GLOBAL_LABELS = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
 
 
-def _validate_bundle_element_order(bundle: ExportedJAXModel) -> None:
-    """Reject bundles whose stored element order disagrees with the fixed API contract."""
-    labels = bundle.data_contract.get("element_input_order")
-    if labels is None:
-        return
-    if not isinstance(labels, list) or not labels:
+def _validate_equilibrium_bundle_global_order(bundle: ExportedJAXModel) -> None:
+    """Reject equilibrium bundles that do not match the ratio-global contract."""
+    feature_order = list(bundle.data_contract.get("global_static_feature_order", []))
+    if feature_order != EQUILIBRIUM_GLOBAL_LABELS:
         raise ValueError(
-            "Export bundle is missing data_contract['element_input_order']; "
-            "re-export the model with the ExoJAX v2 data contract."
+            "Equilibrium bundle global_static_feature_order must be "
+            f"{EQUILIBRIUM_GLOBAL_LABELS}; got {feature_order}. Re-preprocess and retrain "
+            "the equilibrium model with the updated ratio-global chemistry contract."
         )
-    normalized = [str(label) for label in labels]
-    if normalized != ELEMENT_LABELS:
+
+
+def _validate_full_vulcan_bundle_global_order(bundle: ExportedJAXModel) -> None:
+    """Reject full-VULCAN bundles that still use the legacy elemental conditioning contract."""
+    feature_order = list(bundle.data_contract.get("global_static_feature_order", []))
+    if feature_order != FULL_VULCAN_GLOBAL_LABELS:
         raise ValueError(
-            "Export bundle element_input_order does not match the fixed ExoJAX "
-            f"contract {ELEMENT_LABELS}; got {normalized}."
+            "Full-VULCAN bundle global_static_feature_order must be "
+            f"{FULL_VULCAN_GLOBAL_LABELS}; got {feature_order}. Re-preprocess and retrain "
+            "the full-VULCAN model with the updated ratio-global chemistry contract."
         )
 
 
 def _maybe_require_column_constant(values: Any, *, name: str) -> None:
-    """Reject varying profiles in eager mode for the current constant-profile contract."""
+    """Reject varying profiles in eager mode for inputs that remain column-constant."""
     if isinstance(values, jax.core.Tracer):
         return
     arr = np.asarray(values, dtype=np.float64)
@@ -57,6 +67,14 @@ def _maybe_require_column_constant(values: Any, *, name: str) -> None:
         return
     if not is_constant:
         raise ValueError(f"{name} must be vertically constant in the current ExoJAX contract.")
+
+
+def _scalar_input(value: jax.Array | float, *, name: str) -> jax.Array:
+    """Normalize one scalar chemistry input to a rank-0 JAX array."""
+    scalar = jnp.asarray(value, dtype=jnp.float32)
+    if scalar.ndim != 0:
+        raise ValueError(f"{name} must be a scalar input, got shape {tuple(scalar.shape)}.")
+    return scalar
 
 
 def _global_vector(
@@ -86,7 +104,7 @@ def _full_vulcan_static_defaults(bundle: ExportedJAXModel) -> dict[str, float]:
     if "physics_toggles" not in bundle.config or "vulcan_runtime" not in bundle.config:
         raise ValueError(
             "Full-VULCAN bundle config is missing physics/base defaults required by "
-            "the ExoJAX v2 wrapper."
+            "the ExoJAX wrapper."
         )
     return static_conditioning_defaults(bundle.config)
 
@@ -94,64 +112,48 @@ def _full_vulcan_static_defaults(bundle: ExportedJAXModel) -> dict[str, float]:
 def make_equilibrium_vmr_fn(
     bundle: ExportedJAXModel,
 ) -> tuple[Any, list[str]]:
-    """Create the ExoJAX v2 equilibrium interface for one equilibrium bundle."""
+    """Create a differentiable equilibrium-profile wrapper for ExoJAX."""
     if not bundle.is_equilibrium:
         raise ValueError("make_equilibrium_vmr_fn requires an equilibrium bundle.")
 
-    _validate_bundle_element_order(bundle)
+    _validate_equilibrium_bundle_global_order(bundle)
     species_labels = list(bundle.data_contract["output_species_order"])
     feature_order = list(bundle.data_contract["global_static_feature_order"])
 
     def vmr_fn(
-        temperatures_k: jax.Array,           # shape: (nz,), top -> bottom
-        pressures_bar: jax.Array,            # shape: (nz,), top -> bottom
-        elemental_abundances_x_h: jax.Array, # shape: (nz, n_elements), top -> bottom
-        gravity_cm_s2: jax.Array,            # shape: (nz,), top -> bottom
+        temperatures_k: jax.Array,  # shape: (nz,), top -> bottom
+        pressures_bar: jax.Array,  # shape: (nz,), top -> bottom
+        metallicity_log10: jax.Array,  # scalar
+        c_to_o: jax.Array,  # scalar
+        s_to_o: jax.Array,  # scalar
+        gravity_cm_s2: jax.Array,  # shape: (nz,), top -> bottom
     ) -> jax.Array:
-        """Return linear VMRs in shape ``(nz, n_species)`` using top-to-bottom order."""
-        _maybe_require_column_constant(
-            elemental_abundances_x_h,
-            name="elemental_abundances_x_h",
-        )
-        _maybe_require_column_constant(
-            gravity_cm_s2,
-            name="gravity_cm_s2",
-        )
+        """Return linear VMRs with shape ``(nz, n_species)`` in top-to-bottom order."""
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
-        elemental = jnp.asarray(elemental_abundances_x_h, dtype=jnp.float32)
         gravity = jnp.asarray(gravity_cm_s2, dtype=jnp.float32)
 
         if temperatures.ndim != 1 or pressures.ndim != 1 or gravity.ndim != 1:
             raise ValueError("temperatures_k, pressures_bar, and gravity_cm_s2 must be 1-D arrays.")
         if temperatures.shape != pressures.shape or temperatures.shape != gravity.shape:
             raise ValueError("temperatures_k, pressures_bar, and gravity_cm_s2 must share the same shape.")
-        if elemental.ndim != 2 or elemental.shape[0] != temperatures.shape[0]:
-            raise ValueError(
-                "elemental_abundances_x_h must have shape (nz, n_elements) with nz matching the profiles."
-            )
-        if elemental.shape[1] != len(ELEMENT_LABELS):
-            raise ValueError(
-                f"elemental_abundances_x_h must have {len(ELEMENT_LABELS)} columns, got {elemental.shape[1]}."
-            )
 
-        # Internal models were trained on bottom-to-top ordering.
         internal_temperatures = temperatures[::-1]
         internal_pressures = pressures[::-1]
-        internal_elemental = elemental[::-1, :]
-
-        # Current equilibrium models are conditioned only on column chemistry.
-        element_vector = internal_elemental[0, :]
         global_inputs = _global_vector(
             feature_order=feature_order,
-            values={name: element_vector[idx] for idx, name in enumerate(ELEMENT_LABELS)},
+            values={
+                "metallicity_log10": _scalar_input(metallicity_log10, name="metallicity_log10"),
+                "c_to_o": _scalar_input(c_to_o, name="c_to_o"),
+                "s_to_o": _scalar_input(s_to_o, name="s_to_o"),
+            },
         )
         vmr_internal = bundle.predict_equilibrium_profile(
             pressure_bar=internal_pressures,
             temperature_k=internal_temperatures,
             global_inputs=global_inputs,
         )
-        # Keep gravity in the public signature; current equilibrium bundles do not use it.
+        # Keep gravity in the public signature for interface compatibility.
         del gravity
         return vmr_internal[::-1, :]
 
@@ -161,35 +163,30 @@ def make_equilibrium_vmr_fn(
 def make_full_vulcan_vmr_fn(
     bundle: ExportedJAXModel,
 ) -> tuple[Any, list[str]]:
-    """Create the ExoJAX v2 full-VULCAN interface for one full-VULCAN bundle."""
+    """Create a differentiable full-VULCAN-profile wrapper for ExoJAX."""
     if bundle.is_equilibrium:
         raise ValueError("make_full_vulcan_vmr_fn requires a full_vulcan bundle.")
 
-    _validate_bundle_element_order(bundle)
+    _validate_full_vulcan_bundle_global_order(bundle)
     species_labels = list(bundle.data_contract["output_species_order"])
     feature_order = list(bundle.data_contract["global_static_feature_order"])
     static_defaults = _full_vulcan_static_defaults(bundle)
 
     def vmr_fn(
-        temperatures_k: jax.Array,           # shape: (nz,), top -> bottom
-        pressures_bar: jax.Array,            # shape: (nz,), top -> bottom
-        elemental_abundances_x_h: jax.Array, # shape: (nz, n_elements), top -> bottom
-        kzz_cm2_s: jax.Array,                # shape: (nz,), top -> bottom
-        gravity_cm_s2: jax.Array,            # shape: (nz,), top -> bottom
-        spectrum_flux: jax.Array,            # shape: (spectrum_dim,)
+        temperatures_k: jax.Array,  # shape: (nz,), top -> bottom
+        pressures_bar: jax.Array,  # shape: (nz,), top -> bottom
+        kzz_cm2_s: jax.Array,  # shape: (nz,), top -> bottom
+        metallicity_log10: jax.Array,  # scalar
+        c_to_o: jax.Array,  # scalar
+        s_to_o: jax.Array,  # scalar
+        gravity_cm_s2: jax.Array,  # shape: (nz,), top -> bottom
+        spectrum_flux: jax.Array,  # shape: (spectrum_dim,)
     ) -> jax.Array:
-        """Return linear VMRs in shape ``(nz, n_species)`` using top-to-bottom order."""
-        _maybe_require_column_constant(
-            elemental_abundances_x_h,
-            name="elemental_abundances_x_h",
-        )
-        _maybe_require_column_constant(
-            gravity_cm_s2,
-            name="gravity_cm_s2",
-        )
+        """Return linear VMRs with shape ``(nz, n_species)`` in top-to-bottom order."""
+        _maybe_require_column_constant(gravity_cm_s2, name="gravity_cm_s2")
+
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
-        elemental = jnp.asarray(elemental_abundances_x_h, dtype=jnp.float32)
         kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)
         gravity = jnp.asarray(gravity_cm_s2, dtype=jnp.float32)
 
@@ -197,34 +194,28 @@ def make_full_vulcan_vmr_fn(
             raise ValueError(
                 "temperatures_k, pressures_bar, kzz_cm2_s, and gravity_cm_s2 must be 1-D arrays."
             )
-        if not (
-            temperatures.shape == pressures.shape == kzz.shape == gravity.shape
-        ):
+        if not (temperatures.shape == pressures.shape == kzz.shape == gravity.shape):
             raise ValueError(
                 "temperatures_k, pressures_bar, kzz_cm2_s, and gravity_cm_s2 must share the same shape."
-            )
-        if elemental.ndim != 2 or elemental.shape[0] != temperatures.shape[0]:
-            raise ValueError(
-                "elemental_abundances_x_h must have shape (nz, n_elements) with nz matching the profiles."
-            )
-        if elemental.shape[1] != len(ELEMENT_LABELS):
-            raise ValueError(
-                f"elemental_abundances_x_h must have {len(ELEMENT_LABELS)} columns, got {elemental.shape[1]}."
             )
 
         internal_temperatures = temperatures[::-1]
         internal_pressures = pressures[::-1]
-        internal_elemental = elemental[::-1, :]
         internal_kzz = kzz[::-1]
         internal_gravity = gravity[::-1]
 
-        element_vector = internal_elemental[0, :]
-        gravity_value = internal_gravity[0]
         global_values: dict[str, Any] = dict(static_defaults)
-        global_values["gravity_cm_s2"] = gravity_value
-        for idx, name in enumerate(ELEMENT_LABELS):
-            global_values[name] = element_vector[idx]
-
+        global_values.update(
+            {
+                "gravity_cm_s2": internal_gravity[0],
+                "metallicity_log10": _scalar_input(
+                    metallicity_log10,
+                    name="metallicity_log10",
+                ),
+                "c_to_o": _scalar_input(c_to_o, name="c_to_o"),
+                "s_to_o": _scalar_input(s_to_o, name="s_to_o"),
+            }
+        )
         global_inputs = _global_vector(feature_order=feature_order, values=global_values)
         vmr_internal = bundle.predict_full_vulcan_profile(
             pressure_bar=internal_pressures,

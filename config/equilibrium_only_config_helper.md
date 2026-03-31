@@ -8,7 +8,8 @@ This mode is for local equilibrium chemistry only:
 - output target: FastChem equilibrium abundances
 - model family: FiLM-conditioned per-level MLP
 - vertical coupling: none between neighboring layers
-- required profile inputs at inference time: pressure, temperature, elemental abundances
+- required inputs at inference time: pressure, temperature, `metallicity_log10`, `c_to_o`, `s_to_o`, gravity
+- current FiLM conditioning globals: `metallicity_log10`, `c_to_o`, `s_to_o`
 
 ## Top-Level Layout
 
@@ -61,9 +62,10 @@ These set the synthetic atmosphere parameter ranges:
 - `c_to_o_range`: carbon-to-oxygen ratio range
 - `s_to_o_range`: sulfur-to-oxygen ratio range
 
-The public chemistry input is still passed as explicit elemental abundances,
-but the current generator samples chemistry from metallicity, C/O, and S/O and
-then converts that to the fixed internal elemental channels.
+The supported public chemistry contract is the ratio-global triplet
+`metallicity_log10`, `c_to_o`, and `s_to_o`. The generator still converts
+those sampled ratios to fixed internal elemental channels for FastChem, but
+the learned equilibrium model FiLM-conditions only on the ratio globals.
 
 ## `temperature_profiles`
 
@@ -103,14 +105,17 @@ This controls how inputs and targets are scaled before training:
 - `sequence_methods`: scaling per sequence feature
 - `global_methods`: scaling per global feature
 
+For the equilibrium model, the global features are the derived column
+chemistry parameters `metallicity_log10`, `c_to_o`, and `s_to_o`.
+
 Supported normalization methods are:
 
 - `standard`
 - `log-standard`
 - `none`
 
-Typical chemistry scaling is `log-standard`, which is `log10` followed by
-z-score normalization.
+For the supported ratio-global chemistry contract, `metallicity_log10`,
+`c_to_o`, and `s_to_o` are typically scaled with `standard`.
 
 ## `training`
 
@@ -122,6 +127,7 @@ This controls optimization:
 - `learning_rate`
 - `min_lr`
 - `warmup_epochs`
+- `early_stopping_patience`
 - `scheduler`
 - `weight_decay`
 - `gradient_clip`
@@ -136,6 +142,9 @@ Supported schedulers are:
 
 - `reduce_on_plateau`
 - `cosine`
+
+`early_stopping_patience` stops training after that many consecutive epochs
+without improvement in the validation checkpoint metric. The default is `30`.
 
 ## `equilibrium_only.model`
 

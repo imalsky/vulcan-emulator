@@ -18,8 +18,10 @@ from src.models.jax_model import (
     init_equilibrium_mlp_params,
     init_model_params,
 )
+from src.utils.config import DEFAULT_REQUIRED_GLOBAL_INPUTS, static_conditioning_defaults
 
-ELEMENT_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
+EQ_GLOBAL_ORDER = ["metallicity_log10", "c_to_o", "s_to_o"]
+FULL_GLOBAL_ORDER = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
 
 
 def _sequence_static_numpy(static_inputs: np.ndarray, blocks: list[dict]) -> np.ndarray:
@@ -33,7 +35,7 @@ def _sequence_static_numpy(static_inputs: np.ndarray, blocks: list[dict]) -> np.
 def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
     dims = EquilibriumMLPDimensions(
         sequence_dim=2,
-        global_dim=len(ELEMENT_ORDER),
+        global_dim=len(EQ_GLOBAL_ORDER),
         target_dim=2,
         d_hidden=8,
         num_hidden_layers=2,
@@ -52,10 +54,10 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
         },
         "global_static": {
             "method": "mixed",
-            "methods": ["log-standard"] * len(ELEMENT_ORDER),
-            "mean": [-1.1, -3.5, -3.3, -4.2, -4.8],
-            "std": [0.1, 0.2, 0.2, 0.2, 0.2],
-            "floor": [1.0e-30] * len(ELEMENT_ORDER),
+            "methods": ["standard"] * len(EQ_GLOBAL_ORDER),
+            "mean": [0.0, 0.65, 0.03],
+            "std": [0.3, 0.15, 0.01],
+            "floor": [None] * len(EQ_GLOBAL_ORDER),
         },
         "target": {
             "method": "log-standard",
@@ -66,8 +68,7 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
     }
     contract = {
         "model_type": "equilibrium",
-        "global_static_feature_order": list(ELEMENT_ORDER),
-        "element_input_order": list(ELEMENT_ORDER),
+        "global_static_feature_order": list(EQ_GLOBAL_ORDER),
         "output_species_order": ["H2O", "CO"],
     }
     payload = {
@@ -83,17 +84,15 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
     pressure_bar = np.array([100.0, 10.0, 1.0, 0.1], dtype=np.float32)
     temperature_k = np.array([1450.0, 1300.0, 1050.0, 900.0], dtype=np.float32)
     global_inputs = {
-        "He_H": 8.38e-2,
-        "C_H": 3.40e-4,
-        "O_H": 5.10e-4,
-        "N_H": 8.50e-5,
-        "S_H": 1.60e-5,
+        "metallicity_log10": 0.0,
+        "c_to_o": 0.67,
+        "s_to_o": 0.03,
     }
 
     static_inputs = np.stack([pressure_bar, temperature_k], axis=-1)
     sequence_norm = _sequence_static_numpy(static_inputs, normalization["sequence_static"]["blocks"])
     globals_norm = apply_mixed_block(
-        np.array([[global_inputs[name] for name in ELEMENT_ORDER]], dtype=np.float64),
+        np.array([[global_inputs[name] for name in EQ_GLOBAL_ORDER]], dtype=np.float64),
         normalization["global_static"],
     )
     expected_norm, _ = apply_equilibrium_mlp(
@@ -128,7 +127,7 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
 def test_exported_full_vulcan_bundle_predicts_from_physical_inputs(tmp_path):
     dims = ModelDimensions(
         sequence_dim=3,
-        global_dim=len(ELEMENT_ORDER) + 1,
+        global_dim=len(FULL_GLOBAL_ORDER),
         spectrum_dim=4,
         target_dim=2,
         d_model=8,
@@ -161,10 +160,10 @@ def test_exported_full_vulcan_bundle_predicts_from_physical_inputs(tmp_path):
         },
         "global_static": {
             "method": "mixed",
-            "methods": ["log-standard"] * (len(ELEMENT_ORDER) + 1),
-            "mean": [3.0, -1.1, -3.5, -3.3, -4.2, -4.8],
-            "std": [0.2, 0.1, 0.2, 0.2, 0.2, 0.2],
-            "floor": [1.0e-30] * (len(ELEMENT_ORDER) + 1),
+            "methods": ["log-standard", "standard", "standard", "standard"] + ["none"] * (len(FULL_GLOBAL_ORDER) - 4),
+            "mean": [3.0, 0.0, 0.65, 0.03] + [0.0] * (len(FULL_GLOBAL_ORDER) - 4),
+            "std": [0.2, 0.3, 0.15, 0.01] + [1.0] * (len(FULL_GLOBAL_ORDER) - 4),
+            "floor": [1.0e-30, None, None, None] + [None] * (len(FULL_GLOBAL_ORDER) - 4),
         },
         "spectrum": {
             "method": "log-standard",
@@ -174,9 +173,8 @@ def test_exported_full_vulcan_bundle_predicts_from_physical_inputs(tmp_path):
         },
     }
     contract = {
-        "global_static_feature_order": ["gravity_cm_s2", *ELEMENT_ORDER],
+        "global_static_feature_order": list(FULL_GLOBAL_ORDER),
         "spectrum_dim": 4,
-        "element_input_order": list(ELEMENT_ORDER),
         "output_species_order": ["H2O", "CO"],
     }
     payload = {
@@ -184,7 +182,22 @@ def test_exported_full_vulcan_bundle_predicts_from_physical_inputs(tmp_path):
         "model_dimensions": dims.to_dict(),
         "normalization": normalization,
         "data_contract": contract,
-        "config": {"task": {"kind": "full_vulcan"}},
+        "config": {
+            "task": {"kind": "full_vulcan"},
+            "physics_toggles": {
+                "use_photochemistry": True,
+                "use_ion_chemistry": False,
+                "use_eddy_diffusion": False,
+                "use_molecular_diffusion": False,
+                "use_upwind_molecular_diffusion": False,
+                "use_boundary_conditions": False,
+                "use_condensation": False,
+                "use_settling": False,
+                "use_initial_cold_trap": False,
+                "use_sat_surface_h2o": False,
+            },
+            "vulcan_runtime": {"atm_base": "H2"},
+        },
     }
     bundle_path = export_checkpoint_payload(payload, tmp_path / "full_vulcan_export.npz")
     bundle = load_exported_model(bundle_path)
@@ -194,11 +207,10 @@ def test_exported_full_vulcan_bundle_predicts_from_physical_inputs(tmp_path):
     kzz_cm2_s = np.array([1.0e8, 1.0e8, 1.0e8], dtype=np.float32)
     global_inputs = {
         "gravity_cm_s2": 900.0,
-        "He_H": 8.38e-2,
-        "C_H": 3.40e-4,
-        "O_H": 5.10e-4,
-        "N_H": 8.50e-5,
-        "S_H": 1.60e-5,
+        "metallicity_log10": 0.0,
+        "c_to_o": 0.67,
+        "s_to_o": 0.03,
+        **static_conditioning_defaults(payload["config"]),
     }
     spectrum_flux = np.array([15.0, 20.0, 18.0, 12.0], dtype=np.float32)
 
@@ -206,7 +218,7 @@ def test_exported_full_vulcan_bundle_predicts_from_physical_inputs(tmp_path):
     sequence_norm = _sequence_static_numpy(static_inputs, normalization["sequence_static"]["blocks"])
     globals_norm = apply_mixed_block(
         np.array(
-            [[global_inputs["gravity_cm_s2"], *[global_inputs[name] for name in ELEMENT_ORDER]]],
+            [[global_inputs[name] for name in FULL_GLOBAL_ORDER]],
             dtype=np.float64,
         ),
         normalization["global_static"],

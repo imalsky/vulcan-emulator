@@ -131,7 +131,7 @@
   },
   "generation": {
     "mode": "vulcan",
-    "num_runs": 100000,
+    "num_runs": 500000,
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
@@ -151,11 +151,9 @@
       "temperature_k": "standard"
     },
     "global_methods": {
-      "He_H": "log-standard",
-      "C_H": "log-standard",
-      "O_H": "log-standard",
-      "N_H": "log-standard",
-      "S_H": "log-standard"
+      "metallicity_log10": "standard",
+      "c_to_o": "standard",
+      "s_to_o": "standard"
     }
   },
   "training": {
@@ -165,6 +163,7 @@
     "learning_rate": 3e-4,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
+    "early_stopping_patience": 30,
     "scheduler": {
       "name": "reduce_on_plateau",
       "factor": 0.5,

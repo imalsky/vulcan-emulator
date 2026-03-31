@@ -40,11 +40,15 @@ TASK_KIND_TO_MODEL_TYPE = {
     "full_vulcan": "full_vulcan",
 }
 ELEMENT_INPUT_ORDER = ("He_H", "C_H", "O_H", "N_H", "S_H")
-FULL_VULCAN_CORE_GLOBAL_INPUTS = (
+EQUILIBRIUM_CONDITIONING_INPUT_ORDER = ("metallicity_log10", "c_to_o", "s_to_o")
+FULL_VULCAN_CONDITIONING_INPUT_ORDER = (
     "gravity_cm_s2",
-    *ELEMENT_INPUT_ORDER,
+    *EQUILIBRIUM_CONDITIONING_INPUT_ORDER,
 )
-EQUILIBRIUM_CORE_GLOBAL_INPUTS = ELEMENT_INPUT_ORDER
+FULL_VULCAN_CORE_GLOBAL_INPUTS = (
+    *FULL_VULCAN_CONDITIONING_INPUT_ORDER,
+)
+EQUILIBRIUM_CORE_GLOBAL_INPUTS = EQUILIBRIUM_CONDITIONING_INPUT_ORDER
 FULL_VULCAN_OPTIONAL_GLOBAL_INPUTS = (
     *PUBLIC_PHYSICS_TOGGLES,
     *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
@@ -966,6 +970,10 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     )
     for key in ("seed", "batch_size", "epochs", "warmup_epochs"):
         training[key] = _as_int(training[key], f"training.{key}")
+    training["early_stopping_patience"] = _as_int(
+        training.get("early_stopping_patience", 30),
+        "training.early_stopping_patience",
+    )
     for key in ("learning_rate", "min_lr", "weight_decay", "gradient_clip"):
         training[key] = _as_float(training[key], f"training.{key}")
     training["scheduler"] = _validate_training_scheduler(
@@ -974,6 +982,8 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     )
     if training["batch_size"] < 1 or training["epochs"] < 1:
         raise ConfigValidationError("training.batch_size and training.epochs must be >= 1.")
+    if training["early_stopping_patience"] < 1:
+        raise ConfigValidationError("training.early_stopping_patience must be >= 1.")
     if training["learning_rate"] <= 0.0 or training["min_lr"] <= 0.0:
         raise ConfigValidationError("Learning rates must be positive.")
     if training["min_lr"] > training["learning_rate"]:
@@ -1221,6 +1231,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "learning_rate": training["learning_rate"],
         "min_lr": training["min_lr"],
         "warmup_epochs": training["warmup_epochs"],
+        "early_stopping_patience": training["early_stopping_patience"],
         "scheduler": training["scheduler"],
         "weight_decay": training["weight_decay"],
         "gradient_clip": training["gradient_clip"],
