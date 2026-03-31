@@ -131,8 +131,8 @@
   },
   "generation": {
     "mode": "vulcan",
-    "num_runs": 50000,
-    "seed": 7,
+    "num_runs": 2000,
+    "seed": 1,
     "overwrite": true,
     "reuse_raw_if_present": false,
     "parallel_workers": 8
