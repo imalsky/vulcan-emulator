@@ -8,11 +8,8 @@ import h5py
 import numpy as np
 import pytest
 
-import src.data_generation.sampling as sampling_module
-import src.data_generation.generation as vulcan_runner_module
-from src.data_generation.sampling import sample_run_specifications
+import src.data_generation.generation as generation_module
 from src.data_generation.generation import (
-    build_flat_h2_he_anchor,
     _copy_fastchem_runtime,
     _patch_vulcan_cfg,
     convert_fastchem_output_to_hdf5,
@@ -21,65 +18,91 @@ from src.data_generation.generation import (
     generate_synthetic_raw_runs,
     patch_python_assignments,
     run_vulcan_generation,
+    write_equilibrium_hdf5,
 )
+from src.data_generation.sampling import sample_run_specifications
+from src.utils.config import load_and_validate_config
+
+
+def _open_first_run(artifact) -> h5py.Group:
+    """Return the first stored run group from a raw-generation artifact."""
+    if artifact.consolidated_path is None:
+        handle = h5py.File(artifact.run_files[0], "r")
+        return handle
+    root = h5py.File(artifact.consolidated_path, "r")
+    return root[sorted(root.keys())[0]]
+
+
+def _make_equilibrium_config(tmp_path: Path) -> dict:
+    """Build one small equilibrium config suitable for unit tests."""
+    root = Path(__file__).resolve().parents[1]
+    config = load_and_validate_config(root / "config" / "equilibrium_only_config.json")
+    config = copy.deepcopy(config)
+    config["paths"]["raw_root"] = str(tmp_path / "raw")
+    config["paths"]["processed_root"] = str(tmp_path / "processed")
+    config["paths"]["checkpoints_root"] = str(tmp_path / "checkpoints")
+    config["paths"]["vulcan_source_root"] = str(tmp_path / "VULCAN")
+    config["generation"]["mode"] = "vulcan"
+    config["generation"]["num_runs"] = 1
+    config["generation"]["parallel_workers"] = 1
+    config["temperature_profiles"]["source_mode"] = "analytic"
+    config["temperature_profiles"].pop("data_glob", None)
+    config["temperature_profiles"].pop("analytic_probability", None)
+    config["_project_root"] = root
+    return config
 
 
 def test_patch_python_assignments():
     text = "use_photo = False\nnetwork = 'old.txt'\n"
-    patched = patch_python_assignments(text, {"use_photo": True, "network": "new.txt", "extra_key": 3})
+    patched = patch_python_assignments(
+        text,
+        {"use_photo": True, "network": "new.txt", "extra_key": 3},
+    )
     assert "use_photo = True" in patched
     assert "network = 'new.txt'" in patched
     assert "extra_key = 3" in patched
 
 
-def test_generate_synthetic_raw_runs(tiny_config):
+def test_sample_run_specifications_no_longer_include_trajectory_fields(tiny_config):
+    spec = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=1,
+        seed=5,
+    )[0]
+    assert not hasattr(spec, "initial_ymix")
+    assert not hasattr(spec, "time_s")
+
+
+def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
     artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
     assert len(artifact.run_files) == tiny_config["generation"]["num_runs"]
     assert artifact.manifest_path is not None and artifact.manifest_path.exists()
     assert artifact.coverage_path is not None and artifact.coverage_path.exists()
-    if artifact.consolidated_path is not None:
-        with h5py.File(artifact.consolidated_path, "r") as root:
-            handle = root[sorted(root.keys())[0]]
-            species = [item.decode("utf-8") for item in handle["inputs/state_species"][:]]
-            element_labels = [item.decode("utf-8") for item in handle["inputs/element_input_order"][:]]
-            assert "OH" in species and "H2S" in species and "SO2" in species
-            assert element_labels == ["He_H", "C_H", "O_H", "N_H", "S_H"]
-            time_s = np.asarray(handle["trajectory/time_s"])
-            assert np.all(np.diff(time_s) > 0.0)
-            assert time_s.size == int(tiny_config["sampling"]["num_time_steps"])
-            ymix = np.asarray(handle["trajectory/ymix_state"])
-            assert ymix.shape[0] == time_s.size
-            assert np.all(np.isfinite(ymix))
-            assert np.asarray(handle["inputs/elemental_abundances_x_h"]).shape[0] == int(
-                tiny_config["sampling"]["num_levels"]
-            )
-            assert np.asarray(handle["inputs/gravity_cm_s2"]).shape[0] == int(tiny_config["sampling"]["num_levels"])
-            reference = np.asarray(handle["inputs/reference_ymix_state"])
-            assert np.allclose(ymix[0], reference)
-            assert handle["inputs/target_mode"][()].decode("utf-8") == tiny_config["generation"]["target_mode"]
-            spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
-            assert spectrum.size > 10
-    else:
-        with h5py.File(artifact.run_files[0], "r") as handle:
-            species = [item.decode("utf-8") for item in handle["inputs/state_species"][:]]
-            element_labels = [item.decode("utf-8") for item in handle["inputs/element_input_order"][:]]
-            assert "OH" in species and "H2S" in species and "SO2" in species
-            assert element_labels == ["He_H", "C_H", "O_H", "N_H", "S_H"]
-            time_s = np.asarray(handle["trajectory/time_s"])
-            assert np.all(np.diff(time_s) > 0.0)
-            assert time_s.size == int(tiny_config["sampling"]["num_time_steps"])
-            ymix = np.asarray(handle["trajectory/ymix_state"])
-            assert ymix.shape[0] == time_s.size
-            assert np.all(np.isfinite(ymix))
-            assert np.asarray(handle["inputs/elemental_abundances_x_h"]).shape[0] == int(
-                tiny_config["sampling"]["num_levels"]
-            )
-            assert np.asarray(handle["inputs/gravity_cm_s2"]).shape[0] == int(tiny_config["sampling"]["num_levels"])
-            reference = np.asarray(handle["inputs/reference_ymix_state"])
-            assert np.allclose(ymix[0], reference)
-            assert handle["inputs/target_mode"][()].decode("utf-8") == tiny_config["generation"]["target_mode"]
-            spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
-            assert spectrum.size > 10
+
+    handle = _open_first_run(artifact)
+    try:
+        species = [item.decode("utf-8") for item in handle["inputs/state_species"][:]]
+        element_labels = [item.decode("utf-8") for item in handle["inputs/element_input_order"][:]]
+        final_state = np.asarray(handle["final_state/ymix_output"])
+        assert "trajectory" not in handle
+        assert final_state.shape[0] == int(tiny_config["sampling"]["num_levels"])
+        assert final_state.shape[1] == len(tiny_config["data_spec"]["output_species"])
+        assert np.all(np.isfinite(final_state))
+        assert species == list(tiny_config["data_spec"]["state_species"])
+        assert element_labels == ["He_H", "C_H", "O_H", "N_H", "S_H"]
+        assert np.asarray(handle["inputs/elemental_abundances_x_h"]).shape == (
+            int(tiny_config["sampling"]["num_levels"]),
+            len(element_labels),
+        )
+        assert np.asarray(handle["inputs/gravity_cm_s2"]).shape == (
+            int(tiny_config["sampling"]["num_levels"]),
+        )
+        spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
+        assert spectrum.size > 10
+        assert "target_mode" not in handle["inputs"]
+    finally:
+        handle.file.close()
 
 
 def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_config):
@@ -129,27 +152,33 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
     assert "atm_type = 'file'" in patched
     assert "Kzz_prof = 'file'" in patched
     assert "T_cross_sp = ['H2O', 'H2S', 'SH', 'SO2', 'S2']" in patched
+    assert "use_lowT_limit_rates = True" in patched
+    assert "use_adapt_rtol = True" in patched
 
 
-def test_convert_fake_vulcan_output_to_hdf5(tmp_path, tiny_config):
-    config = copy.deepcopy(tiny_config)
-    config["generation"]["target_mode"] = "trajectory"
-    specs = sample_run_specifications(config=tiny_config, project_root=tiny_config["_project_root"], num_runs=1, seed=5)
+def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, tiny_config):
+    specs = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=1,
+        seed=5,
+    )
     spec = specs[0]
     species = list(tiny_config["data_spec"]["state_species"])
-    nt = 3
     nz = spec.pressure_bar.size
     state_dim = len(species)
-    reference = np.asarray(spec.initial_ymix, dtype=np.float64)
-    ymix_time = np.repeat(reference[None, :, :], nt, axis=0)
-    t_time = np.asarray([10.0, 100.0, 1000.0], dtype=np.float64)
+    reference = np.full((nz, state_dim), 1.0e-8, dtype=np.float64)
+    reference[:, species.index("H2")] = 0.84
+    reference[:, species.index("He")] = 0.15
+    reference[:, species.index("H2O")] = 1.0e-3
+    reference /= np.sum(reference, axis=1, keepdims=True)
+    ymix_time = np.stack([reference * 0.98, reference], axis=0)
     n0 = np.full(nz, 1.0e12, dtype=np.float64)
     fake = {
         "variable": {
             "species": species,
             "ymix_time": ymix_time,
             "y_ini": reference * n0[:, None],
-            "t_time": t_time,
         },
         "atm": {
             "pco": spec.pressure_bar * 1.0e6,
@@ -162,100 +191,53 @@ def test_convert_fake_vulcan_output_to_hdf5(tmp_path, tiny_config):
     with vul_path.open("wb") as handle:
         pickle.dump(fake, handle, protocol=pickle.HIGHEST_PROTOCOL)
     out_h5 = tmp_path / "converted.h5"
-    spec = type(spec)(
+    converted_spec = type(spec)(
         run_id=spec.run_id,
         pressure_bar=spec.pressure_bar,
         temperature_k=spec.temperature_k,
         kzz_cm2_s=spec.kzz_cm2_s,
-        initial_ymix=spec.initial_ymix,
-        time_s=spec.time_s,
         globals=spec.globals,
         spectrum=spec.spectrum,
         metadata={**spec.metadata, "state_species": species, "output_species": species},
         elemental_abundances_x_h=spec.elemental_abundances_x_h,
         gravity_cm_s2=spec.gravity_cm_s2,
     )
-    convert_vulcan_output_to_hdf5(vul_path, output_h5_path=out_h5, spec=spec, config=config)
-    with h5py.File(out_h5, "r") as handle:
-        time_s = np.asarray(handle["trajectory/time_s"])
-        ymix = np.asarray(handle["trajectory/ymix_state"])
-        reference_out = np.asarray(handle["inputs/reference_ymix_state"])
-        assert ymix.shape == (nt + 1, nz, state_dim)
-        assert np.isclose(time_s[0], 0.0)
-        assert np.allclose(ymix[0], reference_out)
-        assert np.allclose(ymix[1:], ymix_time)
-
-
-def test_convert_fake_vulcan_output_to_hdf5_equilibrium_only_shell(tmp_path, tiny_config):
-    config = copy.deepcopy(tiny_config)
-    config["generation"]["target_mode"] = "equilibrium_only"
-    specs = sample_run_specifications(config=config, project_root=config["_project_root"], num_runs=1, seed=5)
-    spec = specs[0]
-    species = list(config["data_spec"]["state_species"])
-    nz = spec.pressure_bar.size
-    state_dim = len(species)
-    reference = np.asarray(spec.initial_ymix, dtype=np.float64)
-    n0 = np.full(nz, 1.0e12, dtype=np.float64)
-    fake = {
-        "variable": {
-            "species": species,
-            "ymix_time": np.repeat(reference[None, :, :], 2, axis=0),
-            "y_ini": reference * n0[:, None],
-            "t_time": np.asarray([10.0, 100.0], dtype=np.float64),
-        },
-        "atm": {
-            "pco": spec.pressure_bar * 1.0e6,
-            "Tco": spec.temperature_k,
-            "Kzz": spec.kzz_cm2_s[:-1],
-            "n_0": n0,
-        },
-    }
-    vul_path = tmp_path / "fake_eq.vul"
-    with vul_path.open("wb") as handle:
-        pickle.dump(fake, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    out_h5 = tmp_path / "converted_eq.h5"
-    spec = type(spec)(
-        run_id=spec.run_id,
-        pressure_bar=spec.pressure_bar,
-        temperature_k=spec.temperature_k,
-        kzz_cm2_s=spec.kzz_cm2_s,
-        initial_ymix=spec.initial_ymix,
-        time_s=spec.time_s,
-        globals=spec.globals,
-        spectrum=spec.spectrum,
-        metadata={**spec.metadata, "state_species": species, "output_species": species},
-        elemental_abundances_x_h=spec.elemental_abundances_x_h,
-        gravity_cm_s2=spec.gravity_cm_s2,
+    convert_vulcan_output_to_hdf5(
+        vul_path,
+        output_h5_path=out_h5,
+        spec=converted_spec,
+        config=tiny_config,
     )
-    convert_vulcan_output_to_hdf5(vul_path, output_h5_path=out_h5, spec=spec, config=config)
     with h5py.File(out_h5, "r") as handle:
-        time_s = np.asarray(handle["trajectory/time_s"])
-        ymix = np.asarray(handle["trajectory/ymix_state"])
-        reference_out = np.asarray(handle["inputs/reference_ymix_state"])
-        assert ymix.shape == (2, nz, state_dim)
-        assert np.allclose(time_s, np.array([0.0, 1.0]))
-        assert np.allclose(ymix[0], build_flat_h2_he_anchor(species, nz=nz))
-        assert np.allclose(ymix[1], reference_out)
+        assert "trajectory" not in handle
+        assert "target_mode" not in handle["inputs"]
+        final_state = np.asarray(handle["final_state/ymix_output"])
+        assert final_state.shape == (nz, state_dim)
+        np.testing.assert_allclose(final_state, ymix_time[-1], atol=1.0e-12)
+        assert np.asarray(handle["inputs/kzz_cm2_s"]).shape == (nz,)
 
 
-def test_convert_fake_fastchem_output_to_hdf5_equilibrium_only_shell(tmp_path, tiny_config):
-    config = copy.deepcopy(tiny_config)
-    config["generation"]["target_mode"] = "equilibrium_only"
-    specs = sample_run_specifications(config=config, project_root=config["_project_root"], num_runs=1, seed=5)
+def test_convert_fake_fastchem_output_to_hdf5_writes_equilibrium_contract(tmp_path, tiny_config):
+    specs = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=1,
+        seed=7,
+    )
     spec = specs[0]
-    species = list(config["data_spec"]["state_species"])
+    species = list(tiny_config["data_spec"]["state_species"])
     nz = spec.pressure_bar.size
-    reference = build_flat_h2_he_anchor(species, nz=nz)
-    idx = {name: i for i, name in enumerate(species)}
-    reference[:, idx["H2O"]] = 1.0e-3
-    reference[:, idx["CH4"]] = 5.0e-4
-    reference[:, idx["H2"]] -= 1.5e-3
-    reference /= np.sum(reference, axis=1, keepdims=True)
+    equilibrium_ymix = np.full((nz, len(species)), 1.0e-8, dtype=np.float64)
+    equilibrium_ymix[:, species.index("H2")] = 0.84
+    equilibrium_ymix[:, species.index("He")] = 0.15
+    equilibrium_ymix[:, species.index("CO")] = 5.0e-4
+    equilibrium_ymix[:, species.index("H2O")] = 1.0e-3
+    equilibrium_ymix /= np.sum(equilibrium_ymix, axis=1, keepdims=True)
 
     fastchem_output = tmp_path / "vulcan_EQ.dat"
     with fastchem_output.open("w", encoding="utf-8") as handle:
         handle.write(" ".join(species) + "\n")
-        for row in reference:
+        for row in equilibrium_ymix:
             handle.write(" ".join(f"{value:.8e}" for value in row) + "\n")
 
     out_h5 = tmp_path / "converted_fastchem.h5"
@@ -263,17 +245,13 @@ def test_convert_fake_fastchem_output_to_hdf5_equilibrium_only_shell(tmp_path, t
         fastchem_output,
         output_h5_path=out_h5,
         spec=spec,
-        config=config,
+        config=tiny_config,
     )
 
     with h5py.File(out_h5, "r") as handle:
-        time_s = np.asarray(handle["trajectory/time_s"])
-        ymix = np.asarray(handle["trajectory/ymix_state"])
-        reference_out = np.asarray(handle["inputs/reference_ymix_state"])
-        assert np.allclose(time_s, np.array([0.0, 1.0]))
-        assert np.allclose(ymix[0], build_flat_h2_he_anchor(species, nz=nz))
-        assert np.allclose(ymix[1], reference)
-        assert np.allclose(reference_out, reference)
+        assert "trajectory" not in handle
+        assert "target_mode" not in handle["inputs"]
+        np.testing.assert_allclose(np.asarray(handle["equilibrium/ymix"]), equilibrium_ymix, atol=1.0e-12)
 
 
 def test_copy_fastchem_runtime_copies_minimal_runtime(tmp_path):
@@ -299,12 +277,8 @@ def test_copy_fastchem_runtime_copies_minimal_runtime(tmp_path):
     assert not (copied_root / "obj").exists()
 
 
-def test_run_vulcan_generation_equilibrium_only_skips_vulcan_runtime(tmp_path, tiny_config, monkeypatch):
-    config = copy.deepcopy(tiny_config)
-    config["generation"]["mode"] = "vulcan"
-    config["generation"]["target_mode"] = "equilibrium_only"
-    config["generation"]["num_runs"] = 1
-    config["paths"]["vulcan_source_root"] = str(tmp_path / "VULCAN")
+def test_run_vulcan_generation_equilibrium_only_skips_vulcan_runtime(tmp_path, monkeypatch):
+    config = _make_equilibrium_config(tmp_path)
 
     fastchem_root = Path(config["paths"]["vulcan_source_root"]) / "fastchem_vulcan"
     (fastchem_root / "input").mkdir(parents=True)
@@ -316,54 +290,60 @@ def test_run_vulcan_generation_equilibrium_only_skips_vulcan_runtime(tmp_path, t
         encoding="utf-8",
     )
 
-    def _unexpected_initial_ymix(*args, **kwargs):
-        raise AssertionError("Equilibrium-only VULCAN generation should not sample an initial ymix.")
-
-    def _unexpected_time_grid(*args, **kwargs):
-        raise AssertionError("Equilibrium-only VULCAN generation should not sample a time grid.")
-
-    monkeypatch.setattr(sampling_module, "sample_initial_ymix", _unexpected_initial_ymix)
-    monkeypatch.setattr(sampling_module, "sample_time_grid", _unexpected_time_grid)
-
     def _unexpected_vulcan(*args, **kwargs):
-        raise AssertionError("Equilibrium-only generation should not invoke the VULCAN runtime.")
+        raise AssertionError("Equilibrium generation should not invoke the VULCAN runtime.")
 
     def _fake_fastchem(spec, *, source_root, worker_base, runs_dir, config):
-        del source_root
-        species = list(config["data_spec"]["state_species"])
-        reference = build_flat_h2_he_anchor(species, nz=spec.pressure_bar.size)
-        idx = {name: i for i, name in enumerate(species)}
-        reference[:, idx["H2O"]] = 1.0e-3
-        reference[:, idx["CH4"]] = 5.0e-4
-        reference[:, idx["H2"]] -= 1.5e-3
-        reference /= np.sum(reference, axis=1, keepdims=True)
-        fastchem_output = worker_base / f"{spec.run_id}_fake_fastchem.dat"
-        fastchem_output.parent.mkdir(parents=True, exist_ok=True)
-        with fastchem_output.open("w", encoding="utf-8") as handle:
-            handle.write(" ".join(species) + "\n")
-            for row in reference:
-                handle.write(" ".join(f"{value:.8e}" for value in row) + "\n")
-        return convert_fastchem_output_to_hdf5(
-            fastchem_output,
-            output_h5_path=runs_dir / f"{spec.run_id}.h5",
+        del source_root, worker_base
+        nz = spec.pressure_bar.size
+        species = list(config["data_spec"]["output_species"])
+        equilibrium_ymix = np.full((nz, len(species)), 1.0e-8, dtype=np.float64)
+        equilibrium_ymix[:, species.index("H2")] = 0.84
+        equilibrium_ymix[:, species.index("He")] = 0.15
+        equilibrium_ymix[:, species.index("H2O")] = 1.0e-3
+        equilibrium_ymix /= np.sum(equilibrium_ymix, axis=1, keepdims=True)
+        return write_equilibrium_hdf5(
+            runs_dir / f"{spec.run_id}.h5",
             spec=spec,
-            config=config,
+            equilibrium_ymix=equilibrium_ymix,
+            state_species=list(config["data_spec"]["state_species"]),
+            output_species=species,
         )
 
-    monkeypatch.setattr(vulcan_runner_module, "_run_single_vulcan_spec", _unexpected_vulcan)
-    monkeypatch.setattr(vulcan_runner_module, "_run_single_fastchem_spec", _fake_fastchem)
+    monkeypatch.setattr(generation_module, "_run_single_vulcan_spec", _unexpected_vulcan)
+    monkeypatch.setattr(generation_module, "_run_single_fastchem_spec", _fake_fastchem)
 
     artifact = run_vulcan_generation(config, project_root=config["_project_root"])
 
     assert len(artifact.run_files) == 1
-    if artifact.consolidated_path is not None:
-        with h5py.File(artifact.consolidated_path, "r") as root:
-            handle = root[sorted(root.keys())[0]]
-            time_s = np.asarray(handle["trajectory/time_s"])
-            assert np.allclose(time_s, np.array([0.0, 1.0]))
-            assert handle["inputs/target_mode"][()].decode("utf-8") == "equilibrium_only"
-    else:
-        with h5py.File(artifact.run_files[0], "r") as handle:
-            time_s = np.asarray(handle["trajectory/time_s"])
-            assert np.allclose(time_s, np.array([0.0, 1.0]))
-            assert handle["inputs/target_mode"][()].decode("utf-8") == "equilibrium_only"
+    handle = _open_first_run(artifact)
+    try:
+        assert "equilibrium" in handle
+        assert "final_state" not in handle
+        assert "target_mode" not in handle["inputs"]
+    finally:
+        handle.file.close()
+
+
+def test_run_vulcan_generation_hard_fails_on_shortfall(tmp_path, tiny_config, monkeypatch):
+    config = copy.deepcopy(tiny_config)
+    config["generation"]["mode"] = "vulcan"
+    config["generation"]["num_runs"] = 2
+    config["generation"]["parallel_workers"] = 1
+    config["generation"]["backfill"] = {"enabled": True, "max_retries": 1}
+
+    def _fake_validated_paths(config, *, project_root):
+        del config, project_root
+        return tmp_path, tmp_path / "network.txt"
+
+    def _always_fail(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(generation_module, "_validated_vulcan_paths", _fake_validated_paths)
+    monkeypatch.setattr(generation_module, "_run_single_vulcan_spec", _always_fail)
+
+    with pytest.raises(RuntimeError, match="successful runs short"):
+        run_vulcan_generation(config, project_root=config["_project_root"])
+
+    failed_log = Path(config["paths"]["raw_root"]) / "failed_runs.json"
+    assert failed_log.exists()

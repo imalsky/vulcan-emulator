@@ -13,7 +13,7 @@ from src.models.jax_model import (
 )
 from src.models.exojax_api import (
     make_equilibrium_vmr_fn,
-    make_transition_vmr_fn,
+    make_full_vulcan_vmr_fn,
 )
 
 ELEMENT_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
@@ -88,8 +88,8 @@ def _make_equilibrium_bundle(tmp_path):
     return load_exported_model(bundle_path)
 
 
-def _make_transition_bundle(tmp_path):
-    """Build and export a tiny synthetic transition bundle for testing."""
+def _make_full_vulcan_bundle(tmp_path):
+    """Build and export a tiny synthetic full-VULCAN bundle for testing."""
     global_static_order = [
         "gravity_cm_s2",
         *ELEMENT_ORDER,
@@ -97,8 +97,8 @@ def _make_transition_bundle(tmp_path):
         "atm_base_H2",
     ]
     dims = ModelDimensions(
-        sequence_dim=5,
-        global_dim=len(global_static_order) + 1,
+        sequence_dim=3,
+        global_dim=len(global_static_order),
         spectrum_dim=4,
         target_dim=2,
         d_model=8,
@@ -123,7 +123,6 @@ def _make_transition_bundle(tmp_path):
                 {"method": "log-standard", "mean": [8.0], "std": [0.5], "floor": 1e-30},
             ],
         },
-        "state": {"method": "log-standard", "mean": [-4.0, -5.0], "std": [0.8, 1.1], "floor": 1e-30},
         "target": {"method": "log-standard", "mean": [-6.0, -7.0], "std": [1.0, 0.7], "floor": 1e-30},
         "global_static": {
             "method": "mixed",
@@ -132,7 +131,6 @@ def _make_transition_bundle(tmp_path):
             "std": [0.2, 0.1, 0.2, 0.2, 0.2, 0.2, 1.0, 1.0],
             "floor": [1e-30] * 6 + [None, None],
         },
-        "log10_dt_s": {"method": "standard", "mean": [3.0], "std": [0.5]},
         "spectrum": {
             "method": "log-standard",
             "mean": [1.0, 1.2, 1.1, 0.9],
@@ -141,9 +139,7 @@ def _make_transition_bundle(tmp_path):
         },
     }
     contract = {
-        "target_mode": "trajectory",
         "global_static_feature_order": global_static_order,
-        "dt_feature_index": 6,
         "spectrum_dim": 4,
         "element_input_order": list(ELEMENT_ORDER),
         "output_species_order": ["H2O", "CO"],
@@ -166,13 +162,11 @@ def _make_transition_bundle(tmp_path):
                 "use_settling": False,
                 "use_initial_cold_trap": False,
                 "use_sat_surface_h2o": False,
-                "use_lowT_limit_rates": False,
-                "use_adaptive_rtol": False,
             },
             "vulcan_runtime": {"atm_base": "H2"},
         },
     }
-    bundle_path = export_checkpoint_payload(payload, tmp_path / "tr_bundle.npz")
+    bundle_path = export_checkpoint_payload(payload, tmp_path / "fv_bundle.npz")
     return load_exported_model(bundle_path)
 
 
@@ -266,29 +260,19 @@ def test_equilibrium_vmr_fn_rejects_nonconstant_profiles_in_eager_mode(tmp_path)
         vmr_fn(T, P, elemental, gravity)
 
 
-def test_transition_vmr_fn_matches_bundle_after_level_reversal(tmp_path):
-    bundle = _make_transition_bundle(tmp_path)
-    vmr_fn, species = make_transition_vmr_fn(bundle)
+def test_full_vulcan_vmr_fn_matches_bundle_after_level_reversal(tmp_path):
+    bundle = _make_full_vulcan_bundle(tmp_path)
+    vmr_fn, species = make_full_vulcan_vmr_fn(bundle)
 
     internal_p = np.array([100.0, 10.0, 1.0], dtype=np.float32)
     internal_t = np.array([1500.0, 1200.0, 950.0], dtype=np.float32)
     internal_kzz = np.array([1.0e8, 1.0e8, 1.0e8], dtype=np.float32)
-    internal_state = np.array(
-        [
-            [1.0e-4, 2.0e-6],
-            [8.0e-5, 1.5e-6],
-            [5.0e-5, 1.0e-6],
-        ],
-        dtype=np.float32,
-    )
     public_p = jnp.asarray(internal_p[::-1])
     public_t = jnp.asarray(internal_t[::-1])
     public_kzz = jnp.asarray(internal_kzz[::-1])
-    public_state = jnp.asarray(internal_state[::-1])
     elemental = _element_profile(public_p.shape[0])
     gravity = jnp.full(public_p.shape, 900.0, dtype=jnp.float32)
     spectrum_flux = jnp.asarray([15.0, 20.0, 18.0, 12.0], dtype=jnp.float32)
-    dt_s = jnp.asarray(1.0e4, dtype=jnp.float32)
 
     vmr_api = np.asarray(
         vmr_fn(
@@ -297,17 +281,14 @@ def test_transition_vmr_fn_matches_bundle_after_level_reversal(tmp_path):
             elemental,
             public_kzz,
             gravity,
-            public_state,
             spectrum_flux,
-            dt_s,
         )
     )
     vmr_ref = np.asarray(
-        bundle.predict_transition_profile(
+        bundle.predict_full_vulcan_profile(
             pressure_bar=internal_p,
             temperature_k=internal_t,
             kzz_cm2_s=internal_kzz,
-            anchor_state=internal_state,
             global_inputs={
                 "gravity_cm_s2": 900.0,
                 **_element_dict(),
@@ -315,7 +296,6 @@ def test_transition_vmr_fn_matches_bundle_after_level_reversal(tmp_path):
                 "atm_base_H2": 1.0,
             },
             spectrum_flux=spectrum_flux,
-            dt_s=dt_s,
         )
     )[::-1]
 
@@ -323,9 +303,9 @@ def test_transition_vmr_fn_matches_bundle_after_level_reversal(tmp_path):
     np.testing.assert_allclose(vmr_api, vmr_ref, rtol=1e-5, atol=1e-7)
 
 
-def test_transition_vmr_fn_jit_and_vjp(tmp_path):
-    bundle = _make_transition_bundle(tmp_path)
-    vmr_fn, _ = make_transition_vmr_fn(bundle)
+def test_full_vulcan_vmr_fn_jit_and_vjp(tmp_path):
+    bundle = _make_full_vulcan_bundle(tmp_path)
+    vmr_fn, _ = make_full_vulcan_vmr_fn(bundle)
 
     nz = 4
     T = jnp.linspace(900.0, 1400.0, nz, dtype=jnp.float32)
@@ -333,34 +313,14 @@ def test_transition_vmr_fn_jit_and_vjp(tmp_path):
     Kzz = jnp.full((nz,), 1.0e8, dtype=jnp.float32)
     elemental = _element_profile(nz)
     gravity = jnp.full((nz,), 850.0, dtype=jnp.float32)
-    anchor = jnp.full((nz, 2), 1.0e-5, dtype=jnp.float32)
     spectrum_flux = jnp.asarray([15.0, 20.0, 18.0, 12.0], dtype=jnp.float32)
-    dt_s = jnp.asarray(1.0e4, dtype=jnp.float32)
 
-    eager = vmr_fn(
-        T,
-        P,
-        elemental,
-        Kzz,
-        gravity,
-        anchor,
-        spectrum_flux,
-        dt_s,
-    )
-    compiled = jax.jit(vmr_fn)(
-        T,
-        P,
-        elemental,
-        Kzz,
-        gravity,
-        anchor,
-        spectrum_flux,
-        dt_s,
-    )
+    eager = vmr_fn(T, P, elemental, Kzz, gravity, spectrum_flux)
+    compiled = jax.jit(vmr_fn)(T, P, elemental, Kzz, gravity, spectrum_flux)
     np.testing.assert_allclose(np.asarray(eager), np.asarray(compiled), atol=1e-6)
 
     grad_t = jax.grad(
-        lambda temp: jnp.sum(vmr_fn(temp, P, elemental, Kzz, gravity, anchor, spectrum_flux, dt_s))
+        lambda temp: jnp.sum(vmr_fn(temp, P, elemental, Kzz, gravity, spectrum_flux))
     )(T)
     assert grad_t.shape == T.shape
 
@@ -369,18 +329,14 @@ def test_transition_vmr_fn_jit_and_vjp(tmp_path):
     batched_elemental = jnp.stack([elemental, elemental], axis=0)
     batched_kzz = jnp.stack([Kzz, Kzz], axis=0)
     batched_gravity = jnp.stack([gravity, gravity], axis=0)
-    batched_anchor = jnp.stack([anchor, anchor], axis=0)
     batched_spectrum = jnp.stack([spectrum_flux, spectrum_flux], axis=0)
-    batched_dt = jnp.stack([dt_s, dt_s], axis=0)
     vmapped = jax.vmap(vmr_fn)(
         batched_t,
         batched_p,
         batched_elemental,
         batched_kzz,
         batched_gravity,
-        batched_anchor,
         batched_spectrum,
-        batched_dt,
     )
     assert vmapped.shape == (2, nz, 2)
 
@@ -391,27 +347,23 @@ def test_transition_vmr_fn_jit_and_vjp(tmp_path):
         elemental,
         Kzz,
         gravity,
-        anchor,
         spectrum_flux,
-        dt_s,
     )
-    g_t, g_p, g_elem, g_kzz, g_g, g_anchor, g_spectrum, g_dt = vjp_fn(jnp.ones_like(vmr_val))
+    g_t, g_p, g_elem, g_kzz, g_g, g_spectrum = vjp_fn(jnp.ones_like(vmr_val))
 
     assert g_t.shape == T.shape
     assert g_p.shape == P.shape
     assert g_elem.shape == elemental.shape
     assert g_kzz.shape == Kzz.shape
     assert g_g.shape == gravity.shape
-    assert g_anchor.shape == anchor.shape
     assert g_spectrum.shape == spectrum_flux.shape
-    assert g_dt.shape == ()
 
 
-def test_transition_vmr_fn_rejects_nonconstant_gravity_in_eager_mode(tmp_path):
+def test_full_vulcan_vmr_fn_rejects_nonconstant_gravity_in_eager_mode(tmp_path):
     import pytest
 
-    bundle = _make_transition_bundle(tmp_path)
-    vmr_fn, _ = make_transition_vmr_fn(bundle)
+    bundle = _make_full_vulcan_bundle(tmp_path)
+    vmr_fn, _ = make_full_vulcan_vmr_fn(bundle)
 
     nz = 4
     T = jnp.linspace(900.0, 1400.0, nz, dtype=jnp.float32)
@@ -419,33 +371,22 @@ def test_transition_vmr_fn_rejects_nonconstant_gravity_in_eager_mode(tmp_path):
     Kzz = jnp.full((nz,), 1.0e8, dtype=jnp.float32)
     elemental = _element_profile(nz)
     gravity = jnp.asarray([850.0, 850.0, 900.0, 850.0], dtype=jnp.float32)
-    anchor = jnp.full((nz, 2), 1.0e-5, dtype=jnp.float32)
     spectrum_flux = jnp.asarray([15.0, 20.0, 18.0, 12.0], dtype=jnp.float32)
-    dt_s = jnp.asarray(1.0e4, dtype=jnp.float32)
 
     with pytest.raises(ValueError, match="gravity_cm_s2"):
-        vmr_fn(
-            T,
-            P,
-            elemental,
-            Kzz,
-            gravity,
-            anchor,
-            spectrum_flux,
-            dt_s,
-        )
+        vmr_fn(T, P, elemental, Kzz, gravity, spectrum_flux)
 
 
 def test_exojax_v2_factories_reject_wrong_bundle_type(tmp_path):
     import pytest
 
     eq_bundle = _make_equilibrium_bundle(tmp_path)
-    tr_bundle = _make_transition_bundle(tmp_path)
+    fv_bundle = _make_full_vulcan_bundle(tmp_path)
 
     with pytest.raises(ValueError, match="equilibrium"):
-        make_equilibrium_vmr_fn(tr_bundle)
-    with pytest.raises(ValueError, match="transition"):
-        make_transition_vmr_fn(eq_bundle)
+        make_equilibrium_vmr_fn(fv_bundle)
+    with pytest.raises(ValueError, match="full_vulcan"):
+        make_full_vulcan_vmr_fn(eq_bundle)
 
 
 def test_old_ratio_helpers_are_not_exported():

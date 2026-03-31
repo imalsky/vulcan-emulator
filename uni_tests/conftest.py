@@ -77,9 +77,6 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                     "c_to_o_range": [0.25, 1.1],
                     "s_to_o_range": [0.005, 0.1],
                     "kzz_cm2_s": 1.0e8,
-                    "num_time_steps": 24,
-                    "time_step_log10_min_s": 1.0,
-                    "time_step_log10_max_s": 5.0,
                 },
                 "temperature_profiles": {
                     "source_mode": "mixed",
@@ -121,9 +118,7 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                     },
                     "state_floor": 1e-30,
                     "spectrum_floor": 1e-30,
-                    "state_method": "log-standard",
                     "target_method": "log-standard",
-                    "log10_dt_method": "standard",
                     "spectrum_method": "log-standard",
                     "sequence_methods": {
                         "pressure_bar": "log-standard",
@@ -147,8 +142,6 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                         "use_settling": "none",
                         "use_initial_cold_trap": "none",
                         "use_sat_surface_h2o": "none",
-                        "use_lowT_limit_rates": "none",
-                        "use_adaptive_rtol": "none",
                         "atm_base_H2": "none",
                         "atm_base_N2": "none",
                         "atm_base_O2": "none",
@@ -165,10 +158,6 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                     "warmup_epochs": 0,
                     "weight_decay": 1e-05,
                     "gradient_clip": 1.0,
-                    "live_sampling": {
-                        "train_pairs_per_run_per_epoch": 128,
-                        "eval_pairs_per_run": 32,
-                    },
                     "loss": {
                         "lambda_z": 1.0,
                         "lambda_phys": 0.1,
@@ -196,18 +185,11 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                         "use_settling": False,
                         "use_initial_cold_trap": False,
                         "use_sat_surface_h2o": False,
-                        "use_lowT_limit_rates": False,
-                        "use_adaptive_rtol": False,
                     },
                     "vulcan_runtime": {
-                        "python_executable": "python",
-                        "cfg_file": "vulcan_cfg.py",
                         "chemistry_file": "thermo/SNCHO_photo_network_2025.txt",
-                        "worker_root": "data/vulcan_workers",
-                        "regenerate_chem_funs": True,
                         "atm_base": "H2",
                         "t_cross_sp": ["H2O", "H2S", "SH", "SO2", "S2"],
-                        "cfg_assignments": {},
                     },
                     "stellar_spectrum": {
                         "enabled": True,
@@ -224,12 +206,6 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                         "semi_major_axis_au": 0.04858,
                         "zenith_angle_deg": 48.0,
                         "diurnal_factor": 1.0,
-                    },
-                    "trajectory_sampling": {
-                        "dt_min_s": 100.0,
-                        "dt_max_s": 100000.0,
-                        "min_future_saved_steps": 1,
-                        "num_logdt_bins": 8,
                     },
                 },
             },
@@ -277,7 +253,6 @@ def tiny_config(tmp_path):
     config["generation"]["seed"] = 11
     config["generation"]["parallel_workers"] = 1
     config["sampling"]["num_levels"] = 12
-    config["sampling"]["num_time_steps"] = 8
 
     config["full_vulcan"]["stellar_spectrum"]["num_bins"] = 32
     config["full_vulcan"]["stellar_spectrum"]["hidden_dim"] = 16
@@ -288,8 +263,6 @@ def tiny_config(tmp_path):
 
     config["training"]["batch_size"] = 4
     config["training"]["epochs"] = 1
-    config["training"]["live_sampling"]["train_pairs_per_run_per_epoch"] = 4
-    config["training"]["live_sampling"]["eval_pairs_per_run"] = 2
     config["training"]["model"]["d_model"] = 16
     config["training"]["model"]["nhead"] = 4
     config["training"]["model"]["num_layers"] = 1

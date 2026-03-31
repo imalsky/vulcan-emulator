@@ -1,7 +1,7 @@
 """Stellar spectrum handling: Planck function and template interpolation.
 
 Provides utilities for generating, reading, writing, and resampling
-stellar spectra used as conditioning inputs for the transition model.
+stellar spectra used as conditioning inputs for the full-VULCAN model.
 The default template is an analytic blackbody approximation to the
 WASP-39 host star.
 

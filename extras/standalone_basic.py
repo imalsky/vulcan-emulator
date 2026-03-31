@@ -18,8 +18,14 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
+from src.utils.numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
+
 import numpy as np
 from src.models.export_bundle import load_exported_model
+
+_EXPECTED_ELEMENT_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
 
 # ---------------------------------------------------------------------------
 # 1. Load the model
@@ -28,11 +34,22 @@ from src.models.export_bundle import load_exported_model
 # normalisation statistics, and the species/feature ordering are all inside.
 # Nothing from the training codebase is needed.
 model = load_exported_model(_ROOT / "models/equilibrium_only_silu/best_exported.npz")
+global_order = list(model.data_contract["global_static_feature_order"])
+if global_order != _EXPECTED_ELEMENT_ORDER:
+    raise RuntimeError(
+        "extras/standalone_basic.py requires an exported equilibrium bundle with the "
+        f"current explicit elemental-abundance contract {_EXPECTED_ELEMENT_ORDER}, "
+        f"but the default bundle stores {global_order}. Regenerate the example bundle "
+        "from a checkpoint trained with the current pipeline."
+    )
 
 # ---------------------------------------------------------------------------
 # 2. Build a T-P profile
 # ---------------------------------------------------------------------------
 # 50 pressure levels, log-spaced from 100 bar (deep) to 1e-5 bar (top).
+# This direct ExportedJAXModel helper uses the repository's internal
+# bottom-to-top ordering (high pressure -> low pressure).  The ExoJAX API
+# wrappers are the public top-to-bottom interface.
 pressure_bar  = np.logspace(2, -5, 50)
 
 # Simple power-law temperature profile: warm at depth, cooler at the top.
@@ -41,8 +58,10 @@ temperature_k = 800.0 + 1200.0 * (pressure_bar / 100.0) ** 0.08
 # ---------------------------------------------------------------------------
 # 3. Call the model
 # ---------------------------------------------------------------------------
-# predict_equilibrium_profile handles all normalisation internally.
-# Inputs are raw physical units; outputs are log10 mixing ratios by species.
+# predict_equilibrium_profile handles all normalization internally.
+# Inputs are raw physical units in the exported-bundle feature order, and the
+# elemental abundances are FastChem-native hydrogen-normalized abundances n_X/n_H.
+# Outputs are log10 mixing ratios by species.
 mixing_ratios_log10 = model.predict_equilibrium_profile(
     pressure_bar=pressure_bar,
     temperature_k=temperature_k,

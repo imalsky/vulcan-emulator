@@ -3,7 +3,7 @@
 Two branch-specific factories are provided:
 
     make_equilibrium_vmr_fn(bundle)
-    make_transition_vmr_fn(bundle)
+    make_full_vulcan_vmr_fn(bundle)
 
 Both return pure JAX callables plus species labels.  The public API uses
 top-to-bottom level order and FastChem-native hydrogen-normalized number
@@ -74,7 +74,7 @@ def _global_vector(
     )
 
 
-def _transition_static_defaults(bundle: ExportedJAXModel) -> dict[str, float]:
+def _full_vulcan_static_defaults(bundle: ExportedJAXModel) -> dict[str, float]:
     """Resolve static full-VULCAN conditioning inputs baked into the bundle config."""
     feature_order = list(bundle.data_contract["global_static_feature_order"])
     needs_defaults = any(
@@ -85,7 +85,7 @@ def _transition_static_defaults(bundle: ExportedJAXModel) -> dict[str, float]:
         return {}
     if "physics_toggles" not in bundle.config or "vulcan_runtime" not in bundle.config:
         raise ValueError(
-            "Transition bundle config is missing physics/base defaults required by "
+            "Full-VULCAN bundle config is missing physics/base defaults required by "
             "the ExoJAX v2 wrapper."
         )
     return static_conditioning_defaults(bundle.config)
@@ -158,17 +158,17 @@ def make_equilibrium_vmr_fn(
     return vmr_fn, species_labels
 
 
-def make_transition_vmr_fn(
+def make_full_vulcan_vmr_fn(
     bundle: ExportedJAXModel,
 ) -> tuple[Any, list[str]]:
-    """Create the ExoJAX v2 transition/full-VULCAN interface for one transition bundle."""
+    """Create the ExoJAX v2 full-VULCAN interface for one full-VULCAN bundle."""
     if bundle.is_equilibrium:
-        raise ValueError("make_transition_vmr_fn requires a transition bundle.")
+        raise ValueError("make_full_vulcan_vmr_fn requires a full_vulcan bundle.")
 
     _validate_bundle_element_order(bundle)
     species_labels = list(bundle.data_contract["output_species_order"])
     feature_order = list(bundle.data_contract["global_static_feature_order"])
-    static_defaults = _transition_static_defaults(bundle)
+    static_defaults = _full_vulcan_static_defaults(bundle)
 
     def vmr_fn(
         temperatures_k: jax.Array,           # shape: (nz,), top -> bottom
@@ -176,9 +176,7 @@ def make_transition_vmr_fn(
         elemental_abundances_x_h: jax.Array, # shape: (nz, n_elements), top -> bottom
         kzz_cm2_s: jax.Array,                # shape: (nz,), top -> bottom
         gravity_cm_s2: jax.Array,            # shape: (nz,), top -> bottom
-        anchor_state: jax.Array,             # shape: (nz, state_dim), top -> bottom
         spectrum_flux: jax.Array,            # shape: (spectrum_dim,)
-        dt_s: jax.Array,                     # shape: (), scalar
     ) -> jax.Array:
         """Return linear VMRs in shape ``(nz, n_species)`` using top-to-bottom order."""
         _maybe_require_column_constant(
@@ -194,7 +192,6 @@ def make_transition_vmr_fn(
         elemental = jnp.asarray(elemental_abundances_x_h, dtype=jnp.float32)
         kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)
         gravity = jnp.asarray(gravity_cm_s2, dtype=jnp.float32)
-        state = jnp.asarray(anchor_state, dtype=jnp.float32)
 
         if temperatures.ndim != 1 or pressures.ndim != 1 or kzz.ndim != 1 or gravity.ndim != 1:
             raise ValueError(
@@ -214,15 +211,12 @@ def make_transition_vmr_fn(
             raise ValueError(
                 f"elemental_abundances_x_h must have {len(ELEMENT_LABELS)} columns, got {elemental.shape[1]}."
             )
-        if state.ndim != 2 or state.shape[0] != temperatures.shape[0]:
-            raise ValueError("anchor_state must have shape (nz, state_dim).")
 
         internal_temperatures = temperatures[::-1]
         internal_pressures = pressures[::-1]
         internal_elemental = elemental[::-1, :]
         internal_kzz = kzz[::-1]
         internal_gravity = gravity[::-1]
-        internal_state = state[::-1, :]
 
         element_vector = internal_elemental[0, :]
         gravity_value = internal_gravity[0]
@@ -232,14 +226,12 @@ def make_transition_vmr_fn(
             global_values[name] = element_vector[idx]
 
         global_inputs = _global_vector(feature_order=feature_order, values=global_values)
-        vmr_internal = bundle.predict_transition_profile(
+        vmr_internal = bundle.predict_full_vulcan_profile(
             pressure_bar=internal_pressures,
             temperature_k=internal_temperatures,
             kzz_cm2_s=internal_kzz,
-            anchor_state=internal_state,
             global_inputs=global_inputs,
             spectrum_flux=spectrum_flux,
-            dt_s=dt_s,
         )
         return vmr_internal[::-1, :]
 

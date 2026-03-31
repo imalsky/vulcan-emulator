@@ -7,8 +7,9 @@ from pathlib import Path
 def test_asset_layout_uses_assets_for_immutable_inputs():
     root = Path(__file__).resolve().parents[1]
     equilibrium = json.loads((root / "config" / "equilibrium_only_config.json").read_text(encoding="utf-8"))
+    full_vulcan = json.loads((root / "config" / "full_vulcan_config.json").read_text(encoding="utf-8"))
     assert equilibrium["temperature_profiles"]["data_glob"].startswith("assets/")
-    assert not (root / "config" / "full_vulcan_config.json").exists()
+    assert full_vulcan["full_vulcan"]["stellar_spectrum"]["template_file"].startswith("assets/")
 
 
 def test_real_assets_are_gitignored_and_fixtures_are_local():

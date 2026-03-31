@@ -44,6 +44,10 @@ sys.path.insert(0, str(_ROOT))
 # Also add extras/ so we can optionally import compare_test_profile_fastchem.
 sys.path.insert(0, str(_ROOT / "extras"))
 
+from src.utils.numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
+
 import numpy as np
 
 # JAX is the main computational framework — it compiles, JITs, and
@@ -61,6 +65,8 @@ from src.models.export_bundle import (
     load_exported_model,                # load .npz bundle into ExportedJAXModel
 )
 from src.models.jax_model import apply_equilibrium_mlp  # the FiLM-conditioned MLP
+
+_EXPECTED_ELEMENT_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
 
 # ---------------------------------------------------------------------------
 # Paths — adjust BUNDLE_PATH if your model lives in a different directory.
@@ -105,6 +111,13 @@ contract      = model.data_contract
 species       = list(contract["output_species_order"])
 n_species     = len(species)
 global_order  = list(contract["global_static_feature_order"])
+if global_order != _EXPECTED_ELEMENT_ORDER:
+    raise RuntimeError(
+        "extras/standalone_test.py requires an exported equilibrium bundle with the "
+        f"current explicit elemental-abundance contract {_EXPECTED_ELEMENT_ORDER}, "
+        f"but the selected bundle stores {global_order}. Regenerate the example bundle "
+        "from a checkpoint trained with the current pipeline."
+    )
 
 def _globals_vector(
     globals_map: dict[str, float],
@@ -152,9 +165,10 @@ print("=" * 72)
 
 # ------- Pressure grid -------------------------------------------------------
 # 50 levels log-spaced from 100 bar (deep photosphere) to 10^-5 bar (top).
-# VULCAN uses a top-to-bottom ordering (index 0 = lowest pressure), but the
-# emulator accepts any monotonic ordering; predict_equilibrium_profile does
-# not assume a particular direction.
+# This standalone script calls ExportedJAXModel.predict_equilibrium_profile
+# directly, so it uses the repository's internal bottom-to-top ordering
+# (high pressure -> low pressure).  The ExoJAX wrapper layer is the separate
+# public top-to-bottom interface.
 N_LEVELS = 50
 P_BOTTOM = 100.0    # bar
 P_TOP    = 1.0e-5   # bar
@@ -179,10 +193,9 @@ print(f"  Pressure grid   : {pressure_bar[-1]:.1e} − {pressure_bar[0]:.1f} bar
 print(f"  Temperature     : {temperature_k[-1]:.0f} K (top layer) − {temperature_k[0]:.0f} K (bottom)")
 
 # ------- Global chemistry parameters ----------------------------------------
-# The public equilibrium API now takes explicit FastChem-native
-# hydrogen-normalized elemental abundances (n_X / n_H).  These values are
-# near-solar and match the ordering baked into the exported bundle's data
-# contract.
+# The chemistry inputs are explicit FastChem-native hydrogen-normalized
+# elemental abundances (n_X / n_H).  These values are near-solar and match the
+# ordering baked into the exported bundle's data contract.
 global_inputs = {
     "He_H": 8.38e-2,
     "C_H": 2.95e-4,

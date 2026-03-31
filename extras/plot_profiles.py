@@ -1,9 +1,9 @@
 """Plot randomly sampled PT profiles: analytic, Roth (PT-library), and convective.
 
 Overlays all three types on a single panel with distinct line styles:
-  - Solid:  analytic (radiative only)
-  - Dashed: Roth PT-library
-  - Dotted: convective adjustment applied
+  - Solid:  Roth PT-library
+  - Dashed: analytic (radiative only)
+  - Dash-dot: convective adjustment applied
 
 Usage:
     python extras/plot_profiles.py
@@ -19,6 +19,10 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
+
+from src.utils.numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -190,7 +194,7 @@ def main(argv: list[str] | None = None) -> None:
     plt.style.use(str(_STYLE))
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    # Color maps: blues for analytic, reds for Roth, purples for conv. adj.
+    # Color maps: blues for analytic, reds for Roth, purples for convective adjustment.
     blue_cmap = plt.cm.Blues
     red_cmap = plt.cm.Reds
     purple_cmap = plt.cm.Purples

@@ -19,9 +19,9 @@ trainer.  The pipeline has four stages:
 Two top-level entry points handle the two task kinds:
 
 * ``preprocess_equilibrium_dataset`` — for equilibrium-only models
-  (no trajectory, no spectrum).
-* ``preprocess_raw_dataset`` — for full-VULCAN transition models
-  (trajectory + spectrum + dt features).
+  (no spectrum).
+* ``preprocess_raw_dataset`` — for full-VULCAN models
+  (final-state + spectrum).
 
 ``PROCESSED_DATA_VERSION`` is bumped whenever the on-disk tensor
 layout changes in a backwards-incompatible way.
@@ -38,7 +38,6 @@ import h5py
 import numpy as np
 
 from ..utils.config import (
-    effective_transition_sampling,
     is_equilibrium,
     resolve_conditioning_inputs,
     task_kind,
@@ -48,30 +47,24 @@ from ..utils.helpers import ensure_dir, get_logger, resolve_path
 LOGGER = get_logger(__name__)
 from ..utils.provenance import fingerprint_payload, manifest_for_files
 from .spectrum import SpectrumRecord, fixed_wavelength_grid, resample_spectrum
-from .transition_sampling import fit_log10_dt_normalization
-
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
-PROCESSED_DATA_VERSION = 7
+PROCESSED_DATA_VERSION = 9
 
 
 @dataclass(frozen=True)
 class RawRun:
-    """Raw transition run loaded from HDF5 before normalization.
+    """Raw full-VULCAN run loaded from HDF5 before normalization.
 
     Fields mirror the HDF5 layout produced by ``generation.write_raw_run_hdf5``.
     Species columns are already reordered to match the config's
-    ``state_species`` / ``output_species`` contract.
+    ``output_species`` contract.
     """
     run_id: str
     pressure_bar: np.ndarray
     temperature_k: np.ndarray
     kzz_cm2_s: np.ndarray
-    time_s: np.ndarray
-    ymix_state: np.ndarray
-    ymix_output: np.ndarray
-    reference_ymix_state: np.ndarray
-    target_mode: str
+    final_ymix_output: np.ndarray
     globals: dict[str, float]
     spectrum_name: str
     spectrum_wavelength_nm: np.ndarray
@@ -303,19 +296,6 @@ def inverse_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
     return np.stack(outputs, axis=-1)
 
 
-def _fit_log10_dt_block(stats: dict[str, float], *, method: str) -> dict[str, Any]:
-    """Wrap fitted log-dt statistics using the configured normalization method."""
-    if method == "standard":
-        return {
-            "method": "standard",
-            "mean": [float(stats["mean"])],
-            "std": [float(stats["std"])],
-        }
-    if method == "none":
-        return {"method": "none", "mean": [0.0], "std": [1.0]}
-    raise ValueError(f"Unsupported log10_dt_s normalization method: {method}")
-
-
 def load_raw_run(
     source: str | Path | h5py.Group,
     *,
@@ -323,13 +303,12 @@ def load_raw_run(
     spectrum_grid_nm: np.ndarray,
     run_id: str | None = None,
 ) -> RawRun:
-    """Load one raw HDF5 transition run and align it to the configured species contract.
+    """Load one raw HDF5 full-VULCAN run and align it to the configured species contract.
 
     *source* may be a file path (legacy per-file layout) or an already-opened
     ``h5py.Group`` from a consolidated ``runs.h5``.  When *source* is a group,
     *run_id* must be supplied explicitly.
     """
-    requested_state_species = list(config["data_spec"]["state_species"])
     requested_output_species = list(config["data_spec"]["output_species"])
 
     def _extract(handle: h5py.Group) -> dict[str, Any]:
@@ -340,13 +319,8 @@ def load_raw_run(
             "element_input_order": _decode_species(np.asarray(handle["inputs/element_input_order"])),
             "elemental_abundances_x_h": np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64),
             "gravity_cm_s2": np.asarray(handle["inputs/gravity_cm_s2"], dtype=np.float64),
-            "stored_state_species": _decode_species(np.asarray(handle["inputs/state_species"])),
             "stored_output_species": _decode_species(np.asarray(handle["inputs/output_species"])),
-            "reference_ymix_state": np.asarray(handle["inputs/reference_ymix_state"], dtype=np.float64),
-            "target_mode": handle["inputs/target_mode"][()].decode("utf-8"),
-            "time_s": np.asarray(handle["trajectory/time_s"], dtype=np.float64),
-            "ymix_state": np.asarray(handle["trajectory/ymix_state"], dtype=np.float64),
-            "ymix_output": np.asarray(handle["trajectory/ymix_output"], dtype=np.float64),
+            "final_ymix_output": np.asarray(handle["final_state/ymix_output"], dtype=np.float64),
             "globals_map": {
                 key: float(np.asarray(handle[f"globals/{key}"]))
                 for key in handle["globals"].keys()
@@ -369,10 +343,7 @@ def load_raw_run(
     pressure_bar = d["pressure_bar"]
     temperature_k = d["temperature_k"]
     kzz_cm2_s = d["kzz_cm2_s"]
-    time_s = d["time_s"]
-    ymix_state = d["ymix_state"]
-    ymix_output = d["ymix_output"]
-    reference_ymix_state = d["reference_ymix_state"]
+    final_ymix_output = d["final_ymix_output"]
 
     if not np.all(np.isfinite(pressure_bar)):
         raise ValueError(f"{label}: non-finite pressure values detected.")
@@ -384,20 +355,13 @@ def load_raw_run(
         raise ValueError(f"{label}: non-finite elemental abundance values detected.")
     if not np.all(np.isfinite(d["gravity_cm_s2"])):
         raise ValueError(f"{label}: non-finite gravity values detected.")
-    if not np.all(np.diff(time_s) > 0.0):
-        raise ValueError(f"{label}: time_s must be strictly increasing.")
-    if ymix_state.shape[0] != time_s.size:
-        raise ValueError(f"{label}: ymix_state time dimension does not match time_s.")
-    if ymix_output.shape[0] != time_s.size:
-        raise ValueError(f"{label}: ymix_output time dimension does not match time_s.")
-    if reference_ymix_state.shape[0] != pressure_bar.size:
-        raise ValueError(f"{label}: reference_ymix_state vertical dimension does not match pressure grid.")
+    if final_ymix_output.shape[0] != pressure_bar.size:
+        raise ValueError(f"{label}: final_ymix_output vertical dimension does not match pressure grid.")
     if d["elemental_abundances_x_h"].shape[0] != pressure_bar.size:
         raise ValueError(f"{label}: elemental abundance profile does not match pressure grid.")
     if d["gravity_cm_s2"].shape != pressure_bar.shape:
         raise ValueError(f"{label}: gravity profile does not match pressure grid.")
 
-    state_indices = [d["stored_state_species"].index(name) for name in requested_state_species]
     output_indices = [d["stored_output_species"].index(name) for name in requested_output_species]
     element_order = list(config["data_spec"]["element_input_order"])
     element_indices = [d["element_input_order"].index(name) for name in element_order]
@@ -413,9 +377,7 @@ def load_raw_run(
         }
     )
     reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
-    ymix_state = ymix_state[..., state_indices]
-    ymix_output = ymix_output[..., output_indices]
-    reference_ymix_state = reference_ymix_state[..., state_indices]
+    final_ymix_output = final_ymix_output[:, output_indices]
     resampled_spectrum = resample_spectrum(
         SpectrumRecord(
             name=d["spectrum_name"],
@@ -429,11 +391,7 @@ def load_raw_run(
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
-        time_s=time_s,
-        ymix_state=ymix_state,
-        ymix_output=ymix_output,
-        reference_ymix_state=reference_ymix_state,
-        target_mode=d["target_mode"],
+        final_ymix_output=final_ymix_output,
         globals=reduced_globals,
         spectrum_name=d["spectrum_name"],
         spectrum_wavelength_nm=np.asarray(spectrum_grid_nm, dtype=np.float64),
@@ -480,13 +438,12 @@ def _normalization_payload(
     global_static_order: list[str],
     spectrum_grid_nm: np.ndarray,
 ) -> dict[str, Any]:
-    """Fit all normalization blocks for the full-VULCAN transition pipeline.
+    """Fit all normalization blocks for the full-VULCAN pipeline.
 
     Statistics are computed from ``train_runs`` only.  The returned
     dict contains blocks for: ``sequence_static`` (P, T, Kzz),
-    ``state`` (ymix input), ``target`` (ymix output),
-    ``global_static`` (conditioning scalars), ``log10_dt_s`` (time
-    step feature), and ``spectrum`` (stellar flux).
+    ``target`` (final ymix output), ``global_static`` (conditioning
+    scalars), and ``spectrum`` (stellar flux).
     """
     state_floor = float(config["normalization"]["state_floor"])
     spectrum_floor = float(config["normalization"]["spectrum_floor"])
@@ -500,9 +457,8 @@ def _normalization_payload(
         ],
         axis=0,
     )
-    state_values = np.concatenate([run.ymix_state.reshape(-1, run.ymix_state.shape[-1]) for run in train_runs], axis=0)
     target_values = np.concatenate(
-        [run.ymix_output.reshape(-1, run.ymix_output.shape[-1]) for run in train_runs],
+        [run.final_ymix_output for run in train_runs],
         axis=0,
     )
     spectrum_values = np.stack(
@@ -526,30 +482,10 @@ def _normalization_payload(
         ],
         axis=0,
     )
-    transition_sampling = effective_transition_sampling(config)
     global_methods = [
         config["normalization"]["global_methods"][name]
         for name in global_static_order
     ]
-
-    # Fit dt normalization from padded trajectory shells so each training split
-    # uses a single consistent dt feature transform.
-    dt_stats = fit_log10_dt_normalization(
-        time_s=np.stack(
-            [np.pad(run.time_s, (0, max(r.time_s.size for r in train_runs) - run.time_s.size), mode="constant") for run in train_runs],
-            axis=0,
-        ),
-        valid_steps_mask=np.stack(
-            [
-                np.pad(np.ones(run.time_s.shape, dtype=bool), (0, max(r.time_s.size for r in train_runs) - run.time_s.size), mode="constant")
-                for run in train_runs
-            ],
-            axis=0,
-        ),
-        dt_min_s=float(transition_sampling["dt_min_s"]),
-        dt_max_s=float(transition_sampling["dt_max_s"]),
-        min_future_saved_steps=int(transition_sampling["min_future_saved_steps"]),
-    )
 
     sequence_methods = config["normalization"]["sequence_methods"]
     sequence_blocks = []
@@ -570,21 +506,12 @@ def _normalization_payload(
             "feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
             "blocks": sequence_blocks,
         },
-        "state": _fit_block_by_method(
-            state_values,
-            method=config["normalization"]["state_method"],
-            floor=state_floor,
-        ),
         "target": _fit_block_by_method(
             target_values,
             method=config["normalization"]["target_method"],
             floor=state_floor,
         ),
         "global_static": _fit_mixed_block(global_static, global_methods),
-        "log10_dt_s": _fit_log10_dt_block(
-            dt_stats,
-            method=config["normalization"]["log10_dt_method"],
-        ),
         "spectrum": _fit_block_by_method(
             spectrum_values,
             method=config["normalization"]["spectrum_method"],
@@ -685,7 +612,7 @@ def _equilibrium_normalization_payload(
 ) -> dict[str, Any]:
     """Fit normalization statistics for the equilibrium model.
 
-    Simpler than the transition payload: only ``sequence_static``
+    Simpler than the full-VULCAN payload: only ``sequence_static``
     (P, T), ``target`` (equilibrium ymix), and ``global_static``
     blocks are needed — no spectrum, dt, or state trajectory blocks.
     """
@@ -949,10 +876,6 @@ def preprocess_raw_dataset(
         raw_runs = [load_raw_run(path, config=config, spectrum_grid_nm=spectrum_grid_nm) for path in raw_run_files]
     split_indices = _split_indices(len(raw_runs), config=config)
     train_runs = [raw_runs[i] for i in split_indices["train"]]
-    target_modes = {run.target_mode for run in raw_runs}
-    if len(target_modes) != 1:
-        raise ValueError(f"Raw dataset mixes multiple target modes: {sorted(target_modes)}.")
-    target_mode = target_modes.pop()
     global_static_order = list(config["data_spec"]["global_static_feature_order"])
     normalization = _normalization_payload(
         train_runs,
@@ -964,25 +887,19 @@ def preprocess_raw_dataset(
     for split_name, indices in split_indices.items():
         split_dir = ensure_dir(processed_root / split_name)
         runs = [raw_runs[i] for i in indices]
-        max_steps = max(run.time_s.size for run in runs)
         nz = runs[0].pressure_bar.size
-        state_dim = runs[0].ymix_state.shape[-1]
-        target_dim = runs[0].ymix_output.shape[-1]
+        target_dim = runs[0].final_ymix_output.shape[-1]
 
         sequence_inputs = np.zeros((len(runs), nz, 3), dtype=np.float32)
-        state_trajectories = np.zeros((len(runs), max_steps, nz, state_dim), dtype=np.float32)
-        target_outputs = np.zeros((len(runs), max_steps, nz, target_dim), dtype=np.float32)
+        target_outputs = np.zeros((len(runs), nz, target_dim), dtype=np.float32)
         global_inputs = np.zeros((len(runs), len(global_static_order)), dtype=np.float32)
         spectrum_inputs = np.zeros((len(runs), spectrum_grid_nm.size), dtype=np.float32)
-        time_s = np.zeros((len(runs), max_steps), dtype=np.float64)
-        valid_steps_mask = np.zeros((len(runs), max_steps), dtype=bool)
         run_ids: list[str] = []
 
         for idx, run in enumerate(runs):
             static = np.stack([run.pressure_bar, run.temperature_k, run.kzz_cm2_s], axis=-1)
             sequence_inputs[idx] = _apply_sequence_static_normalization(static, normalization["sequence_static"]).astype(np.float32)
-            state_trajectories[idx, : run.time_s.size] = apply_block(run.ymix_state, normalization["state"]).astype(np.float32)
-            target_outputs[idx, : run.time_s.size] = apply_block(run.ymix_output, normalization["target"]).astype(np.float32)
+            target_outputs[idx] = apply_block(run.final_ymix_output, normalization["target"]).astype(np.float32)
             static_inputs = resolve_conditioning_inputs(
                 raw_global_inputs=run.globals,
                 config=config,
@@ -991,49 +908,37 @@ def preprocess_raw_dataset(
             global_vector = np.array([static_inputs[name] for name in global_static_order], dtype=np.float64)
             global_inputs[idx] = apply_mixed_block(global_vector[None, :], normalization["global_static"])[0].astype(np.float32)
             spectrum_inputs[idx] = apply_block(run.spectrum_flux_erg_cm2_s_nm[None, :], normalization["spectrum"])[0].astype(np.float32)
-            time_s[idx, : run.time_s.size] = run.time_s
-            valid_steps_mask[idx, : run.time_s.size] = True
             run_ids.append(run.run_id)
 
         metadata = {
             "processed_data_version": PROCESSED_DATA_VERSION,
             "task_kind": task_kind(config),
             "split": split_name,
-            "target_mode": target_mode,
             "num_runs": len(runs),
             "num_levels": nz,
-            "max_steps": int(max_steps),
             "sequence_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
-            "state_species_order": list(config["data_spec"]["state_species"]),
             "output_species_order": list(config["data_spec"]["output_species"]),
             "element_input_order": list(config["data_spec"]["element_input_order"]),
             "global_feature_order": list(config["data_spec"]["global_feature_order"]),
             "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
-            "dt_feature_index": int(config["data_spec"]["dt_feature_index"]),
             "spectrum_num_bins": int(spectrum_grid_nm.size),
         }
         np.save(split_dir / "sequence_inputs.npy", sequence_inputs)
-        np.save(split_dir / "state_trajectories.npy", state_trajectories)
         np.save(split_dir / "target_outputs.npy", target_outputs)
         np.save(split_dir / "global_inputs.npy", global_inputs)
         np.save(split_dir / "spectrum_inputs.npy", spectrum_inputs)
-        np.save(split_dir / "time_s.npy", time_s)
-        np.save(split_dir / "valid_steps_mask.npy", valid_steps_mask)
         (split_dir / "run_ids.json").write_text(json.dumps(run_ids, indent=2) + "\n", encoding="utf-8")
         (split_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
     data_contract = {
         "processed_data_version": PROCESSED_DATA_VERSION,
         "task_kind": task_kind(config),
-        "target_mode": target_mode,
-        "state_species_order": list(config["data_spec"]["state_species"]),
         "output_species_order": list(config["data_spec"]["output_species"]),
         "element_input_order": list(config["data_spec"]["element_input_order"]),
         "sequence_static_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
         "global_feature_order": list(config["data_spec"]["global_feature_order"]),
         "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
-        "dt_feature_index": int(config["data_spec"]["dt_feature_index"]),
-        "sequence_dim": 3 + len(config["data_spec"]["state_species"]),
+        "sequence_dim": 3,
         "target_dim": len(config["data_spec"]["output_species"]),
         "spectrum_dim": int(spectrum_grid_nm.size),
         "spectrum_wavelength_nm": spectrum_grid_nm.tolist(),
@@ -1054,7 +959,6 @@ def preprocess_raw_dataset(
         "raw_files": manifest_for_files(raw_source_files),
         "splits": split_indices,
         "task_kind": task_kind(config),
-        "target_mode": target_mode,
         "normalization_fingerprint": fingerprint_payload(normalization),
     }
     (processed_root / "processed_manifest.json").write_text(

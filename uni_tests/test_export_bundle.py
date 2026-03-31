@@ -125,10 +125,10 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
     np.testing.assert_allclose(np.asarray(predicted_log10), expected_log10, rtol=1.0e-5, atol=1.0e-6)
 
 
-def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
+def test_exported_full_vulcan_bundle_predicts_from_physical_inputs(tmp_path):
     dims = ModelDimensions(
-        sequence_dim=5,
-        global_dim=len(ELEMENT_ORDER) + 2,
+        sequence_dim=3,
+        global_dim=len(ELEMENT_ORDER) + 1,
         spectrum_dim=4,
         target_dim=2,
         d_model=8,
@@ -153,12 +153,6 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
                 {"method": "log-standard", "mean": [8.0], "std": [0.5], "floor": 1.0e-30},
             ],
         },
-        "state": {
-            "method": "log-standard",
-            "mean": [-4.0, -5.0],
-            "std": [0.8, 1.1],
-            "floor": 1.0e-30,
-        },
         "target": {
             "method": "log-standard",
             "mean": [-6.0, -7.0],
@@ -172,11 +166,6 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
             "std": [0.2, 0.1, 0.2, 0.2, 0.2, 0.2],
             "floor": [1.0e-30] * (len(ELEMENT_ORDER) + 1),
         },
-        "log10_dt_s": {
-            "method": "standard",
-            "mean": [3.0],
-            "std": [0.5],
-        },
         "spectrum": {
             "method": "log-standard",
             "mean": [1.0, 1.2, 1.1, 0.9],
@@ -185,9 +174,7 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
         },
     }
     contract = {
-        "target_mode": "trajectory",
         "global_static_feature_order": ["gravity_cm_s2", *ELEMENT_ORDER],
-        "dt_feature_index": len(ELEMENT_ORDER) + 1,
         "spectrum_dim": 4,
         "element_input_order": list(ELEMENT_ORDER),
         "output_species_order": ["H2O", "CO"],
@@ -199,20 +186,12 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
         "data_contract": contract,
         "config": {"task": {"kind": "full_vulcan"}},
     }
-    bundle_path = export_checkpoint_payload(payload, tmp_path / "transition_export.npz")
+    bundle_path = export_checkpoint_payload(payload, tmp_path / "full_vulcan_export.npz")
     bundle = load_exported_model(bundle_path)
 
     pressure_bar = np.array([100.0, 10.0, 1.0], dtype=np.float32)
     temperature_k = np.array([1500.0, 1200.0, 950.0], dtype=np.float32)
     kzz_cm2_s = np.array([1.0e8, 1.0e8, 1.0e8], dtype=np.float32)
-    anchor_state = np.array(
-        [
-            [1.0e-4, 2.0e-6],
-            [8.0e-5, 1.5e-6],
-            [5.0e-5, 1.0e-6],
-        ],
-        dtype=np.float32,
-    )
     global_inputs = {
         "gravity_cm_s2": 900.0,
         "He_H": 8.38e-2,
@@ -222,37 +201,21 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
         "S_H": 1.60e-5,
     }
     spectrum_flux = np.array([15.0, 20.0, 18.0, 12.0], dtype=np.float32)
-    dt_s = 1.0e4
 
     static_inputs = np.stack([pressure_bar, temperature_k, kzz_cm2_s], axis=-1)
-    static_norm = _sequence_static_numpy(static_inputs, normalization["sequence_static"]["blocks"])
-    state_norm = apply_block(anchor_state, normalization["state"])
-    sequence = np.concatenate([static_norm, state_norm], axis=-1)
-    globals_static = apply_mixed_block(
+    sequence_norm = _sequence_static_numpy(static_inputs, normalization["sequence_static"]["blocks"])
+    globals_norm = apply_mixed_block(
         np.array(
             [[global_inputs["gravity_cm_s2"], *[global_inputs[name] for name in ELEMENT_ORDER]]],
             dtype=np.float64,
         ),
         normalization["global_static"],
-    )[0]
-    dt_feature = (
-        (np.log10(dt_s) - float(normalization["log10_dt_s"]["mean"][0]))
-        / float(normalization["log10_dt_s"]["std"][0])
-    )
-    dt_feature_index = int(contract["dt_feature_index"])
-    globals_full = np.concatenate(
-        [
-            globals_static[:dt_feature_index],
-            np.array([dt_feature]),
-            globals_static[dt_feature_index:],
-        ],
-        axis=0,
     )
     spectrum_norm = apply_block(spectrum_flux[None, :], normalization["spectrum"])
     expected_norm, _ = apply_model(
         params,
-        jnp.asarray(sequence[None, :, :], dtype=jnp.float32),
-        jnp.asarray(globals_full[None, :], dtype=jnp.float32),
+        jnp.asarray(sequence_norm[None, :, :], dtype=jnp.float32),
+        jnp.asarray(globals_norm, dtype=jnp.float32),
         jnp.asarray(spectrum_norm, dtype=jnp.float32),
         dims,
     )
@@ -263,23 +226,19 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
         + np.asarray(normalization["target"]["mean"], dtype=np.float64)
     )
 
-    predicted_physical = bundle.predict_transition_profile(
+    predicted_physical = bundle.predict_full_vulcan_profile(
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
-        anchor_state=anchor_state,
         global_inputs=global_inputs,
         spectrum_flux=spectrum_flux,
-        dt_s=dt_s,
     )
-    predicted_log10 = bundle.predict_transition_profile(
+    predicted_log10 = bundle.predict_full_vulcan_profile(
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
-        anchor_state=anchor_state,
         global_inputs=global_inputs,
         spectrum_flux=spectrum_flux,
-        dt_s=dt_s,
         return_log10=True,
     )
 

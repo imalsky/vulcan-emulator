@@ -133,8 +133,8 @@
     "mode": "vulcan",
     "num_runs": 2000,
     "seed": 1,
-    "overwrite": true,
-    "reuse_raw_if_present": false,
+    "overwrite": false,
+    "reuse_raw_if_present": true,
     "parallel_workers": 8
   },
   "normalization": {
@@ -160,9 +160,9 @@
   },
   "training": {
     "seed": 123,
-    "batch_size": 512,
+    "batch_size": 256,
     "epochs": 300,
-    "learning_rate": 1e-4,
+    "learning_rate": 3e-4,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
     "scheduler": {
@@ -173,10 +173,6 @@
     },
     "weight_decay": 1e-5,
     "gradient_clip": 1.0,
-    "live_sampling": {
-      "train_pairs_per_run_per_epoch": 1,
-      "eval_pairs_per_run": 1
-    },
     "loss": {
       "lambda_z": 1.0,
       "lambda_phys": 0.25
@@ -184,11 +180,11 @@
   },
   "equilibrium_only": {
     "model": {
-      "activation": "silu",
-      "d_hidden": 512,
-      "num_hidden_layers": 8,
+      "activation": "relu",
+      "d_hidden": 1024,
+      "num_hidden_layers": 16,
       "conditioning_hidden_dim": 512,
-      "film_clamp": 5.0
+      "film_clamp": 100.0
     }
   }
 }

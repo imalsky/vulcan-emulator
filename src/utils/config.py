@@ -5,9 +5,8 @@ This module is the single source of truth for config schema validation.  It:
 1. Loads a JSON config file from disk.
 2. Validates every field against its expected type, range, and task-specific
    constraints (equilibrium_only vs full_vulcan).
-3. Derives internal compatibility aliases (``model_type``, ``generation.target_mode``,
-   ``training.model``, ``roth_sampler``) so downstream code can rely on a
-   normalized, validated structure.
+3. Derives internal aliases (``model_type``, ``training.model``, ``roth_sampler``)
+   so downstream code can rely on a normalized, validated structure.
 4. Returns a dict that is safe to pass to any pipeline stage.
 
 Validation is strict and fail-fast: any schema violation raises
@@ -23,7 +22,7 @@ from typing import Any
 
 
 SUPPORTED_ATM_BASES = ("H2", "N2", "O2", "CO2", "H2O")
-SUPPORTED_PHYSICS_TOGGLES = (
+PUBLIC_PHYSICS_TOGGLES = (
     "use_photochemistry",
     "use_ion_chemistry",
     "use_eddy_diffusion",
@@ -34,23 +33,20 @@ SUPPORTED_PHYSICS_TOGGLES = (
     "use_settling",
     "use_initial_cold_trap",
     "use_sat_surface_h2o",
-    "use_lowT_limit_rates",
-    "use_adaptive_rtol",
 )
 TASK_KINDS = ("equilibrium_only", "full_vulcan")
 TASK_KIND_TO_MODEL_TYPE = {
     "equilibrium_only": "equilibrium",
-    "full_vulcan": "transition",
+    "full_vulcan": "full_vulcan",
 }
 ELEMENT_INPUT_ORDER = ("He_H", "C_H", "O_H", "N_H", "S_H")
 FULL_VULCAN_CORE_GLOBAL_INPUTS = (
     "gravity_cm_s2",
     *ELEMENT_INPUT_ORDER,
-    "log10_dt_s",
 )
 EQUILIBRIUM_CORE_GLOBAL_INPUTS = ELEMENT_INPUT_ORDER
 FULL_VULCAN_OPTIONAL_GLOBAL_INPUTS = (
-    *SUPPORTED_PHYSICS_TOGGLES,
+    *PUBLIC_PHYSICS_TOGGLES,
     *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
 )
 DEFAULT_REQUIRED_GLOBAL_INPUTS = (
@@ -78,11 +74,19 @@ DEFAULT_STATE_SPECIES = (
 )
 ALLOWED_MODEL_TYPES = tuple(sorted(set(TASK_KIND_TO_MODEL_TYPE.values())))
 _ALLOWED_SPECTRUM_ENCODERS = {"autoencoder", "linear", "none"}
-_ALLOWED_ACTIVATIONS = {"gelu", "relu", "silu"}
+_ALLOWED_ACTIVATIONS = {
+    "elu",
+    "gelu",
+    "leaky_relu",
+    "relu",
+    "selu",
+    "silu",
+    "softplus",
+    "tanh",
+}
 _ALLOWED_LR_SCHEDULERS = {"cosine", "reduce_on_plateau"}
 _ALLOWED_TEMPERATURE_PROFILE_SOURCE_MODES = {"analytic", "pt_library", "mixed"}
 _ALLOWED_NORMALIZATION_METHODS = {"standard", "log-standard", "none"}
-_ALLOWED_LOG10_DT_METHODS = {"standard", "none"}
 _ALLOWED_TEMPERATURE_PROFILE_NUMERIC_FILTER_KEYS = {
     "Teq",
     "LogMet",
@@ -96,6 +100,49 @@ _ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS = (
     _ALLOWED_TEMPERATURE_PROFILE_NUMERIC_FILTER_KEYS
     | _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS
 )
+_REMOVED_LEGACY_KEYS = {
+    "training.live_sampling": (
+        "training.live_sampling has been removed. The full-VULCAN path now trains "
+        "only on final converged outputs."
+    ),
+    "sampling.num_time_steps": (
+        "sampling.num_time_steps has been removed. Full-VULCAN raw generation no "
+        "longer stores sampled trajectories."
+    ),
+    "sampling.time_step_log10_min_s": (
+        "sampling.time_step_log10_min_s has been removed. Full-VULCAN raw generation "
+        "no longer stores sampled trajectories."
+    ),
+    "sampling.time_step_log10_max_s": (
+        "sampling.time_step_log10_max_s has been removed. Full-VULCAN raw generation "
+        "no longer stores sampled trajectories."
+    ),
+    "generation.target_mode": (
+        "generation.target_mode has been removed. task.kind now fully determines the "
+        "supported generation contract."
+    ),
+    "normalization.state_method": (
+        "normalization.state_method has been removed. Full-VULCAN training now uses "
+        "final-state targets only."
+    ),
+    "normalization.log10_dt_method": (
+        "normalization.log10_dt_method has been removed. Full-VULCAN training no "
+        "longer includes timestep control."
+    ),
+    "full_vulcan.trajectory_sampling": (
+        "full_vulcan.trajectory_sampling has been removed. The supported full-VULCAN "
+        "task is final-state-only."
+    ),
+}
+_INTERNAL_VULCAN_RUNTIME_DEFAULTS = {
+    "python_executable": "python",
+    "cfg_file": "vulcan_cfg.py",
+    "worker_root": "data/vulcan_workers",
+    "regenerate_chem_funs": False,
+    "cfg_assignments": {},
+    "use_lowT_limit_rates": True,
+    "use_adaptive_rtol": True,
+}
 
 
 class ConfigValidationError(ValueError):
@@ -107,6 +154,23 @@ def _require_keys(mapping: dict[str, Any], keys: tuple[str, ...] | list[str], sc
     missing = [key for key in keys if key not in mapping]
     if missing:
         raise ConfigValidationError(f"Missing required keys in {scope}: {missing}")
+
+
+def _nested_key_present(mapping: dict[str, Any], path: str) -> bool:
+    """Return True when a dotted config path exists in the user payload."""
+    current: Any = mapping
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
+def _reject_removed_legacy_keys(config: dict[str, Any]) -> None:
+    """Fail fast on removed config keys with targeted migration messages."""
+    for path, message in _REMOVED_LEGACY_KEYS.items():
+        if _nested_key_present(config, path):
+            raise ConfigValidationError(message)
 
 
 def _as_bool(value: Any, field: str) -> bool:
@@ -204,7 +268,7 @@ def static_conditioning_defaults(config: dict[str, Any]) -> dict[str, float]:
         return {}
     physics = config["physics_toggles"]
     runtime = config["vulcan_runtime"]
-    defaults = {name: float(bool(physics[name])) for name in SUPPORTED_PHYSICS_TOGGLES}
+    defaults = {name: float(bool(physics[name])) for name in PUBLIC_PHYSICS_TOGGLES}
     atm_base = _as_nonempty_str(runtime["atm_base"], "full_vulcan.vulcan_runtime.atm_base")
     if atm_base not in SUPPORTED_ATM_BASES:
         raise ConfigValidationError(
@@ -229,8 +293,6 @@ def resolve_conditioning_inputs(
     defaults = static_conditioning_defaults(config)
     resolved: dict[str, float] = {}
     for name in required_global_inputs:
-        if name == "log10_dt_s":
-            continue
         if name in raw_global_inputs:
             resolved[name] = float(raw_global_inputs[name])
         elif name in defaults:
@@ -243,30 +305,13 @@ def resolve_conditioning_inputs(
 
 
 def global_static_feature_order(config: dict[str, Any]) -> list[str]:
-    """Return the global feature order without the transition timestep."""
-    return [
-        name
-        for name in config["data_spec"]["required_global_inputs"]
-        if name != "log10_dt_s"
-    ]
-
-
-def global_feature_order(config: dict[str, Any]) -> list[str]:
-    """Full global feature vector order."""
+    """Return the global feature order (static conditioning inputs)."""
     return list(config["data_spec"]["required_global_inputs"])
 
 
-def effective_transition_sampling(config: dict[str, Any]) -> dict[str, float | int] | None:
-    """Return the active transition sampling settings, or None for equilibrium tasks."""
-    if is_equilibrium(config):
-        return None
-    traj = config["trajectory_sampling"]
-    return {
-        "dt_min_s": float(traj["dt_min_s"]),
-        "dt_max_s": float(traj["dt_max_s"]),
-        "min_future_saved_steps": int(traj["min_future_saved_steps"]),
-        "num_logdt_bins": int(traj["num_logdt_bins"]),
-    }
+def global_feature_order(config: dict[str, Any]) -> list[str]:
+    """Full global feature vector order (identical to static order)."""
+    return list(config["data_spec"]["required_global_inputs"])
 
 
 def _validate_equilibrium_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
@@ -297,7 +342,7 @@ def _validate_equilibrium_model_config(model: dict[str, Any], scope: str) -> dic
     return normalized
 
 
-def _validate_transition_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
+def _validate_full_vulcan_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
     """Validate the full-VULCAN transformer config section."""
     _require_keys(
         model,
@@ -669,6 +714,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
+    _reject_removed_legacy_keys(config)
 
     kind = _task_kind(config)
     equilibrium = kind == "equilibrium_only"
@@ -751,9 +797,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         required_sampling += [
             "gravity_range_cm_s2",
             "kzz_cm2_s",
-            "num_time_steps",
-            "time_step_log10_min_s",
-            "time_step_log10_max_s",
         ]
     _require_keys(sampling, required_sampling, "sampling")
     sampling["num_levels"] = _as_int(sampling["num_levels"], "sampling.num_levels")
@@ -789,27 +832,9 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             raise ConfigValidationError(f"sampling.{key} must be strictly increasing.")
         sampling[key] = [low, high]
     if not equilibrium:
-        sampling["num_time_steps"] = _as_int(
-            sampling["num_time_steps"],
-            "sampling.num_time_steps",
-        )
-        if sampling["num_time_steps"] < 3:
-            raise ConfigValidationError("sampling.num_time_steps must be >= 3.")
         sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
         if sampling["kzz_cm2_s"] <= 0.0:
             raise ConfigValidationError("sampling.kzz_cm2_s must be positive.")
-        sampling["time_step_log10_min_s"] = _as_float(
-            sampling["time_step_log10_min_s"],
-            "sampling.time_step_log10_min_s",
-        )
-        sampling["time_step_log10_max_s"] = _as_float(
-            sampling["time_step_log10_max_s"],
-            "sampling.time_step_log10_max_s",
-        )
-        if not sampling["time_step_log10_min_s"] < sampling["time_step_log10_max_s"]:
-            raise ConfigValidationError(
-                "sampling.time_step_log10_min_s must be smaller than sampling.time_step_log10_max_s."
-            )
 
     config["temperature_profiles"] = _validate_temperature_profiles(config["temperature_profiles"])
 
@@ -837,7 +862,16 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("generation.num_runs must be >= 1.")
     if generation["parallel_workers"] < 1:
         raise ConfigValidationError("generation.parallel_workers must be >= 1.")
-    generation["target_mode"] = "equilibrium_only" if equilibrium else "trajectory"
+    backfill = generation.get("backfill", {"enabled": True, "max_retries": 3})
+    if not isinstance(backfill, dict):
+        raise ConfigValidationError("generation.backfill must be a mapping.")
+    backfill["enabled"] = _as_bool(backfill.get("enabled", True), "generation.backfill.enabled")
+    backfill["max_retries"] = _as_int(
+        backfill.get("max_retries", 3), "generation.backfill.max_retries"
+    )
+    if backfill["max_retries"] < 0:
+        raise ConfigValidationError("generation.backfill.max_retries must be >= 0.")
+    generation["backfill"] = backfill
 
     normalization = config["normalization"]
     required_normalization_keys = [
@@ -849,7 +883,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     ]
     if not equilibrium:
         required_normalization_keys.extend(
-            ["spectrum_floor", "state_method", "log10_dt_method", "spectrum_method"]
+            ["spectrum_floor", "spectrum_method"]
         )
     _require_keys(normalization, required_normalization_keys, "normalization")
     normalization["split"] = _validate_split(normalization["split"])
@@ -897,18 +931,9 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             f"normalization.global_methods.{key}",
         )
     if not equilibrium:
-        normalization["state_method"] = _normalized_method_name(
-            normalization["state_method"],
-            "normalization.state_method",
-        )
         normalization["spectrum_method"] = _normalized_method_name(
             normalization["spectrum_method"],
             "normalization.spectrum_method",
-        )
-        normalization["log10_dt_method"] = _normalized_method_name(
-            normalization["log10_dt_method"],
-            "normalization.log10_dt_method",
-            allowed=_ALLOWED_LOG10_DT_METHODS,
         )
 
     training = config["training"]
@@ -923,7 +948,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             "warmup_epochs",
             "weight_decay",
             "gradient_clip",
-            "live_sampling",
             "loss",
         ],
         "training",
@@ -944,22 +968,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("training.min_lr cannot exceed training.learning_rate.")
     if training["gradient_clip"] <= 0.0:
         raise ConfigValidationError("training.gradient_clip must be positive.")
-    live = training["live_sampling"]
-    _require_keys(
-        live,
-        ["train_pairs_per_run_per_epoch", "eval_pairs_per_run"],
-        "training.live_sampling",
-    )
-    live["train_pairs_per_run_per_epoch"] = _as_int(
-        live["train_pairs_per_run_per_epoch"],
-        "training.live_sampling.train_pairs_per_run_per_epoch",
-    )
-    live["eval_pairs_per_run"] = _as_int(
-        live["eval_pairs_per_run"],
-        "training.live_sampling.eval_pairs_per_run",
-    )
-    if live["train_pairs_per_run_per_epoch"] < 1 or live["eval_pairs_per_run"] < 1:
-        raise ConfigValidationError("live sampling budgets must be >= 1.")
     loss = training["loss"]
     loss_required = ["lambda_z", "lambda_phys"]
     if not equilibrium:
@@ -1003,12 +1011,11 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 "physics_toggles",
                 "vulcan_runtime",
                 "stellar_spectrum",
-                "trajectory_sampling",
             ],
             "full_vulcan",
         )
         physics = section["physics_toggles"]
-        for name in SUPPORTED_PHYSICS_TOGGLES:
+        for name in PUBLIC_PHYSICS_TOGGLES:
             physics[name] = _as_bool(
                 physics.get(name, False),
                 f"full_vulcan.physics_toggles.{name}",
@@ -1017,36 +1024,15 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         _require_keys(
             runtime,
             [
-                "python_executable",
-                "cfg_file",
                 "chemistry_file",
-                "worker_root",
-                "regenerate_chem_funs",
                 "atm_base",
                 "t_cross_sp",
-                "cfg_assignments",
             ],
             "full_vulcan.vulcan_runtime",
-        )
-        runtime["python_executable"] = _as_nonempty_str(
-            runtime["python_executable"],
-            "full_vulcan.vulcan_runtime.python_executable",
-        )
-        runtime["cfg_file"] = _as_nonempty_str(
-            runtime["cfg_file"],
-            "full_vulcan.vulcan_runtime.cfg_file",
         )
         runtime["chemistry_file"] = _as_nonempty_str(
             runtime["chemistry_file"],
             "full_vulcan.vulcan_runtime.chemistry_file",
-        )
-        runtime["worker_root"] = _as_nonempty_str(
-            runtime["worker_root"],
-            "full_vulcan.vulcan_runtime.worker_root",
-        )
-        runtime["regenerate_chem_funs"] = _as_bool(
-            runtime["regenerate_chem_funs"],
-            "full_vulcan.vulcan_runtime.regenerate_chem_funs",
         )
         runtime["atm_base"] = _as_nonempty_str(
             runtime["atm_base"],
@@ -1061,10 +1047,48 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             runtime["t_cross_sp"],
             "full_vulcan.vulcan_runtime.t_cross_sp",
         )
-        if not isinstance(runtime["cfg_assignments"], dict):
+        runtime["python_executable"] = _as_nonempty_str(
+            runtime.get("python_executable", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["python_executable"]),
+            "full_vulcan.vulcan_runtime.python_executable",
+        )
+        runtime["cfg_file"] = _as_nonempty_str(
+            runtime.get("cfg_file", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["cfg_file"]),
+            "full_vulcan.vulcan_runtime.cfg_file",
+        )
+        runtime["worker_root"] = _as_nonempty_str(
+            runtime.get("worker_root", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["worker_root"]),
+            "full_vulcan.vulcan_runtime.worker_root",
+        )
+        runtime["regenerate_chem_funs"] = _as_bool(
+            runtime.get(
+                "regenerate_chem_funs",
+                _INTERNAL_VULCAN_RUNTIME_DEFAULTS["regenerate_chem_funs"],
+            ),
+            "full_vulcan.vulcan_runtime.regenerate_chem_funs",
+        )
+        cfg_assignments = runtime.get(
+            "cfg_assignments",
+            _INTERNAL_VULCAN_RUNTIME_DEFAULTS["cfg_assignments"],
+        )
+        if not isinstance(cfg_assignments, dict):
             raise ConfigValidationError(
                 "full_vulcan.vulcan_runtime.cfg_assignments must be a mapping."
             )
+        runtime["cfg_assignments"] = dict(cfg_assignments)
+        runtime["use_lowT_limit_rates"] = _as_bool(
+            runtime.get(
+                "use_lowT_limit_rates",
+                _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_lowT_limit_rates"],
+            ),
+            "full_vulcan.vulcan_runtime.use_lowT_limit_rates",
+        )
+        runtime["use_adaptive_rtol"] = _as_bool(
+            runtime.get(
+                "use_adaptive_rtol",
+                _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_adaptive_rtol"],
+            ),
+            "full_vulcan.vulcan_runtime.use_adaptive_rtol",
+        )
         spectrum = section["stellar_spectrum"]
         _require_keys(
             spectrum,
@@ -1154,56 +1178,18 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             raise ConfigValidationError(
                 "full_vulcan.stellar_spectrum.zenith_angle_deg must lie in [0, 90)."
             )
-        traj = section["trajectory_sampling"]
-        _require_keys(
-            traj,
-            ["dt_min_s", "dt_max_s", "min_future_saved_steps", "num_logdt_bins"],
-            "full_vulcan.trajectory_sampling",
-        )
-        traj["dt_min_s"] = _as_float(
-            traj["dt_min_s"],
-            "full_vulcan.trajectory_sampling.dt_min_s",
-        )
-        traj["dt_max_s"] = _as_float(
-            traj["dt_max_s"],
-            "full_vulcan.trajectory_sampling.dt_max_s",
-        )
-        traj["min_future_saved_steps"] = _as_int(
-            traj["min_future_saved_steps"],
-            "full_vulcan.trajectory_sampling.min_future_saved_steps",
-        )
-        traj["num_logdt_bins"] = _as_int(
-            traj["num_logdt_bins"],
-            "full_vulcan.trajectory_sampling.num_logdt_bins",
-        )
-        if traj["dt_min_s"] <= 0.0 or traj["dt_max_s"] <= 0.0:
-            raise ConfigValidationError("trajectory_sampling dt bounds must be positive.")
-        if traj["dt_min_s"] >= traj["dt_max_s"]:
-            raise ConfigValidationError(
-                "full_vulcan.trajectory_sampling.dt_min_s must be < dt_max_s."
-            )
-        if traj["min_future_saved_steps"] < 1:
-            raise ConfigValidationError(
-                "full_vulcan.trajectory_sampling.min_future_saved_steps must be >= 1."
-            )
-        if traj["num_logdt_bins"] < 1:
-            raise ConfigValidationError(
-                "full_vulcan.trajectory_sampling.num_logdt_bins must be >= 1."
-            )
-        section["model"] = _validate_transition_model_config(
+        section["model"] = _validate_full_vulcan_model_config(
             section["model"],
             "full_vulcan.model",
         )
         section["physics_toggles"] = physics
         section["vulcan_runtime"] = runtime
         section["stellar_spectrum"] = spectrum
-        section["trajectory_sampling"] = traj
         config["full_vulcan"] = section
         config["training"]["model"] = dict(section["model"])
         config["physics_toggles"] = dict(physics)
         config["vulcan_runtime"] = dict(runtime)
         config["stellar_spectrum"] = dict(spectrum)
-        config["trajectory_sampling"] = dict(traj)
         config["roth_sampler"] = {
             "enabled": config["temperature_profiles"]["source_mode"] in {"pt_library", "mixed"},
             "source_mode": (
@@ -1226,7 +1212,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "scheduler": training["scheduler"],
         "weight_decay": training["weight_decay"],
         "gradient_clip": training["gradient_clip"],
-        "live_sampling": training["live_sampling"],
         "model": training["model"],
         "loss": training["loss"],
     }
@@ -1246,10 +1231,4 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         ]
     config["data_spec"]["global_static_feature_order"] = global_static_feature_order(config)
     config["data_spec"]["global_feature_order"] = global_feature_order(config)
-    if equilibrium:
-        config["data_spec"]["dt_feature_index"] = None
-    else:
-        config["data_spec"]["dt_feature_index"] = config["data_spec"]["global_feature_order"].index(
-            "log10_dt_s"
-        )
     return config

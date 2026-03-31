@@ -6,15 +6,21 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+from src.utils.numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 
-
-_ROOT = Path(__file__).resolve().parents[1]
-_STYLE = _ROOT / "extras" / "plots" / "paper.mplstyle"
+_STYLE = _ROOT / "extras" / "science.mplstyle"
 
 CONFIG_PATH = _ROOT / "config" / "equilibrium_only_config.json"
 PROCESSED_ROOT_OVERRIDE: Path | None = None

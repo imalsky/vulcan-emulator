@@ -224,7 +224,7 @@ def sinusoidal_position_encoding(length: int, dim: int, dtype: jnp.dtype = jnp.f
 
 
 def init_model_params(key: jax.Array, dims: ModelDimensions) -> dict[str, Any]:
-    """Allocate and Xavier-initialize all transition Transformer parameters.
+    """Allocate and Xavier-initialize all full-VULCAN Transformer parameters.
 
     Splits the PRNG key into enough sub-keys for every linear layer and
     LayerNorm in the model.  The key budget is:
@@ -436,9 +436,14 @@ def init_equilibrium_mlp_params(
 def _resolve_activation(name: str):
     """Return the JAX activation function for the given name."""
     activations = {
+        "elu": jax.nn.elu,
         "gelu": jax.nn.gelu,
+        "leaky_relu": jax.nn.leaky_relu,
         "relu": jax.nn.relu,
+        "selu": jax.nn.selu,
         "silu": jax.nn.silu,
+        "softplus": jax.nn.softplus,
+        "tanh": jnp.tanh,
     }
     try:
         return activations[name]
@@ -510,7 +515,7 @@ def apply_model(
     spectrum_inputs: jax.Array,
     dims: ModelDimensions,
 ) -> tuple[jax.Array, dict[str, jax.Array | None]]:
-    """Run the transition Transformer forward pass in normalized space.
+    """Run the full-VULCAN Transformer forward pass in normalized space.
 
     Architecture flow:
     1. Encode the stellar spectrum into a latent vector.

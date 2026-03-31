@@ -9,7 +9,7 @@ This module provides two main capabilities:
 
 2. **Physical-unit inference**: ``ExportedJAXModel`` wraps the exported
    bundle and provides ``predict_equilibrium_profile()`` and
-   ``predict_transition_profile()`` methods that accept raw physical
+   ``predict_full_vulcan_profile()`` methods that accept raw physical
    inputs (pressure in bar, temperature in K, etc.), normalize them
    internally, run the JAX forward pass, and return predictions in
    physical space (mixing ratios or log10 mixing ratios).
@@ -177,15 +177,6 @@ def _ordered_feature_vector(
     return arr
 
 
-def _normalize_log10_dt_s(dt_s: float | jax.Array | np.ndarray, block: dict[str, Any]) -> jax.Array:
-    """Normalize a physical timestep by taking log10 before applying the fitted affine block."""
-    dt = jnp.asarray(dt_s, dtype=jnp.float32)
-    if dt.ndim != 0:
-        raise ValueError(f"dt_s must be a scalar, got shape {tuple(dt.shape)}.")
-    mean = jnp.asarray(float(block["mean"][0]), dtype=dt.dtype)
-    std = jnp.asarray(float(block["std"][0]), dtype=dt.dtype)
-    return (jnp.log10(jnp.maximum(dt, 1.0e-30)) - mean) / std
-
 
 def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) -> Path:
     """Write one checkpoint payload to a portable NPZ bundle."""
@@ -342,23 +333,20 @@ class ExportedJAXModel:
             return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
         return inverse_block_jax(pred_norm, self.normalization["target"])
 
-    def predict_transition_profile(
+    def predict_full_vulcan_profile(
         self,
         *,
         pressure_bar: jax.Array | np.ndarray,
         temperature_k: jax.Array | np.ndarray,
         kzz_cm2_s: jax.Array | np.ndarray,
-        anchor_state: jax.Array | np.ndarray,
         global_inputs: dict[str, float] | jax.Array | np.ndarray,
         spectrum_flux: jax.Array | np.ndarray,
-        dt_s: float | jax.Array | np.ndarray,
         return_log10: bool = False,
     ) -> jax.Array:
-        """Run transition-model inference directly from physical-unit inputs.
+        """Run full-VULCAN inference directly from physical-unit inputs.
 
-        Bakes in all normalization: sequence-static features (pressure,
-        temperature, Kzz), anchor mixing-ratio state, global conditioning
-        (including log10(dt_s) insertion), and stellar spectrum normalization.
+        Normalizes sequence-static features (pressure, temperature, Kzz),
+        global conditioning scalars, and stellar spectrum internally.
         Predictions are inverse-normalized back to physical mixing ratios.
 
         Parameters
@@ -369,16 +357,12 @@ class ExportedJAXModel:
             Temperature profile in Kelvin, shape ``(nz,)``.
         kzz_cm2_s : array-like
             Eddy diffusion coefficient in cm^2/s, shape ``(nz,)``.
-        anchor_state : array-like
-            Anchor mixing ratios in physical space, shape ``(nz, state_dim)``.
         global_inputs : dict or array-like
             Global conditioning scalars (gravity, FastChem-native
             hydrogen-normalized elemental abundances ``n_X / n_H``, plus any
             physics toggles and atmosphere-base flags).
         spectrum_flux : array-like
             Stellar spectrum flux values, shape ``(spectrum_dim,)``.
-        dt_s : float or scalar array
-            Physical timestep in seconds (anchor to target).
         return_log10 : bool
             If True, return log10 mixing ratios instead of linear.
 
@@ -388,19 +372,16 @@ class ExportedJAXModel:
             Predicted mixing ratios, shape ``(nz, target_dim)``.
         """
         if self.is_equilibrium:
-            raise ValueError("predict_transition_profile requires a transition export bundle.")
+            raise ValueError("predict_full_vulcan_profile requires a full_vulcan export bundle.")
 
         pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
         temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
         kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)
-        state = jnp.asarray(anchor_state, dtype=jnp.float32)
         spectrum = jnp.asarray(spectrum_flux, dtype=jnp.float32)
         if pressure.ndim != 1 or temperature.ndim != 1 or kzz.ndim != 1:
             raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must be 1-D arrays.")
         if not (pressure.shape == temperature.shape == kzz.shape):
             raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must share the same shape.")
-        if state.ndim != 2 or state.shape[0] != pressure.shape[0]:
-            raise ValueError("anchor_state must have shape (nz, state_dim).")
         if spectrum.ndim != 1 or spectrum.shape[0] != int(self.data_contract["spectrum_dim"]):
             raise ValueError(
                 "spectrum_flux must be a 1-D array with length "
@@ -408,34 +389,26 @@ class ExportedJAXModel:
             )
 
         static_inputs = jnp.stack([pressure, temperature, kzz], axis=-1)  # shape: (nz, 3)
-        static_norm = _apply_sequence_static_block_jax(
+        sequence = _apply_sequence_static_block_jax(
             static_inputs,
             self.normalization["sequence_static"],
-        )
-        state_norm = apply_block_jax(state, self.normalization["state"])
-        sequence = jnp.concatenate([static_norm, state_norm], axis=-1)[None, :, :]
+        )[None, :, :]  # shape: (1, nz, 3)
 
         global_vector = _ordered_feature_vector(
             global_inputs,
             list(self.data_contract["global_static_feature_order"]),
             field_name="global_inputs",
         )
-        static_globals = apply_mixed_block_jax(
-            global_vector,
+        globals_norm = apply_mixed_block_jax(
+            global_vector[None, :],
             self.normalization["global_static"],
-        )
-        dt_feature = _normalize_log10_dt_s(dt_s, self.normalization["log10_dt_s"])[None]
-        dt_index = int(self.data_contract["dt_feature_index"])
-        globals_full = jnp.concatenate(
-            [static_globals[:dt_index], dt_feature, static_globals[dt_index:]],
-            axis=0,
-        )[None, :]
+        )  # shape: (1, global_dim)
 
         spectrum_norm = apply_block_jax(spectrum[None, :], self.normalization["spectrum"])
         pred_norm, _ = apply_model(
             self.params,
             sequence,
-            globals_full,
+            globals_norm,
             spectrum_norm,
             self.dims,
         )
@@ -453,7 +426,7 @@ def load_exported_model(
     """Load an exported NPZ bundle and return an ``ExportedJAXModel`` instance.
 
     Automatically detects whether the bundle contains an equilibrium MLP or
-    a transition Transformer based on the presence of ``d_hidden`` in the
+    a full-VULCAN Transformer based on the presence of ``d_hidden`` in the
     serialized model dimensions.
 
     Parameters
@@ -468,7 +441,7 @@ def load_exported_model(
     -------
     ExportedJAXModel
         Ready-to-use model with ``predict_equilibrium_profile()`` or
-        ``predict_transition_profile()`` methods.
+        ``predict_full_vulcan_profile()`` methods.
     """
     bundle = Path(bundle_path)
     with np.load(bundle, allow_pickle=False) as arrays:

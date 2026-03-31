@@ -5,9 +5,9 @@ This module provides the complete training pipeline for both emulator tasks:
 - **Equilibrium MLP** (``train_equilibrium_model``): Trains a FiLM-conditioned
   per-level MLP on (P, T, globals) -> equilibrium mixing ratios.
 
-- **Transition Transformer** (``train_model`` dispatching to the non-equilibrium
-  path): Trains a FiLM-conditioned Transformer on atmospheric columns with
-  timestep conditioning and stellar spectrum inputs.
+- **Full-VULCAN Transformer** (``train_full_vulcan_model``): Trains a
+  FiLM-conditioned Transformer on (P, T, Kzz, globals, spectrum) ->
+  final converged VULCAN mixing ratios.
 
 Both paths share the same optimizer (AdamW with decoupled weight decay),
 gradient clipping (global L2 norm), and checkpointing logic (save best by
@@ -36,26 +36,20 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..data_generation.data_loader import (
-    EquilibriumSplit,
-    iter_batches,
     iter_equilibrium_batches,
+    iter_full_vulcan_batches,
     load_equilibrium_dataset,
-    load_processed_dataset,
+    load_full_vulcan_dataset,
 )
 from ..data_generation.generation import generate_raw_dataset
 from ..data_generation.preprocess import PROCESSED_DATA_VERSION, preprocess_raw_dataset
-from ..data_generation.transition_sampling import (
-    build_candidate_table,
-    sample_eval_rows,
-    sample_train_rows,
-)
 from ..models.jax_model import (
     apply_equilibrium_mlp,
     apply_model,
     count_parameters,
     initialize_model,
 )
-from ..utils.config import effective_transition_sampling, is_equilibrium, task_kind
+from ..utils.config import is_equilibrium, task_kind
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
@@ -338,14 +332,14 @@ def make_train_eval_functions(
     gradient_clip: float,
     weight_decay: float,
 ):
-    """Build the transition-model JIT train/eval functions."""
+    """Build the full-VULCAN JIT train/eval functions."""
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
     def train_step(params, opt_state, batch, learning_rate):
-        """Run one optimizer step for the transition model."""
+        """Run one optimizer step for the full-VULCAN model."""
         def loss_fn(model_params):
-            """Compute the weighted transition-training loss and metrics."""
+            """Compute the weighted full-VULCAN training loss and metrics."""
             pred, aux = apply_model(
                 model_params,
                 batch["sequence"],
@@ -391,7 +385,7 @@ def make_train_eval_functions(
 
     @jax.jit
     def eval_step(params, batch):
-        """Evaluate the transition model on one batch without updates."""
+        """Evaluate the full-VULCAN model on one batch without updates."""
         pred, aux = apply_model(
             params,
             batch["sequence"],
@@ -438,6 +432,49 @@ def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
     }
 
 
+def _feature_order_matches(contract: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Return True when processed feature orders still match the active config."""
+    expected_sequence = list(config["data_spec"]["sequence_static_feature_order"])
+    expected_globals = list(config["data_spec"]["global_static_feature_order"])
+    return (
+        list(contract.get("sequence_static_feature_order", [])) == expected_sequence
+        and list(contract.get("global_static_feature_order", [])) == expected_globals
+    )
+
+
+def _format_epoch_log(
+    *,
+    epoch: int,
+    epochs: int,
+    train_summary: dict[str, float],
+    val_summary: dict[str, float],
+    learning_rate: float,
+    epoch_seconds: float,
+    train_steps: int,
+    val_steps: int,
+    include_spectrum: bool,
+) -> str:
+    """Format one compact, high-signal epoch log line."""
+    parts = [
+        f"Epoch {epoch:3d}/{epochs:3d}",
+        f"loss {train_summary['combined_loss']:.4e}/{val_summary['combined_loss']:.4e}",
+        f"z {train_summary['mse_norm']:.4e}/{val_summary['mse_norm']:.4e}",
+        f"log10 {train_summary['mse_log10']:.4e}/{val_summary['mse_log10']:.4e}",
+    ]
+    if include_spectrum:
+        parts.append(
+            f"spec {train_summary['spectrum_recon_mse']:.4e}/{val_summary['spectrum_recon_mse']:.4e}"
+        )
+    parts.extend(
+        [
+            f"lr {learning_rate:.4e}",
+            f"steps {train_steps}/{val_steps}",
+            f"{epoch_seconds:.3f}s",
+        ]
+    )
+    return " | ".join(parts)
+
+
 def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
     """Ensure the processed dataset exists and matches the active config."""
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
@@ -448,6 +485,7 @@ def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
             version_ok = int(contract.get("processed_data_version", -1)) == PROCESSED_DATA_VERSION
             task_ok = str(contract.get("task_kind", "")).lower() == task_kind(config)
+            feature_order_ok = _feature_order_matches(contract, config)
             if equilibrium:
                 mode_ok = contract.get("model_type") == "equilibrium"
                 required_files_ok = all(
@@ -455,14 +493,13 @@ def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
                     for split in ("train", "val", "test")
                 )
             else:
-                mode_ok = str(contract.get("target_mode", "")).lower() == str(
-                    config["generation"]["target_mode"]
-                ).lower()
+                mode_ok = True
                 required_files_ok = all(
-                    (processed_root / split / "state_trajectories.npy").exists()
+                    (processed_root / split / "target_outputs.npy").exists()
                     for split in ("train", "val", "test")
                 )
-            if version_ok and task_ok and mode_ok and required_files_ok:
+            if version_ok and task_ok and feature_order_ok and mode_ok and required_files_ok:
+                LOGGER.info("Using existing processed dataset at %s", processed_root)
                 return processed_root
         except (OSError, ValueError, TypeError):
             pass
@@ -627,6 +664,14 @@ def train_equilibrium_model(
     steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
     warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
     total_steps = epochs * steps_per_epoch
+    LOGGER.info(
+        "Training equilibrium model from %s | runs train/val/test=%d/%d/%d | steps/epoch=%d",
+        processed_root,
+        train_split.num_runs,
+        val_split.num_runs,
+        test_split.num_runs,
+        steps_per_epoch,
+    )
 
     rng = np.random.default_rng(int(config["training"]["seed"]))
 
@@ -634,6 +679,7 @@ def train_equilibrium_model(
         epoch_t0 = time.monotonic()
         train_batches = iter_equilibrium_batches(train_split, batch_size=batch_size, rng=rng)
         train_metrics_epoch: list[dict[str, float]] = []
+        train_steps = 0
 
         for batch in train_batches:
             lr = _scheduled_learning_rate(
@@ -652,15 +698,18 @@ def train_equilibrium_model(
             )
             train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
             global_step += 1
+            train_steps += 1
 
         # Validation.
         val_batches = iter_equilibrium_batches(val_split, batch_size=batch_size, rng=rng)
         val_metrics_epoch: list[dict[str, float]] = []
+        val_steps = 0
         for batch in val_batches:
             # Evaluation uses the same device transfer path without optimizer updates.
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
             metrics = eval_step(params, device_batch)
             val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            val_steps += 1
 
         epoch_dt = time.monotonic() - epoch_t0
         train_summary = _mean_metrics(train_metrics_epoch)
@@ -673,12 +722,31 @@ def train_equilibrium_model(
             warmup_steps=warmup_steps,
             min_lr=min_lr,
         )
-        record = {"epoch": epoch + 1, "train": train_summary, "val": val_summary}
+        current_lr = float(
+            plateau_state.current_lr if plateau_state is not None and scheduler["name"] == "reduce_on_plateau" else lr
+        )
+        record = {
+            "epoch": epoch + 1,
+            "learning_rate": current_lr,
+            "epoch_seconds": float(epoch_dt),
+            "train_steps": train_steps,
+            "val_steps": val_steps,
+            "train": train_summary,
+            "val": val_summary,
+        }
         history.append(record)
         LOGGER.info(
-            "Epoch %d/%d  train=%.4e  val=%.4e  lr=%.4e  %.1fs",
-            epoch + 1, epochs, train_summary["combined_loss"], val_summary["combined_loss"],
-            lr, epoch_dt,
+            _format_epoch_log(
+                epoch=epoch + 1,
+                epochs=epochs,
+                train_summary=train_summary,
+                val_summary=val_summary,
+                learning_rate=current_lr,
+                epoch_seconds=epoch_dt,
+                train_steps=train_steps,
+                val_steps=val_steps,
+                include_spectrum=False,
+            )
         )
 
         current_payload = _checkpoint_payload(
@@ -726,43 +794,26 @@ def train_equilibrium_model(
     )
 
 
-def train_model(
+def train_full_vulcan_model(
     config: dict[str, Any],
     *,
     project_root: Path,
 ) -> TrainingArtifacts:
-    """Train the active model family (equilibrium MLP or transition Transformer).
+    """Train the full-VULCAN chemistry emulator (FiLM-Transformer).
 
-    Dispatches to ``train_equilibrium_model`` for equilibrium tasks.  For
-    full-VULCAN tasks, builds candidate transition-pair tables, trains the
-    Transformer with live per-epoch sampling, and evaluates on held-out data.
+    Full pipeline: ensure processed data exists, load splits, initialize
+    model, train with AdamW plus the configured LR schedule, save best/last
+    checkpoints, evaluate on test split, and write history + metrics.
     """
-    if is_equilibrium(config):
-        return train_equilibrium_model(config, project_root=project_root)
     processed_root = _ensure_processed(config, project_root=project_root)
-    splits, normalization, contract = load_processed_dataset(processed_root)
+    splits, normalization, contract = load_full_vulcan_dataset(processed_root)
 
     train_split = splits["train"]
     val_split = splits["val"]
-    test_split = splits["test"]
-
-    dt_stats = {
-        "mean": float(normalization["log10_dt_s"]["mean"][0]),
-        "std": float(normalization["log10_dt_s"]["std"][0]),
-    }
-    transition_sampling = effective_transition_sampling(config)
-    candidate_common = {
-        "dt_min_s": float(transition_sampling["dt_min_s"]),
-        "dt_max_s": float(transition_sampling["dt_max_s"]),
-        "min_future_saved_steps": int(transition_sampling["min_future_saved_steps"]),
-        "log10_dt_stats": dt_stats,
-    }
-    train_candidates = build_candidate_table(train_split.time_s, train_split.valid_steps_mask, **candidate_common)
-    val_candidates = build_candidate_table(val_split.time_s, val_split.valid_steps_mask, **candidate_common)
-    test_candidates = build_candidate_table(test_split.time_s, test_split.valid_steps_mask, **candidate_common)
+    test_split = splits.get("test", val_split)
 
     dims, params = initialize_model(config, contract, seed=int(config["training"]["seed"]))
-    LOGGER.info("Initialized model with %d parameters.", count_parameters(params))
+    LOGGER.info("Initialized full-VULCAN model with %d parameters.", count_parameters(params))
     opt_state = _init_adamw_state(params)
     train_step, eval_step = make_train_eval_functions(
         dims=dims,
@@ -775,20 +826,8 @@ def train_model(
     checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
     ensure_dir(checkpoints_root)
 
-    eval_pairs = int(config["training"]["live_sampling"]["eval_pairs_per_run"])
-    val_rows = sample_eval_rows(
-        val_candidates,
-        pairs_per_run=eval_pairs,
-        num_logdt_bins=int(transition_sampling["num_logdt_bins"]),
-        seed=int(config["training"]["seed"]) + 1,
-    )
-    test_rows = sample_eval_rows(
-        test_candidates,
-        pairs_per_run=eval_pairs,
-        num_logdt_bins=int(transition_sampling["num_logdt_bins"]),
-        seed=int(config["training"]["seed"]) + 2,
-    )
-
+    batch_size = int(config["training"]["batch_size"])
+    epochs = int(config["training"]["epochs"])
     history: list[dict[str, Any]] = []
     best_payload: dict[str, Any] | None = None
     best_val = float("inf")
@@ -802,39 +841,25 @@ def train_model(
         else None
     )
 
-    # Pre-compute LR schedule parameters (row count is constant across epochs).
-    _initial_rows = sample_train_rows(
-        train_candidates,
-        pairs_per_run=int(config["training"]["live_sampling"]["train_pairs_per_run_per_epoch"]),
-        num_logdt_bins=int(transition_sampling["num_logdt_bins"]),
-        seed=int(config["training"]["seed"]),
-        epoch=0,
-    )
-    steps_per_epoch = max(
-        (len(_initial_rows) + int(config["training"]["batch_size"]) - 1)
-        // int(config["training"]["batch_size"]),
-        1,
-    )
+    steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
     warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
-    total_steps = int(config["training"]["epochs"]) * steps_per_epoch
-    del _initial_rows
+    total_steps = epochs * steps_per_epoch
+    LOGGER.info(
+        "Training full-VULCAN model from %s | runs train/val/test=%d/%d/%d | steps/epoch=%d",
+        processed_root,
+        train_split.num_runs,
+        val_split.num_runs,
+        test_split.num_runs,
+        steps_per_epoch,
+    )
 
-    for epoch in range(int(config["training"]["epochs"])):
+    rng = np.random.default_rng(int(config["training"]["seed"]))
+
+    for epoch in range(epochs):
         epoch_t0 = time.monotonic()
-        train_rows = sample_train_rows(
-            train_candidates,
-            pairs_per_run=int(config["training"]["live_sampling"]["train_pairs_per_run_per_epoch"]),
-            num_logdt_bins=int(transition_sampling["num_logdt_bins"]),
-            seed=int(config["training"]["seed"]),
-            epoch=epoch,
-        )
-        train_batches = iter_batches(
-            train_split,
-            train_candidates,
-            train_rows,
-            batch_size=int(config["training"]["batch_size"]),
-        )
+        train_batches = iter_full_vulcan_batches(train_split, batch_size=batch_size, rng=rng)
         train_metrics_epoch: list[dict[str, float]] = []
+        train_steps = 0
 
         for batch in train_batches:
             lr = _scheduled_learning_rate(
@@ -846,29 +871,23 @@ def train_model(
                 scheduler=scheduler,
                 plateau_state=plateau_state,
             )
-            device_batch = {
-                key: jnp.asarray(value)
-                for key, value in batch.items()
-                if key != "row_indices"
-            }
+            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
             params, opt_state, metrics = train_step(
-                params,
-                opt_state,
-                device_batch,
-                jnp.asarray(lr, dtype=jnp.float32),
+                params, opt_state, device_batch, jnp.asarray(lr, dtype=jnp.float32),
             )
             train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
             global_step += 1
+            train_steps += 1
 
+        # Validation.
+        val_batches = iter_full_vulcan_batches(val_split, batch_size=batch_size, rng=rng)
         val_metrics_epoch: list[dict[str, float]] = []
-        for batch in iter_batches(val_split, val_candidates, val_rows, batch_size=int(config["training"]["batch_size"])):
-            device_batch = {
-                key: jnp.asarray(value)
-                for key, value in batch.items()
-                if key != "row_indices"
-            }
+        val_steps = 0
+        for batch in val_batches:
+            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
             metrics = eval_step(params, device_batch)
             val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            val_steps += 1
 
         epoch_dt = time.monotonic() - epoch_t0
         train_summary = _mean_metrics(train_metrics_epoch)
@@ -881,36 +900,40 @@ def train_model(
             warmup_steps=warmup_steps,
             min_lr=min_lr,
         )
+        current_lr = float(
+            plateau_state.current_lr if plateau_state is not None and scheduler["name"] == "reduce_on_plateau" else lr
+        )
         record = {
             "epoch": epoch + 1,
+            "learning_rate": current_lr,
+            "epoch_seconds": float(epoch_dt),
+            "train_steps": train_steps,
+            "val_steps": val_steps,
             "train": train_summary,
             "val": val_summary,
         }
         history.append(record)
         LOGGER.info(
-            "Epoch %d/%d  train=%.4e  val=%.4e  lr=%.4e  %.1fs",
-            epoch + 1,
-            int(config["training"]["epochs"]),
-            train_summary["combined_loss"],
-            val_summary["combined_loss"],
-            lr, epoch_dt,
+            _format_epoch_log(
+                epoch=epoch + 1,
+                epochs=epochs,
+                train_summary=train_summary,
+                val_summary=val_summary,
+                learning_rate=current_lr,
+                epoch_seconds=epoch_dt,
+                train_steps=train_steps,
+                val_steps=val_steps,
+                include_spectrum=True,
+            )
         )
 
         current_payload = _checkpoint_payload(
-            params=params,
-            dims=dims,
-            config=config,
-            normalization=normalization,
-            data_contract=contract,
-            metrics={
-                "epoch": epoch + 1,
-                "train": train_summary,
-                "val": val_summary,
-            },
+            params=params, dims=dims, config=config,
+            normalization=normalization, data_contract=contract,
+            metrics={"epoch": epoch + 1, "train": train_summary, "val": val_summary},
             history=history,
         )
         _write_checkpoint(checkpoints_root / "last.pt", current_payload)
-
         if val_summary["combined_loss"] < best_val:
             best_val = val_summary["combined_loss"]
             best_payload = current_payload
@@ -919,29 +942,46 @@ def train_model(
     if best_payload is None:
         raise RuntimeError("Training completed without producing a best checkpoint.")
 
-    test_metrics_epoch: list[dict[str, float]] = []
+    # Test evaluation.
     best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
-    for batch in iter_batches(test_split, test_candidates, test_rows, batch_size=int(config["training"]["batch_size"])):
-        device_batch = {
-            key: jnp.asarray(value)
-            for key, value in batch.items()
-            if key != "row_indices"
-        }
+    test_batches = iter_full_vulcan_batches(test_split, batch_size=batch_size, rng=rng)
+    test_metrics_epoch: list[dict[str, float]] = []
+    for batch in test_batches:
+        device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
         metrics = eval_step(best_params, device_batch)
         test_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+
     final_metrics = {
         "best_val_combined_loss": float(best_val),
         "test": _mean_metrics(test_metrics_epoch),
-        "num_train_candidates": int(train_candidates.num_rows()),
-        "num_val_candidates": int(val_candidates.num_rows()),
-        "num_test_candidates": int(test_candidates.num_rows()),
+        "num_train_runs": train_split.num_runs,
+        "num_val_runs": val_split.num_runs,
+        "num_test_runs": test_split.num_runs,
         "parameter_count": int(count_parameters(best_params)),
     }
-    (checkpoints_root / "history.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
-    (checkpoints_root / "metrics.json").write_text(json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8")
-
+    (checkpoints_root / "history.json").write_text(
+        json.dumps(history, indent=2) + "\n", encoding="utf-8",
+    )
+    (checkpoints_root / "metrics.json").write_text(
+        json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8",
+    )
     return TrainingArtifacts(
         checkpoint_path=checkpoints_root / "best.pt",
         history_path=checkpoints_root / "history.json",
         metrics_path=checkpoints_root / "metrics.json",
     )
+
+
+def train_model(
+    config: dict[str, Any],
+    *,
+    project_root: Path,
+) -> TrainingArtifacts:
+    """Train the active model family (equilibrium MLP or full-VULCAN Transformer).
+
+    Dispatches to ``train_equilibrium_model`` for equilibrium tasks
+    and ``train_full_vulcan_model`` for full-VULCAN tasks.
+    """
+    if is_equilibrium(config):
+        return train_equilibrium_model(config, project_root=project_root)
+    return train_full_vulcan_model(config, project_root=project_root)

@@ -26,6 +26,10 @@ BENCH_ITERS = 20
 
 sys.path.insert(0, str(_ROOT))
 
+from src.utils.numpy_compat import patch_numpy_asarray_copy
+
+patch_numpy_asarray_copy()
+
 import jax
 import numpy as np
 
@@ -79,12 +83,6 @@ def _print_row(dev_name: str, bs: int, median_s: float):
     tput = bs / median_s
     print(f"{dev_name:<8} {bs:>6} {median_s * 1000:>11.3f} "
           f"{per_ms:>15.4f} {tput:>11.0f} /s")
-
-
-def _plots_dir() -> Path:
-    plots = CHECKPOINT.parent / "plots"
-    plots.mkdir(parents=True, exist_ok=True)
-    return plots
 
 
 def benchmark_equilibrium(payload: dict):

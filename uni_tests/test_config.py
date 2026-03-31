@@ -23,7 +23,6 @@ def test_shipped_equilibrium_config_loads():
     assert config["data_spec"]["state_species"] == list(DEFAULT_STATE_SPECIES)
     assert config["data_spec"]["required_global_inputs"] == ["He_H", "C_H", "O_H", "N_H", "S_H"]
     assert config["data_spec"]["element_input_order"] == ["He_H", "C_H", "O_H", "N_H", "S_H"]
-    assert config["data_spec"]["dt_feature_index"] is None
     assert config["normalization"]["target_method"] == "log-standard"
     assert config["normalization"]["global_methods"] == {
         "He_H": "log-standard",
@@ -45,13 +44,53 @@ def test_shipped_equilibrium_config_loads():
     assert config["temperature_profiles"]["analytic_sampler"]["power_law_n_range"] == [0.5, 2.0]
     assert config["roth_sampler"]["enabled"] is True
     assert config["roth_sampler"]["data_glob"] == "assets/PTprofiles/*.dat"
-    assert config["training"]["model"]["activation"] == "silu"
+    assert config["training"]["model"]["activation"] == "relu"
     assert config["training"]["scheduler"] == {
         "name": "reduce_on_plateau",
         "factor": 0.5,
         "patience": 10,
         "threshold": pytest.approx(1.0e-4),
     }
+
+
+def test_shipped_full_vulcan_config_loads():
+    root = Path(__file__).resolve().parents[1]
+    raw_config = _load_raw_json(root / "config" / "full_vulcan_config.json")
+    assert "python_executable" not in raw_config["full_vulcan"]["vulcan_runtime"]
+    assert "cfg_file" not in raw_config["full_vulcan"]["vulcan_runtime"]
+    config = load_and_validate_config(root / "config" / "full_vulcan_config.json")
+    assert config["task"]["kind"] == "full_vulcan"
+    assert config["model_type"] == "full_vulcan"
+    assert config["data_spec"]["required_global_inputs"] == [
+        "gravity_cm_s2",
+        "He_H",
+        "C_H",
+        "O_H",
+        "N_H",
+        "S_H",
+        "use_photochemistry",
+        "use_ion_chemistry",
+        "use_eddy_diffusion",
+        "use_molecular_diffusion",
+        "use_upwind_molecular_diffusion",
+        "use_boundary_conditions",
+        "use_condensation",
+        "use_settling",
+        "use_initial_cold_trap",
+        "use_sat_surface_h2o",
+        "atm_base_H2",
+        "atm_base_N2",
+        "atm_base_O2",
+        "atm_base_CO2",
+        "atm_base_H2O",
+    ]
+    assert config["vulcan_runtime"]["python_executable"] == "python"
+    assert config["vulcan_runtime"]["cfg_file"] == "vulcan_cfg.py"
+    assert config["vulcan_runtime"]["worker_root"] == "data/vulcan_workers"
+    assert config["vulcan_runtime"]["use_lowT_limit_rates"] is True
+    assert config["vulcan_runtime"]["use_adaptive_rtol"] is True
+    assert "use_lowT_limit_rates" not in config["physics_toggles"]
+    assert "use_adaptive_rtol" not in config["physics_toggles"]
 
 
 def test_missing_task_specific_section_is_rejected(tmp_path):
@@ -82,6 +121,25 @@ def test_invalid_equilibrium_activation_is_rejected(tmp_path):
     config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     with pytest.raises(ConfigValidationError):
         load_and_validate_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "activation",
+    ["relu", "gelu", "silu", "tanh", "elu", "selu", "softplus", "leaky_relu"],
+)
+def test_supported_activations_validate_for_both_model_families(tmp_path, activation):
+    root = Path(__file__).resolve().parents[1]
+    equilibrium = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    equilibrium["equilibrium_only"]["model"]["activation"] = activation
+    equilibrium_path = tmp_path / f"equilibrium_{activation}.json"
+    equilibrium_path.write_text(json.dumps(equilibrium, indent=2) + "\n", encoding="utf-8")
+    assert load_and_validate_config(equilibrium_path)["training"]["model"]["activation"] == activation
+
+    full_vulcan = _load_raw_json(root / "config" / "full_vulcan_config.json")
+    full_vulcan["full_vulcan"]["model"]["activation"] = activation
+    full_vulcan_path = tmp_path / f"full_vulcan_{activation}.json"
+    full_vulcan_path.write_text(json.dumps(full_vulcan, indent=2) + "\n", encoding="utf-8")
+    assert load_and_validate_config(full_vulcan_path)["training"]["model"]["activation"] == activation
 
 
 def test_invalid_mixed_temperature_profile_probability_is_rejected(tmp_path):
@@ -160,3 +218,26 @@ def test_explicit_cosine_scheduler_is_preserved(tmp_path):
     config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     validated = load_and_validate_config(config_path)
     assert validated["training"]["scheduler"] == {"name": "cosine"}
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        (("training", "live_sampling"), "training.live_sampling"),
+        (("sampling", "num_time_steps"), "sampling.num_time_steps"),
+        (("generation", "target_mode"), "generation.target_mode"),
+        (("normalization", "state_method"), "normalization.state_method"),
+        (("full_vulcan", "trajectory_sampling"), "full_vulcan.trajectory_sampling"),
+    ],
+)
+def test_removed_legacy_keys_raise_targeted_errors(tmp_path, path, message):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "full_vulcan_config.json")
+    cursor = payload
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = {"legacy": True} if path[-1] == "trajectory_sampling" else 1
+    config_path = tmp_path / "legacy_config.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError, match=message):
+        load_and_validate_config(config_path)

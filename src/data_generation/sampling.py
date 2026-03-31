@@ -20,8 +20,8 @@ temperature-profile sources, selected by ``temperature_profiles.source_mode``:
   GCM-derived profiles.
 
 The module also handles Latin-hypercube sampling of the global conditioning
-scalars (metallicity, C/O, S/O, and optionally gravity), initial mixing-ratio
-construction, time-grid sampling, and stellar spectrum loading.
+scalars (metallicity, C/O, S/O, and optionally gravity) plus stellar-spectrum
+selection for the final-state full-VULCAN task.
 """
 
 from __future__ import annotations
@@ -40,9 +40,6 @@ from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
 from .spectrum import SpectrumRecord, load_spectrum_manifest, save_spectrum_manifest
 
 logger = logging.getLogger(__name__)
-
-# Mixing profile constants used by the synthetic smoke path.
-_HELIUM_FRACTION_RANGE = (0.11, 0.17)
 
 # Maximum number of rejection-resampling attempts for analytic profiles.
 _MAX_PROFILE_ATTEMPTS = 100
@@ -68,8 +65,6 @@ class RunSpecification:
     globals: dict[str, float]
     metadata: dict[str, Any]
     kzz_cm2_s: np.ndarray | None = None
-    initial_ymix: np.ndarray | None = None
-    time_s: np.ndarray | None = None
     spectrum: SpectrumRecord | None = None
     elemental_abundances_x_h: np.ndarray | None = None
     gravity_cm_s2: np.ndarray | None = None
@@ -616,112 +611,6 @@ def sample_kzz_profile(
     return np.full(np.asarray(pressure_bar).shape, kzz_value, dtype=np.float64)
 
 
-def _heavy_species_budget(metallicity_log10: float) -> float:
-    """Map metallicity to a bounded heavy-species mass budget."""
-    heavy = 0.01 * (10.0 ** metallicity_log10)
-    return float(np.clip(heavy, 1.0e-4, 0.15))
-
-
-def sample_initial_ymix(
-    pressure_bar: np.ndarray,
-    *,
-    config: dict[str, Any],
-    rng: np.random.Generator,
-    metallicity_log10: float,
-    c_to_o: float,
-) -> np.ndarray:
-    """Sample a sulfur-aware initial mixing-ratio composition for synthetic mode.
-
-    Constructs a physically motivated but approximate initial state for the
-    full-VULCAN trajectory mode.  The composition varies with metallicity, C/O
-    ratio, and depth (via a log-pressure weighting that places more heavy
-    species at lower pressures).  A small log-normal perturbation is applied
-    per-cell for diversity.  The result is re-normalized so mixing ratios sum
-    to unity at every level.
-
-    Parameters
-    ----------
-    pressure_bar : np.ndarray
-        Pressure grid in bar, shape ``(nz,)``.
-    config : dict
-        Validated pipeline config.
-    rng : np.random.Generator
-        Random number generator.
-    metallicity_log10 : float
-        Log10 metallicity relative to solar.
-    c_to_o : float
-        Carbon-to-oxygen ratio.
-
-    Returns
-    -------
-    np.ndarray
-        Initial mixing ratios, shape ``(nz, state_dim)``, summing to 1.0
-        at each level.
-    """
-    species = list(config["data_spec"]["state_species"])
-    nz = pressure_bar.size
-    state_dim = len(species)
-    y = np.full((nz, state_dim), 1.0e-30, dtype=np.float64)
-    idx = {name: i for i, name in enumerate(species)}
-
-    heavy_budget = _heavy_species_budget(metallicity_log10)
-    he_fraction = rng.uniform(*_HELIUM_FRACTION_RANGE)
-    h2_fraction = max(1.0 - heavy_budget - he_fraction, 0.7)
-
-    logp = np.log10(pressure_bar)
-    deep_weight = (logp - logp.min()) / max(logp.max() - logp.min(), 1.0e-6)
-    deep_weight = np.clip(deep_weight, 0.0, 1.0)
-
-    carbon_budget = heavy_budget * (0.35 + 0.35 * (c_to_o / max(c_to_o + 1.0, 1.0e-6)))
-    oxygen_budget = heavy_budget * 0.35
-    nitrogen_budget = heavy_budget * 0.1
-    sulfur_budget = heavy_budget * 0.03 * (10.0 ** (0.5 * metallicity_log10))
-    sulfur_budget = float(np.clip(sulfur_budget, 1.0e-8, 0.02 * heavy_budget))
-
-    y[:, idx["He"]] = he_fraction
-    y[:, idx["H2"]] = h2_fraction
-    y[:, idx["H"]] = 5.0e-7 * (1.0 + 6.0 * (1.0 - deep_weight))
-    y[:, idx["O"]] = oxygen_budget * 3.0e-4 * (1.0 + 3.0 * (1.0 - deep_weight))
-    y[:, idx["OH"]] = oxygen_budget * 8.0e-4 * (1.0 + 4.0 * (1.0 - deep_weight))
-
-    y[:, idx["H2O"]] = oxygen_budget * (0.7 + 0.3 * (1.0 - deep_weight))
-    y[:, idx["CO"]] = carbon_budget * (0.3 + 0.5 * deep_weight)
-    y[:, idx["CO2"]] = carbon_budget * (0.08 + 0.18 * (1.0 - deep_weight))
-    y[:, idx["CH4"]] = carbon_budget * (0.2 + 0.25 * (1.0 - deep_weight))
-    y[:, idx["N2"]] = nitrogen_budget * (0.6 + 0.3 * deep_weight)
-    y[:, idx["NH3"]] = nitrogen_budget * (0.2 + 0.2 * (1.0 - deep_weight))
-    y[:, idx["H2S"]] = sulfur_budget * (0.85 + 0.1 * deep_weight)
-    y[:, idx["SH"]] = sulfur_budget * 1.0e-3 * (1.0 + 2.0 * (1.0 - deep_weight))
-    y[:, idx["S"]] = sulfur_budget * 5.0e-4 * (1.0 + 2.0 * (1.0 - deep_weight))
-    y[:, idx["SO"]] = sulfur_budget * 5.0e-5
-    y[:, idx["SO2"]] = sulfur_budget * 1.0e-5
-    y[:, idx["S2"]] = sulfur_budget * 1.0e-5
-
-    perturb = np.exp(rng.normal(0.0, 0.15, size=y.shape))
-    y *= perturb
-    y = np.clip(y, 1.0e-30, None)
-    other_sum = np.sum(y[:, [i for name, i in idx.items() if name not in {"H2", "He"}]], axis=1)
-    reservoir = np.clip(1.0 - other_sum, 1.0e-4, 1.0)
-    y[:, idx["H2"]] = reservoir * (h2_fraction / max(h2_fraction + he_fraction, 1.0e-12))
-    y[:, idx["He"]] = reservoir * (he_fraction / max(h2_fraction + he_fraction, 1.0e-12))
-    y /= np.sum(y, axis=1, keepdims=True)
-    return y
-
-
-def sample_time_grid(*, config: dict[str, Any], rng: np.random.Generator) -> np.ndarray:
-    """Sample a monotonically increasing saved-time grid for the synthetic path."""
-    sampling = config["sampling"]
-    steps = int(sampling["num_time_steps"])
-    log_dt = rng.uniform(
-        float(sampling["time_step_log10_min_s"]),
-        float(sampling["time_step_log10_max_s"]),
-        size=steps - 1,
-    )
-    dt_s = np.power(10.0, np.asarray(log_dt, dtype=np.float64))
-    time_s = np.concatenate([np.array([0.0], dtype=np.float64), np.cumsum(dt_s)])
-    return time_s
-
-
 def _latin_hypercube_unit_samples(
     *,
     num_samples: int,
@@ -813,8 +702,6 @@ def sample_run_specifications(
     project_root: Path,
     num_runs: int | None = None,
     seed: int | None = None,
-    include_initial_ymix: bool = True,
-    include_time_grid: bool = True,
 ) -> list[RunSpecification]:
     """Sample the full set of atmospheric configurations used to generate raw runs.
 
@@ -833,10 +720,6 @@ def sample_run_specifications(
         Override for ``generation.num_runs``.
     seed : int or None
         Override for ``generation.seed``.
-    include_initial_ymix : bool
-        Whether to sample initial mixing ratios (full-VULCAN only).
-    include_time_grid : bool
-        Whether to sample a time grid (full-VULCAN only).
 
     Returns
     -------
@@ -860,7 +743,7 @@ def sample_run_specifications(
             num_samples=total_runs, num_dimensions=4, rng=rng,
         )
 
-    # Spectrum loading only needed for transition models.
+    # Spectrum loading only needed for full-VULCAN models.
     spectra: dict[str, SpectrumRecord] | None = None
     spectrum_names: list[str] | None = None
     if not equilibrium:
@@ -966,20 +849,6 @@ def sample_run_specifications(
                 flux_erg_cm2_s_nm=np.asarray(template.flux_erg_cm2_s_nm, dtype=np.float64),
                 metadata={**template.metadata, "template_name": template.name},
             )
-            if include_initial_ymix:
-                initial_ymix = sample_initial_ymix(
-                    pressure_bar,
-                    config=config,
-                    rng=rng,
-                    metallicity_log10=metallicity,
-                    c_to_o=c_to_o,
-                )
-            else:
-                initial_ymix = np.empty((0, 0), dtype=np.float64)
-            if include_time_grid:
-                time_s = sample_time_grid(config=config, rng=rng)
-            else:
-                time_s = np.empty((0,), dtype=np.float64)
             globals_map = {
                 **base_globals,
                 **element_scalars,
@@ -996,8 +865,6 @@ def sample_run_specifications(
                         "spectrum_name": spectrum.name,
                     },
                     kzz_cm2_s=np.asarray(kzz, dtype=np.float64),
-                    initial_ymix=np.asarray(initial_ymix, dtype=np.float64),
-                    time_s=np.asarray(time_s, dtype=np.float64),
                     spectrum=spectrum,
                     elemental_abundances_x_h=elemental_profile,
                     gravity_cm_s2=gravity_profile,
