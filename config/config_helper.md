@@ -54,22 +54,26 @@ All paths are strings, resolved relative to the project root unless absolute.
 
 ## `data_spec`
 
-Defines the chemical species tracked by the emulator and the global conditioning inputs.
+Defines the chemical species tracked by the emulator.
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
 | `state_species` | list[string] | yes | Ordered list of chemical species tracked in the atmospheric state vector. These are the species VULCAN evolves. Default: 17 NCHO+S species (H2, He, H, O, OH, H2O, CO, CO2, CH4, N2, NH3, H2S, SH, S, SO, SO2, S2). |
 | `output_species` | list[string] | yes | Ordered list of species the model predicts. Usually identical to `state_species` but can be a subset. |
-| `required_global_inputs` | list[string] | yes | Names of the global conditioning scalars. For equilibrium: `["metallicity_log10", "c_to_o", "s_to_o"]`. For full_vulcan: includes gravity, physics toggles, atmosphere-base one-hot flags, and `"log10_dt_s"`. |
 
-**Derived fields** (computed during validation, not set by the user):
+**Internal derived metadata** (computed during validation, not valid user config keys):
 
 - `state_dim`: number of state species.
 - `target_dim`: number of output species.
+- `element_input_order`: fixed FastChem-native elemental abundance channels, always `["He_H", "C_H", "O_H", "N_H", "S_H"]`.
+- `required_global_inputs`: derived conditioning scalar order. For equilibrium this is the fixed element list above. For full_vulcan it prepends `gravity_cm_s2`, appends `log10_dt_s`, and includes the physics-toggle and atmosphere-base flags.
 - `sequence_static_feature_order`: ordered names of per-level input columns.
 - `global_static_feature_order`: global feature names excluding `log10_dt_s`.
 - `global_feature_order`: full global feature names including `log10_dt_s`.
 - `dt_feature_index`: index of `log10_dt_s` in the global vector (null for equilibrium).
+
+These fields appear in validated configs, processed metadata, and exported bundles for
+self-description, but they must not be provided manually in the user JSON.
 
 ---
 
@@ -85,9 +89,9 @@ Controls the atmospheric parameter space from which training data is drawn.
 | `pressure_top_bar` | float | yes | Lowest pressure in bar (top of atmosphere). Must be positive and less than `pressure_bottom_bar`. Example: `1e-7`. |
 | `pressure_bottom_bar` | float | yes | Highest pressure in bar (bottom of atmosphere). Must be positive. Example: `100.0`. |
 | `temperature_range_k` | [float, float] | yes | Hard bounds on temperature in Kelvin. Used for validation. Example: `[500.0, 2500.0]`. |
-| `metallicity_log10_range` | [float, float] | yes | Log10 metallicity range (solar = 0). Example: `[0.0, 1.0]`. |
-| `c_to_o_range` | [float, float] | yes | Carbon-to-oxygen ratio range. Example: `[0.45, 0.85]`. |
-| `s_to_o_range` | [float, float] | yes | Sulfur-to-oxygen ratio range. Example: `[0.01, 0.03]`. |
+| `metallicity_log10_range` | [float, float] | yes | Generation-only sampler range for the latent metallicity control used to synthesize explicit elemental abundances. Example: `[0.0, 1.0]`. |
+| `c_to_o_range` | [float, float] | yes | Generation-only sampler range for the latent carbon-to-oxygen control used to synthesize explicit elemental abundances. Example: `[0.45, 0.85]`. |
+| `s_to_o_range` | [float, float] | yes | Generation-only sampler range for the latent sulfur-to-oxygen control used to synthesize explicit elemental abundances. Example: `[0.01, 0.03]`. |
 
 ### Full-VULCAN only fields
 
@@ -187,6 +191,11 @@ fitting, and tensor export.
 | `state_floor` | float | yes | Minimum value used before taking log10 of mixing ratios. Prevents log(0). Must be positive. Example: `1e-30`. |
 | `spectrum_floor` | float | full_vulcan only | Minimum value for stellar spectrum normalization. Must be positive. |
 | `sequence_methods` | object | yes | Per-column normalization method for sequence-static features. Keys must be exactly `{pressure_bar, temperature_k}` for equilibrium or `{pressure_bar, temperature_k, kzz_cm2_s}` for full_vulcan. Allowed values: `"standard"`, `"log-standard"`, `"none"`. |
+| `global_methods` | object | yes | Per-feature normalization method for the derived global static feature order. Keys must match the derived `global_static_feature_order`. Allowed values: `"standard"`, `"log-standard"`, `"none"`. |
+| `target_method` | string | yes | Normalization method for target mixing ratios. Allowed values: `"standard"`, `"log-standard"`, `"none"`. |
+| `state_method` | string | full_vulcan only | Normalization method for trajectory state inputs. Allowed values: `"standard"`, `"log-standard"`, `"none"`. |
+| `spectrum_method` | string | full_vulcan only | Normalization method for stellar spectrum inputs. Allowed values: `"standard"`, `"log-standard"`, `"none"`. |
+| `log10_dt_method` | string | full_vulcan only | Normalization method for the already-log10 timestep feature. Allowed values: `"standard"`, `"none"`. |
 
 ---
 

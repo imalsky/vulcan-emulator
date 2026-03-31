@@ -39,10 +39,6 @@ fi
 CONFIG_PATH="${CONFIG_PATH:-config/equilibrium_only_config.json}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
-ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
-GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
-GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
-TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
 DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
@@ -52,9 +48,6 @@ export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
-export VULCAN_TRAIN_DEBUG="${VULCAN_TRAIN_DEBUG:-1}"
-export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-1}"
-export TRAINING_PROGRESS_FILE="${TRAINING_PROGRESS_FILE:-${PROJECT_ROOT}/training_progress.txt}"
 
 if [ "${DISABLE_TRITON_GEMM}" = "1" ]; then
   export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false"
@@ -88,30 +81,19 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE} VULCAN_TRAIN_DEBUG=${VULCAN_TRAIN_DEBUG} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM}"
-echo "Debug settings: TRAINING_PROGRESS_FILE=${TRAINING_PROGRESS_FILE} XLA_FLAGS=${XLA_FLAGS:-<unset>}"
+echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM}"
 
-echo "Runtime preflight on host: $(hostname)"
-if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
-  echo "Allocated nodes:"
-  sort -u "${PBS_NODEFILE}" || true
-fi
+# Fail early if the environment cannot provide the requested JAX accelerator.
 if ! python - <<'PY'
 import os
 import sys
 
 ok = True
 jax_backend = "unknown"
-print(f"python executable: {sys.executable}")
 try:
     import jax
-    import jaxlib
 
     jax_backend = str(jax.default_backend()).lower()
-    print(f"jax_backend={jax_backend}")
-    print(f"jax_devices={jax.devices()}")
-    print(f"jax_file={getattr(jax, '__file__', '<namespace>')}")
-    print(f"jaxlib_file={getattr(jaxlib, '__file__', '<namespace>')}")
 except Exception as exc:
     print(f"jax_error={exc!r}")
     ok = False
@@ -124,33 +106,6 @@ then
   echo "ERROR: runtime preflight failed."
   exit 1
 fi
-
-GPU_MONITOR_PID=""
-if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
-  : > "${GPU_MONITOR_LOG}"
-  (
-    while true; do
-      {
-        echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
-        nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
-        nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true
-      } >> "${GPU_MONITOR_LOG}" 2>&1
-      sleep "${GPU_MONITOR_INTERVAL_SEC}"
-    done
-  ) &
-  GPU_MONITOR_PID=$!
-  echo "GPU monitor enabled: ${GPU_MONITOR_LOG} (pid=${GPU_MONITOR_PID})"
-fi
-
-cleanup() {
-  if [ -n "${GPU_MONITOR_PID}" ]; then
-    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
-mkdir -p "$(dirname "${TRAIN_LOG}")"
-: > "${TRAIN_LOG}"
 
 echo "Stage: dataset generation check (RUN_GEN_IF_MISSING=${RUN_GEN_IF_MISSING})"
 if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
@@ -200,7 +155,7 @@ PY
     echo "Stage: raw dataset already present (${RUN_COUNT} runs), skipping generation"
   elif [ "${RUN_COUNT}" -eq 0 ] && [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
     echo "Stage: generating raw runs"
-    python -u -m src.utils --config "${CONFIG_PATH}" --stage generation 2>&1 | tee -a "${TRAIN_LOG}"
+    python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
   else
     echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} per-file runs in ${RAW_RUN_DIR} and ${CONSOLIDATED_COUNT} runs in ${CONSOLIDATED_PATH}, expected ${EXPECTED_RUNS}."
     echo "Set generation.overwrite=true and regenerate, or align generation.num_runs with the existing dataset."
@@ -209,113 +164,7 @@ PY
 fi
 
 echo "Stage: preprocessing"
-python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization 2>&1 | tee -a "${TRAIN_LOG}"
-
-echo "Stage: JAX GPU smoke test (JIT compile + run on GPU)"
-if ! timeout 120 python -u - <<'SMOKE' 2>&1 | tee -a "${TRAIN_LOG}"
-import time
-import jax
-import jax.numpy as jnp
-
-print(f"smoke_test_backend={jax.default_backend()}")
-print(f"smoke_test_devices={jax.devices()}")
-
-@jax.jit
-def smoke_fn(a, b):
-    return jnp.dot(a, b).sum()
-
-a = jnp.ones((64, 64), dtype=jnp.float64)
-b = jnp.ones((64, 64), dtype=jnp.float64)
-
-print("smoke_test: dispatching JIT-compiled matmul to GPU...")
-t0 = time.monotonic()
-result = smoke_fn(a, b)
-jax.block_until_ready(result)
-t1 = time.monotonic()
-print(f"smoke_test: OK  result={float(result):.1f}  jit_compile+run={t1-t0:.2f}s")
-
-# Larger test closer to real workload shapes
-print("smoke_test: dispatching larger matmul (128x512 @ 512x256)...")
-a2 = jnp.ones((128, 512), dtype=jnp.float64)
-b2 = jnp.ones((512, 256), dtype=jnp.float64)
-
-@jax.jit
-def smoke_fn2(a, b):
-    return jnp.dot(a, b)
-
-t0 = time.monotonic()
-result2 = smoke_fn2(a2, b2)
-jax.block_until_ready(result2)
-t1 = time.monotonic()
-print(f"smoke_test: OK  shape={result2.shape}  jit_compile+run={t1-t0:.2f}s")
-
-# Gradient test: mimics train_step (forward + value_and_grad + optimizer-like update)
-print("smoke_test: dispatching value_and_grad test (simulates train_step)...")
-W = jax.random.normal(jax.random.PRNGKey(0), (256, 128), dtype=jnp.float64)
-x_in = jnp.ones((128, 256), dtype=jnp.float64)
-target = jnp.zeros((128, 128), dtype=jnp.float64)
-
-@jax.jit
-def smoke_grad_fn(params, x, y):
-    def loss_fn(p):
-        pred = jnp.dot(x, p)
-        return jnp.mean((pred - y) ** 2)
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    new_params = params - 0.01 * grads  # SGD step
-    return new_params, loss
-
-t0 = time.monotonic()
-W_new, loss_val = smoke_grad_fn(W, x_in, target)
-jax.block_until_ready(W_new)
-t1 = time.monotonic()
-print(f"smoke_test: OK  loss={float(loss_val):.4f}  value_and_grad+run={t1-t0:.2f}s")
-
-# Memory report after smoke tests
-for dev in jax.devices():
-    stats = dev.memory_stats()
-    if stats:
-        peak = stats.get("peak_bytes_in_use", 0) / 1e6
-        current = stats.get("bytes_in_use", 0) / 1e6
-        limit = stats.get("bytes_limit", 0) / 1e6
-        print(f"smoke_test: device={dev}  mem_current={current:.0f}MB  mem_peak={peak:.0f}MB  mem_limit={limit:.0f}MB")
-
-print(f"smoke_test: PASSED — GPU JIT compilation and gradient computation working")
-SMOKE
-then
-  echo "ERROR: JAX GPU smoke test failed or timed out after 120s."
-  echo "This likely means XLA cannot compile CUDA kernels for this GPU."
-  echo "Check: XLA_FLAGS=${XLA_FLAGS:-<unset>}"
-  exit 1
-fi
+python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization
 
 echo "Stage: training"
-echo "Training log file: ${TRAIN_LOG}"
-python - <<'PY' 2>&1 | tee -a "${TRAIN_LOG}"
-import importlib
-from pathlib import Path
-import os
-import site
-import sys
-
-import jax
-
-print(f"training_python={sys.executable}")
-print(f"training_site_enable_user_site={site.ENABLE_USER_SITE}")
-print("training_sys_path:")
-for entry in sys.path:
-    print(f"  - {entry}")
-print(f"training_cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
-print(f"training_jax_enable_x64={os.environ.get('JAX_ENABLE_X64', '<unset>')}")
-print(f"training_xla_flags={os.environ.get('XLA_FLAGS', '<unset>')}")
-print(f"training_jax_backend={jax.default_backend()}")
-print(f"training_jax_devices={jax.devices()}")
-for module_name in ("jax", "jaxlib", "numpy", "h5py"):
-    module = importlib.import_module(module_name)
-    module_file = getattr(module, "__file__", "<namespace>")
-    if module_file not in {None, "<namespace>"}:
-        module_file = str(Path(str(module_file)).resolve())
-    print(f"training_{module_name}={getattr(module, '__version__', '<unknown>')}")
-    print(f"training_{module_name}.__file__={module_file}")
-PY
-
-python -u -m src.utils --config "${CONFIG_PATH}" --stage training 2>&1 | tee -a "${TRAIN_LOG}"
+python -u -m src.utils --config "${CONFIG_PATH}" --stage training

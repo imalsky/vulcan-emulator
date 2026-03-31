@@ -41,10 +41,6 @@ MAIN_MODULE="${MAIN_MODULE:-gcmulator}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 REQUIRE_TORCH_CUDA="${REQUIRE_TORCH_CUDA:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
-ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
-GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
-GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
-TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -83,35 +79,23 @@ if [ ! -d "${PROJECT_ROOT}/src/gcmulator" ]; then
   exit 1
 fi
 
+# Verify the environment quietly before long-running stages begin.
 if ! python - <<'PY'
 import my_swamp
-import sys
-print(f"my_swamp import OK from: {getattr(my_swamp, '__file__', '<namespace>')}")
-print(f"python executable: {sys.executable}")
 PY
 then
   echo "ERROR: my_swamp import failed from the existing environment/package path."
   exit 1
 fi
 
-if python - <<'PY'
-import sys
+if ! python - <<'PY'
 import torch_harmonics
-print(f"torch_harmonics import OK from: {getattr(torch_harmonics, '__file__', '<namespace>')}")
-print(f"python executable: {sys.executable}")
 PY
 then
-  echo "Using existing torch_harmonics install; skipping reinstall."
-else
   echo "ERROR: torch_harmonics import failed from the existing environment/package path."
   exit 1
 fi
 
-echo "Runtime preflight on host: $(hostname)"
-if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
-  echo "Allocated nodes:"
-  sort -u "${PBS_NODEFILE}" || true
-fi
 if ! python - <<'PY'
 import os
 import sys
@@ -122,20 +106,17 @@ jax_backend = "unknown"
 try:
     import torch
     torch_cuda_available = bool(torch.cuda.is_available())
-    print(f"torch_cuda_available={torch_cuda_available}")
 except Exception as exc:
     print(f"torch_error={exc!r}")
     ok = False
 try:
     import jax
     jax_backend = str(jax.default_backend()).lower()
-    print(f"jax_backend={jax_backend}")
 except Exception as exc:
     print(f"jax_error={exc!r}")
     ok = False
 try:
     import torch_harmonics
-    print(f"torch_harmonics_file={getattr(torch_harmonics, '__file__', '<namespace>')}")
 except Exception as exc:
     print(f"torch_harmonics_error={exc!r}")
     ok = False
@@ -151,30 +132,6 @@ then
   echo "ERROR: runtime preflight failed."
   exit 1
 fi
-
-GPU_MONITOR_PID=""
-if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
-  : > "${GPU_MONITOR_LOG}"
-  (
-    while true; do
-      {
-        echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
-        nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
-        nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true
-      } >> "${GPU_MONITOR_LOG}" 2>&1
-      sleep "${GPU_MONITOR_INTERVAL_SEC}"
-    done
-  ) &
-  GPU_MONITOR_PID=$!
-  echo "GPU monitor enabled: ${GPU_MONITOR_LOG} (pid=${GPU_MONITOR_PID})"
-fi
-
-cleanup() {
-  if [ -n "${GPU_MONITOR_PID}" ]; then
-    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
 
 echo "Stage: dataset generation check (RUN_GEN_IF_MISSING=${RUN_GEN_IF_MISSING})"
 if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
@@ -208,7 +165,4 @@ PY
 fi
 
 echo "Stage: training"
-echo "Training log file: ${TRAIN_LOG}"
-mkdir -p "$(dirname "${TRAIN_LOG}")"
-: > "${TRAIN_LOG}"
-python -u -m "${MAIN_MODULE}" --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"
+python -u -m "${MAIN_MODULE}" --train --config "${CONFIG_PATH}"

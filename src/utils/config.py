@@ -42,14 +42,13 @@ TASK_KIND_TO_MODEL_TYPE = {
     "equilibrium_only": "equilibrium",
     "full_vulcan": "transition",
 }
+ELEMENT_INPUT_ORDER = ("He_H", "C_H", "O_H", "N_H", "S_H")
 FULL_VULCAN_CORE_GLOBAL_INPUTS = (
     "gravity_cm_s2",
-    "metallicity_log10",
-    "c_to_o",
-    "s_to_o",
+    *ELEMENT_INPUT_ORDER,
     "log10_dt_s",
 )
-EQUILIBRIUM_CORE_GLOBAL_INPUTS = ("metallicity_log10", "c_to_o", "s_to_o")
+EQUILIBRIUM_CORE_GLOBAL_INPUTS = ELEMENT_INPUT_ORDER
 FULL_VULCAN_OPTIONAL_GLOBAL_INPUTS = (
     *SUPPORTED_PHYSICS_TOGGLES,
     *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
@@ -82,6 +81,8 @@ _ALLOWED_SPECTRUM_ENCODERS = {"autoencoder", "linear", "none"}
 _ALLOWED_ACTIVATIONS = {"gelu", "relu", "silu"}
 _ALLOWED_LR_SCHEDULERS = {"cosine", "reduce_on_plateau"}
 _ALLOWED_TEMPERATURE_PROFILE_SOURCE_MODES = {"analytic", "pt_library", "mixed"}
+_ALLOWED_NORMALIZATION_METHODS = {"standard", "log-standard", "none"}
+_ALLOWED_LOG10_DT_METHODS = {"standard", "none"}
 _ALLOWED_TEMPERATURE_PROFILE_NUMERIC_FILTER_KEYS = {
     "Teq",
     "LogMet",
@@ -144,6 +145,22 @@ def _as_string_list(value: Any, field: str) -> list[str]:
     if len(set(result)) != len(result):
         raise ConfigValidationError(f"{field} contains duplicate entries.")
     return result
+
+
+def _normalized_method_name(
+    value: Any,
+    field: str,
+    *,
+    allowed: set[str] | None = None,
+) -> str:
+    """Validate and return one normalization method name."""
+    method_name = _as_nonempty_str(value, field).lower()
+    allowed_methods = _ALLOWED_NORMALIZATION_METHODS if allowed is None else allowed
+    if method_name not in allowed_methods:
+        raise ConfigValidationError(
+            f"{field} must be one of {sorted(allowed_methods)}, got {method_name!r}."
+        )
+    return method_name
 
 
 def _task_kind(config: dict[str, Any]) -> str:
@@ -702,26 +719,23 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         data_spec.get("output_species", list(state_species)),
         "data_spec.output_species",
     )
-    default_globals = (
+    if "required_global_inputs" in data_spec:
+        raise ConfigValidationError(
+            "data_spec.required_global_inputs is derived internally and must not be set in the user config."
+        )
+    if "element_input_order" in data_spec:
+        raise ConfigValidationError(
+            "data_spec.element_input_order is derived internally and must not be set in the user config."
+        )
+    derived_globals = (
         list(EQUILIBRIUM_CORE_GLOBAL_INPUTS)
         if equilibrium
         else list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
     )
-    required_global_inputs = _as_string_list(
-        data_spec.get("required_global_inputs", default_globals),
-        "data_spec.required_global_inputs",
-    )
-    if equilibrium and "log10_dt_s" in required_global_inputs:
-        raise ConfigValidationError(
-            "data_spec.required_global_inputs must not contain 'log10_dt_s' for equilibrium_only."
-        )
-    if not equilibrium and "log10_dt_s" not in required_global_inputs:
-        raise ConfigValidationError(
-            "data_spec.required_global_inputs must contain 'log10_dt_s' for full_vulcan."
-        )
     data_spec["state_species"] = state_species
     data_spec["output_species"] = output_species
-    data_spec["required_global_inputs"] = required_global_inputs
+    data_spec["element_input_order"] = list(ELEMENT_INPUT_ORDER)
+    data_spec["required_global_inputs"] = derived_globals
 
     sampling = config["sampling"]
     required_sampling = [
@@ -826,7 +840,18 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     generation["target_mode"] = "equilibrium_only" if equilibrium else "trajectory"
 
     normalization = config["normalization"]
-    _require_keys(normalization, ["split", "state_floor", "sequence_methods"], "normalization")
+    required_normalization_keys = [
+        "split",
+        "state_floor",
+        "sequence_methods",
+        "global_methods",
+        "target_method",
+    ]
+    if not equilibrium:
+        required_normalization_keys.extend(
+            ["spectrum_floor", "state_method", "log10_dt_method", "spectrum_method"]
+        )
+    _require_keys(normalization, required_normalization_keys, "normalization")
     normalization["split"] = _validate_split(normalization["split"])
     normalization["state_floor"] = _as_float(
         normalization["state_floor"],
@@ -836,6 +861,8 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("normalization.state_floor must be positive.")
     if not isinstance(normalization["sequence_methods"], dict):
         raise ConfigValidationError("normalization.sequence_methods must be a mapping.")
+    if not isinstance(normalization["global_methods"], dict):
+        raise ConfigValidationError("normalization.global_methods must be a mapping.")
     if equilibrium:
         expected_sequence_methods = {"pressure_bar", "temperature_k"}
     else:
@@ -851,15 +878,38 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             f"normalization.sequence_methods must define exactly {expected_sequence_methods}."
         )
     for key, method in normalization["sequence_methods"].items():
-        method_name = _as_nonempty_str(
+        normalization["sequence_methods"][key] = _normalized_method_name(
             method,
             f"normalization.sequence_methods.{key}",
-        ).lower()
-        if method_name not in {"standard", "log-standard", "none"}:
-            raise ConfigValidationError(
-                f"Unsupported normalization method for {key}: {method_name}."
-            )
-        normalization["sequence_methods"][key] = method_name
+        )
+    normalization["target_method"] = _normalized_method_name(
+        normalization["target_method"],
+        "normalization.target_method",
+    )
+    expected_global_methods = set(global_static_feature_order(config))
+    if set(normalization["global_methods"].keys()) != expected_global_methods:
+        raise ConfigValidationError(
+            f"normalization.global_methods must define exactly {expected_global_methods}."
+        )
+    for key, method in normalization["global_methods"].items():
+        normalization["global_methods"][key] = _normalized_method_name(
+            method,
+            f"normalization.global_methods.{key}",
+        )
+    if not equilibrium:
+        normalization["state_method"] = _normalized_method_name(
+            normalization["state_method"],
+            "normalization.state_method",
+        )
+        normalization["spectrum_method"] = _normalized_method_name(
+            normalization["spectrum_method"],
+            "normalization.spectrum_method",
+        )
+        normalization["log10_dt_method"] = _normalized_method_name(
+            normalization["log10_dt_method"],
+            "normalization.log10_dt_method",
+            allowed=_ALLOWED_LOG10_DT_METHODS,
+        )
 
     training = config["training"]
     _require_keys(
@@ -1165,8 +1215,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             "data_glob": config["temperature_profiles"].get("data_glob", ""),
             "filters": dict(config["temperature_profiles"]["filters"]),
         }
-
-    config["preprocessing"] = dict(normalization["split"])
 
     config["training"] = {
         "seed": training["seed"],

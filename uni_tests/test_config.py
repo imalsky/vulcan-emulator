@@ -14,12 +14,24 @@ def _load_raw_json(path: Path) -> dict:
 
 def test_shipped_equilibrium_config_loads():
     root = Path(__file__).resolve().parents[1]
+    raw_config = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    assert "required_global_inputs" not in raw_config["data_spec"]
+    assert "element_input_order" not in raw_config["data_spec"]
     config = load_and_validate_config(root / "config" / "equilibrium_only_config.json")
     assert config["task"]["kind"] == "equilibrium_only"
     assert config["model_type"] == "equilibrium"
     assert config["data_spec"]["state_species"] == list(DEFAULT_STATE_SPECIES)
-    assert config["data_spec"]["required_global_inputs"] == ["metallicity_log10", "c_to_o", "s_to_o"]
+    assert config["data_spec"]["required_global_inputs"] == ["He_H", "C_H", "O_H", "N_H", "S_H"]
+    assert config["data_spec"]["element_input_order"] == ["He_H", "C_H", "O_H", "N_H", "S_H"]
     assert config["data_spec"]["dt_feature_index"] is None
+    assert config["normalization"]["target_method"] == "log-standard"
+    assert config["normalization"]["global_methods"] == {
+        "He_H": "log-standard",
+        "C_H": "log-standard",
+        "O_H": "log-standard",
+        "N_H": "log-standard",
+        "S_H": "log-standard",
+    }
     assert config["temperature_profiles"]["source_mode"] == "mixed"
     assert config["temperature_profiles"]["analytic_probability"] == pytest.approx(0.5)
     assert config["temperature_profiles"]["analytic_sampler"]["t_int_k_normal"] == {

@@ -35,7 +35,7 @@ from typing import Any
 import numpy as np
 from scipy.special import expn
 
-from ..utils.config import is_equilibrium, static_conditioning_defaults
+from ..utils.config import ELEMENT_INPUT_ORDER, is_equilibrium, static_conditioning_defaults
 from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
 from .spectrum import SpectrumRecord, load_spectrum_manifest, save_spectrum_manifest
 
@@ -50,6 +50,14 @@ _MAX_PROFILE_ATTEMPTS = 100
 # Bar-to-Pascal conversion factor.
 _BAR_TO_PA = 1.0e5
 
+_SOLAR_ELEMENT_ABUNDANCES = {
+    "O_H": 5.37e-4,
+    "C_H": 2.95e-4,
+    "N_H": 7.08e-5,
+    "S_H": 1.41e-5,
+    "He_H": 8.38e-2,
+}
+
 
 @dataclass(frozen=True)
 class RunSpecification:
@@ -63,6 +71,46 @@ class RunSpecification:
     initial_ymix: np.ndarray | None = None
     time_s: np.ndarray | None = None
     spectrum: SpectrumRecord | None = None
+    elemental_abundances_x_h: np.ndarray | None = None
+    gravity_cm_s2: np.ndarray | None = None
+
+
+def _element_scalars_from_sampled_globals(globals_map: dict[str, float]) -> dict[str, float]:
+    """Derive FastChem-native hydrogen-normalized elemental abundances from sampled globals."""
+    metal_scale = 10.0 ** float(globals_map["metallicity_log10"])
+    oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
+    sulfur_h = oxygen_h * float(globals_map["s_to_o"])
+    return {
+        "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
+        "C_H": float(oxygen_h * float(globals_map["c_to_o"])),
+        "O_H": float(oxygen_h),
+        "N_H": float(_SOLAR_ELEMENT_ABUNDANCES["N_H"] * metal_scale),
+        "S_H": float(sulfur_h),
+    }
+
+
+def _element_profile_from_scalars(
+    element_scalars: dict[str, float],
+    *,
+    num_levels: int,
+) -> np.ndarray:
+    """Broadcast a column-constant elemental composition to the required API shape."""
+    element_vector = np.array(
+        [float(element_scalars[name]) for name in ELEMENT_INPUT_ORDER],
+        dtype=np.float64,
+    )
+    return np.repeat(element_vector[None, :], int(num_levels), axis=0)
+
+
+def _equilibrium_gravity_profile(
+    *,
+    pressure_bar: np.ndarray,
+    config: dict[str, Any],
+) -> np.ndarray:
+    """Build the required per-level gravity array for equilibrium runs."""
+    analytic_sampler = config["temperature_profiles"].get("analytic_sampler", {})
+    gravity_cm_s2 = 100.0 * float(analytic_sampler.get("reference_gravity_m_s2", 25.0))
+    return np.full(np.asarray(pressure_bar).shape, gravity_cm_s2, dtype=np.float64)
 
 
 def sample_pressure_grid(
@@ -865,13 +913,37 @@ def sample_run_specifications(
             config=config,
             rng=rng,
         )
-
         if equilibrium:
-            globals_map: dict[str, float] = {
+            base_globals: dict[str, float] = {
                 "metallicity_log10": float(metallicity),
                 "c_to_o": float(c_to_o),
                 "s_to_o": float(s_to_o),
             }
+            element_scalars = _element_scalars_from_sampled_globals(base_globals)
+            gravity_profile = _equilibrium_gravity_profile(
+                pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
+                config=config,
+            )
+        else:
+            base_globals = {
+                "gravity_cm_s2": float(gravity),
+                "metallicity_log10": float(metallicity),
+                "c_to_o": float(c_to_o),
+                "s_to_o": float(s_to_o),
+            }
+            element_scalars = _element_scalars_from_sampled_globals(base_globals)
+            gravity_profile = np.full(
+                np.asarray(pressure_bar).shape,
+                float(gravity),
+                dtype=np.float64,
+            )
+        elemental_profile = _element_profile_from_scalars(
+            element_scalars,
+            num_levels=np.asarray(pressure_bar).size,
+        )
+
+        if equilibrium:
+            globals_map = {**base_globals, **element_scalars}
             result.append(
                 RunSpecification(
                     run_id=f"run_{run_idx:05d}",
@@ -879,6 +951,8 @@ def sample_run_specifications(
                     temperature_k=np.asarray(temperature_k, dtype=np.float64),
                     globals=globals_map,
                     metadata=dict(temperature_metadata),
+                    elemental_abundances_x_h=elemental_profile,
+                    gravity_cm_s2=gravity_profile,
                 )
             )
         else:
@@ -907,10 +981,8 @@ def sample_run_specifications(
             else:
                 time_s = np.empty((0,), dtype=np.float64)
             globals_map = {
-                "gravity_cm_s2": float(gravity),
-                "metallicity_log10": float(metallicity),
-                "c_to_o": float(c_to_o),
-                "s_to_o": float(s_to_o),
+                **base_globals,
+                **element_scalars,
                 **{key: float(value) for key, value in physics_defaults.items()},
             }
             result.append(
@@ -927,6 +999,8 @@ def sample_run_specifications(
                     initial_ymix=np.asarray(initial_ymix, dtype=np.float64),
                     time_s=np.asarray(time_s, dtype=np.float64),
                     spectrum=spectrum,
+                    elemental_abundances_x_h=elemental_profile,
+                    gravity_cm_s2=gravity_profile,
                 )
             )
     return result

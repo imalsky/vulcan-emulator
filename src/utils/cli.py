@@ -19,9 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from .config import load_and_validate_config
-from .helpers import get_logger, resolve_project_root, setup_file_logging
+from .helpers import get_logger, resolve_project_root
 from ..data_generation.migrate import migrate_from_config
 from ..data_generation.preprocess import preprocess_raw_dataset
 from ..data_generation.generation import generate_raw_dataset
@@ -30,12 +31,13 @@ from ..training.trainer import train_model
 LOGGER = get_logger(__name__)
 
 
-def _load_config(config_path: str | Path, project_root: Path) -> dict:
-    """Resolve and validate the requested config file."""
+def _load_config(config_path: str | Path, project_root: Path) -> dict[str, Any]:
+    """Resolve, validate, and annotate the requested config file."""
     path = Path(config_path)
     if not path.is_absolute():
         path = project_root / path
     config = load_and_validate_config(path)
+    # Persist the resolved project root for downstream path resolution.
     config["_project_root"] = str(project_root.resolve())
     return config
 
@@ -66,7 +68,6 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     project_root = resolve_project_root(Path(__file__).resolve())
-    setup_file_logging(project_root)
     config = _load_config(args.config, project_root)
 
     LOGGER.info("Starting stage: %s", args.stage)

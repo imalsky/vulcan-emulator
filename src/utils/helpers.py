@@ -1,7 +1,7 @@
-"""Shared utilities: logging setup, path resolution, and directory management.
+"""Shared helpers for logging, path resolution, and directory creation.
 
-Small, dependency-free helpers used across every module in the
-emulator.  Keeps I/O and logging concerns out of the domain logic.
+The emulator uses these helpers to keep filesystem and logging concerns
+out of the data-generation, preprocessing, and training modules.
 """
 
 from __future__ import annotations
@@ -14,28 +14,28 @@ PROJECT_MARKERS = ("pyproject.toml", "spec.md")
 
 
 _LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+_NOISY_LOGGER_NAMES = (
+    "absl",
+    "jax",
+    "jax._src.xla_bridge",
+    "jaxlib",
+)
 
 
-def setup_file_logging(project_root: Path) -> None:
-    """Add a shared file handler writing to ``logs/pipeline.log``."""
+def _configure_console_logging() -> None:
+    """Configure console logging once and suppress noisy backend discovery logs."""
     root_logger = logging.getLogger()
-    # Skip if a file handler is already attached.
-    if any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
-        return
-    log_dir = project_root / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log_dir / "pipeline.log", encoding="utf-8")
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-    root_logger.addHandler(handler)
+    if not root_logger.handlers:
+        logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+    # Keep project INFO logs while muting third-party device diagnostics.
+    for logger_name in _NOISY_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a module logger with a simple deterministic formatter."""
-    logger = logging.getLogger(name)
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
-    return logger
+    """Return a module logger after applying the shared console configuration."""
+    _configure_console_logging()
+    return logging.getLogger(name)
 
 
 def ensure_dir(path: Path) -> Path:

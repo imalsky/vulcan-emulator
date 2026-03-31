@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import pickle
 import time
 from dataclasses import dataclass
@@ -60,47 +59,12 @@ from ..utils.config import effective_transition_sampling, is_equilibrium, task_k
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
-TRAIN_DEBUG_ENABLED = os.environ.get("VULCAN_TRAIN_DEBUG", "0") == "1"
-TRAINING_PROGRESS_FILE = os.environ.get("TRAINING_PROGRESS_FILE", "").strip()
-
-
-def _device_summary(value: Any) -> str:
-    """Best-effort summary of where a JAX array lives for debug logging."""
-    devices_attr = getattr(value, "devices", None)
-    if callable(devices_attr):
-        try:
-            return ",".join(sorted(str(device) for device in devices_attr()))
-        except Exception:  # pragma: no cover - debug path
-            pass
-    device_attr = getattr(value, "device", None)
-    if callable(device_attr):
-        try:
-            return str(device_attr())
-        except Exception:  # pragma: no cover - debug path
-            pass
-    if device_attr is not None:
-        return str(device_attr)
-    return "<unknown>"
-
-
-def _write_training_progress(phase: str, **metadata: Any) -> None:
-    """Write the latest training phase to a machine-readable progress file."""
-    if not TRAINING_PROGRESS_FILE:
-        return
-    payload = {"timestamp": time.time(), "phase": phase}
-    payload.update(metadata)
-    try:
-        Path(TRAINING_PROGRESS_FILE).write_text(
-            json.dumps(payload, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-    except OSError as exc:  # pragma: no cover - debug path
-        LOGGER.warning("Failed to write training progress phase %s: %s", phase, exc)
 
 
 @dataclass(frozen=True)
 class TrainingArtifacts:
     """Key output paths produced by a training run."""
+
     checkpoint_path: Path
     history_path: Path
     metrics_path: Path
@@ -109,6 +73,7 @@ class TrainingArtifacts:
 @dataclass(frozen=True)
 class ReduceOnPlateauState:
     """Track post-warmup reduce-on-plateau learning-rate state."""
+
     current_lr: float
     best_metric: float | None
     bad_epochs: int
@@ -667,17 +632,8 @@ def train_equilibrium_model(
 
     for epoch in range(epochs):
         epoch_t0 = time.monotonic()
-        batch_build_t0 = time.monotonic()
         train_batches = iter_equilibrium_batches(train_split, batch_size=batch_size, rng=rng)
-        batch_build_t1 = time.monotonic()
         train_metrics_epoch: list[dict[str, float]] = []
-        if TRAIN_DEBUG_ENABLED and epoch == 0:
-            _write_training_progress("epoch1_batch_built", num_batches=len(train_batches))
-            LOGGER.warning(
-                "Debug equilibrium epoch 1: built %d train batches in %.3fs",
-                len(train_batches),
-                batch_build_t1 - batch_build_t0,
-            )
 
         for batch in train_batches:
             lr = _scheduled_learning_rate(
@@ -689,67 +645,19 @@ def train_equilibrium_model(
                 scheduler=scheduler,
                 plateau_state=plateau_state,
             )
-            if TRAIN_DEBUG_ENABLED and epoch == 0 and global_step == 0:
-                first_param_leaf = jax.tree_util.tree_leaves(params)[0]
-                LOGGER.warning(
-                    "Debug equilibrium step 1 host batch shapes: sequence=%s global_inputs=%s target=%s param_device=%s",
-                    batch["sequence"].shape,
-                    batch["global_inputs"].shape,
-                    batch["target"].shape,
-                    _device_summary(first_param_leaf),
-                )
-                _write_training_progress("step1_device_put_start")
-                device_put_t0 = time.monotonic()
-                device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-                device_put_t1 = time.monotonic()
-                lr_value = jnp.asarray(lr, dtype=jnp.float32)
-                _write_training_progress("step1_dispatch_enter")
-                dispatch_t0 = time.monotonic()
-                params, opt_state, metrics = train_step(
-                    params, opt_state, device_batch, lr_value,
-                )
-                dispatch_t1 = time.monotonic()
-                _write_training_progress("step1_dispatch_return")
-                _write_training_progress("step1_block_until_ready_enter")
-                sync_t0 = time.monotonic()
-                jax.block_until_ready(metrics)
-                sync_t1 = time.monotonic()
-                _write_training_progress("step1_block_until_ready_return")
-                metrics_host = {key: float(value) for key, value in metrics.items()}
-                metrics_t1 = time.monotonic()
-                _write_training_progress("step1_metrics_host_done")
-                first_param_leaf = jax.tree_util.tree_leaves(params)[0]
-                LOGGER.warning(
-                    "Debug equilibrium step 1 timings: device_put=%.3fs dispatch_return=%.3fs sync=%.3fs host_metrics=%.3fs metric=%.6e param_device=%s batch_device=%s",
-                    device_put_t1 - device_put_t0,
-                    dispatch_t1 - dispatch_t0,
-                    sync_t1 - sync_t0,
-                    metrics_t1 - sync_t1,
-                    metrics_host["combined_loss"],
-                    _device_summary(first_param_leaf),
-                    _device_summary(device_batch["sequence"]),
-                )
-                train_metrics_epoch.append(metrics_host)
-            else:
-                device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-                params, opt_state, metrics = train_step(
-                    params, opt_state, device_batch, jnp.asarray(lr, dtype=jnp.float32),
-                )
-                train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            # Move the host batch onto the accelerator immediately before the train step.
+            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+            params, opt_state, metrics = train_step(
+                params, opt_state, device_batch, jnp.asarray(lr, dtype=jnp.float32),
+            )
+            train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
             global_step += 1
 
         # Validation.
-        val_build_t0 = time.monotonic()
         val_batches = iter_equilibrium_batches(val_split, batch_size=batch_size, rng=rng)
-        val_build_t1 = time.monotonic()
         val_metrics_epoch: list[dict[str, float]] = []
-        if TRAIN_DEBUG_ENABLED and epoch == 0:
-            LOGGER.warning(
-                "Debug equilibrium epoch 1: built %d val batches in %.3fs",
-                len(val_batches),
-                val_build_t1 - val_build_t0,
-            )
         for batch in val_batches:
+            # Evaluation uses the same device transfer path without optimizer updates.
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
             metrics = eval_step(params, device_batch)
             val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})

@@ -22,7 +22,7 @@ def test_equilibrium_model_uses_configured_activation():
     pred, aux = apply_equilibrium_mlp(
         params,
         jnp.ones((2, 5, 2), dtype=jnp.float32),
-        jnp.ones((2, 3), dtype=jnp.float32),
+        jnp.ones((2, contract["global_dim"]), dtype=jnp.float32),
         dims,
     )
     assert dims.activation == "relu"

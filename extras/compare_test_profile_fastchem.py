@@ -75,19 +75,21 @@ def _resolve_path(value: str | Path) -> Path:
 def _element_abundances_from_globals(globals_map: dict[str, float]) -> dict[str, float]:
     """Map one profile's global inputs to the elemental abundances used by FastChem."""
 
-    metal_scale = 10.0 ** float(globals_map["metallicity_log10"])
-    oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
-    sulfur_h = float(
-        oxygen_h * float(globals_map.get("s_to_o", _SOLAR_ELEMENT_ABUNDANCES["S_H"]))
-    )
-
+    explicit_keys = ("He_H", "C_H", "O_H", "N_H", "S_H")
+    missing = [key for key in explicit_keys if key not in globals_map]
+    if missing:
+        raise ValueError(
+            "FastChem comparison requires explicit elemental abundances "
+            f"{explicit_keys}, missing {missing}."
+        )
+    oxygen_h = float(globals_map["O_H"])
     return {
-        "O_H": float(oxygen_h),
-        "C_H": float(oxygen_h * float(globals_map["c_to_o"])),
-        "N_H": float(_SOLAR_ELEMENT_ABUNDANCES["N_H"] * metal_scale),
-        "S_H": sulfur_h,
-        "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
-        "fastchem_met_scale": float(metal_scale),
+        "He_H": float(globals_map["He_H"]),
+        "C_H": float(globals_map["C_H"]),
+        "O_H": oxygen_h,
+        "N_H": float(globals_map["N_H"]),
+        "S_H": float(globals_map["S_H"]),
+        "fastchem_met_scale": float(oxygen_h / _SOLAR_ELEMENT_ABUNDANCES["O_H"]),
     }
 
 
@@ -286,6 +288,14 @@ def _extract_raw_profile(handle: h5py.Group, run_id: str) -> RawEquilibriumProfi
         key: float(np.asarray(handle[f"globals/{key}"]))
         for key in handle["globals"].keys()
     }
+    if "inputs/elemental_abundances_x_h" in handle and "inputs/element_input_order" in handle:
+        element_labels = [
+            item.decode("utf-8") if isinstance(item, bytes) else str(item)
+            for item in np.asarray(handle["inputs/element_input_order"])
+        ]
+        element_profile = np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64)
+        for index, label in enumerate(element_labels):
+            globals_map[label] = float(element_profile[0, index])
 
     return RawEquilibriumProfile(
         run_id=run_id,
@@ -397,11 +407,12 @@ def _plot_profile_comparison(
     ax_delta.set_xlabel(r"$\log_{10}(\mathrm{FastChem}) - \log_{10}(\mathrm{Test})$")
     ax_delta.set_title("FastChem Residual")
 
-    metallicity = profile.globals.get("metallicity_log10", np.nan)
-    c_to_o = profile.globals.get("c_to_o", np.nan)
-    s_to_o = profile.globals.get("s_to_o", np.nan)
     fig.suptitle(
-        f"{profile.run_id}   [M/H]={metallicity:.3f}, C/O={c_to_o:.3f}, S/O={s_to_o:.3f}",
+        (
+            f"{profile.run_id}   He/H={profile.globals['He_H']:.3e}, "
+            f"C/H={profile.globals['C_H']:.3e}, O/H={profile.globals['O_H']:.3e}, "
+            f"N/H={profile.globals['N_H']:.3e}, S/H={profile.globals['S_H']:.3e}"
+        ),
         fontsize=12,
     )
 

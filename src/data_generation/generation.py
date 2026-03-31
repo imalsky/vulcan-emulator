@@ -32,7 +32,7 @@ from typing import Any
 import h5py
 import numpy as np
 
-from ..utils.config import is_equilibrium, task_kind
+from ..utils.config import ELEMENT_INPUT_ORDER, is_equilibrium, task_kind
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
@@ -418,6 +418,23 @@ def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
     so all metals are multiplied by 10^[M/H].  C/O and S/O ratios
     override the default solar proportions for carbon and sulfur.
     """
+    if spec.elemental_abundances_x_h is not None:
+        element_profile = np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
+        if element_profile.ndim != 2 or element_profile.shape[1] != len(ELEMENT_INPUT_ORDER):
+            raise ValueError(
+                "RunSpecification.elemental_abundances_x_h must have shape "
+                f"(nz, {len(ELEMENT_INPUT_ORDER)})."
+            )
+        element_vector = element_profile[0]
+        element_scalars = {
+            name: float(element_vector[idx])
+            for idx, name in enumerate(ELEMENT_INPUT_ORDER)
+        }
+        oxygen_h = float(element_scalars["O_H"])
+        return {
+            **element_scalars,
+            "fastchem_met_scale": float(oxygen_h / _SOLAR_ELEMENT_ABUNDANCES["O_H"]),
+        }
     metal_scale = 10.0 ** float(spec.globals["metallicity_log10"])
     oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
     s_to_o = spec.globals.get("s_to_o")
@@ -433,6 +450,32 @@ def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
         "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
         "fastchem_met_scale": float(metal_scale),
     }
+
+
+def _element_profile_from_spec(spec: RunSpecification) -> np.ndarray:
+    """Return the per-level elemental-abundance input profile for one run."""
+    if spec.elemental_abundances_x_h is not None:
+        profile = np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
+        if profile.ndim != 2 or profile.shape[1] != len(ELEMENT_INPUT_ORDER):
+            raise ValueError(
+                "RunSpecification.elemental_abundances_x_h must have shape "
+                f"(nz, {len(ELEMENT_INPUT_ORDER)})."
+            )
+        return profile
+    scalars = _element_abundances_from_spec(spec)
+    vector = np.array([float(scalars[name]) for name in ELEMENT_INPUT_ORDER], dtype=np.float64)
+    return np.repeat(vector[None, :], int(spec.pressure_bar.size), axis=0)
+
+
+def _gravity_profile_from_spec(spec: RunSpecification) -> np.ndarray:
+    """Return the per-level gravity input profile for one run."""
+    if spec.gravity_cm_s2 is not None:
+        profile = np.asarray(spec.gravity_cm_s2, dtype=np.float64)
+        if profile.ndim != 1:
+            raise ValueError("RunSpecification.gravity_cm_s2 must be a 1-D array.")
+        return profile
+    gravity_value = float(spec.globals.get("gravity_cm_s2", 0.0))
+    return np.full(int(spec.pressure_bar.size), gravity_value, dtype=np.float64)
 
 
 def _write_tp_profile(path: Path, spec: RunSpecification) -> Path:
@@ -477,15 +520,23 @@ def write_equilibrium_hdf5(
 
         inputs/pressure_bar      (nz,)
         inputs/temperature_k     (nz,)
+        inputs/element_input_order (n_elements,) string
+        inputs/elemental_abundances_x_h (nz, n_elements)
+        inputs/gravity_cm_s2     (nz,)
         inputs/output_species    (n_species,) string
         globals/{key}            scalar per global
         equilibrium/ymix         (nz, n_species)
     """
     ensure_dir(path.parent)
+    element_profile = _element_profile_from_spec(spec)
+    gravity_profile = _gravity_profile_from_spec(spec)
     with h5py.File(path, "w") as handle:
         inputs = handle.create_group("inputs")
         inputs.create_dataset("pressure_bar", data=np.asarray(spec.pressure_bar, dtype=np.float64))
         inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
+        inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
+        inputs.create_dataset("elemental_abundances_x_h", data=element_profile)
+        inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
         inputs.create_dataset("state_species", data=np.asarray(state_species, dtype="S"))
         inputs.create_dataset("output_species", data=np.asarray(output_species, dtype="S"))
         inputs.create_dataset("target_mode", data=np.bytes_("equilibrium"))
@@ -515,6 +566,9 @@ def write_raw_run_hdf5(
         inputs/pressure_bar          (nz,)
         inputs/temperature_k         (nz,)
         inputs/kzz_cm2_s             (nz,)
+        inputs/element_input_order   (n_elements,) string
+        inputs/elemental_abundances_x_h (nz, n_elements)
+        inputs/gravity_cm_s2         (nz,)
         inputs/state_species         (n_state,) string
         inputs/output_species        (n_output,) string
         inputs/reference_ymix_state  (nz, n_state)
@@ -530,6 +584,8 @@ def write_raw_run_hdf5(
     output_species = list(output_species or spec.metadata.get("output_species", spec.metadata["state_species"]))
     ymix_output_array = np.asarray(ymix_output if ymix_output is not None else ymix_state, dtype=np.float64)
     initial = spec.initial_ymix
+    element_profile = _element_profile_from_spec(spec)
+    gravity_profile = _gravity_profile_from_spec(spec)
     reference_state_array = np.asarray(
         reference_ymix_state if reference_ymix_state is not None else (initial if initial is not None else ymix_state[0]),
         dtype=np.float64,
@@ -540,6 +596,9 @@ def write_raw_run_hdf5(
         inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
         if spec.kzz_cm2_s is not None:
             inputs.create_dataset("kzz_cm2_s", data=np.asarray(spec.kzz_cm2_s, dtype=np.float64))
+        inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
+        inputs.create_dataset("elemental_abundances_x_h", data=element_profile)
+        inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
         inputs.create_dataset(
             "state_species",
             data=np.asarray(spec.metadata["state_species"], dtype="S"),
@@ -1269,6 +1328,16 @@ def convert_vulcan_output_to_hdf5(
             "state_species": state_species,
             "output_species": list(config["data_spec"]["output_species"]),
         },
+        elemental_abundances_x_h=(
+            np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
+            if spec.elemental_abundances_x_h is not None
+            else None
+        ),
+        gravity_cm_s2=(
+            np.asarray(spec.gravity_cm_s2, dtype=np.float64)
+            if spec.gravity_cm_s2 is not None
+            else None
+        ),
     )
     return write_raw_run_hdf5(
         output_h5_path,
@@ -1336,6 +1405,16 @@ def convert_fastchem_output_to_hdf5(
         initial_ymix=reference_ymix_state,
         time_s=time_s,
         spectrum=spec.spectrum,
+        elemental_abundances_x_h=(
+            np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
+            if spec.elemental_abundances_x_h is not None
+            else None
+        ),
+        gravity_cm_s2=(
+            np.asarray(spec.gravity_cm_s2, dtype=np.float64)
+            if spec.gravity_cm_s2 is not None
+            else None
+        ),
     )
     return write_raw_run_hdf5(
         output_h5_path,

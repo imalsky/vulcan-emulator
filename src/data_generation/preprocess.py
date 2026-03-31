@@ -52,7 +52,7 @@ from .transition_sampling import fit_log10_dt_normalization
 
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
-PROCESSED_DATA_VERSION = 6
+PROCESSED_DATA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -76,6 +76,8 @@ class RawRun:
     spectrum_name: str
     spectrum_wavelength_nm: np.ndarray
     spectrum_flux_erg_cm2_s_nm: np.ndarray
+    elemental_abundances_x_h: np.ndarray
+    gravity_cm_s2: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,8 @@ class RawEquilibriumRun:
     temperature_k: np.ndarray
     equilibrium_ymix: np.ndarray
     globals: dict[str, float]
+    elemental_abundances_x_h: np.ndarray
+    gravity_cm_s2: np.ndarray
 
 
 def _decode_species(values: np.ndarray) -> list[str]:
@@ -97,6 +101,26 @@ def _decode_species(values: np.ndarray) -> list[str]:
         else:
             result.append(str(item))
     return result
+
+
+def _require_column_constant(
+    values: np.ndarray,
+    *,
+    name: str,
+    run_label: str,
+) -> None:
+    """Reject profile inputs that vary with height in the current training contract."""
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 1:
+        reference = arr[0]
+        is_constant = np.allclose(arr, reference, rtol=1.0e-8, atol=0.0)
+    elif arr.ndim == 2:
+        reference = arr[0]
+        is_constant = np.allclose(arr, reference[None, :], rtol=1.0e-8, atol=0.0)
+    else:
+        raise ValueError(f"{run_label}: {name} must be 1-D or 2-D, got shape {arr.shape}.")
+    if not is_constant:
+        raise ValueError(f"{run_label}: {name} must be vertically constant in the current contract.")
 
 
 def _fit_standard(arr: np.ndarray) -> dict[str, Any]:
@@ -179,27 +203,22 @@ def inverse_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
     raise ValueError(f"Unsupported normalization method: {method}")
 
 
-def _global_methods(feature_order: list[str]) -> list[str]:
-    """Choose per-feature normalization methods for global conditioning inputs.
-
-    Boolean flags (``use_*``, ``atm_base_*``) and already-log-scaled
-    quantities (``metallicity_log10``) pass through unchanged.
-    ``gravity_cm_s2`` uses log-standard because gravity spans orders of
-    magnitude.  All other features default to standard z-score scaling.
-    """
-    methods: list[str] = []
-    for name in feature_order:
-        if name.startswith("use_") or name.startswith("atm_base_"):
-            methods.append("none")
-        elif name == "metallicity_log10":
-            methods.append("none")
-        elif name == "gravity_cm_s2":
-            methods.append("log-standard")
-        elif name == "c_to_o":
-            methods.append("standard")
-        else:
-            methods.append("standard")
-    return methods
+def _fit_block_by_method(
+    arr: np.ndarray,
+    *,
+    method: str,
+    floor: float | None = None,
+) -> dict[str, Any]:
+    """Fit one normalization block using an explicit config-selected method."""
+    if method == "standard":
+        return _fit_standard(arr)
+    if method == "log-standard":
+        if floor is None:
+            raise ValueError("log-standard normalization requires a positive floor.")
+        return _fit_log_standard(arr, floor=float(floor))
+    if method == "none":
+        return _fit_none(arr)
+    raise ValueError(f"Unsupported normalization method: {method}")
 
 
 def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
@@ -284,13 +303,17 @@ def inverse_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
     return np.stack(outputs, axis=-1)
 
 
-def _fit_log10_dt_block(stats: dict[str, float]) -> dict[str, Any]:
-    """Wrap fitted log-dt statistics in the standard normalization schema."""
-    return {
-        "method": "standard",
-        "mean": [float(stats["mean"])],
-        "std": [float(stats["std"])],
-    }
+def _fit_log10_dt_block(stats: dict[str, float], *, method: str) -> dict[str, Any]:
+    """Wrap fitted log-dt statistics using the configured normalization method."""
+    if method == "standard":
+        return {
+            "method": "standard",
+            "mean": [float(stats["mean"])],
+            "std": [float(stats["std"])],
+        }
+    if method == "none":
+        return {"method": "none", "mean": [0.0], "std": [1.0]}
+    raise ValueError(f"Unsupported log10_dt_s normalization method: {method}")
 
 
 def load_raw_run(
@@ -314,6 +337,9 @@ def load_raw_run(
             "pressure_bar": np.asarray(handle["inputs/pressure_bar"], dtype=np.float64),
             "temperature_k": np.asarray(handle["inputs/temperature_k"], dtype=np.float64),
             "kzz_cm2_s": np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64),
+            "element_input_order": _decode_species(np.asarray(handle["inputs/element_input_order"])),
+            "elemental_abundances_x_h": np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64),
+            "gravity_cm_s2": np.asarray(handle["inputs/gravity_cm_s2"], dtype=np.float64),
             "stored_state_species": _decode_species(np.asarray(handle["inputs/state_species"])),
             "stored_output_species": _decode_species(np.asarray(handle["inputs/output_species"])),
             "reference_ymix_state": np.asarray(handle["inputs/reference_ymix_state"], dtype=np.float64),
@@ -354,6 +380,10 @@ def load_raw_run(
         raise ValueError(f"{label}: non-finite temperature values detected.")
     if not np.all(np.isfinite(kzz_cm2_s)):
         raise ValueError(f"{label}: non-finite Kzz values detected.")
+    if not np.all(np.isfinite(d["elemental_abundances_x_h"])):
+        raise ValueError(f"{label}: non-finite elemental abundance values detected.")
+    if not np.all(np.isfinite(d["gravity_cm_s2"])):
+        raise ValueError(f"{label}: non-finite gravity values detected.")
     if not np.all(np.diff(time_s) > 0.0):
         raise ValueError(f"{label}: time_s must be strictly increasing.")
     if ymix_state.shape[0] != time_s.size:
@@ -362,9 +392,27 @@ def load_raw_run(
         raise ValueError(f"{label}: ymix_output time dimension does not match time_s.")
     if reference_ymix_state.shape[0] != pressure_bar.size:
         raise ValueError(f"{label}: reference_ymix_state vertical dimension does not match pressure grid.")
+    if d["elemental_abundances_x_h"].shape[0] != pressure_bar.size:
+        raise ValueError(f"{label}: elemental abundance profile does not match pressure grid.")
+    if d["gravity_cm_s2"].shape != pressure_bar.shape:
+        raise ValueError(f"{label}: gravity profile does not match pressure grid.")
 
     state_indices = [d["stored_state_species"].index(name) for name in requested_state_species]
     output_indices = [d["stored_output_species"].index(name) for name in requested_output_species]
+    element_order = list(config["data_spec"]["element_input_order"])
+    element_indices = [d["element_input_order"].index(name) for name in element_order]
+    elemental_profile = d["elemental_abundances_x_h"][:, element_indices]
+    gravity_profile = np.asarray(d["gravity_cm_s2"], dtype=np.float64)
+    _require_column_constant(elemental_profile, name="elemental_abundances_x_h", run_label=label)
+    _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
+    reduced_globals = dict(d["globals_map"])
+    reduced_globals.update(
+        {
+            name: float(elemental_profile[0, idx])
+            for idx, name in enumerate(element_order)
+        }
+    )
+    reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
     ymix_state = ymix_state[..., state_indices]
     ymix_output = ymix_output[..., output_indices]
     reference_ymix_state = reference_ymix_state[..., state_indices]
@@ -386,10 +434,12 @@ def load_raw_run(
         ymix_output=ymix_output,
         reference_ymix_state=reference_ymix_state,
         target_mode=d["target_mode"],
-        globals=d["globals_map"],
+        globals=reduced_globals,
         spectrum_name=d["spectrum_name"],
         spectrum_wavelength_nm=np.asarray(spectrum_grid_nm, dtype=np.float64),
         spectrum_flux_erg_cm2_s_nm=np.asarray(resampled_spectrum, dtype=np.float64),
+        elemental_abundances_x_h=elemental_profile,
+        gravity_cm_s2=gravity_profile,
     )
 
 
@@ -400,11 +450,13 @@ def _split_indices(num_runs: int, *, config: dict[str, Any]) -> dict[str, list[i
     (very small datasets) are handled by guaranteeing at least one
     sample per split.
     """
-    rng = np.random.default_rng(int(config["preprocessing"]["seed"]))
+    split_cfg = config["normalization"]["split"]
+    # The public config contract stores split settings under normalization.split.
+    rng = np.random.default_rng(int(split_cfg["seed"]))
     perm = np.arange(num_runs, dtype=np.int32)
     rng.shuffle(perm)
-    train_n = max(1, int(round(num_runs * float(config["preprocessing"]["train_fraction"]))))
-    val_n = max(1, int(round(num_runs * float(config["preprocessing"]["val_fraction"]))))
+    train_n = max(1, int(round(num_runs * float(split_cfg["train_fraction"]))))
+    val_n = max(1, int(round(num_runs * float(split_cfg["val_fraction"]))))
     if train_n + val_n >= num_runs:
         val_n = max(1, num_runs - train_n - 1)
     test_n = num_runs - train_n - val_n
@@ -475,6 +527,10 @@ def _normalization_payload(
         axis=0,
     )
     transition_sampling = effective_transition_sampling(config)
+    global_methods = [
+        config["normalization"]["global_methods"][name]
+        for name in global_static_order
+    ]
 
     # Fit dt normalization from padded trajectory shells so each training split
     # uses a single consistent dt feature transform.
@@ -514,11 +570,26 @@ def _normalization_payload(
             "feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
             "blocks": sequence_blocks,
         },
-        "state": _fit_log_standard(state_values, floor=state_floor),
-        "target": _fit_log_standard(target_values, floor=state_floor),
-        "global_static": _fit_mixed_block(global_static, _global_methods(global_static_order)),
-        "log10_dt_s": _fit_log10_dt_block(dt_stats),
-        "spectrum": _fit_log_standard(spectrum_values, floor=spectrum_floor),
+        "state": _fit_block_by_method(
+            state_values,
+            method=config["normalization"]["state_method"],
+            floor=state_floor,
+        ),
+        "target": _fit_block_by_method(
+            target_values,
+            method=config["normalization"]["target_method"],
+            floor=state_floor,
+        ),
+        "global_static": _fit_mixed_block(global_static, global_methods),
+        "log10_dt_s": _fit_log10_dt_block(
+            dt_stats,
+            method=config["normalization"]["log10_dt_method"],
+        ),
+        "spectrum": _fit_block_by_method(
+            spectrum_values,
+            method=config["normalization"]["spectrum_method"],
+            floor=spectrum_floor,
+        ),
         "spectrum_wavelength_nm": spectrum_grid_nm.tolist(),
     }
 
@@ -544,23 +615,29 @@ def load_raw_equilibrium_run(
     """
     requested_output_species = list(config["data_spec"]["output_species"])
 
-    def _extract(handle: h5py.Group) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray, dict[str, float]]:
+    def _extract(handle: h5py.Group) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, dict[str, float]]:
         pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
         temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
+        element_input_order = _decode_species(np.asarray(handle["inputs/element_input_order"]))
+        elemental_abundances_x_h = np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64)
+        gravity_cm_s2 = np.asarray(handle["inputs/gravity_cm_s2"], dtype=np.float64)
         stored_output_species = _decode_species(np.asarray(handle["inputs/output_species"]))
         equilibrium_ymix = np.asarray(handle["equilibrium/ymix"], dtype=np.float64)
         globals_map = {
             key: float(np.asarray(handle[f"globals/{key}"]))
             for key in handle["globals"].keys()
         }
-        return pressure_bar, temperature_k, stored_output_species, equilibrium_ymix, globals_map
+        element_order = list(config["data_spec"]["element_input_order"])
+        element_indices = [element_input_order.index(name) for name in element_order]
+        elemental_profile = elemental_abundances_x_h[:, element_indices]
+        return pressure_bar, temperature_k, elemental_profile, gravity_cm_s2, stored_output_species, equilibrium_ymix, globals_map
 
     if isinstance(source, h5py.Group):
-        pressure_bar, temperature_k, stored_output_species, equilibrium_ymix, globals_map = _extract(source)
+        pressure_bar, temperature_k, elemental_profile, gravity_profile, stored_output_species, equilibrium_ymix, globals_map = _extract(source)
         label = run_id or "unknown"
     else:
         with h5py.File(source, "r") as handle:
-            pressure_bar, temperature_k, stored_output_species, equilibrium_ymix, globals_map = _extract(handle)
+            pressure_bar, temperature_k, elemental_profile, gravity_profile, stored_output_species, equilibrium_ymix, globals_map = _extract(handle)
         label = Path(source).stem
         if run_id is None:
             run_id = label
@@ -569,6 +646,24 @@ def load_raw_equilibrium_run(
         raise ValueError(f"{label}: non-finite pressure values detected.")
     if not np.all(np.isfinite(temperature_k)):
         raise ValueError(f"{label}: non-finite temperature values detected.")
+    if not np.all(np.isfinite(elemental_profile)):
+        raise ValueError(f"{label}: non-finite elemental abundance values detected.")
+    if not np.all(np.isfinite(gravity_profile)):
+        raise ValueError(f"{label}: non-finite gravity values detected.")
+    if elemental_profile.shape[0] != pressure_bar.size:
+        raise ValueError(f"{label}: elemental abundance profile does not match pressure grid.")
+    if gravity_profile.shape != pressure_bar.shape:
+        raise ValueError(f"{label}: gravity profile does not match pressure grid.")
+    _require_column_constant(elemental_profile, name="elemental_abundances_x_h", run_label=label)
+    _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
+    globals_map = dict(globals_map)
+    globals_map.update(
+        {
+            name: float(elemental_profile[0, idx])
+            for idx, name in enumerate(config["data_spec"]["element_input_order"])
+        }
+    )
+    globals_map["gravity_cm_s2"] = float(gravity_profile[0])
     output_indices = [stored_output_species.index(name) for name in requested_output_species]
     equilibrium_ymix = equilibrium_ymix[:, output_indices]
     return RawEquilibriumRun(
@@ -577,6 +672,8 @@ def load_raw_equilibrium_run(
         temperature_k=temperature_k,
         equilibrium_ymix=equilibrium_ymix,
         globals=globals_map,
+        elemental_abundances_x_h=elemental_profile,
+        gravity_cm_s2=gravity_profile,
     )
 
 
@@ -610,6 +707,10 @@ def _equilibrium_normalization_payload(
         ],
         axis=0,
     )
+    global_methods = [
+        config["normalization"]["global_methods"][name]
+        for name in global_static_order
+    ]
 
     feature_names = list(sequence_methods.keys())
     sequence_blocks = []
@@ -630,8 +731,12 @@ def _equilibrium_normalization_payload(
             "feature_order": feature_names,
             "blocks": sequence_blocks,
         },
-        "target": _fit_log_standard(target_values, floor=state_floor),
-        "global_static": _fit_mixed_block(global_static, _global_methods(global_static_order)),
+        "target": _fit_block_by_method(
+            target_values,
+            method=config["normalization"]["target_method"],
+            floor=state_floor,
+        ),
+        "global_static": _fit_mixed_block(global_static, global_methods),
     }
 
 
@@ -752,6 +857,7 @@ def preprocess_equilibrium_dataset(
             "sequence_feature_order": sequence_feature_order,
             "output_species_order": list(config["data_spec"]["output_species"]),
             "global_static_feature_order": global_static_order,
+            "element_input_order": list(config["data_spec"]["element_input_order"]),
         }
         np.save(split_dir / "sequence_inputs.npy", sequence_inputs)
         np.save(split_dir / "target_outputs.npy", target_outputs)
@@ -769,6 +875,7 @@ def preprocess_equilibrium_dataset(
         "model_type": "equilibrium",
         "state_species_order": list(config["data_spec"]["state_species"]),
         "output_species_order": list(config["data_spec"]["output_species"]),
+        "element_input_order": list(config["data_spec"]["element_input_order"]),
         "sequence_static_feature_order": sequence_feature_order,
         "global_static_feature_order": global_static_order,
         "sequence_dim": n_seq_features,
@@ -899,6 +1006,7 @@ def preprocess_raw_dataset(
             "sequence_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
             "state_species_order": list(config["data_spec"]["state_species"]),
             "output_species_order": list(config["data_spec"]["output_species"]),
+            "element_input_order": list(config["data_spec"]["element_input_order"]),
             "global_feature_order": list(config["data_spec"]["global_feature_order"]),
             "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
             "dt_feature_index": int(config["data_spec"]["dt_feature_index"]),
@@ -920,6 +1028,7 @@ def preprocess_raw_dataset(
         "target_mode": target_mode,
         "state_species_order": list(config["data_spec"]["state_species"]),
         "output_species_order": list(config["data_spec"]["output_species"]),
+        "element_input_order": list(config["data_spec"]["element_input_order"]),
         "sequence_static_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
         "global_feature_order": list(config["data_spec"]["global_feature_order"]),
         "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),

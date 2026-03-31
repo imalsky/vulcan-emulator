@@ -63,6 +63,9 @@ The config contract is:
 - `equilibrium_only` contains the equilibrium MLP hyperparameters.
 - `normalization` is the full preprocess contract: raw-run splitting, train-only
   normalization fitting, and processed tensor export.
+- The FastChem-native elemental channels are fixed in code as
+  `["He_H", "C_H", "O_H", "N_H", "S_H"]`; they are exported in metadata but are
+  not user-configurable under `data_spec`.
 
 Internally, config validation still derives compatibility aliases such as
 `model_type`, `generation.target_mode`, `training.model`, and `roth_sampler` so the
@@ -162,11 +165,13 @@ data leakage.  The following methods are supported:
 - **`mixed`**: Per-feature method selection within a single block.  Each feature column
   has its own method, mean, std, and floor.
 
-The config key `normalization.sequence_methods` controls per-column behavior for the
-sequence-static features (pressure, temperature, and optionally Kzz).  Target outputs
-(mixing ratios) always use `log-standard`.  Global conditioning features use `mixed`
-with per-feature rules (e.g., booleans use `none`, gravity uses `log-standard`,
-metallicity uses `none`, C/O and S/O use `standard`).
+Normalization-method selection lives entirely in the config:
+
+- `normalization.sequence_methods` for per-column sequence-static features,
+- `normalization.global_methods` for the mixed global-conditioning block,
+- `normalization.target_method` for targets,
+- `normalization.state_method`, `normalization.spectrum_method`, and
+  `normalization.log10_dt_method` for full-VULCAN-specific blocks.
 
 Implementation: `src/data_generation/preprocess.py`.  JAX-compatible versions for
 inference live in `src/models/export_bundle.py`.
@@ -206,10 +211,14 @@ that bake normalization into the forward pass:
 - `predict_equilibrium_profile(pressure_bar, temperature_k, global_inputs)`:
   Accepts physical-unit inputs (1-D arrays), normalizes them internally, runs the
   equilibrium MLP, and returns mixing ratios in physical space (or log10 if
-  `return_log10=True`).
+  `return_log10=True`).  `global_inputs` is the ordered FastChem-native
+  hydrogen-normalized elemental abundance vector (`n_X / n_H`), typically
+  `["He_H", "C_H", "O_H", "N_H", "S_H"]`.
 
 - `predict_transition_profile(pressure_bar, temperature_k, kzz_cm2_s, anchor_state,
   global_inputs, spectrum_flux, dt_s)`: Same pattern for the transition Transformer.
+  `global_inputs` contains gravity, explicit elemental abundances, and any
+  additional static physics/base flags recorded in the bundle contract.
 
 Both methods handle all normalization (sequence static, global mixed, target inverse)
 transparently.
@@ -227,7 +236,7 @@ the atmospheric state, pressure-grid-aligned TP inputs, and run/provenance metad
 |------|-------|-------------|
 | `sequence_inputs.npy` | `(N, nz, 2)` | Normalized [pressure, temperature] per level |
 | `target_outputs.npy` | `(N, nz, target_dim)` | Normalized log10 mixing ratios |
-| `global_inputs.npy` | `(N, global_dim)` | Normalized [metallicity, C/O, S/O] |
+| `global_inputs.npy` | `(N, global_dim)` | Normalized FastChem-native elemental abundances (`n_X / n_H`) |
 | `run_ids.json` | `(N,)` | String run identifiers |
 
 **Full-VULCAN task** (per split directory):
@@ -237,13 +246,13 @@ the atmospheric state, pressure-grid-aligned TP inputs, and run/provenance metad
 | `sequence_inputs.npy` | `(N, nz, 3)` | Normalized [pressure, temperature, Kzz] per level |
 | `state_trajectories.npy` | `(N, T, nz, state_dim)` | Normalized mixing-ratio trajectories |
 | `target_outputs.npy` | `(N, T, nz, target_dim)` | Normalized target mixing ratios |
-| `global_inputs.npy` | `(N, global_dim)` | Normalized global conditioning vector |
+| `global_inputs.npy` | `(N, global_dim)` | Normalized gravity, FastChem-native elemental abundances (`n_X / n_H`), and static conditioning flags |
 | `spectrum_inputs.npy` | `(N, spectrum_dim)` | Normalized stellar spectrum |
 | `time_s.npy` | `(N, T)` | Raw time values in seconds |
 | `valid_steps_mask.npy` | `(N, T)` | Boolean mask for valid timesteps |
 | `run_ids.json` | `(N,)` | String run identifiers |
 
-Processed artifacts are versioned (`PROCESSED_DATA_VERSION = 6`) so incompatible schema
+Processed artifacts are versioned (`PROCESSED_DATA_VERSION = 7`) so incompatible schema
 changes force regeneration.
 
 ## Temperature Profiles
@@ -273,6 +282,80 @@ tabulated versus pressure while preserving the originating Roth metadata for aud
 - `uni_tests/fixtures/` holds the only tracked tiny PT fixtures and other synthetic test
   assets required for CI.
 
+## ExoJAX API
+
+`src/models/exojax_api.py` provides the differentiable ExoJAX-facing interface for
+both supported emulator branches.  It wraps exported bundles as pure JAX functions
+that support `jax.jit`, `jax.grad`, `jax.vjp`, and `jax.vmap`.
+
+### Public surface
+
+```python
+from src.models.exojax_api import make_equilibrium_vmr_fn, make_transition_vmr_fn
+```
+
+**`make_equilibrium_vmr_fn(bundle) → (vmr_fn, species_labels)`**
+
+Factory function.  Binds one equilibrium export bundle and returns a plain pure-JAX
+function with top-to-bottom layer order:
+
+```python
+vmr_fn(
+    temperatures_k: jax.Array,           # (nz,), top -> bottom
+    pressures_bar: jax.Array,            # (nz,), top -> bottom
+    elemental_abundances_x_h: jax.Array, # (nz, n_elements), top -> bottom
+    gravity_cm_s2: jax.Array,            # (nz,), top -> bottom
+) -> jax.Array                           # (nz, n_species), linear VMR
+```
+
+`species_labels` is the companion `list[str]` in bundle output order.  The elemental
+input order is fixed in code as `["He_H", "C_H", "O_H", "N_H", "S_H"]`.
+
+**`make_transition_vmr_fn(bundle) → (vmr_fn, species_labels)`**
+
+Factory function.  Binds one transition/full-VULCAN export bundle and returns:
+
+```python
+vmr_fn(
+    temperatures_k: jax.Array,           # (nz,), top -> bottom
+    pressures_bar: jax.Array,            # (nz,), top -> bottom
+    elemental_abundances_x_h: jax.Array, # (nz, n_elements), top -> bottom
+    kzz_cm2_s: jax.Array,                # (nz,), top -> bottom
+    gravity_cm_s2: jax.Array,            # (nz,), top -> bottom
+    anchor_state: jax.Array,             # (nz, state_dim), top -> bottom
+    spectrum_flux: jax.Array,            # (spectrum_dim,)
+    dt_s: jax.Array,                     # scalar
+) -> jax.Array                           # (nz, n_species), linear VMR
+```
+
+### ExoJAX contract
+
+- Public layer order is always top-to-bottom.
+- Wrappers reverse to the repository's internal canonical order and reverse outputs
+  back before returning them.
+- `elemental_abundances_x_h` uses the FastChem-native hydrogen-normalized number abundance `n_X / n_H`, not a total-gas mixing ratio and not relative-to-solar.
+- `gravity_cm_s2` is required in both wrappers for contract consistency.
+- Current trained models still assume column-constant chemistry and constant-per-level
+  gravity, so eager calls reject vertically varying elemental-abundance or gravity
+  profiles.
+- Layer geometry, altitude grids, and radius grids are intentionally out of scope for
+  this API version.
+
+### Current training-manifold assumptions
+
+The public API accepts explicit per-layer elemental-abundance and gravity profiles, but
+the current training data is still generated from a column-constant latent sampler:
+
+- `metallicity_log10_range`
+- `c_to_o_range`
+- `s_to_o_range`
+
+Those latent controls are generation-time only.  Raw data materializes them into
+explicit `He_H/C_H/O_H/N_H/S_H` profiles, and preprocessing reduces those constant
+profiles back to the explicit global conditioning vectors used by the trained models.
+
+Implementation: `src/models/exojax_api.py`.
+
 ## Extras Scripts
 
 The `extras/` directory contains standalone utility scripts that operate outside the
@@ -292,3 +375,13 @@ patch NumPy compatibility, and insert the project root onto `sys.path`.
 
 - **`extras/benchmark.py`**: Time JIT compilation and steady-state inference for the
   active model type across multiple batch sizes and devices.
+
+- **`extras/standalone_basic.py`**: Minimal equilibrium-bundle example using
+  `ExportedJAXModel.predict_equilibrium_profile` directly with explicit FastChem-native
+  elemental abundances.
+
+- **`extras/standalone_test.py`**: End-to-end equilibrium demonstration with forward
+  inference, optional FastChem comparison, and JAX autodiff examples.
+
+- **`extras/compare_test_profile_fastchem.py`**: Utility for comparing stored test/raw
+  profiles against FastChem using the explicit elemental-abundance contract.

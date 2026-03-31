@@ -19,6 +19,8 @@ from src.models.jax_model import (
     init_model_params,
 )
 
+ELEMENT_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
+
 
 def _sequence_static_numpy(static_inputs: np.ndarray, blocks: list[dict]) -> np.ndarray:
     """Apply per-column sequence normalization with the repository contract."""
@@ -31,7 +33,7 @@ def _sequence_static_numpy(static_inputs: np.ndarray, blocks: list[dict]) -> np.
 def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
     dims = EquilibriumMLPDimensions(
         sequence_dim=2,
-        global_dim=3,
+        global_dim=len(ELEMENT_ORDER),
         target_dim=2,
         d_hidden=8,
         num_hidden_layers=2,
@@ -50,10 +52,10 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
         },
         "global_static": {
             "method": "mixed",
-            "methods": ["none", "standard", "standard"],
-            "mean": [0.0, 0.8, 0.02],
-            "std": [1.0, 0.2, 0.01],
-            "floor": [None, None, None],
+            "methods": ["log-standard"] * len(ELEMENT_ORDER),
+            "mean": [-1.1, -3.5, -3.3, -4.2, -4.8],
+            "std": [0.1, 0.2, 0.2, 0.2, 0.2],
+            "floor": [1.0e-30] * len(ELEMENT_ORDER),
         },
         "target": {
             "method": "log-standard",
@@ -64,7 +66,8 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
     }
     contract = {
         "model_type": "equilibrium",
-        "global_static_feature_order": ["metallicity_log10", "c_to_o", "s_to_o"],
+        "global_static_feature_order": list(ELEMENT_ORDER),
+        "element_input_order": list(ELEMENT_ORDER),
         "output_species_order": ["H2O", "CO"],
     }
     payload = {
@@ -80,15 +83,17 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
     pressure_bar = np.array([100.0, 10.0, 1.0, 0.1], dtype=np.float32)
     temperature_k = np.array([1450.0, 1300.0, 1050.0, 900.0], dtype=np.float32)
     global_inputs = {
-        "metallicity_log10": 0.3,
-        "c_to_o": 0.7,
-        "s_to_o": 0.018,
+        "He_H": 8.38e-2,
+        "C_H": 3.40e-4,
+        "O_H": 5.10e-4,
+        "N_H": 8.50e-5,
+        "S_H": 1.60e-5,
     }
 
     static_inputs = np.stack([pressure_bar, temperature_k], axis=-1)
     sequence_norm = _sequence_static_numpy(static_inputs, normalization["sequence_static"]["blocks"])
     globals_norm = apply_mixed_block(
-        np.array([[global_inputs["metallicity_log10"], global_inputs["c_to_o"], global_inputs["s_to_o"]]], dtype=np.float64),
+        np.array([[global_inputs[name] for name in ELEMENT_ORDER]], dtype=np.float64),
         normalization["global_static"],
     )
     expected_norm, _ = apply_equilibrium_mlp(
@@ -123,7 +128,7 @@ def test_exported_equilibrium_bundle_predicts_from_physical_inputs(tmp_path):
 def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
     dims = ModelDimensions(
         sequence_dim=5,
-        global_dim=3,
+        global_dim=len(ELEMENT_ORDER) + 2,
         spectrum_dim=4,
         target_dim=2,
         d_model=8,
@@ -162,10 +167,10 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
         },
         "global_static": {
             "method": "mixed",
-            "methods": ["none", "standard"],
-            "mean": [0.0, 0.75],
-            "std": [1.0, 0.15],
-            "floor": [None, None],
+            "methods": ["log-standard"] * (len(ELEMENT_ORDER) + 1),
+            "mean": [3.0, -1.1, -3.5, -3.3, -4.2, -4.8],
+            "std": [0.2, 0.1, 0.2, 0.2, 0.2, 0.2],
+            "floor": [1.0e-30] * (len(ELEMENT_ORDER) + 1),
         },
         "log10_dt_s": {
             "method": "standard",
@@ -181,9 +186,10 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
     }
     contract = {
         "target_mode": "trajectory",
-        "global_static_feature_order": ["metallicity_log10", "c_to_o"],
-        "dt_feature_index": 1,
+        "global_static_feature_order": ["gravity_cm_s2", *ELEMENT_ORDER],
+        "dt_feature_index": len(ELEMENT_ORDER) + 1,
         "spectrum_dim": 4,
+        "element_input_order": list(ELEMENT_ORDER),
         "output_species_order": ["H2O", "CO"],
     }
     payload = {
@@ -208,8 +214,12 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
         dtype=np.float32,
     )
     global_inputs = {
-        "metallicity_log10": 0.2,
-        "c_to_o": 0.9,
+        "gravity_cm_s2": 900.0,
+        "He_H": 8.38e-2,
+        "C_H": 3.40e-4,
+        "O_H": 5.10e-4,
+        "N_H": 8.50e-5,
+        "S_H": 1.60e-5,
     }
     spectrum_flux = np.array([15.0, 20.0, 18.0, 12.0], dtype=np.float32)
     dt_s = 1.0e4
@@ -219,14 +229,25 @@ def test_exported_transition_bundle_predicts_from_physical_inputs(tmp_path):
     state_norm = apply_block(anchor_state, normalization["state"])
     sequence = np.concatenate([static_norm, state_norm], axis=-1)
     globals_static = apply_mixed_block(
-        np.array([[global_inputs["metallicity_log10"], global_inputs["c_to_o"]]], dtype=np.float64),
+        np.array(
+            [[global_inputs["gravity_cm_s2"], *[global_inputs[name] for name in ELEMENT_ORDER]]],
+            dtype=np.float64,
+        ),
         normalization["global_static"],
     )[0]
     dt_feature = (
         (np.log10(dt_s) - float(normalization["log10_dt_s"]["mean"][0]))
         / float(normalization["log10_dt_s"]["std"][0])
     )
-    globals_full = np.concatenate([globals_static[:1], np.array([dt_feature]), globals_static[1:]], axis=0)
+    dt_feature_index = int(contract["dt_feature_index"])
+    globals_full = np.concatenate(
+        [
+            globals_static[:dt_feature_index],
+            np.array([dt_feature]),
+            globals_static[dt_feature_index:],
+        ],
+        axis=0,
+    )
     spectrum_norm = apply_block(spectrum_flux[None, :], normalization["spectrum"])
     expected_norm, _ = apply_model(
         params,

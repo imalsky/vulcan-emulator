@@ -37,20 +37,49 @@ def test_generate_synthetic_raw_runs(tiny_config):
     assert len(artifact.run_files) == tiny_config["generation"]["num_runs"]
     assert artifact.manifest_path is not None and artifact.manifest_path.exists()
     assert artifact.coverage_path is not None and artifact.coverage_path.exists()
-    with h5py.File(artifact.run_files[0], "r") as handle:
-        species = [item.decode("utf-8") for item in handle["inputs/state_species"][:]]
-        assert "OH" in species and "H2S" in species and "SO2" in species
-        time_s = np.asarray(handle["trajectory/time_s"])
-        assert np.all(np.diff(time_s) > 0.0)
-        assert time_s.size == int(tiny_config["sampling"]["num_time_steps"])
-        ymix = np.asarray(handle["trajectory/ymix_state"])
-        assert ymix.shape[0] == time_s.size
-        assert np.all(np.isfinite(ymix))
-        reference = np.asarray(handle["inputs/reference_ymix_state"])
-        assert np.allclose(ymix[0], reference)
-        assert handle["inputs/target_mode"][()].decode("utf-8") == tiny_config["generation"]["target_mode"]
-        spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
-        assert spectrum.size > 10
+    if artifact.consolidated_path is not None:
+        with h5py.File(artifact.consolidated_path, "r") as root:
+            handle = root[sorted(root.keys())[0]]
+            species = [item.decode("utf-8") for item in handle["inputs/state_species"][:]]
+            element_labels = [item.decode("utf-8") for item in handle["inputs/element_input_order"][:]]
+            assert "OH" in species and "H2S" in species and "SO2" in species
+            assert element_labels == ["He_H", "C_H", "O_H", "N_H", "S_H"]
+            time_s = np.asarray(handle["trajectory/time_s"])
+            assert np.all(np.diff(time_s) > 0.0)
+            assert time_s.size == int(tiny_config["sampling"]["num_time_steps"])
+            ymix = np.asarray(handle["trajectory/ymix_state"])
+            assert ymix.shape[0] == time_s.size
+            assert np.all(np.isfinite(ymix))
+            assert np.asarray(handle["inputs/elemental_abundances_x_h"]).shape[0] == int(
+                tiny_config["sampling"]["num_levels"]
+            )
+            assert np.asarray(handle["inputs/gravity_cm_s2"]).shape[0] == int(tiny_config["sampling"]["num_levels"])
+            reference = np.asarray(handle["inputs/reference_ymix_state"])
+            assert np.allclose(ymix[0], reference)
+            assert handle["inputs/target_mode"][()].decode("utf-8") == tiny_config["generation"]["target_mode"]
+            spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
+            assert spectrum.size > 10
+    else:
+        with h5py.File(artifact.run_files[0], "r") as handle:
+            species = [item.decode("utf-8") for item in handle["inputs/state_species"][:]]
+            element_labels = [item.decode("utf-8") for item in handle["inputs/element_input_order"][:]]
+            assert "OH" in species and "H2S" in species and "SO2" in species
+            assert element_labels == ["He_H", "C_H", "O_H", "N_H", "S_H"]
+            time_s = np.asarray(handle["trajectory/time_s"])
+            assert np.all(np.diff(time_s) > 0.0)
+            assert time_s.size == int(tiny_config["sampling"]["num_time_steps"])
+            ymix = np.asarray(handle["trajectory/ymix_state"])
+            assert ymix.shape[0] == time_s.size
+            assert np.all(np.isfinite(ymix))
+            assert np.asarray(handle["inputs/elemental_abundances_x_h"]).shape[0] == int(
+                tiny_config["sampling"]["num_levels"]
+            )
+            assert np.asarray(handle["inputs/gravity_cm_s2"]).shape[0] == int(tiny_config["sampling"]["num_levels"])
+            reference = np.asarray(handle["inputs/reference_ymix_state"])
+            assert np.allclose(ymix[0], reference)
+            assert handle["inputs/target_mode"][()].decode("utf-8") == tiny_config["generation"]["target_mode"]
+            spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
+            assert spectrum.size > 10
 
 
 def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_config):
@@ -143,6 +172,8 @@ def test_convert_fake_vulcan_output_to_hdf5(tmp_path, tiny_config):
         globals=spec.globals,
         spectrum=spec.spectrum,
         metadata={**spec.metadata, "state_species": species, "output_species": species},
+        elemental_abundances_x_h=spec.elemental_abundances_x_h,
+        gravity_cm_s2=spec.gravity_cm_s2,
     )
     convert_vulcan_output_to_hdf5(vul_path, output_h5_path=out_h5, spec=spec, config=config)
     with h5py.File(out_h5, "r") as handle:
@@ -193,6 +224,8 @@ def test_convert_fake_vulcan_output_to_hdf5_equilibrium_only_shell(tmp_path, tin
         globals=spec.globals,
         spectrum=spec.spectrum,
         metadata={**spec.metadata, "state_species": species, "output_species": species},
+        elemental_abundances_x_h=spec.elemental_abundances_x_h,
+        gravity_cm_s2=spec.gravity_cm_s2,
     )
     convert_vulcan_output_to_hdf5(vul_path, output_h5_path=out_h5, spec=spec, config=config)
     with h5py.File(out_h5, "r") as handle:
@@ -323,7 +356,14 @@ def test_run_vulcan_generation_equilibrium_only_skips_vulcan_runtime(tmp_path, t
     artifact = run_vulcan_generation(config, project_root=config["_project_root"])
 
     assert len(artifact.run_files) == 1
-    with h5py.File(artifact.run_files[0], "r") as handle:
-        time_s = np.asarray(handle["trajectory/time_s"])
-        assert np.allclose(time_s, np.array([0.0, 1.0]))
-        assert handle["inputs/target_mode"][()].decode("utf-8") == "equilibrium_only"
+    if artifact.consolidated_path is not None:
+        with h5py.File(artifact.consolidated_path, "r") as root:
+            handle = root[sorted(root.keys())[0]]
+            time_s = np.asarray(handle["trajectory/time_s"])
+            assert np.allclose(time_s, np.array([0.0, 1.0]))
+            assert handle["inputs/target_mode"][()].decode("utf-8") == "equilibrium_only"
+    else:
+        with h5py.File(artifact.run_files[0], "r") as handle:
+            time_s = np.asarray(handle["trajectory/time_s"])
+            assert np.allclose(time_s, np.array([0.0, 1.0]))
+            assert handle["inputs/target_mode"][()].decode("utf-8") == "equilibrium_only"

@@ -303,7 +303,7 @@ class ExportedJAXModel:
         global_inputs : dict or array-like
             Global conditioning scalars.  If a dict, keys must match
             ``data_contract["global_static_feature_order"]`` (e.g.,
-            ``{"metallicity_log10": 0.0, "c_to_o": 0.55, "s_to_o": 0.02}``).
+            ``{"He_H": 8.38e-2, "C_H": 2.95e-4, "O_H": 5.37e-4, "N_H": 7.08e-5, "S_H": 1.41e-5}``).
             If an array, must have shape ``(global_dim,)`` in the correct order.
         return_log10 : bool
             If True, return log10 mixing ratios instead of linear.
@@ -372,8 +372,9 @@ class ExportedJAXModel:
         anchor_state : array-like
             Anchor mixing ratios in physical space, shape ``(nz, state_dim)``.
         global_inputs : dict or array-like
-            Global conditioning scalars (gravity, metallicity, C/O, S/O, plus
-            physics toggles and atmosphere base flags).
+            Global conditioning scalars (gravity, FastChem-native
+            hydrogen-normalized elemental abundances ``n_X / n_H``, plus any
+            physics toggles and atmosphere-base flags).
         spectrum_flux : array-like
             Stellar spectrum flux values, shape ``(spectrum_dim,)``.
         dt_s : float or scalar array
