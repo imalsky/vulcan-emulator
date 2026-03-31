@@ -45,6 +45,7 @@ def test_shipped_equilibrium_config_loads():
     assert config["roth_sampler"]["enabled"] is True
     assert config["roth_sampler"]["data_glob"] == "assets/PTprofiles/*.dat"
     assert config["training"]["model"]["activation"] == "leaky_relu"
+    assert config["training"]["model"]["dropout_rate"] == pytest.approx(0.05)
     assert config["training"]["scheduler"] == {
         "name": "reduce_on_plateau",
         "factor": 0.5,
@@ -137,6 +138,32 @@ def test_default_activation_is_leaky_relu_for_both_model_families(tmp_path):
     full_vulcan_path = tmp_path / "full_vulcan_default_activation.json"
     full_vulcan_path.write_text(json.dumps(full_vulcan, indent=2) + "\n", encoding="utf-8")
     assert load_and_validate_config(full_vulcan_path)["training"]["model"]["activation"] == "leaky_relu"
+
+
+def test_default_dropout_rate_is_point_zero_five_for_both_model_families(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+
+    equilibrium = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    equilibrium["equilibrium_only"]["model"].pop("dropout_rate")
+    equilibrium_path = tmp_path / "equilibrium_default_dropout.json"
+    equilibrium_path.write_text(json.dumps(equilibrium, indent=2) + "\n", encoding="utf-8")
+    assert load_and_validate_config(equilibrium_path)["training"]["model"]["dropout_rate"] == pytest.approx(0.05)
+
+    full_vulcan = _load_raw_json(root / "config" / "full_vulcan_config.json")
+    full_vulcan["full_vulcan"]["model"].pop("dropout_rate")
+    full_vulcan_path = tmp_path / "full_vulcan_default_dropout.json"
+    full_vulcan_path.write_text(json.dumps(full_vulcan, indent=2) + "\n", encoding="utf-8")
+    assert load_and_validate_config(full_vulcan_path)["training"]["model"]["dropout_rate"] == pytest.approx(0.05)
+
+
+def test_invalid_dropout_rate_is_rejected(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    payload = _load_raw_json(root / "config" / "equilibrium_only_config.json")
+    payload["equilibrium_only"]["model"]["dropout_rate"] = 1.0
+    config_path = tmp_path / "invalid_dropout_equilibrium.json"
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigValidationError, match="dropout_rate"):
+        load_and_validate_config(config_path)
 
 
 @pytest.mark.parametrize(

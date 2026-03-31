@@ -78,6 +78,89 @@ def test_training_checkpoint_smoke_with_cosine_scheduler(tiny_config):
     assert artifacts.checkpoint_path.exists()
 
 
+def test_dropout_is_stochastic_only_in_training_mode(tiny_config):
+    eq_dims = EquilibriumMLPDimensions(
+        sequence_dim=2,
+        global_dim=5,
+        target_dim=3,
+        d_hidden=16,
+        num_hidden_layers=2,
+        conditioning_hidden_dim=8,
+        film_clamp=1.5,
+        activation="leaky_relu",
+        dropout_rate=0.5,
+    )
+    eq_params = init_equilibrium_mlp_params(jax.random.PRNGKey(0), eq_dims)
+    eq_sequence = jnp.ones((2, 6, 2), dtype=jnp.float32)
+    eq_globals = jnp.ones((2, 5), dtype=jnp.float32)
+    eq_eval_a, _ = apply_equilibrium_mlp(eq_params, eq_sequence, eq_globals, eq_dims)
+    eq_eval_b, _ = apply_equilibrium_mlp(
+        eq_params,
+        eq_sequence,
+        eq_globals,
+        eq_dims,
+        dropout_key=jax.random.PRNGKey(1),
+        training=False,
+    )
+    eq_train_a, _ = apply_equilibrium_mlp(
+        eq_params,
+        eq_sequence,
+        eq_globals,
+        eq_dims,
+        dropout_key=jax.random.PRNGKey(2),
+        training=True,
+    )
+    eq_train_b, _ = apply_equilibrium_mlp(
+        eq_params,
+        eq_sequence,
+        eq_globals,
+        eq_dims,
+        dropout_key=jax.random.PRNGKey(3),
+        training=True,
+    )
+    assert np.allclose(np.asarray(eq_eval_a), np.asarray(eq_eval_b))
+    assert not np.allclose(np.asarray(eq_train_a), np.asarray(eq_train_b))
+
+    config = copy.deepcopy(tiny_config)
+    config["training"]["model"]["dropout_rate"] = 0.5
+    config["full_vulcan"]["model"]["dropout_rate"] = 0.5
+    batch, _, contract = _prepare_batch(config)
+    dims, params = initialize_model(config, contract, seed=3)
+    sequence = jnp.asarray(batch["sequence"])
+    globals_ = jnp.asarray(batch["global_inputs"])
+    spectrum = jnp.asarray(batch["spectrum_inputs"])
+    eval_a, _ = apply_model(params, sequence, globals_, spectrum, dims)
+    eval_b, _ = apply_model(
+        params,
+        sequence,
+        globals_,
+        spectrum,
+        dims,
+        dropout_key=jax.random.PRNGKey(4),
+        training=False,
+    )
+    train_a, _ = apply_model(
+        params,
+        sequence,
+        globals_,
+        spectrum,
+        dims,
+        dropout_key=jax.random.PRNGKey(5),
+        training=True,
+    )
+    train_b, _ = apply_model(
+        params,
+        sequence,
+        globals_,
+        spectrum,
+        dims,
+        dropout_key=jax.random.PRNGKey(6),
+        training=True,
+    )
+    assert np.allclose(np.asarray(eval_a), np.asarray(eval_b))
+    assert not np.allclose(np.asarray(train_a), np.asarray(train_b))
+
+
 @pytest.mark.parametrize(
     "activation",
     ["relu", "gelu", "silu", "tanh", "elu", "selu", "softplus", "leaky_relu"],

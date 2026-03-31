@@ -1,18 +1,18 @@
-"""Transformer-based surrogate model for 1-D photochemical trajectories.
+"""JAX model definitions for the equilibrium and full-VULCAN emulators.
 
-Implements a FiLM-conditioned transformer that maps an atmospheric column
-(pressure, temperature, Kzz, and anchor mixing ratios) to future mixing
-ratios, conditioned on global scalars (gravity, metallicity, C/O, physics
-toggles) and a stellar spectrum latent vector.
+Implements:
+
+- a FiLM-conditioned per-level MLP for FastChem-style equilibrium chemistry
+- a FiLM-conditioned Transformer for final-state full-VULCAN chemistry
 
 The architecture:
-    1. Project the per-level sequence (P, T, Kzz, ymix) to d_model.
+    1. Project the per-level sequence to the model width.
     2. Add sinusoidal positional encoding over the vertical grid.
     3. Encode the stellar spectrum into a latent vector.
     4. Concatenate [global_scalars, spectrum_latent] and project to
        per-layer FiLM parameters (gamma, beta).
     5. Run L transformer blocks with pre-norm multi-head self-attention,
-       FiLM modulation, and GELU feed-forward sub-layers.
+       FiLM modulation, and configurable feed-forward sub-layers.
     6. Project the final representation to target mixing ratios.
 
 All operations are pure JAX and compatible with ``jax.grad`` / ``jax.jvp``.
@@ -39,9 +39,9 @@ class ModelDimensions:
     Fields
     ------
     sequence_dim : int
-        Per-level input width (3 static + state_dim anchor species).
+        Per-level input width (pressure, temperature, Kzz for full-VULCAN).
     global_dim : int
-        Width of the full global conditioning vector (static + dt).
+        Width of the full global conditioning vector.
     spectrum_dim : int
         Number of wavelength bins in the input spectrum.
     target_dim : int
@@ -67,8 +67,9 @@ class ModelDimensions:
     spectrum_encoder_mode : str
         One of ``"autoencoder"``, ``"linear"``, or ``"none"``.
     activation : str
-        Hidden activation applied throughout the model (``"gelu"``, ``"relu"``,
-        or ``"silu"``).
+        Hidden activation applied throughout the model.
+    dropout_rate : float
+        Dropout probability applied to hidden activations during training.
     """
 
     sequence_dim: int
@@ -86,6 +87,7 @@ class ModelDimensions:
     spectrum_hidden_dim: int
     spectrum_encoder_mode: str
     activation: str = "gelu"
+    dropout_rate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the dimensions dataclass to a plain dictionary."""
@@ -145,6 +147,21 @@ def _linear(params: dict[str, jax.Array], x: jax.Array) -> jax.Array:
     x_2d = x.reshape((-1, x.shape[-1]))
     y_2d = x_2d @ params["weight"] + params["bias"]
     return y_2d.reshape(leading_shape + (params["bias"].shape[0],))
+
+
+def _apply_dropout(
+    x: jax.Array,
+    *,
+    rate: float,
+    key: jax.Array | None,
+    training: bool,
+) -> jax.Array:
+    """Apply inverted dropout when training is enabled and a key is provided."""
+    if not training or rate <= 0.0 or key is None:
+        return x
+    keep_prob = 1.0 - float(rate)
+    mask = jax.random.bernoulli(key, p=keep_prob, shape=x.shape)
+    return jnp.where(mask, x / keep_prob, jnp.zeros_like(x))
 
 
 def _init_layer_norm(dim: int) -> dict[str, jax.Array]:
@@ -337,6 +354,9 @@ def _encode_spectrum(
     params: dict[str, Any],
     spectrum_inputs: jax.Array,
     dims: ModelDimensions,
+    *,
+    dropout_keys: tuple[jax.Array | None, jax.Array | None] | None = None,
+    training: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Compress the stellar spectrum into a latent vector.
 
@@ -352,9 +372,23 @@ def _encode_spectrum(
         return latent, None
     if mode == "autoencoder":
         act = _resolve_activation(dims.activation)
+        encoder_dropout_key = None if dropout_keys is None else dropout_keys[0]
+        decoder_dropout_key = None if dropout_keys is None else dropout_keys[1]
         hidden = act(_linear(params["encoder_1"], spectrum_inputs))
+        hidden = _apply_dropout(
+            hidden,
+            rate=dims.dropout_rate,
+            key=encoder_dropout_key,
+            training=training,
+        )
         latent = _linear(params["encoder_2"], hidden)
         recon_hidden = act(_linear(params["decoder_1"], latent))
+        recon_hidden = _apply_dropout(
+            recon_hidden,
+            rate=dims.dropout_rate,
+            key=decoder_dropout_key,
+            training=training,
+        )
         reconstruction = _linear(params["decoder_2"], recon_hidden)
         return latent, reconstruction
     raise ValueError(f"Unsupported spectrum encoder mode: {mode}")
@@ -373,7 +407,7 @@ class EquilibriumMLPDimensions:
     sequence_dim : int
         Per-level input width (P, T).
     global_dim : int
-        Width of the global conditioning vector (metallicity, C/O, S/O).
+        Width of the global conditioning vector (elemental abundances).
     target_dim : int
         Number of output species per level.
     d_hidden : int
@@ -386,6 +420,8 @@ class EquilibriumMLPDimensions:
         Symmetric clamp applied to FiLM gamma / beta.
     activation : str
         Hidden activation applied in the context and per-level MLP blocks.
+    dropout_rate : float
+        Dropout probability applied to hidden activations during training.
     """
 
     sequence_dim: int
@@ -396,6 +432,7 @@ class EquilibriumMLPDimensions:
     conditioning_hidden_dim: int
     film_clamp: float
     activation: str
+    dropout_rate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the equilibrium dimensions dataclass to a dictionary."""
@@ -456,6 +493,9 @@ def apply_equilibrium_mlp(
     sequence_inputs: jax.Array,
     global_inputs: jax.Array,
     dims: EquilibriumMLPDimensions,
+    *,
+    dropout_key: jax.Array | None = None,
+    training: bool = False,
 ) -> tuple[jax.Array, dict]:
     """Forward pass for the equilibrium FiLM-MLP.
 
@@ -469,6 +509,10 @@ def apply_equilibrium_mlp(
         Global conditioning ``[batch, global_dim]``.
     dims : EquilibriumMLPDimensions
         Architecture dimensions.
+    dropout_key : jax.Array or None
+        PRNG key used for hidden-layer dropout during training.
+    training : bool
+        Whether to enable dropout.
 
     Returns
     -------
@@ -483,6 +527,9 @@ def apply_equilibrium_mlp(
         raise ValueError("global_inputs must have shape [batch, global_dim].")
 
     activation = _resolve_activation(dims.activation)
+    layer_dropout_keys = [None] * dims.num_hidden_layers
+    if training and dims.dropout_rate > 0.0 and dropout_key is not None:
+        layer_dropout_keys = list(jax.random.split(dropout_key, dims.num_hidden_layers))
 
     # Conditioning: globals → per-layer FiLM parameters.
     context = activation(_linear(params["context_in"], global_inputs))
@@ -493,7 +540,7 @@ def apply_equilibrium_mlp(
 
     # Per-level MLP with FiLM modulation at each hidden layer.
     x = sequence_inputs
-    for layer_index, layer in enumerate(params["layers"]):
+    for layer_index, (layer, layer_key) in enumerate(zip(params["layers"], layer_dropout_keys)):
         x = _linear(layer["linear"], x)
         gamma = jnp.clip(
             film[:, layer_index, 0], -dims.film_clamp, dims.film_clamp
@@ -503,6 +550,12 @@ def apply_equilibrium_mlp(
         )
         x = x * (1.0 + gamma[:, None, :]) + beta[:, None, :]
         x = activation(x)
+        x = _apply_dropout(
+            x,
+            rate=dims.dropout_rate,
+            key=layer_key,
+            training=training,
+        )
 
     pred = _linear(params["output"], x)
     return pred, {}
@@ -514,6 +567,9 @@ def apply_model(
     global_inputs: jax.Array,
     spectrum_inputs: jax.Array,
     dims: ModelDimensions,
+    *,
+    dropout_key: jax.Array | None = None,
+    training: bool = False,
 ) -> tuple[jax.Array, dict[str, jax.Array | None]]:
     """Run the full-VULCAN Transformer forward pass in normalized space.
 
@@ -541,6 +597,10 @@ def apply_model(
         Stellar spectrum ``[batch, spectrum_dim]``.
     dims : ModelDimensions
         Architecture hyperparameters.
+    dropout_key : jax.Array or None
+        PRNG key used for hidden-activation dropout during training.
+    training : bool
+        Whether to enable dropout.
 
     Returns
     -------
@@ -556,9 +616,30 @@ def apply_model(
         raise ValueError("spectrum_inputs must have shape [batch, spectrum_dim].")
 
     act = _resolve_activation(dims.activation)
+    spectrum_dropout_keys: tuple[jax.Array | None, jax.Array | None] | None = None
+    layer_dropout_keys: list[tuple[jax.Array | None, jax.Array | None]] = [
+        (None, None)
+        for _ in range(dims.num_layers)
+    ]
+    output_dropout_key: jax.Array | None = None
+    if training and dims.dropout_rate > 0.0 and dropout_key is not None:
+        total_dropout_keys = 2 + (dims.num_layers * 2) + 1
+        dropout_keys = iter(jax.random.split(dropout_key, total_dropout_keys))
+        spectrum_dropout_keys = (next(dropout_keys), next(dropout_keys))
+        layer_dropout_keys = [
+            (next(dropout_keys), next(dropout_keys))
+            for _ in range(dims.num_layers)
+        ]
+        output_dropout_key = next(dropout_keys)
 
     # Encode the stellar spectrum and combine with global scalars for FiLM.
-    latent, reconstruction = _encode_spectrum(params["spectrum_encoder"], spectrum_inputs, dims)
+    latent, reconstruction = _encode_spectrum(
+        params["spectrum_encoder"],
+        spectrum_inputs,
+        dims,
+        dropout_keys=spectrum_dropout_keys,
+        training=training,
+    )
     context = jnp.concatenate([global_inputs, latent], axis=-1)
     context = act(_linear(params["context_in"], context))
     # Produce per-layer FiLM parameters: [batch, num_layers, 2 (gamma/beta), d_model].
@@ -570,21 +651,40 @@ def apply_model(
     x = x + sinusoidal_position_encoding(sequence_inputs.shape[1], dims.d_model, x.dtype)[None, :, :]
 
     # Pre-norm transformer blocks with FiLM modulation after attention.
-    for layer_index, layer in enumerate(params["layers"]):
+    for layer_index, (layer, dropout_keys) in enumerate(zip(params["layers"], layer_dropout_keys)):
+        attn_dropout_key, ff_dropout_key = dropout_keys
         gamma = jnp.clip(film[:, layer_index, 0], -dims.film_clamp, dims.film_clamp)
         beta = jnp.clip(film[:, layer_index, 1], -dims.film_clamp, dims.film_clamp)
         x_norm = _layer_norm(layer["ln1"], x)
         attn = _multihead_attention(layer, x_norm, nhead=dims.nhead)
+        attn = _apply_dropout(
+            attn,
+            rate=dims.dropout_rate,
+            key=attn_dropout_key,
+            training=training,
+        )
         x = x + attn  # Residual connection from attention.
         x = x * (1.0 + gamma[:, None, :]) + beta[:, None, :]  # FiLM conditioning.
         ff_in = _layer_norm(layer["ln2"], x)
         ff_hidden = act(_linear(layer["ff1"], ff_in))
+        ff_hidden = _apply_dropout(
+            ff_hidden,
+            rate=dims.dropout_rate,
+            key=ff_dropout_key,
+            training=training,
+        )
         ff = _linear(layer["ff2"], ff_hidden)
         x = x + ff  # Residual connection from feed-forward.
 
     # Output head: layer-norm → bottleneck → final projection.
     x = _layer_norm(params["out_norm"], x)
     x = act(_linear(params["out_head_hidden"], x))
+    x = _apply_dropout(
+        x,
+        rate=dims.dropout_rate,
+        key=output_dropout_key,
+        training=training,
+    )
     pred = _linear(params["out_head_final"], x)
     aux = {
         "spectrum_reconstruction": reconstruction,
@@ -615,6 +715,7 @@ def build_model_dimensions(
             conditioning_hidden_dim=int(model_cfg["conditioning_hidden_dim"]),
             film_clamp=float(model_cfg["film_clamp"]),
             activation=str(model_cfg["activation"]).lower(),
+            dropout_rate=float(model_cfg.get("dropout_rate", 0.05)),
         )
     spectrum_cfg = config["stellar_spectrum"]
     return ModelDimensions(
@@ -632,7 +733,8 @@ def build_model_dimensions(
         spectrum_latent_dim=int(spectrum_cfg["latent_dim"]),
         spectrum_hidden_dim=int(spectrum_cfg["hidden_dim"]),
         spectrum_encoder_mode=str(spectrum_cfg["encoder_mode"]).lower(),
-        activation=str(model_cfg.get("activation", "gelu")).lower(),
+        activation=str(model_cfg.get("activation", "leaky_relu")).lower(),
+        dropout_rate=float(model_cfg.get("dropout_rate", 0.05)),
     )
 
 

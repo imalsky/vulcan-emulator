@@ -329,6 +329,10 @@ def _validate_equilibrium_model_config(model: dict[str, Any], scope: str) -> dic
         normalized.get("activation", "leaky_relu"),
         f"{scope}.activation",
     ).lower()
+    normalized["dropout_rate"] = _as_float(
+        normalized.get("dropout_rate", 0.05),
+        f"{scope}.dropout_rate",
+    )
     if normalized["activation"] not in _ALLOWED_ACTIVATIONS:
         raise ConfigValidationError(
             f"{scope}.activation must be one of {_ALLOWED_ACTIVATIONS}."
@@ -339,6 +343,8 @@ def _validate_equilibrium_model_config(model: dict[str, Any], scope: str) -> dic
         raise ConfigValidationError(f"{scope}.conditioning_hidden_dim must be >= 1.")
     if normalized["film_clamp"] <= 0.0:
         raise ConfigValidationError(f"{scope}.film_clamp must be positive.")
+    if not 0.0 <= normalized["dropout_rate"] < 1.0:
+        raise ConfigValidationError(f"{scope}.dropout_rate must be in [0, 1).")
     return normalized
 
 
@@ -372,6 +378,10 @@ def _validate_full_vulcan_model_config(model: dict[str, Any], scope: str) -> dic
         normalized.get("activation", "leaky_relu"),
         f"{scope}.activation",
     ).lower()
+    normalized["dropout_rate"] = _as_float(
+        normalized.get("dropout_rate", 0.05),
+        f"{scope}.dropout_rate",
+    )
     if normalized["activation"] not in _ALLOWED_ACTIVATIONS:
         raise ConfigValidationError(
             f"{scope}.activation must be one of {_ALLOWED_ACTIVATIONS}."
@@ -388,6 +398,8 @@ def _validate_full_vulcan_model_config(model: dict[str, Any], scope: str) -> dic
         raise ConfigValidationError(f"{scope}.output_head_divisor must be >= 1.")
     if normalized["film_clamp"] <= 0.0:
         raise ConfigValidationError(f"{scope}.film_clamp must be positive.")
+    if not 0.0 <= normalized["dropout_rate"] < 1.0:
+        raise ConfigValidationError(f"{scope}.dropout_rate must be in [0, 1).")
     return normalized
 
 

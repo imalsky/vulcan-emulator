@@ -9,6 +9,7 @@ from src.training.trainer import (
     _init_reduce_on_plateau_state,
     _maybe_update_plateau_scheduler,
     _scheduled_learning_rate,
+    _should_early_stop,
 )
 
 
@@ -154,3 +155,8 @@ def test_epoch_row_formats_plain_values_without_logger_prefix():
     assert "0.071s" in row
     assert "INFO" not in row
     assert "src.training.trainer" not in row
+
+
+def test_early_stopping_triggers_after_thirty_non_improving_epochs():
+    assert _should_early_stop(29) is False
+    assert _should_early_stop(30) is True

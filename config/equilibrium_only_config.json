@@ -5,7 +5,7 @@
   "paths": {
     "raw_root": "data/raw/equilibrium_only",
     "processed_root": "data/processed/equilibrium_only",
-    "checkpoints_root": "models/equilibrium_only_silu",
+    "checkpoints_root": "models/eq",
     "vulcan_source_root": "../VULCAN-master"
   },
   "data_spec": {
@@ -49,7 +49,7 @@
     ]
   },
   "sampling": {
-    "num_levels": 64,
+    "num_levels": 50,
     "pressure_top_bar": 1e-07,
     "pressure_bottom_bar": 100.0,
     "temperature_range_k": [
@@ -131,11 +131,11 @@
   },
   "generation": {
     "mode": "vulcan",
-    "num_runs": 2000,
+    "num_runs": 100000,
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
-    "parallel_workers": 8
+    "parallel_workers": 64
   },
   "normalization": {
     "split": {
@@ -161,7 +161,7 @@
   "training": {
     "seed": 123,
     "batch_size": 256,
-    "epochs": 300,
+    "epochs": 200,
     "learning_rate": 3e-4,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
@@ -172,7 +172,7 @@
       "threshold": 1e-4
     },
     "weight_decay": 1e-5,
-    "gradient_clip": 1.0,
+    "gradient_clip": 5.0,
     "loss": {
       "lambda_z": 1.0,
       "lambda_phys": 0.25
@@ -181,9 +181,10 @@
   "equilibrium_only": {
     "model": {
       "activation": "leaky_relu",
+      "dropout_rate": 0.05,
       "d_hidden": 1024,
-      "num_hidden_layers": 16,
-      "conditioning_hidden_dim": 512,
+      "num_hidden_layers": 8,
+      "conditioning_hidden_dim": 256,
       "film_clamp": 100.0
     }
   }

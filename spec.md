@@ -221,6 +221,7 @@ Supported activations for both model families:
 - `leaky_relu`
 
 Default activation for both model families: `leaky_relu`.
+Both model families also support `dropout_rate`; the shipped configs start at `0.05`.
 
 ## Export Bundle
 

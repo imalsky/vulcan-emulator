@@ -168,7 +168,8 @@
       "conditioning_hidden_dim": 256,
       "film_clamp": 100.0,
       "output_head_divisor": 2,
-      "activation": "leaky_relu"
+      "activation": "leaky_relu",
+      "dropout_rate": 0.05
     },
     "physics_toggles": {
       "use_photochemistry": true,

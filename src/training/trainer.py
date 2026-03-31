@@ -54,6 +54,7 @@ from ..utils.config import is_equilibrium, task_kind
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
+_EARLY_STOPPING_PATIENCE = 30
 
 
 @dataclass(frozen=True)
@@ -337,7 +338,7 @@ def make_train_eval_functions(
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
-    def train_step(params, opt_state, batch, learning_rate):
+    def train_step(params, opt_state, batch, learning_rate, dropout_key):
         """Run one optimizer step for the full-VULCAN model."""
         def loss_fn(model_params):
             """Compute the weighted full-VULCAN training loss and metrics."""
@@ -347,6 +348,8 @@ def make_train_eval_functions(
                 batch["global_inputs"],
                 batch["spectrum_inputs"],
                 dims,
+                dropout_key=dropout_key,
+                training=True,
             )
             # MSE in normalized space (the primary training signal).
             mse_norm = jnp.mean((pred - batch["target"]) ** 2)
@@ -473,6 +476,11 @@ def _format_epoch_row(
     )
 
 
+def _should_early_stop(no_improvement_epochs: int, *, patience: int = _EARLY_STOPPING_PATIENCE) -> bool:
+    """Return True when validation has failed to improve for the full patience window."""
+    return no_improvement_epochs >= patience
+
+
 def _emit_epoch_table_line(line: str) -> None:
     """Write one plain-text training-table line to stdout and the live PBS log."""
     print(line, flush=True)
@@ -569,12 +577,17 @@ def make_equilibrium_train_eval_functions(
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
-    def train_step(params, opt_state, batch, learning_rate):
+    def train_step(params, opt_state, batch, learning_rate, dropout_key):
         """Run one optimizer step for the equilibrium model."""
         def loss_fn(model_params):
             """Compute the weighted equilibrium-training loss and metrics."""
             pred, _aux = apply_equilibrium_mlp(
-                model_params, batch["sequence"], batch["global_inputs"], dims,
+                model_params,
+                batch["sequence"],
+                batch["global_inputs"],
+                dims,
+                dropout_key=dropout_key,
+                training=True,
             )
             mse_norm = jnp.mean((pred - batch["target"]) ** 2)
             pred_log10 = pred * target_std + target_mean
@@ -659,6 +672,8 @@ def train_equilibrium_model(
     history: list[dict[str, Any]] = []
     best_payload: dict[str, Any] | None = None
     best_val = float("inf")
+    best_epoch = 0
+    no_improvement_epochs = 0
     global_step = 0
     scheduler = config["training"]["scheduler"]
     base_lr = float(config["training"]["learning_rate"])
@@ -685,6 +700,7 @@ def train_equilibrium_model(
     _emit_epoch_table_line(_epoch_table_rule())
 
     rng = np.random.default_rng(int(config["training"]["seed"]))
+    dropout_rng = jax.random.PRNGKey(int(config["training"]["seed"]))
 
     for epoch in range(epochs):
         epoch_t0 = time.monotonic()
@@ -704,8 +720,13 @@ def train_equilibrium_model(
             )
             # Move the host batch onto the accelerator immediately before the train step.
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+            dropout_rng, step_dropout_key = jax.random.split(dropout_rng)
             params, opt_state, metrics = train_step(
-                params, opt_state, device_batch, jnp.asarray(lr, dtype=jnp.float32),
+                params,
+                opt_state,
+                device_batch,
+                jnp.asarray(lr, dtype=jnp.float32),
+                step_dropout_key,
             )
             train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
             global_step += 1
@@ -766,8 +787,20 @@ def train_equilibrium_model(
         _write_checkpoint(checkpoints_root / "last.pt", current_payload)
         if val_summary["combined_loss"] < best_val:
             best_val = val_summary["combined_loss"]
+            best_epoch = epoch + 1
+            no_improvement_epochs = 0
             best_payload = current_payload
             _write_checkpoint(checkpoints_root / "best.pt", current_payload)
+        else:
+            no_improvement_epochs += 1
+            if _should_early_stop(no_improvement_epochs):
+                LOGGER.info(
+                    "Early stopping at epoch %d after %d epochs without validation improvement. Best epoch: %d.",
+                    epoch + 1,
+                    no_improvement_epochs,
+                    best_epoch,
+                )
+                break
 
     if best_payload is None:
         raise RuntimeError("Training completed without producing a best checkpoint.")
@@ -839,6 +872,8 @@ def train_full_vulcan_model(
     history: list[dict[str, Any]] = []
     best_payload: dict[str, Any] | None = None
     best_val = float("inf")
+    best_epoch = 0
+    no_improvement_epochs = 0
     global_step = 0
     scheduler = config["training"]["scheduler"]
     base_lr = float(config["training"]["learning_rate"])
@@ -864,6 +899,7 @@ def train_full_vulcan_model(
     _emit_epoch_table_line(_epoch_table_rule())
 
     rng = np.random.default_rng(int(config["training"]["seed"]))
+    dropout_rng = jax.random.PRNGKey(int(config["training"]["seed"]))
 
     for epoch in range(epochs):
         epoch_t0 = time.monotonic()
@@ -882,8 +918,13 @@ def train_full_vulcan_model(
                 plateau_state=plateau_state,
             )
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+            dropout_rng, step_dropout_key = jax.random.split(dropout_rng)
             params, opt_state, metrics = train_step(
-                params, opt_state, device_batch, jnp.asarray(lr, dtype=jnp.float32),
+                params,
+                opt_state,
+                device_batch,
+                jnp.asarray(lr, dtype=jnp.float32),
+                step_dropout_key,
             )
             train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
             global_step += 1
@@ -943,8 +984,20 @@ def train_full_vulcan_model(
         _write_checkpoint(checkpoints_root / "last.pt", current_payload)
         if val_summary["combined_loss"] < best_val:
             best_val = val_summary["combined_loss"]
+            best_epoch = epoch + 1
+            no_improvement_epochs = 0
             best_payload = current_payload
             _write_checkpoint(checkpoints_root / "best.pt", current_payload)
+        else:
+            no_improvement_epochs += 1
+            if _should_early_stop(no_improvement_epochs):
+                LOGGER.info(
+                    "Early stopping at epoch %d after %d epochs without validation improvement. Best epoch: %d.",
+                    epoch + 1,
+                    no_improvement_epochs,
+                    best_epoch,
+                )
+                break
 
     if best_payload is None:
         raise RuntimeError("Training completed without producing a best checkpoint.")
