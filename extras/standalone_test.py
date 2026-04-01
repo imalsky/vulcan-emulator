@@ -131,7 +131,21 @@ def _globals_vector(
     globals_map: dict[str, float],
     overrides: dict[str, jax.Array | float] | None = None,
 ) -> jax.Array:
-    """Build a global feature vector in the exported bundle order."""
+    """Build a global feature vector in the exported bundle order.
+
+    Parameters
+    ----------
+    globals_map : dict[str, float]
+        Base global-input mapping.
+    overrides : dict[str, jax.Array | float] or None, optional
+        Optional per-feature overrides applied before vectorization.
+
+    Returns
+    -------
+    jax.Array
+        One-dimensional global feature vector aligned with the exported bundle
+        contract.
+    """
     merged = dict(globals_map)
     if overrides is not None:
         merged.update(overrides)
@@ -144,7 +158,18 @@ def _globals_vector(
 
 
 def _global_label(name: str) -> str:
-    """Map exported global feature names to compact plot/table labels."""
+    """Map exported global feature names to compact plot/table labels.
+
+    Parameters
+    ----------
+    name : str
+        Exported global feature name.
+
+    Returns
+    -------
+    str
+        Short label suitable for tables and plot annotations.
+    """
     labels = {
         "He_H": "He/H",
         "C_H": "C/H",
@@ -156,7 +181,18 @@ def _global_label(name: str) -> str:
 
 
 def _fastchem_element_globals(globals_map: dict[str, float]) -> dict[str, float]:
-    """Return explicit FastChem elemental abundances from the exported `X/H` globals."""
+    """Return explicit FastChem elemental abundances from the exported `X/H` globals.
+
+    Parameters
+    ----------
+    globals_map : dict[str, float]
+        Global-input mapping in the exported bundle contract.
+
+    Returns
+    -------
+    dict[str, float]
+        Elemental abundance mapping restricted to the FastChem ``X/H`` fields.
+    """
     required = list(ELEMENT_INPUT_ORDER)
     missing = [name for name in required if name not in globals_map]
     if missing:
@@ -417,7 +453,18 @@ print("  ─" * 35)
 # jax.grad requires a scalar-valued function, so we average H2O over the
 # vertical column first.
 def _mean_h2o(temperature: jax.Array) -> jax.Array:
-    """Column-averaged log10(H2O) as a function of the temperature profile."""
+    """Return column-averaged log10(H2O) as a function of temperature.
+
+    Parameters
+    ----------
+    temperature : jax.Array
+        Temperature profile with shape ``(nz,)``.
+
+    Returns
+    -------
+    jax.Array
+        Scalar column-mean log10 abundance of H2O.
+    """
     log10_ratios = _forward_log10(pressure_jax, temperature, global_arr)
     return jnp.mean(log10_ratios[:, h2o_idx])   # scalar
 
@@ -445,7 +492,18 @@ print("  ─" * 35)
 # (n_species, n_global): each row is how one species responds to the exported
 # global conditioning features.
 def _column_mean_log10(globals_vec: jax.Array) -> jax.Array:
-    """Column-averaged log10 mixing ratio for every species."""
+    """Return the column-mean log10 mixing ratio for every species.
+
+    Parameters
+    ----------
+    globals_vec : jax.Array
+        Global conditioning vector in the exported bundle order.
+
+    Returns
+    -------
+    jax.Array
+        One-dimensional array of column-mean log10 abundances.
+    """
     log10_ratios = _forward_log10(pressure_jax, temperature_jax, globals_vec)
     return jnp.mean(log10_ratios, axis=0)   # (n_species,)
 
@@ -502,7 +560,19 @@ MAX_GRAD      = 1.0e-3  # gradient clip threshold in the scalar optimization spa
 H2O_TOL_DEX   = 0.01    # report convergence only within this residual tolerance
 
 def _h2o_loss(c_h_scalar: jax.Array) -> jax.Array:
-    """Scalar MSE loss: recover the target H2O abundance by varying C/H only."""
+    """Return the scalar H2O recovery loss used in the toy inversion demo.
+
+    Parameters
+    ----------
+    c_h_scalar : jax.Array
+        Candidate carbon abundance ``C/H``.
+
+    Returns
+    -------
+    jax.Array
+        Scalar squared-error loss against the target column-mean H2O
+        abundance.
+    """
     globals_vec = _globals_vector(global_inputs, {"C_H": c_h_scalar})
     log10_ratios = _forward_log10(pressure_jax, temperature_jax, globals_vec)
     predicted    = jnp.mean(log10_ratios[:, h2o_idx])     # scalar

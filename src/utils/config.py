@@ -162,7 +162,27 @@ class ConfigValidationError(ValueError):
 
 
 def _require_keys(mapping: dict[str, Any], keys: tuple[str, ...] | list[str], scope: str) -> None:
-    """Raise when a mapping is missing required keys for a config scope."""
+    """Validate that a config subsection contains every required key.
+
+    Parameters
+    ----------
+    mapping : dict[str, Any]
+        Config subsection to validate.
+    keys : tuple[str, ...] or list[str]
+        Required keys that must appear in ``mapping``.
+    scope : str
+        Human-readable config scope used in validation errors.
+
+    Returns
+    -------
+    None
+        The function returns silently when all keys are present.
+
+    Raises
+    ------
+    ConfigValidationError
+        If one or more required keys are missing.
+    """
     missing = [key for key in keys if key not in mapping]
     if missing:
         raise ConfigValidationError(f"Missing required keys in {scope}: {missing}")
@@ -193,35 +213,103 @@ def _nested_key_present(mapping: dict[str, Any], path: str) -> bool:
 
 
 def _reject_removed_legacy_keys(config: dict[str, Any]) -> None:
-    """Fail fast on removed config keys with targeted migration messages."""
+    """Reject deprecated config keys that now require explicit migration.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Full user configuration payload before normalization.
+
+    Returns
+    -------
+    None
+        The function returns silently when no removed legacy keys are present.
+
+    Raises
+    ------
+    ConfigValidationError
+        If a removed dotted config path still exists in ``config``.
+    """
     for path, message in _REMOVED_LEGACY_KEYS.items():
         if _nested_key_present(config, path):
             raise ConfigValidationError(message)
 
 
 def _as_bool(value: Any, field: str) -> bool:
-    """Validate and return a boolean config value."""
+    """Validate and return one boolean config field.
+
+    Parameters
+    ----------
+    value : Any
+        Raw config value to validate.
+    field : str
+        Field name used in validation errors.
+
+    Returns
+    -------
+    bool
+        Validated boolean value.
+    """
     if not isinstance(value, bool):
         raise ConfigValidationError(f"{field} must be a boolean.")
     return value
 
 
 def _as_int(value: Any, field: str) -> int:
-    """Validate and return an integer config value."""
+    """Validate and return one integer config field.
+
+    Parameters
+    ----------
+    value : Any
+        Raw config value to validate.
+    field : str
+        Field name used in validation errors.
+
+    Returns
+    -------
+    int
+        Validated integer value.
+    """
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigValidationError(f"{field} must be an integer.")
     return int(value)
 
 
 def _as_float(value: Any, field: str) -> float:
-    """Validate and return a numeric config value as a float."""
+    """Validate and return one numeric config field as a float.
+
+    Parameters
+    ----------
+    value : Any
+        Raw config value to validate.
+    field : str
+        Field name used in validation errors.
+
+    Returns
+    -------
+    float
+        Validated numeric value converted to ``float``.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigValidationError(f"{field} must be numeric.")
     return float(value)
 
 
 def _as_nonempty_str(value: Any, field: str) -> str:
-    """Validate and return a non-empty string config value."""
+    """Validate and return one non-empty string config field.
+
+    Parameters
+    ----------
+    value : Any
+        Raw config value to validate.
+    field : str
+        Field name used in validation errors.
+
+    Returns
+    -------
+    str
+        Stripped non-empty string value.
+    """
     if not isinstance(value, str) or not value.strip():
         raise ConfigValidationError(f"{field} must be a non-empty string.")
     return value.strip()
@@ -333,22 +421,66 @@ def get_model_type(config: dict[str, Any]) -> str:
 
 
 def uses_fastchem(config: dict[str, Any]) -> bool:
-    """Return True when the config targets FastChem equilibrium outputs."""
+    """Report whether the config targets FastChem equilibrium chemistry.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config.
+
+    Returns
+    -------
+    bool
+        ``True`` when ``chemistry_type`` resolves to ``"fastchem"``.
+    """
     return get_chemistry_type(config) == "fastchem"
 
 
 def uses_vulcan_chemistry(config: dict[str, Any]) -> bool:
-    """Return True when the config targets converged VULCAN outputs."""
+    """Report whether the config targets converged VULCAN chemistry outputs.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config.
+
+    Returns
+    -------
+    bool
+        ``True`` when ``chemistry_type`` resolves to ``"vulcan"``.
+    """
     return get_chemistry_type(config) == "vulcan"
 
 
 def uses_mlp(config: dict[str, Any]) -> bool:
-    """Return True when the config selects the FiLM-conditioned MLP."""
+    """Report whether the config selects the FiLM-conditioned MLP model.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config.
+
+    Returns
+    -------
+    bool
+        ``True`` when ``model_type`` resolves to ``"mlp"``.
+    """
     return get_model_type(config) == "mlp"
 
 
 def uses_transformer(config: dict[str, Any]) -> bool:
-    """Return True when the config selects the FiLM-conditioned Transformer."""
+    """Report whether the config selects the FiLM-conditioned Transformer.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config.
+
+    Returns
+    -------
+    bool
+        ``True`` when ``model_type`` resolves to ``"transformer"``.
+    """
     return get_model_type(config) == "transformer"
 
 
@@ -361,8 +493,22 @@ def _validate_science_presets(
 ) -> list[dict[str, Any]]:
     """Validate curated full-VULCAN science presets.
 
-    Presets may be omitted; in that case a single default preset is synthesized
-    from the section-level ``physics_toggles`` and ``atm_base`` values.
+    Parameters
+    ----------
+    presets : Any
+        User-provided preset payload or ``None``.
+    default_physics : dict[str, bool]
+        Default public physics toggles used to backfill omitted presets.
+    default_atm_base : str
+        Default atmosphere base used to backfill omitted presets.
+    scope : str
+        Config scope label used in validation errors.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Normalized preset dictionaries containing ``name``, ``atm_base``, and
+        ``physics_toggles``.
     """
     if presets is None:
         return [
@@ -423,10 +569,18 @@ def resolve_conditioning_inputs(
 ) -> dict[str, float]:
     """Resolve and validate the required per-run conditioning inputs.
 
-    Missing required inputs are treated as a hard data-contract failure rather
-    than silently backfilled from config defaults. This ensures stale raw data
-    generated under an older contract is rejected and regenerated instead of
-    being mixed into training under guessed runtime settings.
+    Parameters
+    ----------
+    raw_global_inputs : dict[str, float]
+        Raw globals mapping loaded from a run file.
+    required_global_inputs : list[str]
+        Ordered conditioning-input names required by the active data contract.
+
+    Returns
+    -------
+    dict[str, float]
+        Reduced mapping containing exactly the required conditioning inputs in
+        Python float form.
     """
     resolved: dict[str, float] = {}
     for name in required_global_inputs:
@@ -440,12 +594,37 @@ def resolve_conditioning_inputs(
 
 
 def global_static_feature_order(config: dict[str, Any]) -> list[str]:
-    """Return the global feature order (static conditioning inputs)."""
+    """Return the ordered list of global conditioning feature names.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config whose ``data_spec`` section defines the
+        required global inputs.
+
+    Returns
+    -------
+    list[str]
+        Ordered global feature names used by preprocessing and model I/O.
+    """
     return list(config["data_spec"]["required_global_inputs"])
 
 
 def global_feature_order(config: dict[str, Any]) -> list[str]:
-    """Full global feature vector order (identical to static order)."""
+    """Return the full ordered global feature vector contract for the model.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config whose ``data_spec`` section defines the
+        required global inputs.
+
+    Returns
+    -------
+    list[str]
+        Ordered global feature names. In the current contract this matches
+        :func:`global_static_feature_order`.
+    """
     return list(config["data_spec"]["required_global_inputs"])
 
 
@@ -728,9 +907,16 @@ def _validate_temperature_profile_validation(
 def _validate_analytic_temperature_sampler(sampler_config: Any) -> dict[str, Any]:
     """Validate the Line/Robinson analytic PT sampler configuration.
 
-    Checks the analytic-profile parameter distributions and ranges used by
-    the Line et al. (2013) sampler. Shared temperature validity bounds are
-    validated separately under ``temperature_profiles.validation``.
+    Parameters
+    ----------
+    sampler_config : Any
+        Raw config payload for ``temperature_profiles.analytic_sampler``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalized analytic-sampler config with validated numeric ranges and
+        distribution specifications.
     """
     scope = "temperature_profiles.analytic_sampler"
     if not isinstance(sampler_config, dict):
@@ -802,9 +988,16 @@ def _validate_analytic_temperature_sampler(sampler_config: Any) -> dict[str, Any
 def _validate_temperature_profiles(profile_config: Any) -> dict[str, Any]:
     """Validate shared temperature-profile sampling settings.
 
-    Handles source_mode selection (analytic / pt_library / mixed), filter
-    key validation (Teq, LogMet, etc.), analytic_sampler sub-validation,
-    data_glob requirement for library modes, and analytic_probability bounds.
+    Parameters
+    ----------
+    profile_config : Any
+        Raw ``temperature_profiles`` config payload.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalized temperature-profile config containing validated source-mode,
+        filters, analytic sampler settings, and shared validity bounds.
     """
     if not isinstance(profile_config, dict):
         raise ConfigValidationError("temperature_profiles must be a mapping.")

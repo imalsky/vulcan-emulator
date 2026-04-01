@@ -26,8 +26,20 @@ def migrate_per_file_to_consolidated(
 ) -> Path | None:
     """Consolidate existing per-file runs into ``runs.h5``.
 
-    Returns the consolidated path on success, or ``None`` if there is
-    nothing to migrate.
+    Parameters
+    ----------
+    raw_root : Path
+        Raw dataset root that may contain a legacy ``runs/`` directory with
+        per-file HDF5 runs.
+    dry_run : bool, default=False
+        When ``True``, log what would be migrated without writing
+        ``runs.h5`` or deleting source files.
+
+    Returns
+    -------
+    Path or None
+        Path to the written consolidated file, or ``None`` when there is
+        nothing to migrate or when running in dry-run mode.
     """
     runs_dir = raw_root / "runs"
     run_files = sorted(runs_dir.glob("run_*.h5"))

@@ -19,6 +19,26 @@ from typing import Any
 import numpy as np
 
 
+PROCESSED_INFO_DIRNAME = "info"
+
+
+def processed_info_dir(processed_root: str | Path) -> Path:
+    """Return the shared metadata directory for a processed dataset.
+
+    Parameters
+    ----------
+    processed_root : str or Path
+        Root directory of the processed dataset layout.
+
+    Returns
+    -------
+    Path
+        Directory reserved for shared processed-dataset JSON metadata such as
+        ``normalization.json`` and ``data_contract.json``.
+    """
+    return Path(processed_root) / PROCESSED_INFO_DIRNAME
+
+
 @dataclass(frozen=True)
 class ProcessedSplit:
     """Processed split with normalized tensors and optional spectrum inputs.
@@ -103,7 +123,7 @@ def load_processed_dataset(
     ----------
     processed_root : str or Path
         Processed dataset root containing split subdirectories together with
-        ``normalization.json`` and ``data_contract.json``.
+        ``info/normalization.json`` and ``info/data_contract.json``.
 
     Returns
     -------
@@ -113,13 +133,14 @@ def load_processed_dataset(
         tensor ordering.
     """
     root = Path(processed_root)
+    info_dir = processed_info_dir(root)
     splits = {
         name: load_processed_split(root / name)
         for name in ("train", "val", "test")
         if (root / name / "metadata.json").exists()
     }
-    normalization = json.loads((root / "normalization.json").read_text(encoding="utf-8"))
-    contract = json.loads((root / "data_contract.json").read_text(encoding="utf-8"))
+    normalization = json.loads((info_dir / "normalization.json").read_text(encoding="utf-8"))
+    contract = json.loads((info_dir / "data_contract.json").read_text(encoding="utf-8"))
     return splits, normalization, contract
 
 

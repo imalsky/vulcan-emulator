@@ -98,12 +98,31 @@ class TransformerDimensions:
     dropout_rate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the dimensions dataclass to a plain dictionary."""
+        """Serialize transformer dimension metadata into plain Python types.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary of scalar architecture hyperparameters suitable for
+            checkpointing and JSON-compatible metadata payloads.
+        """
         return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TransformerDimensions":
-        """Reconstruct dimensions from a serialized dictionary."""
+        """Reconstruct transformer dimensions from serialized metadata.
+
+        Parameters
+        ----------
+        payload : dict[str, Any]
+            Dictionary containing the fields required by
+            ``TransformerDimensions``.
+
+        Returns
+        -------
+        TransformerDimensions
+            Dataclass instance rebuilt from the serialized payload.
+        """
         return cls(**payload)
 
 
@@ -424,8 +443,30 @@ def _encode_spectrum(
 ) -> tuple[jax.Array, jax.Array | None]:
     """Compress the stellar spectrum into a latent vector.
 
-    Returns (latent, reconstruction) where reconstruction is non-None only
-    in autoencoder mode.
+    Parameters
+    ----------
+    params : dict[str, Any]
+        Spectrum-encoder parameter subtree.
+    spectrum_inputs : jax.Array or None
+        Batched spectrum tensor with shape ``(batch, spectrum_dim)`` when the
+        encoder is enabled.
+    dims : TransformerDimensions or MLPDimensions
+        Model dimensions containing the spectrum encoder configuration.
+    dropout_keys : tuple[jax.Array | None, jax.Array | None] or None, optional
+        Optional encoder and decoder dropout keys used in autoencoder mode.
+    training : bool, default=False
+        Whether dropout should be active.
+    batch_size : int or None, optional
+        Explicit batch size used when ``spectrum_encoder_mode == "none"``.
+    dtype : jnp.dtype, default=jnp.float32
+        Output dtype for synthesized latent vectors.
+
+    Returns
+    -------
+    tuple[jax.Array, jax.Array | None]
+        ``(latent, reconstruction)`` where ``latent`` has shape
+        ``(batch, spectrum_latent_dim)`` and ``reconstruction`` is non-``None``
+        only in autoencoder mode.
     """
     mode = dims.spectrum_encoder_mode
     if mode == "none":
@@ -514,12 +555,30 @@ class MLPDimensions:
     dropout_rate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the MLP dimensions dataclass to a dictionary."""
+        """Serialize MLP dimension metadata into plain Python types.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary of scalar architecture hyperparameters suitable for
+            checkpointing and exported metadata.
+        """
         return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "MLPDimensions":
-        """Reconstruct MLP dimensions from a serialized dictionary."""
+        """Reconstruct MLP dimensions from serialized metadata.
+
+        Parameters
+        ----------
+        payload : dict[str, Any]
+            Dictionary containing the fields required by ``MLPDimensions``.
+
+        Returns
+        -------
+        MLPDimensions
+            Dataclass instance rebuilt from the serialized payload.
+        """
         return cls(**payload)
 
 
@@ -990,8 +1049,16 @@ def initialize_model(
 def count_parameters(params: dict) -> int:
     """Count the total number of scalar parameters in a nested JAX parameter tree.
 
-    Flattens the tree to its leaf arrays and sums their sizes.  Useful for
-    logging model complexity.
+    Parameters
+    ----------
+    params : dict
+        Nested parameter tree whose leaves are JAX arrays.
+
+    Returns
+    -------
+    int
+        Total number of scalar entries across all leaves in the parameter
+        tree.
     """
     leaves = jax.tree_util.tree_leaves(params)
     return int(sum(int(leaf.size) for leaf in leaves))

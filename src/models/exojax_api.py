@@ -35,6 +35,12 @@ def _validate_fastchem_bundle_global_order(bundle: ExportedJAXModel) -> None:
     bundle : ExportedJAXModel
         Loaded export bundle whose ``data_contract`` should match the ExoJAX
         FastChem elemental-conditioning contract.
+
+    Returns
+    -------
+    None
+        The function returns silently when the bundle matches the current
+        FastChem global-input contract.
     """
     feature_order = list(bundle.data_contract.get("global_static_feature_order", []))
     if feature_order != FASTCHEM_GLOBAL_LABELS:
@@ -53,6 +59,12 @@ def _validate_vulcan_bundle_global_order(bundle: ExportedJAXModel) -> None:
     bundle : ExportedJAXModel
         Loaded export bundle whose ``data_contract`` should match the ExoJAX
         VULCAN runtime-conditioning contract.
+
+    Returns
+    -------
+    None
+        The function returns silently when the bundle matches the current
+        VULCAN global-input contract.
     """
     feature_order = list(bundle.data_contract.get("global_static_feature_order", []))
     if feature_order != VULCAN_GLOBAL_LABELS:
@@ -72,6 +84,12 @@ def _maybe_require_column_constant(values: Any, *, name: str) -> None:
         Candidate scalar, 1-D profile, or 2-D stacked profile input.
     name : str
         Human-readable field name used in validation errors.
+
+    Returns
+    -------
+    None
+        The function returns silently when eager inputs are vertically
+        constant or when tracing prevents eager validation.
     """
     if isinstance(values, jax.core.Tracer):
         return
@@ -102,6 +120,12 @@ def _require_matching_level_shapes(
         Pressure profile with shape ``(nz,)``.
     name : str, default="temperatures_k and pressures_bar"
         Field label used in validation errors.
+
+    Returns
+    -------
+    None
+        The function returns silently when both arrays are one-dimensional and
+        share the same shape.
     """
     if temperatures.ndim != 1 or pressures.ndim != 1:
         raise ValueError(f"{name} must be 1-D arrays.")

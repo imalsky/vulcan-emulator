@@ -37,6 +37,7 @@ import numpy as np
 from ..data_generation.data_loader import (
     iter_batches,
     load_processed_dataset,
+    processed_info_dir,
 )
 from ..data_generation.generation import generate_raw_dataset
 from ..data_generation.preprocess import PROCESSED_DATA_VERSION, preprocess_raw_dataset
@@ -73,9 +74,16 @@ class ReduceOnPlateauState:
 def _tree_global_norm(tree: Any) -> jax.Array:
     """Compute the global L2 norm of a nested JAX parameter or gradient tree.
 
-    Flattens the tree to leaf arrays, squares each element, sums across
-    all leaves, and takes the square root.  Used by ``_clip_tree`` to
-    implement gradient clipping.
+    Parameters
+    ----------
+    tree : Any
+        Nested JAX pytree whose leaves are numeric arrays.
+
+    Returns
+    -------
+    jax.Array
+        Scalar ``float32`` array containing the global L2 norm across all
+        leaves.
     """
     leaves = jax.tree_util.tree_leaves(tree)
     if not leaves:
@@ -86,8 +94,17 @@ def _tree_global_norm(tree: Any) -> jax.Array:
 def _clip_tree(tree: Any, max_norm: float) -> Any:
     """Clip all leaves in a tree so the global L2 norm does not exceed *max_norm*.
 
-    If the current norm is already within the limit, the tree is returned
-    unchanged.  Otherwise, all leaves are scaled by ``max_norm / norm``.
+    Parameters
+    ----------
+    tree : Any
+        Nested JAX pytree whose leaves are numeric arrays.
+    max_norm : float
+        Maximum allowed global L2 norm.
+
+    Returns
+    -------
+    Any
+        Tree with the same structure as ``tree`` after global-norm clipping.
     """
     norm = _tree_global_norm(tree)
     scale = jnp.minimum(1.0, float(max_norm) / jnp.maximum(norm, 1.0e-12))
@@ -97,8 +114,16 @@ def _clip_tree(tree: Any, max_norm: float) -> Any:
 def _init_adamw_state(params: Any) -> dict[str, Any]:
     """Initialize AdamW optimizer state: zero first-moment (m), second-moment (v), and step counter.
 
-    Creates zero-valued trees matching the shape of *params* for the
-    exponential moving averages used by Adam.
+    Parameters
+    ----------
+    params : Any
+        Parameter pytree whose structure defines the optimizer moment trees.
+
+    Returns
+    -------
+    dict[str, Any]
+        Optimizer state dictionary containing zero-valued ``m`` and ``v``
+        trees plus the scalar step counter ``t``.
     """
     zeros = jax.tree_util.tree_map(jnp.zeros_like, params)
     return {"m": zeros, "v": zeros, "t": jnp.asarray(0, dtype=jnp.int32)}
@@ -233,7 +258,19 @@ def _cosine_learning_rate_schedule(
 
 
 def _init_reduce_on_plateau_state(base_lr: float) -> ReduceOnPlateauState:
-    """Initialize reduce-on-plateau state at the peak learning rate."""
+    """Create the initial scheduler state for reduce-on-plateau learning-rate decay.
+
+    Parameters
+    ----------
+    base_lr : float
+        Starting learning rate before any plateau-triggered reductions.
+
+    Returns
+    -------
+    ReduceOnPlateauState
+        Scheduler state with the current learning rate set to ``base_lr`` and
+        no recorded best validation metric yet.
+    """
     return ReduceOnPlateauState(
         current_lr=base_lr,
         best_metric=None,
@@ -397,7 +434,20 @@ def _maybe_update_plateau_scheduler(
 
 
 def _state_stats(normalization: dict[str, Any]) -> tuple[jax.Array, jax.Array]:
-    """Load target-space normalization statistics as JAX arrays."""
+    """Load target normalization statistics as JAX arrays for loss computation.
+
+    Parameters
+    ----------
+    normalization : dict[str, Any]
+        Normalization payload containing a ``"target"`` block with ``"mean"``
+        and ``"std"`` arrays.
+
+    Returns
+    -------
+    tuple[jax.Array, jax.Array]
+        Target means and standard deviations converted to ``float32`` JAX
+        arrays.
+    """
     mean = jnp.asarray(normalization["target"]["mean"], dtype=jnp.float32)
     std = jnp.asarray(normalization["target"]["std"], dtype=jnp.float32)
     return mean, std
@@ -618,12 +668,26 @@ def _feature_order_matches(contract: dict[str, Any], config: dict[str, Any]) -> 
 
 
 def _epoch_table_header() -> str:
-    """Return the plain-text epoch table header shown in live logs."""
+    """Build the fixed-width header row for the live epoch progress table.
+
+    Returns
+    -------
+    str
+        Header text labeling the epoch, train loss, validation loss, learning
+        rate, and elapsed time columns.
+    """
     return f"{'Epoch':>9}  {'Train Loss':>12}  {'Val Loss':>12}  {'LR':>12}  {'Time':>8}"
 
 
 def _epoch_table_rule() -> str:
-    """Return a separator matching the live epoch table width."""
+    """Build a separator row matching the live epoch progress table width.
+
+    Returns
+    -------
+    str
+        Dashed separator string aligned to the same column widths as
+        :func:`_epoch_table_header`.
+    """
     return f"{'-' * 9}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 8}"
 
 
@@ -669,7 +733,21 @@ def _format_epoch_row(
 
 
 def _should_early_stop(no_improvement_epochs: int, *, patience: int) -> bool:
-    """Return True when validation has failed to improve for the full patience window."""
+    """Decide whether early stopping should terminate training.
+
+    Parameters
+    ----------
+    no_improvement_epochs : int
+        Number of consecutive epochs without validation improvement.
+    patience : int
+        Allowed number of non-improving epochs before stopping.
+
+    Returns
+    -------
+    bool
+        ``True`` when the non-improvement count has reached or exceeded the
+        configured patience.
+    """
     return no_improvement_epochs >= patience
 
 
@@ -707,7 +785,7 @@ def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
         Path to a processed dataset compatible with the active config.
     """
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
-    contract_path = processed_root / "data_contract.json"
+    contract_path = processed_info_dir(processed_root) / "data_contract.json"
     if contract_path.exists():
         try:
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
@@ -787,7 +865,22 @@ def _checkpoint_payload(
 
 
 def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
-    """Write a checkpoint payload to disk."""
+    """Serialize one training checkpoint payload to disk with pickle.
+
+    Parameters
+    ----------
+    path : Path
+        Output checkpoint path such as ``best.pt`` or ``last.pt``.
+    payload : dict[str, Any]
+        Checkpoint dictionary containing params, optimizer state, metrics,
+        normalization, and data-contract metadata.
+
+    Returns
+    -------
+    None
+        The checkpoint payload is written to ``path`` using the highest pickle
+        protocol.
+    """
     with path.open("wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
 

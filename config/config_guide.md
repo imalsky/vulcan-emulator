@@ -125,7 +125,7 @@ Output head: LayerNorm -> activation -> bottleneck -> dropout -> Linear(-> targe
 | Key | Description |
 |-----|-------------|
 | `raw_root` | Directory for raw HDF5 runs |
-| `processed_root` | Directory for normalized tensors |
+| `processed_root` | Directory containing `train/`, `val/`, `test/`, and shared metadata in `info/` |
 | `checkpoints_root` | Directory for model checkpoints |
 | `vulcan_source_root` | Path to VULCAN-master (needed for generation) |
 

@@ -1,5 +1,7 @@
 # VULCAN Emulator Spec
 
+> Note: I still need to figure something out with gravity and Kzz.
+
 ## Overview
 
 The public config surface is now defined by:
@@ -213,10 +215,12 @@ PROCESSED_DATA_VERSION = 13
 ```
 
 All processed datasets write:
-- `normalization.json`
-- `data_contract.json`
-- `splits.json`
-- `processed_manifest.json`
+- split directories `train/`, `val/`, and `test/`
+- shared metadata under `info/`
+  - `info/normalization.json`
+  - `info/data_contract.json`
+  - `info/splits.json`
+  - `info/processed_manifest.json`
 
 ### FastChem processed split
 
@@ -232,7 +236,7 @@ All processed datasets write:
 - `global_inputs.npy` `(N, global_dim)`
 - `spectrum_inputs.npy` `(N, spectrum_dim)`
 
-`metadata.json` and `data_contract.json` store explicit:
+`metadata.json` and `info/data_contract.json` store explicit:
 - `chemistry_type`
 - `model_type`
 - `sequence_static_feature_order`

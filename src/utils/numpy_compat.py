@@ -13,10 +13,11 @@ import numpy as np
 def patch_numpy_asarray_copy() -> None:
     """Allow code paths that pass ``copy=...`` to ``np.asarray`` on older NumPy.
 
-    NumPy 2.0 added a ``copy`` keyword to ``np.asarray``.  JAX and
-    other downstream libraries may pass it unconditionally, causing a
-    ``TypeError`` on NumPy < 2.0.  This monkey-patch silently drops
-    the ``copy`` kwarg on older releases so the call succeeds.
+    Returns
+    -------
+    None
+        ``np.asarray`` may be monkey-patched in place on NumPy releases that
+        do not yet accept the ``copy`` keyword argument.
     """
     try:
         np.asarray(0, copy=None)

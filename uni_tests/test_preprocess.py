@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import numpy as np
 
 from src.data_generation.generation import generate_synthetic_raw_runs
-from src.data_generation.data_loader import build_batch, load_processed_dataset
+from src.data_generation.data_loader import build_batch, load_processed_dataset, processed_info_dir
 from src.data_generation.preprocess import preprocess_raw_dataset
 
 
 def test_preprocess_and_batch(tiny_config):
     generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
+    processed_root = Path(tiny_config["paths"]["processed_root"])
+    processed_root.mkdir(parents=True, exist_ok=True)
+    for filename in ("data_contract.json", "normalization.json", "processed_manifest.json", "splits.json"):
+        (processed_root / filename).write_text("{}", encoding="utf-8")
     artifact = preprocess_raw_dataset(tiny_config, project_root=tiny_config["_project_root"])
     assert "processed_root" in artifact
+    info_dir = processed_info_dir(processed_root)
+    assert info_dir.is_dir()
+    for filename in ("data_contract.json", "normalization.json", "processed_manifest.json", "splits.json"):
+        assert (info_dir / filename).is_file()
+        assert not (processed_root / filename).exists()
 
     splits, normalization, contract = load_processed_dataset(tiny_config["paths"]["processed_root"])
     assert set(splits.keys()) == {"train", "val", "test"}

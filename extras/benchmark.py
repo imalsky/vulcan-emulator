@@ -42,10 +42,39 @@ from src.models.jax_model import (
 
 
 def _uses_mlp(payload: dict) -> bool:
+    """Return whether the loaded checkpoint payload stores an MLP model.
+
+    Parameters
+    ----------
+    payload : dict
+        Checkpoint payload loaded from disk.
+
+    Returns
+    -------
+    bool
+        ``True`` when the payload config selects ``model_type == "mlp"``.
+    """
     return str(payload.get("config", {}).get("model_type", "")) == "mlp"
 
 
 def _make_dummy_fastchem(dims: MLPDimensions | TransformerDimensions, batch: int, nz: int = 150):
+    """Create synthetic FastChem inputs for benchmarking one forward pass.
+
+    Parameters
+    ----------
+    dims : MLPDimensions or TransformerDimensions
+        Model dimensions defining the sequence and global input widths.
+    batch : int
+        Batch size to synthesize.
+    nz : int, default=150
+        Number of vertical levels in the dummy sequence tensor.
+
+    Returns
+    -------
+    tuple[jax.Array, jax.Array]
+        Random ``(sequence, global_inputs)`` tensors with benchmark-compatible
+        shapes.
+    """
     k1, k2 = jax.random.split(jax.random.PRNGKey(0))
     seq = jax.random.normal(k1, (batch, nz, dims.sequence_dim))
     globs = jax.random.normal(k2, (batch, dims.global_dim))
@@ -53,6 +82,23 @@ def _make_dummy_fastchem(dims: MLPDimensions | TransformerDimensions, batch: int
 
 
 def _make_dummy_vulcan(dims: MLPDimensions | TransformerDimensions, batch: int, nz: int = 150):
+    """Create synthetic VULCAN inputs for benchmarking one forward pass.
+
+    Parameters
+    ----------
+    dims : MLPDimensions or TransformerDimensions
+        Model dimensions defining the sequence, global, and spectrum widths.
+    batch : int
+        Batch size to synthesize.
+    nz : int, default=150
+        Number of vertical levels in the dummy sequence tensor.
+
+    Returns
+    -------
+    tuple[jax.Array, jax.Array, jax.Array]
+        Random ``(sequence, global_inputs, spectrum_inputs)`` tensors with
+        benchmark-compatible shapes.
+    """
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
     seq = jax.random.normal(k1, (batch, nz, dims.sequence_dim))
     globs = jax.random.normal(k2, (batch, dims.global_dim))
@@ -61,6 +107,22 @@ def _make_dummy_vulcan(dims: MLPDimensions | TransformerDimensions, batch: int, 
 
 
 def _time_fn(fn, n_warmup: int, n_bench: int) -> float:
+    """Measure median execution time for a compiled JAX callable.
+
+    Parameters
+    ----------
+    fn : callable
+        Zero-argument callable that launches one benchmarked forward pass.
+    n_warmup : int
+        Number of warmup iterations excluded from timing.
+    n_bench : int
+        Number of timed iterations used to compute the median latency.
+
+    Returns
+    -------
+    float
+        Median wall-clock latency in seconds.
+    """
     for _ in range(n_warmup):
         jax.block_until_ready(fn())
     times = []
@@ -72,6 +134,13 @@ def _time_fn(fn, n_warmup: int, n_bench: int) -> float:
 
 
 def _print_header(model_label: str):
+    """Print the table header for one benchmark section.
+
+    Parameters
+    ----------
+    model_label : str
+        Human-readable label describing the benchmarked model family.
+    """
     print(f"\n{model_label}")
     print(f"{'Device':<8} {'Batch':>6} {'Median (ms)':>12} "
           f"{'Per-sample (ms)':>16} {'Throughput':>14}")
@@ -79,6 +148,17 @@ def _print_header(model_label: str):
 
 
 def _print_row(dev_name: str, bs: int, median_s: float):
+    """Print one formatted benchmark result row.
+
+    Parameters
+    ----------
+    dev_name : str
+        Device label such as ``"cpu"`` or ``"gpu"``.
+    bs : int
+        Benchmarked batch size.
+    median_s : float
+        Median latency in seconds for the measured forward pass.
+    """
     per_ms = (median_s / bs) * 1000
     tput = bs / median_s
     print(f"{dev_name:<8} {bs:>6} {median_s * 1000:>11.3f} "
@@ -86,6 +166,14 @@ def _print_row(dev_name: str, bs: int, median_s: float):
 
 
 def benchmark_fastchem(payload: dict):
+    """Benchmark a FastChem checkpoint across devices and batch sizes.
+
+    Parameters
+    ----------
+    payload : dict
+        Loaded checkpoint payload containing params, config, and model
+        dimensions.
+    """
     dims = (
         MLPDimensions.from_dict(payload["model_dimensions"])
         if _uses_mlp(payload)
@@ -113,6 +201,14 @@ def benchmark_fastchem(payload: dict):
 
 
 def benchmark_vulcan(payload: dict):
+    """Benchmark a VULCAN checkpoint across devices and batch sizes.
+
+    Parameters
+    ----------
+    payload : dict
+        Loaded checkpoint payload containing params, config, and model
+        dimensions.
+    """
     dims = (
         MLPDimensions.from_dict(payload["model_dimensions"])
         if _uses_mlp(payload)
@@ -140,6 +236,13 @@ def benchmark_vulcan(payload: dict):
 
 
 def main():
+    """Load the configured checkpoint and run the appropriate benchmark.
+
+    Returns
+    -------
+    None
+        Benchmark results are printed to stdout.
+    """
     with CHECKPOINT.open("rb") as f:
         payload = pickle.load(f)
 

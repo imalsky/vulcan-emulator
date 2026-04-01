@@ -89,8 +89,20 @@ class GeneratedRawDataset:
 def patch_python_assignments(text: str, assignments: dict[str, Any]) -> str:
     """Patch simple ``name = value`` assignments in a Python config file.
 
-    Used to inject sampled parameters into VULCAN's ``vulcan_cfg.py``
-    before launching each run.  Missing keys are appended at the end.
+    Parameters
+    ----------
+    text : str
+        Original Python source text to patch.
+    assignments : dict[str, Any]
+        Mapping from variable names to replacement Python values. Each value is
+        serialized with ``repr`` and applied to the first matching top-level
+        ``name = ...`` assignment.
+
+    Returns
+    -------
+    str
+        Updated Python source text with all requested assignments replaced in
+        place, or appended at the end when a name is not already present.
     """
     updated = text
     for name, value in assignments.items():
@@ -106,7 +118,21 @@ def patch_python_assignments(text: str, assignments: dict[str, Any]) -> str:
 
 
 def _requested_run_count(config: dict[str, Any], num_runs: int | None) -> int:
-    """Resolve the requested run count from the override or config."""
+    """Return the number of raw runs the generation stage should produce.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config containing ``generation.num_runs``.
+    num_runs : int or None
+        Optional command-line override for the configured run count.
+
+    Returns
+    -------
+    int
+        Requested number of generated runs after applying the override when
+        provided.
+    """
     return int(config["generation"]["num_runs"] if num_runs is None else num_runs)
 
 
@@ -118,9 +144,22 @@ def consolidate_runs_to_single_hdf5(
 ) -> Path:
     """Merge per-run HDF5 files into a single file with one group per run.
 
-    Each run becomes a top-level group named after the file stem
-    (e.g. ``run_00000``).  Uses ``h5py.Group.copy`` for efficient
-    internal copying without materializing data in Python.
+    Parameters
+    ----------
+    run_files : list[Path]
+        Per-run HDF5 files to merge, typically ``run_*.h5`` files under the
+        raw ``runs/`` directory.
+    output_path : Path
+        Destination consolidated HDF5 file, usually ``runs.h5``.
+    delete_originals : bool, default=True
+        When ``True``, remove the original per-run files after the consolidated
+        file has been written successfully.
+
+    Returns
+    -------
+    Path
+        Path to the consolidated HDF5 file where each original run is stored as
+        a top-level group named after the source file stem.
     """
     ensure_dir(output_path.parent)
     with h5py.File(output_path, "w") as dest:
@@ -142,13 +181,37 @@ def consolidate_runs_to_single_hdf5(
 
 
 def list_run_ids_from_consolidated(consolidated_path: Path) -> list[str]:
-    """Return sorted run-group names from a consolidated HDF5 file."""
+    """List run identifiers stored inside a consolidated raw-data HDF5 file.
+
+    Parameters
+    ----------
+    consolidated_path : Path
+        Path to ``runs.h5`` where each top-level group corresponds to one run.
+
+    Returns
+    -------
+    list[str]
+        Sorted run IDs such as ``["run_00000", "run_00001", ...]``.
+    """
     with h5py.File(consolidated_path, "r") as f:
         return sorted(f.keys())
 
 
 def _generation_worker_count(config: dict[str, Any], total_runs: int) -> int:
-    """Cap the worker count by both config and the number of runs."""
+    """Return the effective number of parallel generation workers to launch.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated config containing ``generation.parallel_workers``.
+    total_runs : int
+        Number of runs that still need to be generated.
+
+    Returns
+    -------
+    int
+        Worker count capped to at least one worker and at most ``total_runs``.
+    """
     configured = int(config["generation"]["parallel_workers"])
     return max(1, min(configured, total_runs))
 
@@ -225,7 +288,25 @@ def _prepare_generation_directory(
 
 
 def _coverage_fraction(low: float, high: float, observed_low: float, observed_high: float) -> float:
-    """Compute the covered fraction of a configured parameter interval."""
+    """Compute how much of a configured interval is covered by sampled values.
+
+    Parameters
+    ----------
+    low : float
+        Configured lower bound of the allowed parameter range.
+    high : float
+        Configured upper bound of the allowed parameter range.
+    observed_low : float
+        Minimum sampled value observed in the generated dataset.
+    observed_high : float
+        Maximum sampled value observed in the generated dataset.
+
+    Returns
+    -------
+    float
+        Fraction of the configured interval covered by the observed samples,
+        clipped to ``[0, 1]``.
+    """
     span = max(high - low, 1.0e-12)
     return float(np.clip((observed_high - observed_low) / span, 0.0, 1.0))
 
@@ -239,9 +320,24 @@ def _sampling_coverage_payload(
 ) -> dict[str, Any]:
     """Summarize the realized dataset coverage against the configured ranges.
 
-    Computes the fraction of each configured parameter interval that
-    was actually covered by the sampled runs.  Written to
-    ``sampling_coverage.json`` for diagnostic inspection.
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated generation config containing the configured sampling ranges.
+    specs : list[RunSpecification]
+        Sampled run specifications used to generate the raw dataset.
+    run_files : list[Path]
+        Raw run files or consolidated files whose stored pressure and
+        temperature profiles define the realized coverage.
+    mode : str
+        Generation mode label recorded in the output payload.
+
+    Returns
+    -------
+    dict[str, Any]
+        JSON-serializable diagnostic payload describing configured ranges,
+        realized min/max values, and coverage fractions for key sampled
+        parameters.
     """
     fastchem = uses_fastchem(config)
     metallicity = np.asarray([spec.globals["metallicity_log10"] for spec in specs], dtype=np.float64)
@@ -392,13 +488,38 @@ def _write_generation_metadata(
 
 
 def _sulfur_enabled(config: dict[str, Any]) -> bool:
-    """Return whether the configured species basis includes sulfur chemistry."""
+    """Return whether the configured species lists require sulfur chemistry.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated config whose ``data_spec`` section defines the state and
+        output species names.
+
+    Returns
+    -------
+    bool
+        ``True`` when any requested species name contains ``"S"`` and the
+        downstream chemistry runtime should include sulfur-bearing elements.
+    """
     species = list(config["data_spec"]["state_species"]) + list(config["data_spec"]["output_species"])
     return any("S" in name for name in species)
 
 
 def _vulcan_atom_list(config: dict[str, Any]) -> list[str]:
-    """Build the atom list expected by VULCAN/FastChem for this config."""
+    """Build the elemental basis expected by the VULCAN and FastChem runtimes.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated config describing the requested species basis.
+
+    Returns
+    -------
+    list[str]
+        Ordered atom symbols passed into the chemistry runtime, including
+        sulfur when the configured species set requires it.
+    """
     atoms = ["H", "O", "C", "N", "He"]
     if _sulfur_enabled(config):
         atoms.append("S")
@@ -408,9 +529,18 @@ def _vulcan_atom_list(config: dict[str, Any]) -> list[str]:
 def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
     """Map one sampled run specification to elemental abundance scalars.
 
-    Metallicity scaling follows the convention [M/H] = log10(Z/Z_sun),
-    so all metals are multiplied by 10^[M/H].  C/O and S/O ratios
-    override the default solar proportions for carbon and sulfur.
+    Parameters
+    ----------
+    spec : RunSpecification
+        Sampled run specification containing either an explicit per-level
+        elemental abundance profile or scalar metallicity and ratio globals.
+
+    Returns
+    -------
+    dict[str, float]
+        Mapping containing hydrogen-normalized elemental abundances for
+        ``He_H``, ``C_H``, ``O_H``, ``N_H``, and ``S_H``, plus the auxiliary
+        ``fastchem_met_scale`` scalar used by the FastChem runtime.
     """
     if spec.elemental_abundances_x_h is not None:
         element_profile = np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
@@ -532,6 +662,12 @@ def _write_scalar_metadata(handle: h5py.File, metadata: dict[str, Any]) -> None:
     metadata : dict[str, Any]
         Flat metadata mapping. Only scalar booleans, numbers, and strings are
         serialized.
+
+    Returns
+    -------
+    None
+        Scalar metadata values are written into ``handle`` under a
+        ``metadata`` group when any serializable entries are present.
     """
     scalar_items: dict[str, Any] = {}
     for key, value in metadata.items():
@@ -557,6 +693,25 @@ def write_equilibrium_hdf5(
     output_species: list[str],
 ) -> Path:
     """Write a simplified HDF5 for equilibrium-only runs (no trajectory/spectrum).
+
+    Parameters
+    ----------
+    path : Path
+        Destination raw-run HDF5 path.
+    spec : RunSpecification
+        Sampled run specification providing pressure, temperature, elemental
+        abundances, gravity, globals, and metadata.
+    equilibrium_ymix : np.ndarray
+        Equilibrium mixing-ratio tensor with shape ``(nz, n_output_species)``.
+    state_species : list[str]
+        Species labels recorded for the state basis.
+    output_species : list[str]
+        Species labels corresponding to the columns of ``equilibrium_ymix``.
+
+    Returns
+    -------
+    Path
+        Path to the written equilibrium raw-run file.
 
     Layout::
 
@@ -598,6 +753,24 @@ def write_raw_run_hdf5(
     output_species: list[str] | None = None,
 ) -> Path:
     """Write one full-VULCAN raw run in the repository HDF5 contract.
+
+    Parameters
+    ----------
+    path : Path
+        Destination raw-run HDF5 path.
+    spec : RunSpecification
+        Sampled run specification providing per-level inputs, globals, and
+        optional spectrum data.
+    final_ymix_output : np.ndarray
+        Final converged composition tensor with shape ``(nz, n_output_species)``.
+    output_species : list[str] or None, optional
+        Output species order for ``final_ymix_output``. When omitted, the value
+        is inferred from ``spec.metadata``.
+
+    Returns
+    -------
+    Path
+        Path to the written raw-run HDF5 file.
 
     Layout::
 
@@ -660,7 +833,21 @@ def write_raw_run_hdf5(
 
 
 def _synthetic_vertical_coordinate(pressure_bar: np.ndarray) -> np.ndarray:
-    """Return a depth coordinate in [0, 1] with 0 at the top and 1 at the bottom."""
+    """Map a pressure profile onto a normalized vertical coordinate.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        One-dimensional pressure profile in bar ordered from top to bottom or
+        bottom to top.
+
+    Returns
+    -------
+    np.ndarray
+        Array with the same shape as ``pressure_bar`` containing values in
+        ``[0, 1]``, where smaller pressures map near 0 and larger pressures
+        map near 1.
+    """
     logp = np.log10(np.clip(np.asarray(pressure_bar, dtype=np.float64), 1.0e-30, None))
     return np.clip((logp - np.min(logp)) / max(np.max(logp) - np.min(logp), 1.0e-8), 0.0, 1.0)
 
@@ -692,7 +879,26 @@ def _synthetic_uv_strength(spec: RunSpecification) -> float:
 
 
 def _assign_species(state: np.ndarray, species_index: dict[str, int], name: str, values: np.ndarray) -> None:
-    """Add one profile into the requested species column when it exists."""
+    """Accumulate one species profile into a state tensor when the column exists.
+
+    Parameters
+    ----------
+    state : np.ndarray
+        State tensor with shape ``(nz, n_species)`` that is updated in place.
+    species_index : dict[str, int]
+        Mapping from species names to columns in ``state``.
+    name : str
+        Species name to update.
+    values : np.ndarray
+        Vertical profile with shape ``(nz,)`` or broadcast-compatible values to
+        add into the selected species column.
+
+    Returns
+    -------
+    None
+        ``state`` is mutated in place when ``name`` appears in
+        ``species_index``; otherwise the function is a no-op.
+    """
     if name in species_index:
         state[:, species_index[name]] += np.asarray(values, dtype=np.float64)
 
@@ -704,10 +910,19 @@ def _synthetic_final_state(
 ) -> np.ndarray:
     """Build one heuristic final-state composition for smoke-test generation.
 
-    The synthetic path is intentionally lightweight. It maps sampled pressure,
-    temperature, elemental abundances, Kzz, spectrum, and public physics knobs
-    directly to one plausible final-state profile without any timestep or
-    anchor-state machinery.
+    Parameters
+    ----------
+    spec : RunSpecification
+        Sampled run specification containing the vertical profile, elemental
+        abundances, global toggles, and optional spectrum data.
+    output_species : list[str]
+        Species order required for the returned final-state tensor.
+
+    Returns
+    -------
+    np.ndarray
+        Heuristic final-state composition with shape
+        ``(nz, len(output_species))`` in physical mixing-ratio space.
     """
     state_species = list(spec.metadata["state_species"])
     species_index = {name: idx for idx, name in enumerate(state_species)}
@@ -1034,7 +1249,22 @@ def generate_synthetic_raw_runs(
 
 
 def _copy_vulcan_source(source_root: Path, worker_root: Path) -> None:
-    """Create a fresh worker-local copy of the VULCAN source tree."""
+    """Refresh one worker-local VULCAN checkout from the shared source tree.
+
+    Parameters
+    ----------
+    source_root : Path
+        Root of the canonical VULCAN source tree in the project workspace.
+    worker_root : Path
+        Worker-local destination directory that should receive a clean copy of
+        the source tree.
+
+    Returns
+    -------
+    None
+        The function replaces any existing ``worker_root`` tree and copies the
+        full source directory into place.
+    """
     if worker_root.exists():
         shutil.rmtree(worker_root)
     shutil.copytree(source_root, worker_root)
@@ -1200,6 +1430,12 @@ def _patch_vulcan_cfg(
         Worker-local TP profile consumed by VULCAN.
     spectrum_file : Path
         Worker-local stellar-spectrum file consumed by VULCAN.
+
+    Returns
+    -------
+    None
+        ``cfg_file`` is updated in place with run-specific profile, spectrum,
+        elemental abundance, and runtime toggle assignments.
     """
     text = cfg_file.read_text(encoding="utf-8")
     runtime = config["vulcan_runtime"]
@@ -1272,7 +1508,18 @@ def _patch_vulcan_cfg(
 
 
 def _trusted_unpickle(path: Path) -> Any:
-    """Load a trusted pickle file produced by the local VULCAN runtime."""
+    """Load a trusted pickle payload emitted by the local chemistry runtime.
+
+    Parameters
+    ----------
+    path : Path
+        Filesystem path to a pickle file produced by the local VULCAN runtime.
+
+    Returns
+    -------
+    Any
+        Deserialized Python object stored in the pickle payload.
+    """
     with path.open("rb") as handle:
         return pickle.load(handle)
 

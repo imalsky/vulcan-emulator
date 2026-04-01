@@ -35,12 +35,37 @@ PROCESSED_ROOT = _ROOT / "data/processed/fastchem_mlp"
 
 
 def _is_fastchem(payload: dict[str, Any]) -> bool:
-    """Return True when the checkpoint payload targets FastChem chemistry."""
+    """Return whether the loaded checkpoint targets FastChem chemistry.
+
+    Parameters
+    ----------
+    payload : dict[str, Any]
+        Loaded training checkpoint payload.
+
+    Returns
+    -------
+    bool
+        ``True`` when the checkpoint config selects ``chemistry_type ==
+        "fastchem"``.
+    """
     return str(payload.get("config", {}).get("chemistry_type", "")) == "fastchem"
 
 
 def _restore_target_log10(values: np.ndarray, normalization: dict[str, Any]) -> np.ndarray:
-    """Convert normalized target outputs back to log10 mixing-ratio space."""
+    """Convert normalized target outputs back to log10 mixing-ratio space.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        Model outputs in normalized target space.
+    normalization : dict[str, Any]
+        Stored target normalization payload.
+
+    Returns
+    -------
+    np.ndarray
+        Target values restored to log10 mixing-ratio space.
+    """
     block = normalization["target"]
     method = str(block["method"])
     mean = np.asarray(block["mean"], dtype=np.float32)
@@ -56,7 +81,22 @@ def _restore_target_log10(values: np.ndarray, normalization: dict[str, Any]) -> 
 
 
 def _recover_column(seq_row: np.ndarray, normalization: dict[str, Any], col: int) -> np.ndarray:
-    """Undo one saved sequence-feature normalization block back to physical space."""
+    """Undo one saved sequence-feature normalization block back to physical space.
+
+    Parameters
+    ----------
+    seq_row : np.ndarray
+        One normalized sequence sample with shape ``(nz, sequence_dim)``.
+    normalization : dict[str, Any]
+        Stored sequence normalization payload.
+    col : int
+        Column index to restore.
+
+    Returns
+    -------
+    np.ndarray
+        Restored physical-unit column with shape ``(nz,)``.
+    """
     block = normalization["sequence_static"]["blocks"][col]
     mean = np.asarray(block["mean"], dtype=np.float64)
     std = np.asarray(block["std"], dtype=np.float64)
@@ -69,7 +109,18 @@ def _recover_column(seq_row: np.ndarray, normalization: dict[str, Any], col: int
 
 
 def _plots_dir(checkpoint: Path) -> Path:
-    """Return the plots directory colocated with the selected checkpoint."""
+    """Return the plots directory colocated with the selected checkpoint.
+
+    Parameters
+    ----------
+    checkpoint : Path
+        Selected checkpoint path.
+
+    Returns
+    -------
+    Path
+        Existing plots directory used to save inference figures.
+    """
     plots = checkpoint.parent / "plots"
     plots.mkdir(parents=True, exist_ok=True)
     return plots
@@ -84,6 +135,30 @@ def _plot_profiles(
     run_id: str,
     output_dir: Path,
 ):
+    """Plot one FastChem prediction against the true profile and save the figure.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Pressure profile in bar.
+    temperature_k : np.ndarray
+        Temperature profile in Kelvin.
+    pred_log10 : np.ndarray
+        Predicted log10 mixing ratios with shape ``(nz, n_species)``.
+    true_log10 : np.ndarray
+        Ground-truth log10 mixing ratios with shape ``(nz, n_species)``.
+    species : list[str]
+        Species labels aligned with the second dimension of the profile arrays.
+    run_id : str
+        Identifier of the plotted processed test run.
+    output_dir : Path
+        Destination directory for the saved figure.
+
+    Returns
+    -------
+    None
+        The figure is written to disk and closed.
+    """
     plt.style.use(str(_STYLE))
     fig, (ax_mix, ax_pt) = plt.subplots(1, 2, figsize=(13, 6), sharey=True)
 
@@ -122,7 +197,18 @@ def _plot_profiles(
 
 
 def run_fastchem(payload: dict[str, Any]) -> None:
-    """Inference for a FastChem model on one random test profile."""
+    """Run one FastChem checkpoint on a random processed test profile.
+
+    Parameters
+    ----------
+    payload : dict[str, Any]
+        Loaded training checkpoint payload.
+
+    Returns
+    -------
+    None
+        A comparison plot is written to the checkpoint's ``plots/`` directory.
+    """
     import jax
     import jax.numpy as jnp
     from src.models.jax_model import (
@@ -180,6 +266,13 @@ def run_fastchem(payload: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    """Load the configured checkpoint and run the FastChem inference demo.
+
+    Returns
+    -------
+    None
+        Demo status is printed and a plot is written to disk.
+    """
     with CHECKPOINT.open("rb") as f:
         payload = pickle.load(f)
 

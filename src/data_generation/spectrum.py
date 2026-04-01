@@ -51,9 +51,11 @@ class SpectrumRecord:
     def validate(self) -> None:
         """Validate the in-memory spectrum contract before use downstream.
 
-        Ensures the wavelength and flux arrays are finite, one-dimensional,
-        equal-length, strictly increasing in wavelength, and non-negative in
-        flux so they can be safely resampled and serialized.
+        Returns
+        -------
+        None
+            The function returns silently when the spectrum arrays satisfy the
+            in-memory contract expected by serialization and resampling code.
         """
         if self.wavelength_nm.ndim != 1 or self.flux_erg_cm2_s_nm.ndim != 1:
             raise ValueError("Spectrum arrays must be one-dimensional.")
@@ -72,8 +74,18 @@ class SpectrumRecord:
 def _planck_lambda_erg_cm2_s_sr_cm(wavelength_cm: np.ndarray, temperature_k: float) -> np.ndarray:
     """Evaluate the Planck function B_lambda(T) in cgs per wavelength interval.
 
-    Returns spectral radiance in erg cm-2 s-1 sr-1 cm-1.  The exponent
-    is clipped to [1e-10, 700] to avoid overflow in ``expm1``.
+    Parameters
+    ----------
+    wavelength_cm : np.ndarray
+        Wavelength grid in centimetres.
+    temperature_k : float
+        Blackbody temperature in Kelvin.
+
+    Returns
+    -------
+    np.ndarray
+        Spectral radiance in ``erg cm^-2 s^-1 sr^-1 cm^-1`` evaluated at each
+        wavelength sample.
     """
     numerator = 2.0 * H_PLANCK * C_LIGHT**2
     exponent = (H_PLANCK * C_LIGHT) / (wavelength_cm * K_BOLTZMANN * temperature_k)
@@ -88,9 +100,18 @@ def blackbody_surface_flux(
 ) -> np.ndarray:
     """Return stellar-surface flux density for a blackbody spectrum.
 
-    VULCAN expects the stellar spectrum file to be a surface flux; the
-    planet-star distance scaling is applied internally through
-    ``r_star`` / ``orbit_radius`` in ``vulcan_cfg.py``.
+    Parameters
+    ----------
+    wavelength_nm : np.ndarray
+        Wavelength grid in nanometres.
+    temperature_k : float
+        Effective blackbody temperature in Kelvin.
+
+    Returns
+    -------
+    np.ndarray
+        Surface flux density in ``erg cm^-2 s^-1 nm^-1`` evaluated on
+        ``wavelength_nm``.
     """
     wavelength_cm = np.asarray(wavelength_nm, dtype=np.float64) * 1.0e-7
     radiance = _planck_lambda_erg_cm2_s_sr_cm(wavelength_cm, temperature_k)
@@ -211,9 +232,18 @@ def read_vulcan_spectrum_txt(path: str | Path, *, name: str | None = None) -> Sp
 def resample_spectrum(record: SpectrumRecord, wavelength_grid_nm: np.ndarray) -> np.ndarray:
     """Resample a spectrum onto a fixed wavelength grid via linear interpolation.
 
-    Points outside the source range are clamped to the nearest
-    endpoint flux value (constant extrapolation), matching the
-    convention used throughout the pipeline.
+    Parameters
+    ----------
+    record : SpectrumRecord
+        Validated source spectrum to interpolate.
+    wavelength_grid_nm : np.ndarray
+        One-dimensional target wavelength grid in nanometres.
+
+    Returns
+    -------
+    np.ndarray
+        Flux values resampled onto ``wavelength_grid_nm`` with constant
+        extrapolation outside the source range.
     """
     record.validate()
     grid = np.asarray(wavelength_grid_nm, dtype=np.float64)
@@ -231,8 +261,19 @@ def fixed_wavelength_grid(
 ) -> np.ndarray:
     """Build the fixed, linearly-spaced wavelength grid used by the surrogate.
 
-    All spectra are resampled onto this common grid before training
-    so that the spectrum encoder sees a consistent input shape.
+    Parameters
+    ----------
+    wavelength_min_nm : float
+        Lower endpoint of the wavelength grid in nanometres.
+    wavelength_max_nm : float
+        Upper endpoint of the wavelength grid in nanometres.
+    num_bins : int
+        Number of evenly spaced wavelength samples.
+
+    Returns
+    -------
+    np.ndarray
+        One-dimensional wavelength grid in nanometres.
     """
     return np.linspace(float(wavelength_min_nm), float(wavelength_max_nm), int(num_bins), dtype=np.float64)
 

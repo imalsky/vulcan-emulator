@@ -13,7 +13,7 @@ trainer.  The pipeline has four stages:
    data remain unseen during fitting.
 4. **Apply & persist** — transform every split through the fitted
    normalization blocks and write the resulting ``.npy`` tensors,
-   ``normalization.json``, ``data_contract.json``, and provenance
+   shared JSON metadata under ``processed_root / "info"``, and provenance
    manifests to ``processed_root``.
 
 Two top-level entry points handle the two chemistry types:
@@ -48,11 +48,18 @@ from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
 from ..utils.provenance import fingerprint_payload, manifest_for_files
+from .data_loader import processed_info_dir
 from .spectrum import SpectrumRecord, fixed_wavelength_grid, resample_spectrum
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
 PROCESSED_DATA_VERSION = 13
 _EQUILIBRIUM_GLOBAL_ORDER = ELEMENT_INPUT_ORDER
+_LEGACY_PROCESSED_INFO_FILES = (
+    "normalization.json",
+    "data_contract.json",
+    "processed_manifest.json",
+    "splits.json",
+)
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,26 @@ class RawEquilibriumRun:
     globals: dict[str, float]
     elemental_abundances_x_h: np.ndarray
     gravity_cm_s2: np.ndarray
+
+
+def _remove_legacy_processed_info_files(processed_root: Path) -> None:
+    """Remove legacy top-level processed metadata files after migrating to ``info``.
+
+    Parameters
+    ----------
+    processed_root : Path
+        Processed dataset root that may still contain legacy top-level JSON
+        metadata files.
+
+    Returns
+    -------
+    None
+        Any legacy top-level shared metadata files are deleted in place.
+    """
+    for filename in _LEGACY_PROCESSED_INFO_FILES:
+        legacy_path = processed_root / filename
+        if legacy_path.exists():
+            legacy_path.unlink()
 
 
 def _decode_species(values: np.ndarray) -> list[str]:
@@ -127,6 +154,12 @@ def _require_column_constant(
         Field name used in validation errors.
     run_label : str
         Run identifier used in validation errors.
+
+    Returns
+    -------
+    None
+        The function returns silently when the supplied values are vertically
+        constant within tolerance.
     """
     arr = np.asarray(values, dtype=np.float64)
     if arr.ndim == 1:
@@ -215,9 +248,17 @@ def _require_elemental_conditioning_globals(
 def _fit_standard(arr: np.ndarray) -> dict[str, Any]:
     """Fit mean and standard deviation for standard (z-score) scaling.
 
-    Flattens all leading dimensions so statistics are computed per
-    feature column.  Any column with std < 1e-8 is clamped to 1.0 to
-    avoid division by zero at apply time.
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array whose last dimension enumerates feature columns.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalization payload containing method ``"standard"`` plus per-column
+        means and standard deviations. Leading dimensions are flattened before
+        computing statistics.
     """
     arr2 = np.reshape(arr, (-1, arr.shape[-1]))
     mean = np.mean(arr2, axis=0)
@@ -227,7 +268,20 @@ def _fit_standard(arr: np.ndarray) -> dict[str, Any]:
 
 
 def _fit_none(arr: np.ndarray) -> dict[str, Any]:
-    """Build a pass-through normalization block."""
+    """Build a no-op normalization block for features left in physical units.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Feature array whose last dimension defines the number of feature
+        columns that need identity normalization statistics.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalization payload with method ``"none"`` plus zero means and unit
+        standard deviations for each feature column.
+    """
     dim = int(arr.shape[-1]) if arr.ndim >= 1 else 1
     return {"method": "none", "mean": [0.0] * dim, "std": [1.0] * dim}
 
@@ -235,10 +289,19 @@ def _fit_none(arr: np.ndarray) -> dict[str, Any]:
 def _fit_log_standard(arr: np.ndarray, *, floor: float) -> dict[str, Any]:
     """Fit standard scaling in log10 space with a lower floor.
 
-    Values below ``floor`` are clipped before the log10 transform,
-    preventing -inf from corrupting statistics.  Used for mixing
-    ratios and other strictly-positive quantities that span many
-    orders of magnitude.
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array whose last dimension enumerates strictly positive feature
+        columns.
+    floor : float
+        Lower bound applied before taking ``log10`` to avoid ``-inf`` values.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalization payload containing method ``"log-standard"``, per-column
+        log-space means and standard deviations, and the applied floor.
     """
     arr2 = np.reshape(np.clip(arr, floor, None), (-1, arr.shape[-1]))
     log10_arr = np.log10(arr2)
@@ -256,8 +319,18 @@ def _fit_log_standard(arr: np.ndarray, *, floor: float) -> dict[str, Any]:
 def apply_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
     """Apply one normalization block (forward direction) to an array.
 
-    Supports ``"standard"`` (z-score), ``"log-standard"`` (log10 then
-    z-score), and ``"none"`` (identity passthrough).
+    Parameters
+    ----------
+    x : np.ndarray
+        Input array whose trailing dimension matches the statistics stored in
+        ``block``.
+    block : dict[str, Any]
+        Normalization payload with method name and any required statistics.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized array with the same shape as ``x``.
     """
     method = block["method"]
     mean = np.asarray(block["mean"], dtype=np.float64)
@@ -276,8 +349,18 @@ def apply_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
 def inverse_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
     """Invert one normalization block back to physical (original) space.
 
-    This is the inverse of ``apply_block``: for ``"log-standard"``
-    the z-score is undone then 10^x recovers the original magnitude.
+    Parameters
+    ----------
+    x : np.ndarray
+        Normalized array whose trailing dimension matches the statistics stored
+        in ``block``.
+    block : dict[str, Any]
+        Normalization payload with method name and any required statistics.
+
+    Returns
+    -------
+    np.ndarray
+        Array with the same shape as ``x`` restored to physical units.
     """
     method = block["method"]
     mean = np.asarray(block["mean"], dtype=np.float64)
@@ -330,10 +413,19 @@ def _fit_block_by_method(
 def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
     """Fit a mixed normalization block with per-column methods.
 
-    Each column of ``arr`` is normalized independently according to
-    the corresponding entry in ``methods``.  This keeps boolean and
-    one-hot features in physical space while continuous features are
-    z-score normalized.
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array whose last dimension enumerates feature columns.
+    methods : list[str]
+        Per-column normalization methods aligned with the trailing dimension of
+        ``arr``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Mixed normalization payload storing one method, mean, standard
+        deviation, and optional floor per feature column.
     """
     arr2 = np.reshape(arr, (-1, arr.shape[-1]))
     transformed_columns = []
@@ -447,9 +539,24 @@ def load_raw_run(
 ) -> RawRun:
     """Load one raw HDF5 full-VULCAN run and align it to the configured species contract.
 
-    *source* may be a file path (legacy per-file layout) or an already-opened
-    ``h5py.Group`` from a consolidated ``runs.h5``.  When *source* is a group,
-    *run_id* must be supplied explicitly.
+    Parameters
+    ----------
+    source : str, Path, or h5py.Group
+        Raw run source expressed as a legacy per-file path or an already opened
+        group from ``runs.h5``.
+    config : dict[str, Any]
+        Validated config defining the requested species and conditioning-input
+        contract.
+    spectrum_grid_nm : np.ndarray
+        Fixed wavelength grid used to resample the stored stellar spectrum.
+    run_id : str or None, optional
+        Explicit run ID required when ``source`` is an ``h5py.Group``.
+
+    Returns
+    -------
+    RawRun
+        Loaded raw run aligned to the configured output-species order and
+        reduced global-input contract.
     """
     requested_output_species = list(config["data_spec"]["output_species"])
 
@@ -558,9 +665,17 @@ def load_raw_run(
 def _split_indices(num_runs: int, *, config: dict[str, Any]) -> dict[str, list[int]]:
     """Split run indices into train/val/test partitions.
 
-    Uses a seeded RNG shuffle to ensure reproducibility.  Edge cases
-    (very small datasets) are handled by guaranteeing at least one
-    sample per split.
+    Parameters
+    ----------
+    num_runs : int
+        Total number of available runs to partition.
+    config : dict[str, Any]
+        Validated config containing ``normalization.split`` settings.
+
+    Returns
+    -------
+    dict[str, list[int]]
+        Mapping from split names to lists of shuffled run indices.
     """
     split_cfg = config["normalization"]["split"]
     # The public config contract stores split settings under normalization.split.
@@ -594,10 +709,22 @@ def _normalization_payload(
 ) -> dict[str, Any]:
     """Fit all normalization blocks for the full-VULCAN pipeline.
 
-    Statistics are computed from ``train_runs`` only.  The returned
-    dict contains blocks for: ``sequence_static`` (P, T, Kzz),
-    ``target`` (final ymix output), ``global_static`` (conditioning
-    scalars), and ``spectrum`` (stellar flux).
+    Parameters
+    ----------
+    train_runs : list[RawRun]
+        Training-only raw runs used to fit normalization statistics.
+    config : dict[str, Any]
+        Validated config defining normalization methods and floors.
+    global_static_order : list[str]
+        Ordered global-input feature contract.
+    spectrum_grid_nm : np.ndarray
+        Fixed wavelength grid shared by the processed dataset.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalization payload containing fitted blocks for sequence-static
+        inputs, targets, global inputs, and stellar spectra.
     """
     state_floor = float(config["normalization"]["state_floor"])
     spectrum_floor = float(config["normalization"]["spectrum_floor"])
@@ -702,9 +829,22 @@ def load_raw_equilibrium_run(
 ) -> RawEquilibriumRun:
     """Load one raw equilibrium HDF5 run.
 
-    *source* may be a file path (legacy per-file layout) or an already-opened
-    ``h5py.Group`` from a consolidated ``runs.h5``.  When *source* is a group,
-    *run_id* must be supplied explicitly.
+    Parameters
+    ----------
+    source : str, Path, or h5py.Group
+        Raw equilibrium source expressed as a legacy per-file path or an
+        already opened group from ``runs.h5``.
+    config : dict[str, Any]
+        Validated config defining the requested output-species and
+        conditioning-input contract.
+    run_id : str or None, optional
+        Explicit run ID required when ``source`` is an ``h5py.Group``.
+
+    Returns
+    -------
+    RawEquilibriumRun
+        Loaded equilibrium run aligned to the configured output-species order
+        and reduced global-input contract.
     """
     requested_output_species = list(config["data_spec"]["output_species"])
 
@@ -794,9 +934,20 @@ def _equilibrium_normalization_payload(
 ) -> dict[str, Any]:
     """Fit normalization statistics for the equilibrium model.
 
-    Simpler than the full-VULCAN payload: only ``sequence_static``
-    (P, T), ``target`` (equilibrium ymix), and ``global_static``
-    blocks are needed — no spectrum, dt, or state trajectory blocks.
+    Parameters
+    ----------
+    train_runs : list[RawEquilibriumRun]
+        Training-only equilibrium runs used to fit normalization statistics.
+    config : dict[str, Any]
+        Validated config defining normalization methods and floors.
+    global_static_order : list[str]
+        Ordered global-input feature contract.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalization payload containing fitted blocks for sequence-static
+        inputs, equilibrium targets, and global inputs.
     """
     state_floor = float(config["normalization"]["state_floor"])
     sequence_methods = config["normalization"]["sequence_methods"]
@@ -852,9 +1003,17 @@ def _equilibrium_normalization_payload(
 def _discover_raw_runs(raw_root: Path) -> tuple[Path | None, list[str]]:
     """Auto-detect consolidated vs per-file raw run layout.
 
-    Returns ``(consolidated_path, run_ids)`` when a ``runs.h5`` file
-    exists, or ``(None, [])`` when only per-file runs are present
-    (caller should fall back to the glob-based path).
+    Parameters
+    ----------
+    raw_root : Path
+        Raw dataset root directory.
+
+    Returns
+    -------
+    tuple[Path | None, list[str]]
+        Consolidated file path plus sorted run IDs when ``runs.h5`` exists, or
+        ``(None, [])`` when callers should fall back to the legacy per-file
+        layout.
     """
     consolidated = raw_root / "runs.h5"
     if consolidated.exists():
@@ -870,11 +1029,18 @@ def preprocess_equilibrium_dataset(
 ) -> dict[str, Any]:
     """Convert raw equilibrium runs into training tensors (no trajectory/spectrum).
 
-    Outputs per split: ``sequence_inputs.npy`` (P, T normalized),
-    ``target_outputs.npy`` (equilibrium ymix, log-standard normalized),
-    ``global_inputs.npy`` (conditioning scalars, mixed normalized).
-    Also writes ``normalization.json``, ``data_contract.json``,
-    ``splits.json``, and ``processed_manifest.json`` to ``processed_root``.
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config for FastChem equilibrium preprocessing.
+    project_root : Path
+        Repository root used to resolve configured raw and processed paths.
+
+    Returns
+    -------
+    dict[str, Any]
+        JSON-serializable artifact summary describing the processed dataset
+        root, shared metadata files, and split directories written to disk.
     """
     LOGGER.info("Preprocessing FastChem dataset")
     chemistry_type = get_chemistry_type(config)
@@ -882,6 +1048,8 @@ def preprocess_equilibrium_dataset(
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     ensure_dir(processed_root)
+    info_dir = ensure_dir(processed_info_dir(processed_root))
+    _remove_legacy_processed_info_files(processed_root)
 
     consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
     if consolidated_path is not None:
@@ -993,13 +1161,13 @@ def preprocess_equilibrium_dataset(
         "target_dim": len(config["data_spec"]["output_species"]),
         "global_dim": len(global_static_order),
     }
-    (processed_root / "normalization.json").write_text(
+    (info_dir / "normalization.json").write_text(
         json.dumps(normalization, indent=2) + "\n", encoding="utf-8",
     )
-    (processed_root / "data_contract.json").write_text(
+    (info_dir / "data_contract.json").write_text(
         json.dumps(data_contract, indent=2) + "\n", encoding="utf-8",
     )
-    (processed_root / "splits.json").write_text(
+    (info_dir / "splits.json").write_text(
         json.dumps(split_indices, indent=2) + "\n", encoding="utf-8",
     )
     processed_manifest = {
@@ -1009,7 +1177,7 @@ def preprocess_equilibrium_dataset(
         "model_type": model_type,
         "normalization_fingerprint": fingerprint_payload(normalization),
     }
-    (processed_root / "processed_manifest.json").write_text(
+    (info_dir / "processed_manifest.json").write_text(
         json.dumps(processed_manifest, indent=2) + "\n", encoding="utf-8",
     )
     LOGGER.info("FastChem preprocessing complete -> %s", processed_root)
@@ -1050,6 +1218,8 @@ def preprocess_raw_dataset(
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     ensure_dir(processed_root)
+    info_dir = ensure_dir(processed_info_dir(processed_root))
+    _remove_legacy_processed_info_files(processed_root)
 
     spectrum_grid_nm = fixed_wavelength_grid(
         float(config["stellar_spectrum"]["wavelength_min_nm"]),
@@ -1145,15 +1315,15 @@ def preprocess_raw_dataset(
         "spectrum_dim": int(spectrum_grid_nm.size),
         "spectrum_wavelength_nm": spectrum_grid_nm.tolist(),
     }
-    (processed_root / "normalization.json").write_text(
+    (info_dir / "normalization.json").write_text(
         json.dumps(normalization, indent=2) + "\n",
         encoding="utf-8",
     )
-    (processed_root / "data_contract.json").write_text(
+    (info_dir / "data_contract.json").write_text(
         json.dumps(data_contract, indent=2) + "\n",
         encoding="utf-8",
     )
-    (processed_root / "splits.json").write_text(
+    (info_dir / "splits.json").write_text(
         json.dumps(split_indices, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -1164,7 +1334,7 @@ def preprocess_raw_dataset(
         "model_type": model_type,
         "normalization_fingerprint": fingerprint_payload(normalization),
     }
-    (processed_root / "processed_manifest.json").write_text(
+    (info_dir / "processed_manifest.json").write_text(
         json.dumps(processed_manifest, indent=2) + "\n",
         encoding="utf-8",
     )

@@ -31,7 +31,19 @@ _EXPECTED_FULL_VULCAN_GLOBAL_ORDER = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
 
 
 def _validate_checkpoint_contract(checkpoint_path: Path) -> None:
-    """Reject checkpoints that do not match the current exported input contracts."""
+    """Reject checkpoints that do not match the current exported input contracts.
+
+    Parameters
+    ----------
+    checkpoint_path : Path
+        Source checkpoint that will be exported.
+
+    Returns
+    -------
+    None
+        The function returns silently when the checkpoint contract matches the
+        current exported global-input ordering.
+    """
     with checkpoint_path.open("rb") as handle:
         payload = pickle.load(handle)
     contract = payload.get("data_contract", {})
@@ -54,6 +66,13 @@ def _validate_checkpoint_contract(checkpoint_path: Path) -> None:
 
 
 def main():
+    """Validate the configured checkpoint and export it to an NPZ bundle.
+
+    Returns
+    -------
+    None
+        Export status and output-path information are printed to stdout.
+    """
     start = time.perf_counter()
     _validate_checkpoint_contract(CHECKPOINT)
     output_path = export_checkpoint_to_npz(CHECKPOINT)

@@ -74,9 +74,19 @@ def _prepare_profile_coordinates(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Validate, sort, and deduplicate one source profile in log-pressure space.
 
-    Non-finite and non-positive pressure samples are removed.
-    Duplicate log-pressure levels are averaged.  Returns
-    ``(log10_pressure, temperature)`` sorted in ascending order.
+    Parameters
+    ----------
+    source_pressure_bar : np.ndarray
+        Source pressure samples in bar.
+    source_temperature_k : np.ndarray
+        Source temperature samples in Kelvin aligned with
+        ``source_pressure_bar``.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Deduplicated ``(log10_pressure, temperature)`` arrays sorted in
+        ascending pressure order and ready for interpolation.
     """
     pressure = np.asarray(source_pressure_bar, dtype=np.float64)
     temperature = np.asarray(source_temperature_k, dtype=np.float64)
@@ -107,10 +117,17 @@ def _prepare_profile_coordinates(
 def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Return shape-preserving cubic Hermite slopes for strictly increasing ``x``.
 
-    Implements the Fritsch-Carlson monotone slope algorithm: interior
-    slopes are the weighted harmonic mean of adjacent secants, set to
-    zero where the sign changes (to prevent overshooting).  Endpoint
-    slopes use the one-sided formula with Brodlie's monotonicity clamp.
+    Parameters
+    ----------
+    x : np.ndarray
+        Strictly increasing sample coordinates.
+    y : np.ndarray
+        Sample values defined on ``x``.
+
+    Returns
+    -------
+    np.ndarray
+        Per-knot tangent slopes used by the monotone PCHIP interpolant.
     """
     if x.size == 2:
         slope = (y[1] - y[0]) / (x[1] - x[0])
@@ -153,9 +170,20 @@ def _pchip_interpolate(
 ) -> np.ndarray:
     """Evaluate a shape-preserving cubic Hermite interpolant with edge clamping.
 
-    Target points outside the source range are clamped to the nearest
-    endpoint value (constant extrapolation).  Interior points use the
-    standard cubic Hermite basis functions ``h00, h10, h01, h11``.
+    Parameters
+    ----------
+    x_target : np.ndarray
+        Target coordinates where the interpolant should be evaluated.
+    x_source : np.ndarray
+        Strictly increasing source coordinates.
+    y_source : np.ndarray
+        Source values defined on ``x_source``.
+
+    Returns
+    -------
+    np.ndarray
+        Interpolated values on ``x_target`` with constant extrapolation
+        outside the source range.
     """
     slopes = _pchip_slopes(x_source, y_source)
     result = np.empty_like(x_target, dtype=np.float64)
@@ -196,9 +224,19 @@ def _interpolate_profile(
 ) -> np.ndarray:
     """Interpolate a source profile onto the emulator's fixed pressure grid.
 
-    Both source and target pressures are converted to log10 space
-    before PCHIP interpolation, ensuring smooth behaviour across the
-    many-orders-of-magnitude pressure range of hot-Jupiter atmospheres.
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Target emulator pressure grid in bar.
+    source_pressure_bar : np.ndarray
+        Source profile pressure samples in bar.
+    source_temperature_k : np.ndarray
+        Source profile temperature samples in Kelvin.
+
+    Returns
+    -------
+    np.ndarray
+        Temperature profile interpolated onto ``pressure_bar``.
     """
     log_target = np.log10(pressure_bar)
     log_source, temperature = _prepare_profile_coordinates(
@@ -211,9 +249,16 @@ def _interpolate_profile(
 def _parse_pt_profile_filename(path: Path) -> dict[str, float | bool | str]:
     """Parse PT-library source parameters from one ``.dat`` filename.
 
-    The expected naming convention encodes six numeric parameters and
-    one boolean flag: ``Teq_1500-LogMet_0.0-LogDrag_-1.0-Mstar_1.0-
-    Rp_1.2-logG_3.5-TiOVO_false``.
+    Parameters
+    ----------
+    path : Path
+        PT-library source file path whose filename encodes the metadata.
+
+    Returns
+    -------
+    dict[str, float | bool | str]
+        Parsed metadata mapping containing the numeric filter keys, ``TiOVO``,
+        and ``source_file`` for provenance.
     """
     match = _PT_PROFILE_FILENAME_PATTERN.search(path.name)
     if match is None:
@@ -302,10 +347,17 @@ def _load_pt_profile_rows(path: Path) -> np.ndarray:
 def _load_pt_dat_profiles(path: Path) -> list[RothProfile]:
     """Expand one PT-library ``.dat`` file into one candidate profile per ``(lon, lat)`` column.
 
-    Each unique ``(lon, lat)`` pair in the CSV produces a separate
-    ``RothProfile`` with its own pressure-temperature arrays, sorted
-    by ascending pressure.  The parent file's metadata is shared
-    across all extracted columns.
+    Parameters
+    ----------
+    path : Path
+        PT-library source file containing one or more ``(lon, lat)`` profile
+        columns.
+
+    Returns
+    -------
+    list[RothProfile]
+        Extracted profile records, one per unique ``(lon, lat)`` pair in the
+        file.
     """
     rows = _load_pt_profile_rows(path)
     base_metadata = _parse_pt_profile_filename(path)

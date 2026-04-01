@@ -187,14 +187,40 @@ def sample_pressure_grid(
 
 
 def _sample_range_value(values: list[float] | tuple[float, float], *, rng: np.random.Generator) -> float:
-    """Draw one scalar from an inclusive config range."""
+    """Sample one scalar uniformly from a two-endpoint numeric range.
+
+    Parameters
+    ----------
+    values : list[float] or tuple[float, float]
+        Two-element ``[lower, upper]`` range specification from the config.
+    rng : np.random.Generator
+        Random number generator driving reproducible sampling.
+
+    Returns
+    -------
+    float
+        Uniform sample between the lower and upper endpoints.
+    """
     lower = float(values[0])
     upper = float(values[1])
     return float(rng.uniform(lower, upper))
 
 
 def _sample_normal_value(spec: dict[str, float], *, rng: np.random.Generator) -> float:
-    """Draw one scalar from a normal config specification."""
+    """Sample one scalar from a config-provided normal distribution.
+
+    Parameters
+    ----------
+    spec : dict[str, float]
+        Distribution spec containing ``"mean"`` and ``"std"`` entries.
+    rng : np.random.Generator
+        Random number generator driving reproducible sampling.
+
+    Returns
+    -------
+    float
+        One sample drawn from ``Normal(mean, std)``.
+    """
     return float(rng.normal(float(spec["mean"]), float(spec["std"])))
 
 
@@ -575,7 +601,21 @@ def _choose_roth_profile(
     *,
     rng: np.random.Generator,
 ) -> RothProfile:
-    """Choose one Roth profile from a preloaded profile list."""
+    """Select one preloaded Roth pressure-temperature profile at random.
+
+    Parameters
+    ----------
+    profiles : list[RothProfile]
+        In-memory catalog of Roth profiles already validated and loaded from
+        disk.
+    rng : np.random.Generator
+        Random number generator used to choose the profile index.
+
+    Returns
+    -------
+    RothProfile
+        One randomly selected profile record from ``profiles``.
+    """
     return profiles[int(rng.integers(0, len(profiles)))]
 
 
@@ -806,7 +846,22 @@ def _latin_hypercube_unit_samples(
 
 
 def _scale_unit_interval(value: float, lower: float, upper: float) -> float:
-    """Linearly map a unit-interval sample into a physical range."""
+    """Map a unit-interval coordinate onto a physical parameter range.
+
+    Parameters
+    ----------
+    value : float
+        Sample in the unit interval, typically from Latin-hypercube sampling.
+    lower : float
+        Physical lower bound for the parameter.
+    upper : float
+        Physical upper bound for the parameter.
+
+    Returns
+    -------
+    float
+        Linearly rescaled value in ``[lower, upper]``.
+    """
     return float(lower + value * (upper - lower))
 
 

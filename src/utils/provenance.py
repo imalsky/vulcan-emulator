@@ -14,12 +14,35 @@ from typing import Any
 
 
 def stable_json_dumps(payload: Any) -> str:
-    """Serialize JSON deterministically for hashing and manifests."""
+    """Serialize a JSON-compatible payload with deterministic formatting.
+
+    Parameters
+    ----------
+    payload : Any
+        JSON-serializable object such as a manifest or metadata dictionary.
+
+    Returns
+    -------
+    str
+        Canonical JSON string with sorted keys and stable separators suitable
+        for hashing.
+    """
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def sha256_text(text: str) -> str:
-    """Hash a UTF-8 text payload with SHA-256."""
+    """Compute the SHA-256 digest of a UTF-8 text payload.
+
+    Parameters
+    ----------
+    text : str
+        Text payload to hash.
+
+    Returns
+    -------
+    str
+        Hexadecimal SHA-256 digest string.
+    """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -51,8 +74,16 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 def manifest_for_files(paths: list[Path]) -> list[dict[str, Any]]:
     """Build a deterministic manifest for a list of filesystem paths.
 
-    Each entry records the filename, full path, byte size, mtime, and
-    SHA-256 hash — enough to detect any change to the source data.
+    Parameters
+    ----------
+    paths : list[Path]
+        Filesystem paths to include in the manifest.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Sorted manifest entries containing the filename, full path, size,
+        nanosecond mtime, and SHA-256 hash for each file.
     """
     manifest: list[dict[str, Any]] = []
     for path in sorted(paths):
@@ -70,5 +101,16 @@ def manifest_for_files(paths: list[Path]) -> list[dict[str, Any]]:
 
 
 def fingerprint_payload(payload: Any) -> str:
-    """Hash a JSON-serializable payload using the stable serializer."""
+    """Compute a deterministic fingerprint for a JSON-serializable payload.
+
+    Parameters
+    ----------
+    payload : Any
+        JSON-serializable manifest or metadata payload.
+
+    Returns
+    -------
+    str
+        Hexadecimal SHA-256 digest of the canonical JSON serialization.
+    """
     return sha256_text(stable_json_dumps(payload))

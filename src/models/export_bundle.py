@@ -178,7 +178,23 @@ def apply_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.Arr
 
 
 def inverse_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.Array:
-    """Invert one normalization block back to physical space in JAX."""
+    """Invert one normalization block from model space back to physical units.
+
+    Parameters
+    ----------
+    x : jax.Array or np.ndarray
+        Normalized array whose last dimension matches the supplied
+        normalization block.
+    block : dict[str, Any]
+        Normalization metadata containing the method name plus any per-feature
+        statistics needed to undo the transform.
+
+    Returns
+    -------
+    jax.Array
+        Array with the same shape as ``x`` expressed in the original physical
+        units.
+    """
     restored = _restore_block_transform_space_jax(jnp.asarray(x, dtype=jnp.float32), block)
     if str(block["method"]).lower() == "log-standard":
         return jnp.power(10.0, restored)
@@ -358,7 +374,20 @@ def export_checkpoint_to_npz(
 
 
 def _resolve_device(device: str | jax.Device | None) -> jax.Device | None:
-    """Resolve an optional device specifier to a concrete JAX device."""
+    """Normalize an optional device specifier into a concrete JAX device.
+
+    Parameters
+    ----------
+    device : str, jax.Device, or None
+        Requested device expressed either as ``None``, a platform name such as
+        ``"cpu"`` or ``"gpu"``, or an already resolved ``jax.Device``.
+
+    Returns
+    -------
+    jax.Device or None
+        Concrete device handle suitable for ``jax.device_put``, or ``None`` to
+        keep JAX's default placement.
+    """
     if device is None:
         return None
     if isinstance(device, str):
@@ -418,22 +447,46 @@ class ExportedJAXModel:
 
     @property
     def uses_fastchem(self) -> bool:
-        """Return whether this bundle targets FastChem chemistry."""
+        """Report whether the exported bundle predicts FastChem chemistry outputs.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``chemistry_type`` equals ``"fastchem"``.
+        """
         return self.chemistry_type == "fastchem"
 
     @property
     def uses_vulcan_chemistry(self) -> bool:
-        """Return whether this bundle targets converged VULCAN chemistry."""
+        """Report whether the exported bundle predicts VULCAN chemistry outputs.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``chemistry_type`` equals ``"vulcan"``.
+        """
         return self.chemistry_type == "vulcan"
 
     @property
     def uses_mlp(self) -> bool:
-        """Return whether this bundle wraps the FiLM-MLP."""
+        """Report whether the exported bundle wraps the FiLM-conditioned MLP.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``model_type`` equals ``"mlp"``.
+        """
         return self.model_type == "mlp"
 
     @property
     def uses_transformer(self) -> bool:
-        """Return whether this bundle wraps the FiLM-Transformer."""
+        """Report whether the exported bundle wraps the FiLM Transformer model.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``model_type`` equals ``"transformer"``.
+        """
         return self.model_type == "transformer"
 
     def predict_fastchem_profile(

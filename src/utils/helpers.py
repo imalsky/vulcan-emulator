@@ -26,7 +26,14 @@ _LIVE_LOG_ENV = "VULCAN_LIVE_LOG_PATH"
 
 
 def _configure_standard_streams() -> None:
-    """Force line-buffered standard streams when the runtime supports it."""
+    """Enable line-buffered stdout and stderr when the runtime supports it.
+
+    Returns
+    -------
+    None
+        Standard streams are reconfigured in place to flush promptly during
+        long-running jobs and PBS log capture.
+    """
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         if stream is not None and hasattr(stream, "reconfigure"):
@@ -77,13 +84,36 @@ def _configure_console_logging() -> None:
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a module logger after applying the shared console configuration."""
+    """Return a logger after applying the project's shared logging setup.
+
+    Parameters
+    ----------
+    name : str
+        Logger name, typically ``__name__`` from the calling module.
+
+    Returns
+    -------
+    logging.Logger
+        Logger configured to share the project's console and optional live-file
+        handlers.
+    """
     _configure_console_logging()
     return logging.getLogger(name)
 
 
 def ensure_dir(path: Path) -> Path:
-    """Create a directory path if needed and return it."""
+    """Create a directory tree if needed and return the resolved path object.
+
+    Parameters
+    ----------
+    path : Path
+        Directory path that should exist after the call.
+
+    Returns
+    -------
+    Path
+        Same ``path`` object after ensuring the directory exists.
+    """
     path.mkdir(parents=True, exist_ok=True)
     return path
 

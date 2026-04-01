@@ -59,7 +59,16 @@ def _load_config(config_path: str | Path, project_root: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments, resolve the project root, and dispatch the requested stage.
 
-    Returns 0 on success.  Raises ``ValueError`` for unrecognised stages.
+    Parameters
+    ----------
+    argv : list[str] or None, optional
+        Optional CLI argument vector. When ``None``, arguments are read from
+        ``sys.argv``.
+
+    Returns
+    -------
+    int
+        Process-style exit code for the selected stage.
     """
     parser = argparse.ArgumentParser(description="Photochemical VULCAN surrogate pipeline.")
     parser.add_argument(

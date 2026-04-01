@@ -44,7 +44,18 @@ _STYLE = _ROOT / "extras" / "science.mplstyle"
 
 
 def _resolve_output_dir(config: dict) -> Path:
-    """Return the plots/ subdirectory under the model checkpoint root."""
+    """Return the plots directory under the configured checkpoint root.
+
+    Parameters
+    ----------
+    config : dict
+        Validated pipeline config containing ``paths.checkpoints_root``.
+
+    Returns
+    -------
+    Path
+        Existing plots directory for saving the profile figure.
+    """
     ckpt_root = _ROOT / config["paths"]["checkpoints_root"]
     plots_dir = ckpt_root / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -121,7 +132,24 @@ def _select_diverse_roth_files(
     num_files: int,
     rng: np.random.Generator,
 ) -> list[Path]:
-    """Choose a metadata-diverse subset of PT-library files."""
+    """Choose a metadata-diverse subset of PT-library files.
+
+    Parameters
+    ----------
+    file_paths : list[Path]
+        Candidate PT-library files.
+    filters : dict
+        Metadata filters that candidate files must satisfy.
+    num_files : int
+        Requested number of files to keep.
+    rng : np.random.Generator
+        Random number generator used to break distance ties.
+
+    Returns
+    -------
+    list[Path]
+        Selected subset of eligible PT-library files.
+    """
     eligible_paths: list[Path] = []
     feature_rows = []
     for path in file_paths:
@@ -171,6 +199,19 @@ def _select_diverse_roth_files(
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Sample analytic and PT-library profiles and save a comparison plot.
+
+    Parameters
+    ----------
+    argv : list[str] or None, optional
+        Optional CLI argument vector. When ``None``, arguments are read from
+        ``sys.argv``.
+
+    Returns
+    -------
+    None
+        A profile comparison figure is written to disk.
+    """
     parser = argparse.ArgumentParser(description="Plot sampled PT profiles.")
     parser.add_argument("--config", default="config/fastchem_mlp_config.json")
     parser.add_argument("--seed", type=int, default=None)
@@ -265,6 +306,20 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Plot: each profile gets a unique color within its category ---
     def _colors(cmap, n):
+        """Return a small evenly spaced color palette sampled from a colormap.
+
+        Parameters
+        ----------
+        cmap : Any
+            Matplotlib colormap callable.
+        n : int
+            Number of colors to sample.
+
+        Returns
+        -------
+        list[Any]
+            Color values sampled from the interior of ``cmap``.
+        """
         return [cmap(0.35 + 0.55 * i / max(n - 1, 1)) for i in range(n)]
 
     for i, t in enumerate(roth_temps):
