@@ -130,7 +130,7 @@
   },
   "generation": {
     "mode": "vulcan",
-    "num_runs": 500000,
+    "num_runs": 10000,
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
@@ -172,21 +172,21 @@
       "threshold": 1e-4
     },
     "weight_decay": 1e-5,
-    "gradient_clip": 1.0,
+    "gradient_clip": 5.0,
     "loss": {
       "lambda_z": 1.0,
-      "lambda_phys": 0.25
+      "lambda_phys": 0.5
     }
   },
   "model": {
-    "d_model": 128,
-    "nhead": 8,
-    "num_layers": 6,
-    "dim_feedforward": 512,
+    "d_model": 256,
+    "nhead": 4,
+    "num_layers": 4,
+    "dim_feedforward": 1024,
     "conditioning_hidden_dim": 256,
-    "film_clamp": 100.0,
+    "film_clamp": 5.0,
     "output_head_divisor": 2,
-    "activation": "leaky_relu",
+    "activation": "gelu",
     "dropout_rate": 0.05
   }
 }
