@@ -23,8 +23,8 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                 "chemistry_type": "vulcan",
                 "model_type": "transformer",
                 "paths": {
-                    "raw_root": "data/raw",
-                    "processed_root": "data/processed",
+                    "raw_root": "data/test_vulcan_transformer/raw",
+                    "processed_root": "data/test_vulcan_transformer/processed",
                     "checkpoints_root": "models/default",
                     "vulcan_source_root": "../VULCAN-master",
                 },
@@ -74,6 +74,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "pressure_bottom_bar": 100.0,
                     "temperature_range_k": [1.0, 4000.0],
                     "gravity_range_cm_s2": [300.0, 900.0],
+                    "planet_radius_range_cm": [7.0e9, 1.1e10],
                     "metallicity_log10_range": [0.0, 2.0],
                     "c_to_o_range": [0.25, 1.1],
                     "s_to_o_range": [0.005, 0.1],
@@ -128,6 +129,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     },
                     "global_methods": {
                         "gravity_cm_s2": "log-standard",
+                        "planet_radius_cm": "log-standard",
                         "He_H": "standard",
                         "C_H": "log-standard",
                         "O_H": "log-standard",
@@ -207,6 +209,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     ],
                     "runtime": {
                         "chemistry_file": "thermo/SNCHO_photo_network_2025.txt",
+                        "rocky": False,
                         "atm_base": "H2",
                         "t_cross_sp": ["H2O", "H2S", "SH", "SO2", "S2"],
                     },

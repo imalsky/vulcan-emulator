@@ -2,8 +2,8 @@
   "chemistry_type": "vulcan",
   "model_type": "mlp",
   "paths": {
-    "raw_root": "data/raw/vulcan",
-    "processed_root": "data/processed/vulcan_mlp",
+    "raw_root": "data/vulcan_mlp/raw",
+    "processed_root": "data/vulcan_mlp/processed",
     "checkpoints_root": "models/vulcan_mlp",
     "vulcan_source_root": "../VULCAN-master"
   },
@@ -56,6 +56,7 @@
     "c_to_o_range": [0.45, 0.85],
     "s_to_o_range": [0.01, 0.03],
     "gravity_range_cm_s2": [500.0, 5000.0],
+    "planet_radius_range_cm": [7000000000.0, 12000000000.0],
     "kzz_cm2_s": 1e9
   },
   "temperature_profiles": {
@@ -113,6 +114,7 @@
     },
     "global_methods": {
       "gravity_cm_s2": "log-standard",
+      "planet_radius_cm": "log-standard",
       "He_H": "standard",
       "C_H": "log-standard",
       "O_H": "log-standard",
@@ -192,6 +194,7 @@
     ],
     "runtime": {
       "chemistry_file": "thermo/SNCHO_photo_network_2024.txt",
+      "rocky": false,
       "atm_base": "H2",
       "t_cross_sp": ["H2", "He"]
     },

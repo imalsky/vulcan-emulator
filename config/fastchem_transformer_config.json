@@ -2,8 +2,8 @@
   "chemistry_type": "fastchem",
   "model_type": "transformer",
   "paths": {
-    "raw_root": "data/raw/fastchem",
-    "processed_root": "data/processed/fastchem_transformer",
+    "raw_root": "data/fastchem_transformer/raw",
+    "processed_root": "data/fastchem_transformer/processed",
     "checkpoints_root": "models/fastchem_transformer",
     "vulcan_source_root": "../VULCAN-master"
   },

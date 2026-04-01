@@ -66,9 +66,10 @@ Removed and rejected legacy keys: `task.kind`, `equilibrium_only`, `full_vulcan`
 ### VULCAN (full kinetic)
 
 - Sequence inputs: `[pressure_bar, temperature_k, kzz_cm2_s]` (nz, 3)
-- Global inputs: `[gravity_cm_s2, He_H, C_H, O_H, N_H, S_H]` + 10 physics toggles + 5 atm_base one-hots (21 total)
+- Global inputs: `[gravity_cm_s2, planet_radius_cm, He_H, C_H, O_H, N_H, S_H]` + 10 physics toggles + 5 atm_base one-hots (22 total)
 - Spectrum inputs: stellar flux resampled to `num_bins` wavelength bins
 - Target: converged VULCAN `final_state/ymix_output`
+- Raw VULCAN HDF5 stores the layerwise gravity profile under `inputs/gravity_cm_s2`, but the learned contract uses scalar surface gravity and scalar planet radius from `globals/*`
 
 The fixed elemental order is internal and not configurable:
 
@@ -124,10 +125,22 @@ Output head: LayerNorm -> activation -> bottleneck -> dropout -> Linear(-> targe
 
 | Key | Description |
 |-----|-------------|
-| `raw_root` | Directory for raw HDF5 runs |
-| `processed_root` | Directory containing `train/`, `val/`, `test/`, and shared metadata in `info/` |
+| `raw_root` | Raw dataset directory. Use `data/<run_name>/raw` |
+| `processed_root` | Processed dataset directory. Use the sibling path `data/<run_name>/processed`, containing `train/`, `val/`, `test/`, and shared metadata in `info/` |
 | `checkpoints_root` | Directory for model checkpoints |
 | `vulcan_source_root` | Path to VULCAN-master (needed for generation) |
+
+`paths.raw_root` and `paths.processed_root` are validated as sibling directories under one run root. The canonical layout is:
+
+```text
+data/<run_name>/
+  raw/
+  processed/
+    info/
+    train/
+    val/
+    test/
+```
 
 ### `data_spec`
 
@@ -148,6 +161,7 @@ Output head: LayerNorm -> activation -> bottleneck -> dropout -> Linear(-> targe
 | `c_to_o_range` | both | [min, max] C/O ratio |
 | `s_to_o_range` | both | [min, max] S/O ratio |
 | `gravity_range_cm_s2` | vulcan only | [min, max] surface gravity (cm/s^2) |
+| `planet_radius_range_cm` | vulcan only | [min, max] planet radius (cm) |
 | `kzz_cm2_s` | vulcan only | Constant eddy diffusion coefficient |
 
 ### `temperature_profiles`
@@ -162,6 +176,10 @@ Output head: LayerNorm -> activation -> bottleneck -> dropout -> Linear(-> targe
 | `analytic_sampler` | Parameters for Line et al. (2013) radiative-equilibrium profiles |
 
 Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeric); `TiOVO` (boolean).
+
+`temperature_profiles.analytic_sampler.reference_gravity_m_s2` controls only
+the analytic PT-profile shape. It does not constrain sampled VULCAN surface
+gravity or planet radius.
 
 ### `generation`
 
@@ -269,6 +287,9 @@ use_initial_cold_trap, use_sat_surface_h2o
 | `chemistry_file` | Path to VULCAN chemistry network file |
 | `atm_base` | Default atmosphere base gas (`H2`, `N2`, `O2`, `CO2`, or `H2O`) |
 | `t_cross_sp` | Cross-section species list |
+| `rocky` | Fixed runtime flag passed through to `vulcan_cfg.py` |
+| `top_bc_flux_file` | Optional top boundary-condition flux file override |
+| `bot_bc_flux_file` | Optional bottom boundary-condition flux file override |
 
 Optional internal keys (not learned inputs): `python_executable`, `cfg_file`, `worker_root`, `regenerate_chem_funs`, `cfg_assignments`, `use_lowT_limit_rates`, `use_adaptive_rtol`.
 

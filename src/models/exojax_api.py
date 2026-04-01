@@ -9,8 +9,8 @@ Both return pure JAX callables plus species labels. The public API uses
 top-to-bottom level order and the same named ``global_inputs`` contract used
 by ``ExportedJAXModel.predict_*_profile()``. FastChem bundles expect
 profile-global elemental abundances in fixed ``X/H`` order, while VULCAN
-bundles expect gravity, the same elemental globals, curated science knobs,
-and atmosphere-base one-hot flags.
+bundles expect surface gravity, planet radius, the same elemental globals,
+curated science knobs, and atmosphere-base one-hot flags.
 """
 
 from __future__ import annotations
@@ -270,6 +270,8 @@ def make_vulcan_vmr_fn(
             raise ValueError("kzz_cm2_s must be a 1-D array sharing the PT grid shape.")
         if isinstance(global_inputs, dict) and "gravity_cm_s2" in global_inputs:
             _maybe_require_column_constant(global_inputs["gravity_cm_s2"], name="gravity_cm_s2")
+        if isinstance(global_inputs, dict) and "planet_radius_cm" in global_inputs:
+            _maybe_require_column_constant(global_inputs["planet_radius_cm"], name="planet_radius_cm")
 
         internal_temperatures = temperatures[::-1]
         internal_pressures = pressures[::-1]

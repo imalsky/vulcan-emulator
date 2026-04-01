@@ -2,8 +2,8 @@
   "chemistry_type": "fastchem",
   "model_type": "mlp",
   "paths": {
-    "raw_root": "data/raw/fastchem",
-    "processed_root": "data/processed/fastchem_mlp",
+    "raw_root": "data/fastchem_mlp/raw",
+    "processed_root": "data/fastchem_mlp/processed",
     "checkpoints_root": "models/fastchem_mlp",
     "vulcan_source_root": "../VULCAN-master"
   },

@@ -4,7 +4,7 @@ JAX-first VULCAN emulator pipeline with one shared workflow and a configurable `
 
 Supported chemistry targets:
 - `fastchem`: FastChem equilibrium chemistry from PT and profile-global `X/H`
-- `vulcan`: final converged VULCAN chemistry from PT, Kzz, gravity, profile-global `X/H`, runtime science knobs, atmosphere-base flags, and stellar spectrum
+- `vulcan`: final converged VULCAN chemistry from PT, Kzz, surface gravity, planet radius, profile-global `X/H`, runtime science knobs, atmosphere-base flags, and stellar spectrum
 
 Supported model families:
 - `mlp`
@@ -41,6 +41,20 @@ Shipped defaults:
 - photochemistry is off
 - eddy diffusion is on
 - Kzz is depth-constant from `sampling.kzz_cm2_s`
+- VULCAN surface gravity is sampled from `sampling.gravity_range_cm_s2`
+- VULCAN planet radius is sampled from `sampling.planet_radius_range_cm`
+- `vulcan.runtime.rocky` defaults to `false`
+
+Data layout:
+- each config now uses a single dataset root under `data/<run_name>/`
+- raw files live in `data/<run_name>/raw`
+- processed tensors live in `data/<run_name>/processed`
+- processed outputs still contain `info/`, `train/`, `val/`, and `test/`
+
+Contract notes:
+- raw VULCAN runs store the layerwise gravity profile in `inputs/gravity_cm_s2`
+- learned VULCAN globals use scalar surface gravity plus scalar `planet_radius_cm`
+- FastChem does not consume gravity or Kzz
 
 Layout:
 - `assets/`: external PT libraries and stellar spectra

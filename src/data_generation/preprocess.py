@@ -52,7 +52,7 @@ from .data_loader import processed_info_dir
 from .spectrum import SpectrumRecord, fixed_wavelength_grid, resample_spectrum
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
-PROCESSED_DATA_VERSION = 13
+PROCESSED_DATA_VERSION = 14
 _EQUILIBRIUM_GLOBAL_ORDER = ELEMENT_INPUT_ORDER
 _LEGACY_PROCESSED_INFO_FILES = (
     "normalization.json",
@@ -630,14 +630,14 @@ def load_raw_run(
     element_indices = [d["element_input_order"].index(name) for name in element_order]
     elemental_profile = d["elemental_abundances_x_h"][:, element_indices]
     gravity_profile = np.asarray(d["gravity_cm_s2"], dtype=np.float64)
-    _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
     element_globals = _elemental_conditioning_globals(
         elemental_profile=elemental_profile,
         run_label=label,
     )
     reduced_globals = dict(d["globals_map"])
     reduced_globals.update(element_globals)
-    reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
+    if "gravity_cm_s2" not in reduced_globals:
+        reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
     final_ymix_output = final_ymix_output[:, output_indices]
     resampled_spectrum = resample_spectrum(
         SpectrumRecord(

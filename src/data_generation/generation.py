@@ -401,6 +401,10 @@ def _sampling_coverage_payload(
 
     if not fastchem:
         gravity = np.asarray([spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64)
+        planet_radius = np.asarray(
+            [spec.globals["planet_radius_cm"] for spec in specs],
+            dtype=np.float64,
+        )
         log10_kzz_rows: list[np.ndarray] = []
         for path in run_files:
             with h5py.File(path, "r") as handle:
@@ -409,11 +413,13 @@ def _sampling_coverage_payload(
                     log10_kzz_rows.append(np.log10(np.asarray(source["inputs/kzz_cm2_s"], dtype=np.float64)))
         log10_kzz = np.concatenate(log10_kzz_rows, axis=0)
         gravity_range = [float(x) for x in config["sampling"]["gravity_range_cm_s2"]]
+        planet_radius_range = [float(x) for x in config["sampling"]["planet_radius_range_cm"]]
         kzz_value = float(config["sampling"]["kzz_cm2_s"])
         log10_kzz_value = float(np.log10(max(kzz_value, 1.0e-30)))
         kzz_range = [log10_kzz_value, log10_kzz_value]
         configured_ranges.update({
             "gravity_cm_s2": gravity_range,
+            "planet_radius_cm": planet_radius_range,
             "log10_kzz_cm2_s": kzz_range,
         })
         realized.update({
@@ -421,6 +427,15 @@ def _sampling_coverage_payload(
                 "min": float(np.min(gravity)),
                 "max": float(np.max(gravity)),
                 "coverage_fraction": _coverage_fraction(*gravity_range, float(np.min(gravity)), float(np.max(gravity))),
+            },
+            "planet_radius_cm": {
+                "min": float(np.min(planet_radius)),
+                "max": float(np.max(planet_radius)),
+                "coverage_fraction": _coverage_fraction(
+                    *planet_radius_range,
+                    float(np.min(planet_radius)),
+                    float(np.max(planet_radius)),
+                ),
             },
             "log10_kzz_cm2_s": {
                 "min": float(np.min(log10_kzz)),
@@ -1443,6 +1458,8 @@ def _patch_vulcan_cfg(
     element_abundances = _element_abundances_from_spec(spec)
     default_preset = dict(config.get("default_science_preset", {}))
     default_physics = dict(default_preset.get("physics_toggles", {}))
+    runtime_top_bc_flux_file = runtime.get("top_bc_flux_file")
+    runtime_bot_bc_flux_file = runtime.get("bot_bc_flux_file")
     physics = {
         name: bool(spec.globals.get(name, default_physics.get(name, False)))
         for name in PUBLIC_PHYSICS_TOGGLES
@@ -1485,6 +1502,8 @@ def _patch_vulcan_cfg(
             "P_b": float(np.max(spec.pressure_bar) * 1.0e6),
             "P_t": float(np.min(spec.pressure_bar) * 1.0e6),
             "gs": float(spec.globals["gravity_cm_s2"]),
+            "Rp": float(spec.globals["planet_radius_cm"]),
+            "rocky": bool(runtime["rocky"]),
             "r_star": float(spectrum_cfg["radius_rsun"]),
             "orbit_radius": float(spectrum_cfg["semi_major_axis_au"]),
             "sl_angle": float(np.deg2rad(spectrum_cfg["zenith_angle_deg"])),
@@ -1504,6 +1523,10 @@ def _patch_vulcan_cfg(
             **element_abundances,
         }
     )
+    if runtime_top_bc_flux_file is not None:
+        assignments["top_BC_flux_file"] = str(runtime_top_bc_flux_file)
+    if runtime_bot_bc_flux_file is not None:
+        assignments["bot_BC_flux_file"] = str(runtime_bot_bc_flux_file)
     cfg_file.write_text(patch_python_assignments(text, assignments), encoding="utf-8")
 
 
@@ -1616,6 +1639,11 @@ def convert_vulcan_output_to_hdf5(
         kzz_cm2_s = np.concatenate([[kzz_raw[0]], 0.5 * (kzz_raw[:-1] + kzz_raw[1:]), [kzz_raw[-1]]])
     else:
         kzz_cm2_s = np.asarray(kzz_raw, dtype=np.float64)
+    gravity_profile_runtime = None
+    try:
+        gravity_profile_runtime = np.asarray(_fetch(data, "atm", "g"), dtype=np.float64)
+    except (AttributeError, KeyError):
+        gravity_profile_runtime = None
 
     # Extract the final converged mixing ratios from VULCAN output.
     if "ymix_time" in _fetch(data, "variable"):
@@ -1648,9 +1676,16 @@ def convert_vulcan_output_to_hdf5(
             else None
         ),
         gravity_cm_s2=(
-            np.asarray(spec.gravity_cm_s2, dtype=np.float64)
-            if spec.gravity_cm_s2 is not None
-            else None
+            gravity_profile_runtime
+            if gravity_profile_runtime is not None
+            and gravity_profile_runtime.ndim == 1
+            and gravity_profile_runtime.shape == pressure_bar.shape
+            and np.all(np.isfinite(gravity_profile_runtime))
+            else (
+                np.asarray(spec.gravity_cm_s2, dtype=np.float64)
+                if spec.gravity_cm_s2 is not None
+                else None
+            )
         ),
     )
     return write_raw_run_hdf5(

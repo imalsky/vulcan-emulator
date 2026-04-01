@@ -30,7 +30,7 @@ _STYLE = _ROOT / "extras" / "science.mplstyle"
 
 # -- Configuration -----------------------------------------------------------
 CHECKPOINT = _ROOT / "models" / "fastchem_mlp" / "best.pt"
-PROCESSED_ROOT = _ROOT / "data/processed/fastchem_mlp"
+PROCESSED_ROOT = _ROOT / "data" / "fastchem_mlp" / "processed"
 # ---------------------------------------------------------------------------
 
 

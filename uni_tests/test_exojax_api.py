@@ -117,11 +117,20 @@ def _make_vulcan_bundle(tmp_path) -> object:
             },
             "global_static": {
                 "method": "mixed",
-                "methods": ["log-standard", "standard", "log-standard", "log-standard", "log-standard", "log-standard"]
-                + ["none"] * (len(VULCAN_GLOBAL_ORDER) - 6),
-                "mean": [3.0, 8.0e-2, -3.5, -3.2, -4.2, -4.8] + [0.0] * (len(VULCAN_GLOBAL_ORDER) - 6),
-                "std": [0.2, 1.0e-2, 0.2, 0.2, 0.2, 0.2] + [1.0] * (len(VULCAN_GLOBAL_ORDER) - 6),
-                "floor": [1e-30, None, 1.0e-30, 1.0e-30, 1.0e-30, 1.0e-30] + [None] * (len(VULCAN_GLOBAL_ORDER) - 6),
+                "methods": [
+                    "log-standard",
+                    "log-standard",
+                    "standard",
+                    "log-standard",
+                    "log-standard",
+                    "log-standard",
+                    "log-standard",
+                ]
+                + ["none"] * (len(VULCAN_GLOBAL_ORDER) - 7),
+                "mean": [3.0, 10.0, 8.0e-2, -3.5, -3.2, -4.2, -4.8] + [0.0] * (len(VULCAN_GLOBAL_ORDER) - 7),
+                "std": [0.2, 0.15, 1.0e-2, 0.2, 0.2, 0.2, 0.2] + [1.0] * (len(VULCAN_GLOBAL_ORDER) - 7),
+                "floor": [1e-30, 1.0e-30, None, 1.0e-30, 1.0e-30, 1.0e-30, 1.0e-30]
+                + [None] * (len(VULCAN_GLOBAL_ORDER) - 7),
             },
             "spectrum": {
                 "method": "log-standard",
@@ -202,6 +211,7 @@ def _make_legacy_vulcan_bundle(tmp_path) -> object:
 def _vulcan_global_dict() -> dict[str, float]:
     return {
         "gravity_cm_s2": 900.0,
+        "planet_radius_cm": 9.0e9,
         **_element_globals(),
         "use_photochemistry": 0.0,
         "use_ion_chemistry": 0.0,
@@ -352,6 +362,22 @@ def test_vulcan_vmr_fn_rejects_nonconstant_gravity_in_eager_mode(tmp_path):
     global_inputs["gravity_cm_s2"] = jnp.asarray([850.0, 850.0, 900.0, 850.0], dtype=jnp.float32)
 
     with pytest.raises(ValueError, match="gravity_cm_s2"):
+        vmr_fn(T, P, Kzz, global_inputs, spectrum_flux)
+
+
+def test_vulcan_vmr_fn_rejects_nonconstant_planet_radius_in_eager_mode(tmp_path):
+    bundle = _make_vulcan_bundle(tmp_path)
+    vmr_fn, _ = make_vulcan_vmr_fn(bundle)
+
+    nz = 4
+    T = jnp.linspace(900.0, 1400.0, nz, dtype=jnp.float32)
+    P = jnp.logspace(-2, 2, nz, dtype=jnp.float32)
+    Kzz = jnp.full((nz,), 1.0e8, dtype=jnp.float32)
+    spectrum_flux = jnp.asarray([15.0, 20.0, 18.0, 12.0], dtype=jnp.float32)
+    global_inputs = _vulcan_global_dict()
+    global_inputs["planet_radius_cm"] = jnp.asarray([9.0e9, 9.0e9, 9.1e9, 9.0e9], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="planet_radius_cm"):
         vmr_fn(T, P, Kzz, global_inputs, spectrum_flux)
 
 

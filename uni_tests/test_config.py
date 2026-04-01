@@ -90,6 +90,26 @@ def test_shipped_configs_load_with_expected_contract(
     }
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "fastchem_mlp_config.json",
+        "fastchem_transformer_config.json",
+        "vulcan_mlp_config.json",
+        "vulcan_transformer_config.json",
+    ],
+)
+def test_shipped_configs_use_single_dataset_root_layout(filename: str):
+    raw_config = _load_raw_json(ROOT / "config" / filename)
+    raw_root = Path(raw_config["paths"]["raw_root"])
+    processed_root = Path(raw_config["paths"]["processed_root"])
+
+    assert raw_root.name == "raw"
+    assert processed_root.name == "processed"
+    assert raw_root.parent == processed_root.parent
+    assert raw_root.parent.name == filename.removesuffix("_config.json")
+
+
 def test_shipped_fastchem_config_defaults_are_correct():
     config = load_and_validate_config(ROOT / "config" / "fastchem_mlp_config.json")
     assert config["normalization"]["global_methods"] == {
@@ -116,18 +136,31 @@ def test_shipped_fastchem_config_defaults_are_correct():
     assert config["training"]["early_stopping_patience"] == 30
 
 
+def test_config_rejects_split_data_roots(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload["paths"]["raw_root"] = "data/raw/fastchem"
+    payload["paths"]["processed_root"] = "data/processed/fastchem_mlp"
+    with pytest.raises(ConfigValidationError, match="/raw'.*'/processed'|shared run directory"):
+        load_and_validate_config(_write_config(tmp_path, "split_roots.json", payload))
+
+
 def test_shipped_vulcan_config_defaults_are_correct():
     raw_config = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
     assert "python_executable" not in raw_config["vulcan"]["runtime"]
     assert "cfg_file" not in raw_config["vulcan"]["runtime"]
+    assert raw_config["vulcan"]["runtime"]["rocky"] is False
 
     config = load_and_validate_config(ROOT / "config" / "vulcan_transformer_config.json")
     assert config["normalization"]["global_methods"]["gravity_cm_s2"] == "log-standard"
+    assert config["normalization"]["global_methods"]["planet_radius_cm"] == "log-standard"
     assert config["vulcan_runtime"]["python_executable"] == "python"
     assert config["vulcan_runtime"]["cfg_file"] == "vulcan_cfg.py"
     assert config["vulcan_runtime"]["worker_root"] == "data/vulcan_workers"
     assert config["vulcan_runtime"]["use_lowT_limit_rates"] is True
     assert config["vulcan_runtime"]["use_adaptive_rtol"] is True
+    assert config["vulcan_runtime"]["rocky"] is False
+    assert config["vulcan_runtime"]["top_bc_flux_file"] is None
+    assert config["vulcan_runtime"]["bot_bc_flux_file"] is None
     assert len(config["science_presets"]) == 1
     assert config["science_presets"][0]["name"] == "basic_h2"
     assert config["science_presets"][0]["atm_base"] == "H2"
@@ -141,6 +174,7 @@ def test_resolve_conditioning_inputs_rejects_missing_vulcan_runtime_inputs():
         resolve_conditioning_inputs(
             raw_global_inputs={
                 "gravity_cm_s2": 1.0e3,
+                "planet_radius_cm": 9.0e9,
                 "He_H": 8.38e-2,
                 "C_H": 2.95e-4,
                 "O_H": 5.37e-4,
@@ -251,6 +285,20 @@ def test_lambda_spectrum_validation_depends_on_chemistry_type(tmp_path):
     vulcan["training"]["loss"].pop("lambda_spectrum")
     with pytest.raises(ConfigValidationError, match="lambda_spectrum"):
         load_and_validate_config(_write_config(tmp_path, "vulcan_missing_lambda_spectrum.json", vulcan))
+
+
+def test_vulcan_requires_planet_radius_sampling_range(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_mlp_config.json")
+    payload["sampling"].pop("planet_radius_range_cm")
+    with pytest.raises(ConfigValidationError, match="planet_radius_range_cm"):
+        load_and_validate_config(_write_config(tmp_path, "missing_planet_radius.json", payload))
+
+
+def test_fastchem_rejects_vulcan_only_sampling_keys(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload["sampling"]["planet_radius_range_cm"] = [7.0e9, 1.0e10]
+    with pytest.raises(ConfigValidationError, match="chemistry_type='fastchem'"):
+        load_and_validate_config(_write_config(tmp_path, "fastchem_planet_radius.json", payload))
 
 
 def test_invalid_mixed_temperature_profile_probability_is_rejected(tmp_path):

@@ -102,6 +102,9 @@ def test_full_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_c
         for name in ("He_H", "C_H", "O_H", "N_H", "S_H"):
             assert name in spec.globals
         assert "gravity_cm_s2" in spec.globals
+        assert "planet_radius_cm" in spec.globals
+        assert float(tiny_config["sampling"]["planet_radius_range_cm"][0]) <= float(spec.globals["planet_radius_cm"])
+        assert float(spec.globals["planet_radius_cm"]) <= float(tiny_config["sampling"]["planet_radius_range_cm"][1])
         assert sum(
             int(float(spec.globals[f"atm_base_{name}"]) > 0.5)
             for name in ("H2", "N2", "O2", "CO2", "H2O")

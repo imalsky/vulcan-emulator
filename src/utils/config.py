@@ -40,6 +40,7 @@ ELEMENT_INPUT_ORDER = ("He_H", "C_H", "O_H", "N_H", "S_H")
 FASTCHEM_CONDITIONING_INPUT_ORDER = ELEMENT_INPUT_ORDER
 VULCAN_CONDITIONING_INPUT_ORDER = (
     "gravity_cm_s2",
+    "planet_radius_cm",
     *FASTCHEM_CONDITIONING_INPUT_ORDER,
 )
 VULCAN_CORE_GLOBAL_INPUTS = VULCAN_CONDITIONING_INPUT_ORDER
@@ -153,6 +154,9 @@ _INTERNAL_VULCAN_RUNTIME_DEFAULTS = {
     "cfg_assignments": {},
     "use_lowT_limit_rates": True,
     "use_adaptive_rtol": True,
+    "rocky": False,
+    "top_bc_flux_file": None,
+    "bot_bc_flux_file": None,
 }
 _DEFAULT_SCIENCE_PRESET_NAME = "default"
 
@@ -1193,6 +1197,19 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     )
     for key in paths:
         paths[key] = _as_nonempty_str(paths[key], f"paths.{key}")
+    raw_root_path = Path(paths["raw_root"])
+    processed_root_path = Path(paths["processed_root"])
+    if raw_root_path.name != "raw" or processed_root_path.name != "processed":
+        raise ConfigValidationError(
+            "paths.raw_root and paths.processed_root must end with '/raw' and '/processed' "
+            "under a shared run directory (for example, data/<run_name>/raw and "
+            "data/<run_name>/processed)."
+        )
+    if raw_root_path.parent != processed_root_path.parent:
+        raise ConfigValidationError(
+            "paths.raw_root and paths.processed_root must share the same parent run directory "
+            "(for example, data/<run_name>/raw and data/<run_name>/processed)."
+        )
 
     data_spec = config["data_spec"]
     if not isinstance(data_spec, dict):
@@ -1236,9 +1253,20 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     if chemistry_type == "vulcan":
         required_sampling += [
             "gravity_range_cm_s2",
+            "planet_radius_range_cm",
             "kzz_cm2_s",
         ]
     _require_keys(sampling, required_sampling, "sampling")
+    if chemistry_type == "fastchem":
+        disallowed_sampling = [
+            key for key in ("gravity_range_cm_s2", "planet_radius_range_cm", "kzz_cm2_s")
+            if key in sampling
+        ]
+        if disallowed_sampling:
+            raise ConfigValidationError(
+                "sampling contains VULCAN-only keys for chemistry_type='fastchem': "
+                f"{disallowed_sampling}"
+            )
     sampling["num_levels"] = _as_int(sampling["num_levels"], "sampling.num_levels")
     if sampling["num_levels"] < 4:
         raise ConfigValidationError("sampling.num_levels must be >= 4.")
@@ -1261,7 +1289,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "s_to_o_range",
     ]
     if chemistry_type == "vulcan":
-        range_keys.append("gravity_range_cm_s2")
+        range_keys.extend(["gravity_range_cm_s2", "planet_radius_range_cm"])
     for key in range_keys:
         values = sampling[key]
         if not isinstance(values, list) or len(values) != 2:
@@ -1271,6 +1299,10 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         if not low < high:
             raise ConfigValidationError(f"sampling.{key} must be strictly increasing.")
         sampling[key] = [low, high]
+    if chemistry_type == "vulcan":
+        for key in ("gravity_range_cm_s2", "planet_radius_range_cm"):
+            if sampling[key][0] <= 0.0:
+                raise ConfigValidationError(f"sampling.{key} must be strictly positive.")
     if chemistry_type == "vulcan":
         sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
         if sampling["kzz_cm2_s"] <= 0.0:
@@ -1513,6 +1545,28 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_adaptive_rtol"],
             ),
             "vulcan.runtime.use_adaptive_rtol",
+        )
+        runtime["rocky"] = _as_bool(
+            runtime.get("rocky", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["rocky"]),
+            "vulcan.runtime.rocky",
+        )
+        top_bc_flux_file = runtime.get(
+            "top_bc_flux_file",
+            _INTERNAL_VULCAN_RUNTIME_DEFAULTS["top_bc_flux_file"],
+        )
+        runtime["top_bc_flux_file"] = (
+            None
+            if top_bc_flux_file is None
+            else _as_nonempty_str(top_bc_flux_file, "vulcan.runtime.top_bc_flux_file")
+        )
+        bot_bc_flux_file = runtime.get(
+            "bot_bc_flux_file",
+            _INTERNAL_VULCAN_RUNTIME_DEFAULTS["bot_bc_flux_file"],
+        )
+        runtime["bot_bc_flux_file"] = (
+            None
+            if bot_bc_flux_file is None
+            else _as_nonempty_str(bot_bc_flux_file, "vulcan.runtime.bot_bc_flux_file")
         )
         default_atm_base = _as_nonempty_str(
             runtime.get("atm_base", "H2"),

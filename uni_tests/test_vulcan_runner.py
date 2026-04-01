@@ -167,6 +167,9 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
     assert "Kzz_prof = 'file'" in patched
     assert "T_cross_sp = ['H2O', 'H2S', 'SH', 'SO2', 'S2']" in patched
     assert f"atm_base = '{expected_atm_base}'" in patched
+    assert f"gs = {float(spec.globals['gravity_cm_s2'])}" in patched
+    assert f"Rp = {float(spec.globals['planet_radius_cm'])}" in patched
+    assert "rocky = False" in patched
     assert "use_lowT_limit_rates = True" in patched
     assert "use_adapt_rtol = True" in patched
 
@@ -189,6 +192,7 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
     reference /= np.sum(reference, axis=1, keepdims=True)
     ymix_time = np.stack([reference * 0.98, reference], axis=0)
     n0 = np.full(nz, 1.0e12, dtype=np.float64)
+    runtime_gravity = np.linspace(2.0e3, 1.7e3, nz, dtype=np.float64)
     fake = {
         "variable": {
             "species": species,
@@ -199,6 +203,7 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
             "pco": spec.pressure_bar * 1.0e6,
             "Tco": spec.temperature_k,
             "Kzz": spec.kzz_cm2_s[:-1],
+            "g": runtime_gravity,
             "n_0": n0,
         },
     }
@@ -230,6 +235,7 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
         assert final_state.shape == (nz, state_dim)
         np.testing.assert_allclose(final_state, ymix_time[-1], atol=1.0e-12)
         assert np.asarray(handle["inputs/kzz_cm2_s"]).shape == (nz,)
+        np.testing.assert_allclose(np.asarray(handle["inputs/gravity_cm_s2"]), runtime_gravity, atol=1.0e-12)
 
 
 def test_convert_fake_fastchem_output_to_hdf5_writes_equilibrium_contract(tmp_path, tiny_config):

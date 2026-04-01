@@ -20,8 +20,8 @@ temperature-profile sources, selected by ``temperature_profiles.source_mode``:
   GCM-derived profiles.
 
 The module also handles Latin-hypercube sampling of the global conditioning
-scalars (metallicity, C/O, S/O, and optionally gravity) plus stellar-spectrum
-selection for VULCAN chemistry runs.
+scalars (metallicity, C/O, S/O, and optionally surface gravity plus planet
+radius) and stellar-spectrum selection for VULCAN chemistry runs.
 """
 
 from __future__ import annotations
@@ -1038,9 +1038,10 @@ def sample_run_specifications(
     """Sample the full set of atmospheric configurations used to generate raw runs.
 
     Uses Latin-hypercube sampling (LHC) to stratify the global conditioning
-    scalars (metallicity, C/O, S/O, and optionally gravity) over the configured
-    ranges.  For each run, a temperature profile is independently drawn from
-    the configured source (analytic, PT-library, or mixed).
+    scalars (metallicity, C/O, S/O, and optionally surface gravity plus planet
+    radius) over the configured ranges. For each run, a temperature profile is
+    independently drawn from the configured source (analytic, PT-library, or
+    mixed).
 
     Parameters
     ----------
@@ -1070,9 +1071,9 @@ def sample_run_specifications(
             num_samples=total_runs, num_dimensions=3, rng=rng,
         )
     else:
-        # LHC over (gravity, metallicity, C/O, S/O) — 4 dimensions.
+        # LHC over (surface gravity, planet radius, metallicity, C/O, S/O).
         design = _latin_hypercube_unit_samples(
-            num_samples=total_runs, num_dimensions=4, rng=rng,
+            num_samples=total_runs, num_dimensions=5, rng=rng,
         )
 
     # Spectrum loading only needed for VULCAN chemistry.
@@ -1111,16 +1112,20 @@ def sample_run_specifications(
                 design[run_idx, 0],
                 *[float(x) for x in config["sampling"]["gravity_range_cm_s2"]],
             )
-            metallicity = _scale_unit_interval(
+            planet_radius_cm = _scale_unit_interval(
                 design[run_idx, 1],
+                *[float(x) for x in config["sampling"]["planet_radius_range_cm"]],
+            )
+            metallicity = _scale_unit_interval(
+                design[run_idx, 2],
                 *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
             )
             c_to_o = _scale_unit_interval(
-                design[run_idx, 2],
+                design[run_idx, 3],
                 *[float(x) for x in config["sampling"]["c_to_o_range"]],
             )
             s_to_o = _scale_unit_interval(
-                design[run_idx, 3],
+                design[run_idx, 4],
                 *[float(x) for x in config["sampling"]["s_to_o_range"]],
             )
 
@@ -1143,6 +1148,7 @@ def sample_run_specifications(
         else:
             base_globals = {
                 "gravity_cm_s2": float(gravity),
+                "planet_radius_cm": float(planet_radius_cm),
                 "metallicity_log10": float(metallicity),
                 "c_to_o": float(c_to_o),
                 "s_to_o": float(s_to_o),

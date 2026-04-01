@@ -1,7 +1,5 @@
 # VULCAN Emulator Spec
 
-> Note: I still need to figure something out with gravity and Kzz.
-
 ## Overview
 
 The public config surface is now defined by:
@@ -61,6 +59,18 @@ Every config contains:
 
 `vulcan` is required only when `chemistry_type = "vulcan"`.
 `vulcan` is invalid when `chemistry_type = "fastchem"`.
+
+Path layout is standardized per run:
+
+```text
+data/<run_name>/
+  raw/
+  processed/
+    info/
+    train/
+    val/
+    test/
+```
 
 The fixed elemental order is internal and not user-configurable:
 
@@ -173,6 +183,9 @@ Internal runtime defaults that are not learned public inputs:
 - `cfg_assignments`
 - `use_lowT_limit_rates`
 - `use_adaptive_rtol`
+- `rocky`
+- optional `top_bc_flux_file`
+- optional `bot_bc_flux_file`
 
 ## Raw Data Contract
 
@@ -188,6 +201,9 @@ Internal runtime defaults that are not learned public inputs:
 - `globals/<name>` scalar datasets
 - `equilibrium/ymix` `(nz, n_output)`
 
+FastChem stores a gravity profile in raw HDF5 for dataset uniformity, but the
+learned FastChem contract does not consume gravity or Kzz.
+
 ### VULCAN raw run
 
 - `inputs/pressure_bar` `(nz,)`
@@ -195,7 +211,8 @@ Internal runtime defaults that are not learned public inputs:
 - `inputs/kzz_cm2_s` `(nz,)`
 - `inputs/element_input_order` `(n_elements,)`
 - `inputs/elemental_abundances_x_h` `(nz, n_elements)`
-- `inputs/gravity_cm_s2` `(nz,)`
+- `inputs/gravity_cm_s2` `(nz,)`, storing the layerwise gravity profile from
+  the VULCAN runtime (`atm.g`) when available
 - `inputs/state_species` `(n_state,)`
 - `inputs/output_species` `(n_output,)`
 - `globals/<name>` scalar datasets
@@ -205,13 +222,16 @@ Internal runtime defaults that are not learned public inputs:
 - `spectrum/flux_erg_cm2_s_nm` `(n_wavelength,)`
 
 There is no trajectory target mode and no timestep-control learning contract.
+The learned VULCAN contract still uses scalar `globals/gravity_cm_s2` (surface
+gravity) and scalar `globals/planet_radius_cm`; the raw layerwise gravity
+profile is retained for provenance and diagnostics only.
 
 ## Processed Data Contract
 
 Processed artifacts are versioned with:
 
 ```python
-PROCESSED_DATA_VERSION = 13
+PROCESSED_DATA_VERSION = 14
 ```
 
 All processed datasets write:
@@ -233,7 +253,8 @@ All processed datasets write:
 
 - `sequence_inputs.npy` `(N, nz, 3)` for `[pressure_bar, temperature_k, kzz_cm2_s]`
 - `target_outputs.npy` `(N, nz, target_dim)`
-- `global_inputs.npy` `(N, global_dim)`
+- `global_inputs.npy` `(N, global_dim)` for
+  `[gravity_cm_s2, planet_radius_cm, He_H, C_H, O_H, N_H, S_H, <physics toggles>, <atm_base one-hots>]`
 - `spectrum_inputs.npy` `(N, spectrum_dim)`
 
 `metadata.json` and `info/data_contract.json` store explicit:
@@ -254,15 +275,15 @@ All processed datasets write:
 Architecture behavior:
 - `fastchem + mlp`: PT + `X/H`
 - `fastchem + transformer`: PT + `X/H`, no spectrum path
-- `vulcan + mlp`: PT + Kzz + runtime globals + spectrum latent
-- `vulcan + transformer`: PT + Kzz + runtime globals + spectrum latent
+- `vulcan + mlp`: PT + Kzz + surface gravity + planet radius + runtime globals + spectrum latent
+- `vulcan + transformer`: PT + Kzz + surface gravity + planet radius + runtime globals + spectrum latent
 
 ## Architecture Contract
 
 Both architectures use **FiLM (Feature-wise Linear Modulation)** to inject
-global context (elemental abundances, gravity, physics toggles, spectrum
-latent) into the per-level prediction pathway.  Layer norms and residual
-connections are architectural defaults, not config-controlled.
+global context (elemental abundances, surface gravity, planet radius, physics
+toggles, spectrum latent) into the per-level prediction pathway. Layer norms
+and residual connections are architectural defaults, not config-controlled.
 
 ### FiLM Conditioning (shared by both architectures)
 
@@ -339,7 +360,11 @@ ExoJAX wrappers:
 The public FastChem wrapper expects only profile-global `X/H`.
 The public VULCAN wrapper expects:
 - `kzz_cm2_s`
-- `global_inputs` containing gravity, `X/H`, toggles, and `atm_base_*`
+- `global_inputs` containing surface gravity, planet radius, `X/H`, toggles,
+  and `atm_base_*`
 - `spectrum_flux`
 
 Both wrappers preserve JAX differentiability.
+PT-library metadata and analytic-sampler reference gravity remain PT-shape-only
+inputs and are intentionally allowed to differ from the VULCAN runtime surface
+gravity and radius.

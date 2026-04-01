@@ -587,9 +587,9 @@ class ExportedJAXModel:
         kzz_cm2_s : array-like
             Eddy diffusion coefficient in cm^2/s, shape ``(nz,)``.
         global_inputs : dict or array-like
-            Global conditioning scalars (gravity, profile-global ``X/H``
-            elemental abundances, plus any physics toggles and
-            atmosphere-base flags).
+            Global conditioning scalars (surface gravity, planet radius,
+            profile-global ``X/H`` elemental abundances, plus any physics
+            toggles and atmosphere-base flags).
         spectrum_flux : array-like
             Stellar spectrum flux values, shape ``(spectrum_dim,)``.
         return_log10 : bool

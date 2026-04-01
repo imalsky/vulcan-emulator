@@ -37,6 +37,7 @@ def _element_globals() -> dict[str, float]:
 def _vulcan_globals() -> dict[str, float]:
     return {
         "gravity_cm_s2": 900.0,
+        "planet_radius_cm": 9.0e9,
         **_element_globals(),
         "use_photochemistry": 0.0,
         "use_ion_chemistry": 0.0,
@@ -106,11 +107,20 @@ def _vulcan_normalization() -> dict:
         },
         "global_static": {
             "method": "mixed",
-            "methods": ["log-standard", "standard", "log-standard", "log-standard", "log-standard", "log-standard"]
-            + ["none"] * (len(VULCAN_GLOBAL_ORDER) - 6),
-            "mean": [3.0, 8.0e-2, -3.5, -3.2, -4.2, -4.8] + [0.0] * (len(VULCAN_GLOBAL_ORDER) - 6),
-            "std": [0.2, 1.0e-2, 0.2, 0.2, 0.2, 0.2] + [1.0] * (len(VULCAN_GLOBAL_ORDER) - 6),
-            "floor": [1.0e-30, None, 1.0e-30, 1.0e-30, 1.0e-30, 1.0e-30] + [None] * (len(VULCAN_GLOBAL_ORDER) - 6),
+            "methods": [
+                "log-standard",
+                "log-standard",
+                "standard",
+                "log-standard",
+                "log-standard",
+                "log-standard",
+                "log-standard",
+            ]
+            + ["none"] * (len(VULCAN_GLOBAL_ORDER) - 7),
+            "mean": [3.0, 10.0, 8.0e-2, -3.5, -3.2, -4.2, -4.8] + [0.0] * (len(VULCAN_GLOBAL_ORDER) - 7),
+            "std": [0.2, 0.15, 1.0e-2, 0.2, 0.2, 0.2, 0.2] + [1.0] * (len(VULCAN_GLOBAL_ORDER) - 7),
+            "floor": [1.0e-30, 1.0e-30, None, 1.0e-30, 1.0e-30, 1.0e-30, 1.0e-30]
+            + [None] * (len(VULCAN_GLOBAL_ORDER) - 7),
         },
         "spectrum": {
             "method": "log-standard",

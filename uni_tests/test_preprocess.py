@@ -28,8 +28,9 @@ def test_preprocess_and_batch(tiny_config):
     assert set(splits.keys()) == {"train", "val", "test"}
     assert contract["target_dim"] == len(tiny_config["data_spec"]["output_species"])
     assert contract["global_static_feature_order"] == tiny_config["data_spec"]["global_static_feature_order"]
-    assert contract["global_static_feature_order"][:6] == [
+    assert contract["global_static_feature_order"][:7] == [
         "gravity_cm_s2",
+        "planet_radius_cm",
         "He_H",
         "C_H",
         "O_H",
