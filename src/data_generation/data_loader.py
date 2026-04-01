@@ -41,17 +41,44 @@ class ProcessedSplit:
 
     @property
     def num_runs(self) -> int:
-        """Return the number of runs stored in this split."""
+        """Return the number of runs stored in this split.
+
+        Returns
+        -------
+        int
+            Size of the leading run dimension shared by the stored arrays.
+        """
         return int(self.sequence_inputs.shape[0])
 
     @property
     def has_spectrum_inputs(self) -> bool:
-        """Return whether this split includes spectrum conditioning arrays."""
+        """Return whether this split includes stellar-spectrum conditioning.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``spectrum_inputs`` is present with shape
+            ``(num_runs, spectrum_dim)``.
+        """
         return self.spectrum_inputs is not None
 
 
 def load_processed_split(split_dir: str | Path) -> ProcessedSplit:
-    """Load one processed split from disk."""
+    """Load one processed dataset split from its on-disk tensors.
+
+    Parameters
+    ----------
+    split_dir : str or Path
+        Directory containing ``sequence_inputs.npy``, ``target_outputs.npy``,
+        ``global_inputs.npy``, ``run_ids.json``, and ``metadata.json``.
+        ``spectrum_inputs.npy`` is optional.
+
+    Returns
+    -------
+    ProcessedSplit
+        In-memory wrapper around the normalized split tensors and their
+        associated metadata.
+    """
     split_path = Path(split_dir)
     metadata = json.loads((split_path / "metadata.json").read_text(encoding="utf-8"))
     run_ids = json.loads((split_path / "run_ids.json").read_text(encoding="utf-8"))
@@ -70,7 +97,21 @@ def load_processed_split(split_dir: str | Path) -> ProcessedSplit:
 def load_processed_dataset(
     processed_root: str | Path,
 ) -> tuple[dict[str, ProcessedSplit], dict[str, Any], dict[str, Any]]:
-    """Load all processed splits plus normalization and contract metadata."""
+    """Load the processed train/val/test splits plus shared metadata.
+
+    Parameters
+    ----------
+    processed_root : str or Path
+        Processed dataset root containing split subdirectories together with
+        ``normalization.json`` and ``data_contract.json``.
+
+    Returns
+    -------
+    tuple[dict[str, ProcessedSplit], dict[str, Any], dict[str, Any]]
+        Mapping of available split names to ``ProcessedSplit`` objects, the
+        normalization payload, and the data-contract metadata that defines the
+        tensor ordering.
+    """
     root = Path(processed_root)
     splits = {
         name: load_processed_split(root / name)
@@ -86,7 +127,25 @@ def build_batch(
     split: ProcessedSplit,
     indices: np.ndarray,
 ) -> dict[str, np.ndarray]:
-    """Build a batch for any chemistry/model combination."""
+    """Assemble one training batch from a processed split.
+
+    Parameters
+    ----------
+    split : ProcessedSplit
+        Source split containing normalized arrays with leading dimension
+        ``num_runs``.
+    indices : np.ndarray
+        Integer run indices selecting the rows to gather from the split.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        Batch dictionary with ``sequence`` of shape
+        ``(batch, nz, sequence_dim)``, ``global_inputs`` of shape
+        ``(batch, global_dim)``, ``target`` of shape
+        ``(batch, nz, target_dim)``, and optional ``spectrum_inputs`` of shape
+        ``(batch, spectrum_dim)``.
+    """
     idx = np.asarray(indices, dtype=np.int32)
     batch = {
         "sequence": split.sequence_inputs[idx].astype(np.float32),
@@ -104,7 +163,23 @@ def iter_batches(
     batch_size: int,
     rng: np.random.Generator,
 ) -> list[dict[str, np.ndarray]]:
-    """Return shuffled batches for one epoch of training."""
+    """Materialize one shuffled epoch of mini-batches for a split.
+
+    Parameters
+    ----------
+    split : ProcessedSplit
+        Normalized split to iterate over.
+    batch_size : int
+        Maximum number of runs per batch.
+    rng : np.random.Generator
+        Random generator used to shuffle run indices reproducibly.
+
+    Returns
+    -------
+    list[dict[str, np.ndarray]]
+        Ordered list of batch dictionaries produced by ``build_batch``. The
+        final batch may be smaller than ``batch_size``.
+    """
     indices = np.arange(split.num_runs, dtype=np.int32)
     rng.shuffle(indices)
     batches: list[dict[str, np.ndarray]] = []

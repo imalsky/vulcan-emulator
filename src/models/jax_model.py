@@ -164,7 +164,25 @@ def _apply_dropout(
     key: jax.Array | None,
     training: bool,
 ) -> jax.Array:
-    """Apply inverted dropout when training is enabled and a key is provided."""
+    """Apply inverted dropout to a hidden activation tensor.
+
+    Parameters
+    ----------
+    x : jax.Array
+        Input activation tensor of any shape.
+    rate : float
+        Dropout probability in ``[0, 1)``.
+    key : jax.Array or None
+        PRNG key used to sample the dropout mask.
+    training : bool
+        Whether dropout should be enabled for this forward pass.
+
+    Returns
+    -------
+    jax.Array
+        Activation tensor with the same shape as ``x``. When dropout is
+        active, surviving activations are scaled by ``1 / (1 - rate)``.
+    """
     if not training or rate <= 0.0 or key is None:
         return x
     keep_prob = 1.0 - float(rate)
@@ -256,7 +274,26 @@ def _init_spectrum_encoder_params(
     spectrum_latent_dim: int,
     spectrum_encoder_mode: str,
 ) -> dict[str, Any]:
-    """Allocate spectrum encoder parameters for either architecture."""
+    """Allocate spectrum-encoder parameters for the selected encoder mode.
+
+    Parameters
+    ----------
+    key_iter : Any
+        Iterator yielding JAX PRNG keys.
+    spectrum_dim : int
+        Input spectrum width.
+    spectrum_hidden_dim : int
+        Hidden width used by the autoencoder variant.
+    spectrum_latent_dim : int
+        Output latent width exposed to the main model.
+    spectrum_encoder_mode : str
+        Encoder mode: ``"autoencoder"``, ``"linear"``, or ``"none"``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Nested parameter tree for the selected encoder variant.
+    """
     if spectrum_encoder_mode == "autoencoder":
         return {
             "encoder_1": _init_linear(next(key_iter), spectrum_dim, spectrum_hidden_dim),
@@ -489,7 +526,20 @@ class MLPDimensions:
 def init_mlp_params(
     key: jax.Array, dims: MLPDimensions
 ) -> dict[str, Any]:
-    """Allocate and Xavier-initialize all MLP parameters."""
+    """Allocate and Xavier-initialize all FiLM-MLP parameters.
+
+    Parameters
+    ----------
+    key : jax.Array
+        Root PRNG key for parameter initialization.
+    dims : MLPDimensions
+        Architecture hyperparameters defining layer widths and encoder mode.
+
+    Returns
+    -------
+    dict[str, Any]
+        Nested parameter tree for the FiLM-conditioned MLP.
+    """
     if dims.spectrum_encoder_mode == "autoencoder":
         spectrum_key_count = 4
     elif dims.spectrum_encoder_mode == "linear":
@@ -529,7 +579,18 @@ def init_mlp_params(
 
 
 def _resolve_activation(name: str):
-    """Return the JAX activation function for the given name."""
+    """Resolve an activation name to the corresponding JAX callable.
+
+    Parameters
+    ----------
+    name : str
+        Activation identifier stored in the validated config.
+
+    Returns
+    -------
+    callable
+        JAX-compatible activation function.
+    """
     activations = {
         "elu": jax.nn.elu,
         "gelu": jax.nn.gelu,
@@ -802,7 +863,23 @@ def apply_transformer_model(
 def build_model_dimensions(
     config: dict, contract: dict
 ) -> TransformerDimensions | MLPDimensions:
-    """Build the model-dimension dataclass for the active model type."""
+    """Build the dimension dataclass for the active chemistry/model contract.
+
+    Parameters
+    ----------
+    config : dict
+        Validated pipeline config containing architecture hyperparameters and
+        spectrum settings.
+    contract : dict
+        Processed-data contract defining sequence, global, target, and
+        spectrum dimensions.
+
+    Returns
+    -------
+    TransformerDimensions or MLPDimensions
+        Dimension dataclass matching the selected model family and chemistry
+        mode.
+    """
     from ..utils.config import uses_fastchem, uses_mlp
 
     model_cfg = config["training"]["model"]
@@ -885,7 +962,22 @@ def build_model_dimensions(
 def initialize_model(
     config: dict, contract: dict, *, seed: int
 ) -> tuple[TransformerDimensions | MLPDimensions, dict]:
-    """Initialize model dimensions and parameters from the validated config."""
+    """Initialize model dimensions and parameters from the validated config.
+
+    Parameters
+    ----------
+    config : dict
+        Validated pipeline config.
+    contract : dict
+        Processed-data contract defining the tensor dimensions.
+    seed : int
+        Random seed used for JAX parameter initialization.
+
+    Returns
+    -------
+    tuple[TransformerDimensions | MLPDimensions, dict]
+        Model-dimension dataclass and the initialized parameter tree.
+    """
     dims = build_model_dimensions(config, contract)
     key = jax.random.PRNGKey(int(seed))
     if isinstance(dims, MLPDimensions):

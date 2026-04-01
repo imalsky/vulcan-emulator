@@ -76,7 +76,20 @@ class RunSpecification:
 
 
 def _element_scalars_from_sampled_globals(globals_map: dict[str, float]) -> dict[str, float]:
-    """Derive FastChem-native hydrogen-normalized elemental abundances from sampled globals."""
+    """Convert sampled global ratios into FastChem elemental abundances.
+
+    Parameters
+    ----------
+    globals_map : dict[str, float]
+        Sampled global scalars containing at least ``metallicity_log10``,
+        ``c_to_o``, and ``s_to_o``.
+
+    Returns
+    -------
+    dict[str, float]
+        Hydrogen-normalized elemental abundances keyed by
+        ``ELEMENT_INPUT_ORDER`` names.
+    """
     metal_scale = 10.0 ** float(globals_map["metallicity_log10"])
     oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
     sulfur_h = oxygen_h * float(globals_map["s_to_o"])
@@ -94,7 +107,21 @@ def _element_profile_from_scalars(
     *,
     num_levels: int,
 ) -> np.ndarray:
-    """Broadcast a column-constant elemental composition to the required API shape."""
+    """Broadcast elemental scalars to a per-level profile tensor.
+
+    Parameters
+    ----------
+    element_scalars : dict[str, float]
+        Elemental abundances keyed by ``ELEMENT_INPUT_ORDER``.
+    num_levels : int
+        Number of vertical levels in the atmospheric column.
+
+    Returns
+    -------
+    np.ndarray
+        Array with shape ``(num_levels, len(ELEMENT_INPUT_ORDER))`` whose rows
+        all contain the same elemental abundance vector.
+    """
     element_vector = np.array(
         [float(element_scalars[name]) for name in ELEMENT_INPUT_ORDER],
         dtype=np.float64,
@@ -107,7 +134,21 @@ def _equilibrium_gravity_profile(
     pressure_bar: np.ndarray,
     config: dict[str, Any],
 ) -> np.ndarray:
-    """Build the required per-level gravity array for equilibrium runs."""
+    """Build the per-level gravity array required by equilibrium datasets.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Pressure grid whose shape defines the output profile length.
+    config : dict[str, Any]
+        Validated config containing
+        ``temperature_profiles.analytic_sampler.reference_gravity_m_s2``.
+
+    Returns
+    -------
+    np.ndarray
+        Column-constant gravity profile with shape matching ``pressure_bar``.
+    """
     analytic_sampler = config["temperature_profiles"].get("analytic_sampler", {})
     gravity_cm_s2 = 100.0 * float(analytic_sampler.get("reference_gravity_m_s2", 25.0))
     return np.full(np.asarray(pressure_bar).shape, gravity_cm_s2, dtype=np.float64)
@@ -430,7 +471,20 @@ def _sample_analytic_temperature_profile_record(
 
 
 def _resolve_roth_data_glob(config: dict[str, Any], roth_cfg: dict[str, Any]) -> str:
-    """Resolve a Roth profile glob against the project root when needed."""
+    """Resolve a PT-library glob against the project root when needed.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Runtime config that may contain ``_project_root``.
+    roth_cfg : dict[str, Any]
+        Temperature-profile config block containing ``data_glob``.
+
+    Returns
+    -------
+    str
+        Absolute or unchanged glob string ready for filesystem expansion.
+    """
     data_glob = str(roth_cfg["data_glob"])
     project_root = config.get("_project_root")
     if project_root is None:
@@ -447,7 +501,25 @@ def _load_configured_roth_profiles(
     config: dict[str, Any],
     roth_cfg: dict[str, Any],
 ) -> list[RothProfile]:
-    """Load the configured Roth profiles onto the requested pressure grid."""
+    """Load, validate, cache, and interpolate configured PT-library profiles.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Target pressure grid in bar with shape ``(nz,)``.
+    config : dict[str, Any]
+        Runtime config containing shared temperature validation bounds and an
+        internal cache.
+    roth_cfg : dict[str, Any]
+        Temperature-profile configuration containing the PT-library glob and
+        optional filters.
+
+    Returns
+    -------
+    list[RothProfile]
+        Interpolated Roth profiles that satisfy both metadata filters and the
+        shared temperature validity bounds.
+    """
     data_glob = _resolve_roth_data_glob(config, roth_cfg)
     filter_items: tuple[tuple[str, RothFilterValue], ...] = tuple(
         sorted(roth_cfg.get("filters", {}).items())
@@ -514,7 +586,24 @@ def _sample_roth_profile(
     roth_cfg: dict[str, Any],
     rng: np.random.Generator,
 ) -> RothProfile:
-    """Sample one interpolated Roth profile from the configured library."""
+    """Sample one interpolated PT-library profile from the configured pool.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Target pressure grid in bar with shape ``(nz,)``.
+    config : dict[str, Any]
+        Runtime config used to load and cache available profiles.
+    roth_cfg : dict[str, Any]
+        PT-library configuration block.
+    rng : np.random.Generator
+        Random generator used to choose one candidate profile.
+
+    Returns
+    -------
+    RothProfile
+        One interpolated profile sampled from the configured library.
+    """
     profiles = _load_configured_roth_profiles(
         pressure_bar,
         config=config,
@@ -528,7 +617,21 @@ def _temperature_profile_metadata(
     *,
     analytic_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build flat provenance metadata for the selected temperature-profile source."""
+    """Build flat provenance metadata for the selected temperature profile.
+
+    Parameters
+    ----------
+    profile : RothProfile or None
+        Chosen PT-library profile, or ``None`` when the analytic sampler was
+        used.
+    analytic_metadata : dict[str, Any] or None, optional
+        Parameter metadata returned by the analytic sampler.
+
+    Returns
+    -------
+    dict[str, Any]
+        Flat metadata dictionary suitable for storage in run provenance.
+    """
     if profile is None:
         metadata: dict[str, Any] = {"temperature_profile_source": "analytic"}
         if analytic_metadata:
@@ -549,7 +652,24 @@ def _sample_temperature_profile_record(
     config: dict[str, Any],
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Sample one temperature profile together with flat provenance metadata."""
+    """Sample one temperature profile together with provenance metadata.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Target pressure grid in bar with shape ``(nz,)``.
+    config : dict[str, Any]
+        Validated config describing the temperature-profile source mode and
+        associated sampler settings.
+    rng : np.random.Generator
+        Random generator used for mixed-mode branching and parameter draws.
+
+    Returns
+    -------
+    tuple[np.ndarray, dict[str, Any]]
+        Temperature profile in Kelvin with shape ``(nz,)`` plus a flat
+        metadata dictionary describing the sampled source and parameters.
+    """
     roth_cfg = config.get("roth_sampler", {"enabled": False})
     if roth_cfg.get("enabled", False):
         if roth_cfg.get("source_mode", "roth") == "mixed":
@@ -595,7 +715,22 @@ def sample_temperature_profile(
     config: dict[str, Any],
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Sample a temperature profile from the analytic, Roth, or mixed-source path."""
+    """Sample a temperature profile on the supplied pressure grid.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Target pressure grid in bar with shape ``(nz,)``.
+    config : dict[str, Any]
+        Validated config selecting the analytic, PT-library, or mixed source.
+    rng : np.random.Generator
+        Random generator used by the selected sampler.
+
+    Returns
+    -------
+    np.ndarray
+        Temperature profile in Kelvin with shape ``(nz,)``.
+    """
     temperature_k, _ = _sample_temperature_profile_record(
         pressure_bar,
         config=config,
@@ -610,7 +745,22 @@ def sample_kzz_profile(
     config: dict[str, Any],
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Sample a depth-constant eddy diffusion profile."""
+    """Construct the configured depth-constant eddy-diffusion profile.
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Pressure grid whose shape defines the output profile length.
+    config : dict[str, Any]
+        Validated config containing ``sampling.kzz_cm2_s``.
+    rng : np.random.Generator
+        Unused random generator kept for a uniform sampler interface.
+
+    Returns
+    -------
+    np.ndarray
+        Constant ``Kzz`` profile with shape matching ``pressure_bar``.
+    """
     del rng
     kzz_value = float(np.clip(config["sampling"]["kzz_cm2_s"], 1.0, None))
     return np.full(np.asarray(pressure_bar).shape, kzz_value, dtype=np.float64)
@@ -665,7 +815,21 @@ def _ensure_wasp39_template(
     project_root: Path,
     config: dict[str, Any],
 ) -> SpectrumRecord:
-    """Load the configured stellar template from disk."""
+    """Load the configured default stellar template from disk.
+
+    Parameters
+    ----------
+    project_root : Path
+        Repository root used to resolve the template path.
+    config : dict[str, Any]
+        Validated config containing ``stellar_spectrum.template_file`` and
+        ``template_name``.
+
+    Returns
+    -------
+    SpectrumRecord
+        Parsed stellar template record.
+    """
     spectrum_cfg = config["stellar_spectrum"]
     template_path = (project_root / spectrum_cfg["template_file"]).resolve()
     if not template_path.exists():
@@ -682,7 +846,21 @@ def _resolve_spectrum_library_glob(
     project_root: Path,
     config: dict[str, Any],
 ) -> str | None:
-    """Resolve the optional spectrum-library glob against the project root."""
+    """Resolve the optional stellar-spectrum library glob.
+
+    Parameters
+    ----------
+    project_root : Path
+        Repository root used to resolve relative glob paths.
+    config : dict[str, Any]
+        Validated config containing the optional
+        ``stellar_spectrum.library_glob`` field.
+
+    Returns
+    -------
+    str or None
+        Absolute glob string when configured, otherwise ``None``.
+    """
     library_glob = config["stellar_spectrum"].get("library_glob")
     if not library_glob:
         return None
@@ -697,7 +875,20 @@ def _load_configured_spectrum_records(
     project_root: Path,
     config: dict[str, Any],
 ) -> dict[str, SpectrumRecord]:
-    """Load the configured stellar spectrum library for full-VULCAN sampling."""
+    """Load the configured stellar spectrum library for VULCAN sampling.
+
+    Parameters
+    ----------
+    project_root : Path
+        Repository root used to resolve template and glob paths.
+    config : dict[str, Any]
+        Validated config containing stellar-spectrum settings.
+
+    Returns
+    -------
+    dict[str, SpectrumRecord]
+        Mapping from spectrum name to in-memory spectrum record.
+    """
     library_glob = _resolve_spectrum_library_glob(project_root=project_root, config=config)
     if library_glob:
         return load_spectrum_records_from_glob(library_glob)
@@ -706,7 +897,19 @@ def _load_configured_spectrum_records(
 
 
 def _science_preset_conditioning_inputs(preset: dict[str, Any]) -> dict[str, float]:
-    """Flatten one curated science preset into conditioning scalars."""
+    """Flatten one curated science preset into model-conditioning scalars.
+
+    Parameters
+    ----------
+    preset : dict[str, Any]
+        Science preset containing ``physics_toggles`` and ``atm_base``.
+
+    Returns
+    -------
+    dict[str, float]
+        Flat conditioning vector components including public physics toggles
+        and one-hot atmosphere-base flags.
+    """
     physics = {
         name: float(bool(preset["physics_toggles"][name]))
         for name in PUBLIC_PHYSICS_TOGGLES
@@ -724,7 +927,21 @@ def ensure_default_spectrum_library(
     project_root: Path,
     config: dict[str, Any],
 ) -> Path:
-    """Write the configured fixed-grid spectrum library and return its manifest path."""
+    """Materialize the configured spectrum library under ``data/spectra_library``.
+
+    Parameters
+    ----------
+    project_root : Path
+        Repository root where the managed spectrum library is stored.
+    config : dict[str, Any]
+        Validated config describing the template or library glob to load.
+
+    Returns
+    -------
+    Path
+        Path to the written manifest describing the serialized spectrum
+        library.
+    """
     output_dir = project_root / "data" / "spectra_library"
     output_dir.mkdir(parents=True, exist_ok=True)
     records = _load_configured_spectrum_records(project_root=project_root, config=config)
@@ -738,7 +955,20 @@ def load_default_spectra(
     project_root: Path,
     config: dict[str, Any],
 ) -> dict[str, SpectrumRecord]:
-    """Load the shipped spectrum library records keyed by spectrum name."""
+    """Load the managed default spectrum library into memory.
+
+    Parameters
+    ----------
+    project_root : Path
+        Repository root where the managed spectrum library is stored.
+    config : dict[str, Any]
+        Validated config describing the library source.
+
+    Returns
+    -------
+    dict[str, SpectrumRecord]
+        Spectrum records keyed by spectrum name.
+    """
     manifest = ensure_default_spectrum_library(project_root=project_root, config=config)
     return load_spectrum_manifest(manifest)
 

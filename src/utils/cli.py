@@ -32,7 +32,21 @@ LOGGER = get_logger(__name__)
 
 
 def _load_config(config_path: str | Path, project_root: Path) -> dict[str, Any]:
-    """Resolve, validate, and annotate the requested config file."""
+    """Resolve, validate, and annotate the requested config file.
+
+    Parameters
+    ----------
+    config_path : str or Path
+        User-supplied config path, absolute or relative to ``project_root``.
+    project_root : Path
+        Repository root used for path resolution and stored for downstream
+        helpers.
+
+    Returns
+    -------
+    dict[str, Any]
+        Validated config dictionary annotated with ``_project_root``.
+    """
     path = Path(config_path)
     if not path.is_absolute():
         path = project_root / path

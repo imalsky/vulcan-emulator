@@ -159,7 +159,25 @@ def _prepare_generation_directory(
     project_root: Path,
     num_runs: int | None,
 ) -> tuple[Path, Path, list[Path] | None]:
-    """Prepare the raw-run directory and honour overwrite/reuse semantics."""
+    """Prepare the raw-data output directory and resolve reuse semantics.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated generation config containing raw-data paths and overwrite /
+        reuse settings.
+    project_root : Path
+        Repository root used to resolve config-relative paths.
+    num_runs : int or None
+        Optional override for the requested run count.
+
+    Returns
+    -------
+    tuple[Path, Path, list[Path] | None]
+        Raw dataset root, per-run staging directory, and either ``None`` when
+        new generation should proceed or a list of reusable raw-run files /
+        consolidated files when reuse is allowed.
+    """
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
     runs_dir = ensure_dir(raw_root / "runs")
     requested_runs = _requested_run_count(config, num_runs)
@@ -333,7 +351,27 @@ def _write_generation_metadata(
     config: dict[str, Any],
     mode: str,
 ) -> tuple[Path, Path]:
-    """Persist the raw-run manifest and parameter-space coverage summary."""
+    """Persist raw-run provenance and sampling-coverage metadata.
+
+    Parameters
+    ----------
+    raw_root : Path
+        Raw dataset directory that receives the metadata files.
+    run_files : list[Path]
+        Raw HDF5 artefacts included in the manifest.
+    specs : list[RunSpecification]
+        Successfully generated run specifications used to summarize coverage.
+    config : dict[str, Any]
+        Validated pipeline config.
+    mode : str
+        Generation mode label such as ``"synthetic"`` or ``"vulcan"``.
+
+    Returns
+    -------
+    tuple[Path, Path]
+        Paths to ``generation_manifest.json`` and
+        ``sampling_coverage.json``.
+    """
     manifest_path = raw_root / "generation_manifest.json"
     coverage_path = raw_root / "sampling_coverage.json"
     manifest_payload = {
@@ -409,7 +447,20 @@ def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
 
 
 def _element_profile_from_spec(spec: RunSpecification) -> np.ndarray:
-    """Return the per-level elemental-abundance input profile for one run."""
+    """Return the per-level elemental-abundance profile for one run.
+
+    Parameters
+    ----------
+    spec : RunSpecification
+        Sampled run specification containing either a precomputed elemental
+        profile or scalar conditioning globals.
+
+    Returns
+    -------
+    np.ndarray
+        Elemental abundance profile with shape
+        ``(nz, len(ELEMENT_INPUT_ORDER))`` ordered by ``ELEMENT_INPUT_ORDER``.
+    """
     if spec.elemental_abundances_x_h is not None:
         profile = np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
         if profile.ndim != 2 or profile.shape[1] != len(ELEMENT_INPUT_ORDER):
@@ -424,7 +475,19 @@ def _element_profile_from_spec(spec: RunSpecification) -> np.ndarray:
 
 
 def _gravity_profile_from_spec(spec: RunSpecification) -> np.ndarray:
-    """Return the per-level gravity input profile for one run."""
+    """Return the per-level gravity profile for one run.
+
+    Parameters
+    ----------
+    spec : RunSpecification
+        Sampled run specification containing either a gravity profile or a
+        profile-global gravity scalar.
+
+    Returns
+    -------
+    np.ndarray
+        Gravity profile with shape ``(nz,)`` in ``cm s^-2``.
+    """
     if spec.gravity_cm_s2 is not None:
         profile = np.asarray(spec.gravity_cm_s2, dtype=np.float64)
         if profile.ndim != 1:
@@ -435,7 +498,21 @@ def _gravity_profile_from_spec(spec: RunSpecification) -> np.ndarray:
 
 
 def _write_tp_profile(path: Path, spec: RunSpecification) -> Path:
-    """Write the temperature-pressure-Kzz profile consumed by VULCAN."""
+    """Write the VULCAN TPK profile text file for one run.
+
+    Parameters
+    ----------
+    path : Path
+        Destination text file.
+    spec : RunSpecification
+        Sampled run specification providing pressure, temperature, and ``Kzz``
+        profiles.
+
+    Returns
+    -------
+    Path
+        Path to the written profile file.
+    """
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as handle:
         handle.write("# Pressure(bar) Temperature(K) Kzz(cm2/s)\n")
@@ -446,7 +523,16 @@ def _write_tp_profile(path: Path, spec: RunSpecification) -> Path:
 
 
 def _write_scalar_metadata(handle: h5py.File, metadata: dict[str, Any]) -> None:
-    """Persist flat scalar metadata fields for provenance without duplicating array payloads."""
+    """Persist scalar provenance fields under the HDF5 ``metadata`` group.
+
+    Parameters
+    ----------
+    handle : h5py.File
+        Open output HDF5 file that will receive a ``metadata`` group.
+    metadata : dict[str, Any]
+        Flat metadata mapping. Only scalar booleans, numbers, and strings are
+        serialized.
+    """
     scalar_items: dict[str, Any] = {}
     for key, value in metadata.items():
         if isinstance(value, bool):
@@ -580,7 +666,19 @@ def _synthetic_vertical_coordinate(pressure_bar: np.ndarray) -> np.ndarray:
 
 
 def _synthetic_uv_strength(spec: RunSpecification) -> float:
-    """Estimate one scalar UV forcing strength from the selected stellar spectrum."""
+    """Estimate one scalar UV forcing strength from a sampled stellar spectrum.
+
+    Parameters
+    ----------
+    spec : RunSpecification
+        Run specification containing an optional ``SpectrumRecord``.
+
+    Returns
+    -------
+    float
+        Fraction of the total stellar flux that falls at wavelengths
+        ``<= 300 nm``, clipped to ``[0, 1]``.
+    """
     if spec.spectrum is None:
         return 0.0
     wavelength_nm = np.asarray(spec.spectrum.wavelength_nm, dtype=np.float64)
@@ -788,7 +886,22 @@ def _generate_single_synthetic_run(
     runs_dir: Path,
     output_species: list[str],
 ) -> Path:
-    """Generate and write one synthetic raw run."""
+    """Generate and serialize one synthetic raw run.
+
+    Parameters
+    ----------
+    spec : RunSpecification
+        Sampled atmospheric specification for the run.
+    runs_dir : Path
+        Directory receiving the generated HDF5 file.
+    output_species : list[str]
+        Output species ordering to write into the run contract.
+
+    Returns
+    -------
+    Path
+        Path to the written synthetic raw-run HDF5 file.
+    """
     final_ymix_output = _synthetic_final_state(spec, output_species=output_species)
     h5_path = runs_dir / f"{spec.run_id}.h5"
     if spec.kzz_cm2_s is None:
@@ -815,7 +928,23 @@ def generate_synthetic_raw_runs(
     project_root: Path,
     num_runs: int | None = None,
 ) -> GeneratedRawDataset:
-    """Generate the synthetic smoke-test raw dataset."""
+    """Generate a full synthetic raw dataset without external chemistry runtimes.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated generation config.
+    project_root : Path
+        Repository root used to resolve raw-data paths.
+    num_runs : int or None, optional
+        Optional override for ``generation.num_runs``.
+
+    Returns
+    -------
+    GeneratedRawDataset
+        Paths describing the generated raw dataset, manifest, and coverage
+        summary.
+    """
     LOGGER.info("Synthetic generation starting (num_runs=%s)", num_runs or "config default")
     raw_root, runs_dir, reusable_files = _prepare_generation_directory(
         config,
@@ -912,7 +1041,20 @@ def _copy_vulcan_source(source_root: Path, worker_root: Path) -> None:
 
 
 def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
-    """Copy just the FastChem runtime subset needed for equilibrium runs."""
+    """Copy the minimal FastChem runtime needed for one worker run.
+
+    Parameters
+    ----------
+    source_root : Path
+        Root of the checked-out VULCAN/FastChem source tree.
+    worker_root : Path
+        Worker-local directory that will receive the copied runtime.
+
+    Returns
+    -------
+    Path
+        Path to the worker-local ``fastchem_vulcan`` directory.
+    """
     if worker_root.exists():
         shutil.rmtree(worker_root)
     worker_root.mkdir(parents=True, exist_ok=True)
@@ -929,7 +1071,21 @@ def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
 
 
 def _write_worker_inputs(worker_root: Path, spec: RunSpecification) -> tuple[Path, Path]:
-    """Write the TP profile and stellar spectrum for one worker run."""
+    """Write worker-local TP and stellar-spectrum inputs for one run.
+
+    Parameters
+    ----------
+    worker_root : Path
+        Worker-local VULCAN checkout directory.
+    spec : RunSpecification
+        Run specification providing the atmospheric profile and stellar
+        spectrum.
+
+    Returns
+    -------
+    tuple[Path, Path]
+        Paths to the written TP profile file and stellar-spectrum file.
+    """
     atm_dir = ensure_dir(worker_root / "atm")
     stellar_dir = ensure_dir(atm_dir / "stellar_flux")
     tp_file = _write_tp_profile(atm_dir / f"{spec.run_id}_tp.txt", spec)
@@ -941,7 +1097,20 @@ def _write_worker_inputs(worker_root: Path, spec: RunSpecification) -> tuple[Pat
 
 
 def _write_fastchem_tp_profile(fastchem_root: Path, spec: RunSpecification) -> Path:
-    """Write the FastChem TP profile input file."""
+    """Write the FastChem pressure-temperature input profile.
+
+    Parameters
+    ----------
+    fastchem_root : Path
+        Worker-local FastChem runtime directory.
+    spec : RunSpecification
+        Run specification providing pressure and temperature profiles.
+
+    Returns
+    -------
+    Path
+        Path to the written ``vulcan_TP.dat`` file.
+    """
     tp_dir = ensure_dir(fastchem_root / "input" / "vulcan_TP")
     tp_path = tp_dir / "vulcan_TP.dat"
     with tp_path.open("w", encoding="utf-8") as handle:
@@ -957,7 +1126,24 @@ def _write_fastchem_element_abundances(
     spec: RunSpecification,
     config: dict[str, Any],
 ) -> Path:
-    """Write the FastChem elemental abundance file for one sampled run."""
+    """Write the FastChem elemental-abundance input file for one run.
+
+    Parameters
+    ----------
+    fastchem_root : Path
+        Worker-local FastChem runtime directory.
+    spec : RunSpecification
+        Run specification supplying metallicity and elemental-abundance
+        conditioning values.
+    config : dict[str, Any]
+        Validated config used to choose the ion / non-ion parameter template
+        and atom list.
+
+    Returns
+    -------
+    Path
+        Path to the written ``element_abundances_vulcan.dat`` file.
+    """
     input_dir = fastchem_root / "input"
     physics = config.get("physics_toggles", {})
     use_ion = bool(physics.get("use_ion_chemistry", False))
@@ -998,7 +1184,23 @@ def _patch_vulcan_cfg(
     tp_file: Path,
     spectrum_file: Path,
 ) -> None:
-    """Patch the copied ``vulcan_cfg.py`` with run-specific inputs."""
+    """Patch a worker-local ``vulcan_cfg.py`` with run-specific inputs.
+
+    Parameters
+    ----------
+    cfg_file : Path
+        Worker-local config file to update in place.
+    spec : RunSpecification
+        Run specification supplying the sampled atmospheric inputs and global
+        conditioning values.
+    config : dict[str, Any]
+        Validated pipeline config containing runtime defaults and spectrum
+        settings.
+    tp_file : Path
+        Worker-local TP profile consumed by VULCAN.
+    spectrum_file : Path
+        Worker-local stellar-spectrum file consumed by VULCAN.
+    """
     text = cfg_file.read_text(encoding="utf-8")
     runtime = config["vulcan_runtime"]
     spectrum_cfg = config["stellar_spectrum"]
@@ -1076,7 +1278,20 @@ def _trusted_unpickle(path: Path) -> Any:
 
 
 def _fetch(container: Any, *keys: str) -> Any:
-    """Traverse nested dict/object containers with a shared helper."""
+    """Traverse nested dict/object containers using a shared key path.
+
+    Parameters
+    ----------
+    container : Any
+        Root object or mapping.
+    *keys : str
+        Attribute or dict keys to follow in sequence.
+
+    Returns
+    -------
+    Any
+        Nested value located at the supplied path.
+    """
     current = container
     for key in keys:
         if isinstance(current, dict):
@@ -1087,7 +1302,18 @@ def _fetch(container: Any, *keys: str) -> Any:
 
 
 def _decode_species_list(values: Any) -> list[str]:
-    """Normalize stored species names to Python strings."""
+    """Normalize stored species labels to plain Python strings.
+
+    Parameters
+    ----------
+    values : Any
+        Iterable of bytes or string-like species labels.
+
+    Returns
+    -------
+    list[str]
+        Species labels converted to Python ``str`` objects.
+    """
     result: list[str] = []
     for item in values:
         if isinstance(item, bytes):
@@ -1104,7 +1330,24 @@ def convert_vulcan_output_to_hdf5(
     spec: RunSpecification,
     config: dict[str, Any],
 ) -> Path:
-    """Convert a VULCAN pickle output into the raw-run HDF5 contract."""
+    """Convert one VULCAN pickle output into the shared raw HDF5 contract.
+
+    Parameters
+    ----------
+    vulcan_output_path : Path
+        Pickled VULCAN output file produced by one worker run.
+    output_h5_path : Path
+        Destination raw-run HDF5 file.
+    spec : RunSpecification
+        Original sampled run specification used to restore external metadata.
+    config : dict[str, Any]
+        Validated config providing state and output species orderings.
+
+    Returns
+    -------
+    Path
+        Path to the written raw-run HDF5 file.
+    """
     data = _trusted_unpickle(vulcan_output_path)
     species = _decode_species_list(_fetch(data, "variable", "species"))
 
@@ -1178,7 +1421,24 @@ def convert_fastchem_output_to_hdf5(
     spec: RunSpecification,
     config: dict[str, Any],
 ) -> Path:
-    """Convert a FastChem equilibrium table into the raw-run HDF5 contract."""
+    """Convert one FastChem equilibrium table into the raw HDF5 contract.
+
+    Parameters
+    ----------
+    fastchem_output_path : Path
+        FastChem text output containing per-level equilibrium abundances.
+    output_h5_path : Path
+        Destination raw-run HDF5 file.
+    spec : RunSpecification
+        Original sampled run specification.
+    config : dict[str, Any]
+        Validated config defining the requested state and output species.
+
+    Returns
+    -------
+    Path
+        Path to the written equilibrium raw-run HDF5 file.
+    """
     fc = np.genfromtxt(fastchem_output_path, names=True, dtype=None, encoding=None)
     if fc.dtype.names is None:
         raise ValueError(f"FastChem output at {fastchem_output_path} does not contain a named header.")
@@ -1207,7 +1467,22 @@ def convert_fastchem_output_to_hdf5(
 
 
 def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tuple[Path, Path]:
-    """Validate the configured VULCAN/FastChem source paths for this run mode."""
+    """Validate external runtime paths for the active chemistry backend.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated config containing ``paths.vulcan_source_root`` and runtime
+        settings.
+    project_root : Path
+        Repository root used to resolve relative paths.
+
+    Returns
+    -------
+    tuple[Path, Path]
+        Source-root path plus the backend-specific key path: either the
+        FastChem binary or the configured VULCAN chemistry file.
+    """
     source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
     if not source_root.exists():
         raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
@@ -1245,7 +1520,26 @@ def _run_single_vulcan_spec(
     runs_dir: Path,
     config: dict[str, Any],
 ) -> Path:
-    """Run one full VULCAN worker and convert its output to HDF5."""
+    """Execute one worker-local VULCAN run and convert its output to HDF5.
+
+    Parameters
+    ----------
+    spec : RunSpecification
+        Sampled run specification to execute.
+    source_root : Path
+        Root of the shared VULCAN source tree.
+    worker_base : Path
+        Parent directory for worker-local runtime copies.
+    runs_dir : Path
+        Directory receiving the converted raw HDF5 file.
+    config : dict[str, Any]
+        Validated config containing runtime settings.
+
+    Returns
+    -------
+    Path
+        Path to the written raw-run HDF5 file.
+    """
     worker_root = worker_base / spec.run_id
     _copy_vulcan_source(source_root, worker_root)
     tp_file, spectrum_file = _write_worker_inputs(worker_root, spec)
@@ -1289,7 +1583,26 @@ def _run_single_fastchem_spec(
     runs_dir: Path,
     config: dict[str, Any],
 ) -> Path:
-    """Run one FastChem worker and convert its output to HDF5."""
+    """Execute one worker-local FastChem run and convert its output to HDF5.
+
+    Parameters
+    ----------
+    spec : RunSpecification
+        Sampled run specification to execute.
+    source_root : Path
+        Root of the shared VULCAN/FastChem source tree.
+    worker_base : Path
+        Parent directory for worker-local runtime copies.
+    runs_dir : Path
+        Directory receiving the converted raw HDF5 file.
+    config : dict[str, Any]
+        Validated config containing runtime settings.
+
+    Returns
+    -------
+    Path
+        Path to the written equilibrium raw-run HDF5 file.
+    """
     worker_root = worker_base / spec.run_id
     fastchem_root = _copy_fastchem_runtime(source_root, worker_root)
     _write_fastchem_element_abundances(
@@ -1317,7 +1630,22 @@ def run_vulcan_generation(
     project_root: Path,
     num_runs: int | None = None,
 ) -> GeneratedRawDataset:
-    """Generate raw data from external VULCAN/FastChem runtimes."""
+    """Generate raw data by running the external VULCAN or FastChem backend.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated generation config.
+    project_root : Path
+        Repository root used to resolve runtime and data paths.
+    num_runs : int or None, optional
+        Optional override for ``generation.num_runs``.
+
+    Returns
+    -------
+    GeneratedRawDataset
+        Paths describing the generated raw dataset and its provenance files.
+    """
     LOGGER.info("VULCAN generation starting (num_runs=%s)", num_runs or "config default")
     raw_root, runs_dir, reusable_files = _prepare_generation_directory(
         config,
@@ -1346,6 +1674,22 @@ def run_vulcan_generation(
     target_count = num_runs or int(config["generation"]["num_runs"])
 
     def _sample_and_prepare(n: int, seed: int, *, start_index: int) -> list[RunSpecification]:
+        """Sample run specs and attach the current processed species contract.
+
+        Parameters
+        ----------
+        n : int
+            Number of specifications to sample.
+        seed : int
+            Sampling seed for the batch.
+        start_index : int
+            Run-index offset used to assign deterministic ``run_XXXXX`` IDs.
+
+        Returns
+        -------
+        list[RunSpecification]
+            Prepared run specifications with output-species metadata attached.
+        """
         specs = sample_run_specifications(
             config=config,
             project_root=project_root,
@@ -1375,7 +1719,19 @@ def run_vulcan_generation(
         return prepared
 
     def _run_batch(specs: list[RunSpecification]) -> tuple[list[Path], list[str]]:
-        """Run a batch of specs, returning successes and failed run IDs."""
+        """Execute one batch of run specifications through the active backend.
+
+        Parameters
+        ----------
+        specs : list[RunSpecification]
+            Run specifications to execute.
+
+        Returns
+        -------
+        tuple[list[Path], list[str]]
+            Successfully written raw-run files and failed run IDs that may be
+            backfilled later.
+        """
         worker_count = _generation_worker_count(config, len(specs))
         successes: list[Path] = []
         failures: list[str] = []
@@ -1488,7 +1844,22 @@ def generate_raw_dataset(
     project_root: Path,
     num_runs: int | None = None,
 ) -> GeneratedRawDataset:
-    """Dispatch raw-data generation to the configured backend."""
+    """Dispatch raw-data generation to the configured backend.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated generation config.
+    project_root : Path
+        Repository root used to resolve backend paths.
+    num_runs : int or None, optional
+        Optional override for the configured run count.
+
+    Returns
+    -------
+    GeneratedRawDataset
+        Description of the generated or reused raw dataset.
+    """
     mode = str(config["generation"]["mode"]).lower()
     if mode == "synthetic":
         return generate_synthetic_raw_runs(config, project_root=project_root, num_runs=num_runs)

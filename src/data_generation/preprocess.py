@@ -89,7 +89,18 @@ class RawEquilibriumRun:
 
 
 def _decode_species(values: np.ndarray) -> list[str]:
-    """Decode stored species labels from HDF5 string arrays."""
+    """Decode species labels loaded from HDF5 string datasets.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        One-dimensional object, bytes, or string array read from HDF5.
+
+    Returns
+    -------
+    list[str]
+        Python string labels in the original stored order.
+    """
     result: list[str] = []
     for item in values:
         if isinstance(item, bytes):
@@ -105,7 +116,18 @@ def _require_column_constant(
     name: str,
     run_label: str,
 ) -> None:
-    """Reject profile inputs that vary with height in the current training contract."""
+    """Reject vertical profiles that should remain column-constant.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        One-dimensional profile ``(nz,)`` or stacked profile ``(nz, ncol)`` to
+        check.
+    name : str
+        Field name used in validation errors.
+    run_label : str
+        Run identifier used in validation errors.
+    """
     arr = np.asarray(values, dtype=np.float64)
     if arr.ndim == 1:
         reference = arr[0]
@@ -124,7 +146,22 @@ def _elemental_conditioning_globals(
     elemental_profile: np.ndarray,
     run_label: str,
 ) -> dict[str, float]:
-    """Resolve one profile-global elemental-abundance vector from the raw inputs."""
+    """Reduce a per-level elemental profile to profile-global conditioning scalars.
+
+    Parameters
+    ----------
+    elemental_profile : np.ndarray
+        Elemental abundance profile with shape ``(nz, n_elements)`` ordered as
+        ``ELEMENT_INPUT_ORDER``.
+    run_label : str
+        Run identifier used in validation errors.
+
+    Returns
+    -------
+    dict[str, float]
+        Mapping from elemental input name to one column-constant ``X/H`` value
+        for the run.
+    """
     profile = np.asarray(elemental_profile, dtype=np.float64)
     if profile.ndim != 2 or profile.shape[1] != len(ELEMENT_INPUT_ORDER):
         raise ValueError(
@@ -145,7 +182,21 @@ def _require_elemental_conditioning_globals(
     globals_map: dict[str, float],
     run_label: str,
 ) -> dict[str, float]:
-    """Return the sampled elemental-abundance globals required by the training contract."""
+    """Validate that the required elemental globals are present and finite.
+
+    Parameters
+    ----------
+    globals_map : dict[str, float]
+        Raw global-conditioning mapping for a run.
+    run_label : str
+        Run identifier used in validation errors.
+
+    Returns
+    -------
+    dict[str, float]
+        Subset of ``globals_map`` containing the required elemental inputs in
+        ``_EQUILIBRIUM_GLOBAL_ORDER``.
+    """
     missing = [name for name in _EQUILIBRIUM_GLOBAL_ORDER if name not in globals_map]
     if missing:
         raise ValueError(
@@ -247,7 +298,24 @@ def _fit_block_by_method(
     method: str,
     floor: float | None = None,
 ) -> dict[str, Any]:
-    """Fit one normalization block using an explicit config-selected method."""
+    """Fit one normalization block selected by method name.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array whose last dimension enumerates features.
+    method : str
+        Normalization method name: ``"standard"``, ``"log-standard"``, or
+        ``"none"``.
+    floor : float or None, optional
+        Positive floor used by ``"log-standard"`` blocks before taking
+        ``log10``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalization payload compatible with ``apply_block``.
+    """
     if method == "standard":
         return _fit_standard(arr)
     if method == "log-standard":
@@ -303,7 +371,21 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
 
 
 def apply_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
-    """Apply a mixed per-feature normalization block."""
+    """Apply a mixed per-feature normalization block.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Input array whose last dimension enumerates feature columns.
+    block : dict[str, Any]
+        Mixed normalization payload with per-column methods, means, stds, and
+        optional floors.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized array with the same shape as ``x``.
+    """
     x = np.asarray(x, dtype=np.float64)
     outputs = []
     for i, method in enumerate(block["methods"]):
@@ -323,7 +405,22 @@ def apply_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
 
 
 def inverse_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
-    """Invert a mixed per-feature normalization block."""
+    """Invert a mixed per-feature normalization block.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Normalized array in model space.
+    block : dict[str, Any]
+        Mixed normalization payload that was previously applied with
+        ``apply_mixed_block``.
+
+    Returns
+    -------
+    np.ndarray
+        Array restored to physical feature space with the same shape as
+        ``x``.
+    """
     x = np.asarray(x, dtype=np.float64)
     outputs = []
     for i, method in enumerate(block["methods"]):
@@ -357,6 +454,20 @@ def load_raw_run(
     requested_output_species = list(config["data_spec"]["output_species"])
 
     def _extract(handle: h5py.Group) -> dict[str, Any]:
+        """Extract one raw VULCAN run payload from an open HDF5 group.
+
+        Parameters
+        ----------
+        handle : h5py.Group
+            Group containing the raw run contract under ``inputs``,
+            ``globals``, ``final_state``, and ``spectrum``.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary of NumPy arrays and Python containers holding the raw
+            profiles, stored species order, globals, and stellar spectrum.
+        """
         return {
             "pressure_bar": np.asarray(handle["inputs/pressure_bar"], dtype=np.float64),
             "temperature_k": np.asarray(handle["inputs/temperature_k"], dtype=np.float64),
@@ -562,7 +673,22 @@ def _normalization_payload(
 
 
 def _apply_sequence_static_normalization(x: np.ndarray, payload: dict[str, Any]) -> np.ndarray:
-    """Apply the configured normalization blocks to sequence-static features."""
+    """Apply per-feature sequence-static normalization blocks.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Sequence-static feature array whose last dimension matches the order
+        stored in ``payload["blocks"]``.
+    payload : dict[str, Any]
+        Sequence-static normalization payload containing one block per
+        feature column.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized sequence-static array with the same shape as ``x``.
+    """
     blocks = payload["blocks"]
     parts = [apply_block(x[..., i : i + 1], block) for i, block in enumerate(blocks)]
     return np.concatenate(parts, axis=-1)
@@ -583,6 +709,20 @@ def load_raw_equilibrium_run(
     requested_output_species = list(config["data_spec"]["output_species"])
 
     def _extract(handle: h5py.Group) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, dict[str, float]]:
+        """Extract one raw FastChem-equilibrium run from an open HDF5 group.
+
+        Parameters
+        ----------
+        handle : h5py.Group
+            Group containing the equilibrium raw-run contract.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, dict[str, float]]
+            Pressure profile, temperature profile, reordered elemental
+            abundance profile, gravity profile, stored output-species labels,
+            equilibrium mixing-ratio array, and raw globals mapping.
+        """
         pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
         temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
         element_input_order = _decode_species(np.asarray(handle["inputs/element_input_order"]))
@@ -886,7 +1026,22 @@ def preprocess_raw_dataset(
     *,
     project_root: Path,
 ) -> dict[str, Any]:
-    """Convert raw runs into training tensors. Dispatches by chemistry type."""
+    """Convert raw runs into processed tensors for the active chemistry type.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config defining raw paths, feature orders,
+        normalization methods, and spectrum settings.
+    project_root : Path
+        Repository root used to resolve config-relative paths.
+
+    Returns
+    -------
+    dict[str, Any]
+        Summary payload containing the processed-root path, normalization
+        metadata, data contract, and train/val/test split indices.
+    """
     if uses_fastchem(config):
         return preprocess_equilibrium_dataset(config, project_root=project_root)
     LOGGER.info("Preprocessing VULCAN dataset")

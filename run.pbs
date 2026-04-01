@@ -3,7 +3,7 @@
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
-#PBS -l walltime=72:00:00
+#PBS -l walltime=10:00:00
 #PBS -j oe
 #PBS -m abe
 
@@ -53,10 +53,13 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
 export REQUIRE_JAX_GPU
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
+XLA_FLAGS_VALUE="${XLA_FLAGS:-}"
 if [ "${DISABLE_TRITON_GEMM}" = "1" ]; then
-  export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false"
+  XLA_FLAGS_VALUE="${XLA_FLAGS_VALUE} --xla_gpu_enable_triton_gemm=false"
 fi
-export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_autotune_level=0"
+XLA_FLAGS_VALUE="${XLA_FLAGS_VALUE} --xla_gpu_autotune_level=0"
+export XLA_FLAGS="${XLA_FLAGS_VALUE# }"
+unset XLA_FLAGS_VALUE
 
 if [ -n "${PBS_JOBID:-}" ]; then
   export VULCAN_LIVE_LOG_PATH="${VULCAN_LIVE_LOG_PATH:-${LOG_ROOT}/pbs_${PBS_JOBID}.log}"

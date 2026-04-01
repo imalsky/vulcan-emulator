@@ -228,7 +228,22 @@ def _parse_pt_profile_filename(path: Path) -> dict[str, float | bool | str]:
 
 
 def _matches_filters(metadata: dict[str, Any], filters: RothFilterConfig | None) -> bool:
-    """Return true when metadata satisfies the configured PT-library filter constraints."""
+    """Return whether one profile metadata record satisfies the filter config.
+
+    Parameters
+    ----------
+    metadata : dict[str, Any]
+        Parsed PT-profile metadata, typically from the filename or serialized
+        sidecar fields.
+    filters : RothFilterConfig or None
+        Optional numeric or boolean constraints keyed by PT-library metadata
+        name.
+
+    Returns
+    -------
+    bool
+        ``True`` when all configured constraints are satisfied.
+    """
     for key, requirement in (filters or {}).items():
         if key not in metadata:
             return False
@@ -249,7 +264,20 @@ def _matches_filters(metadata: dict[str, Any], filters: RothFilterConfig | None)
 
 
 def _load_pt_profile_rows(path: Path) -> np.ndarray:
-    """Load the numeric data block from one PT-library `.dat` file."""
+    """Load the numeric rows from one Roth PT-library ``.dat`` file.
+
+    Parameters
+    ----------
+    path : Path
+        Source CSV-like file containing profile rows with at least five
+        numeric columns.
+
+    Returns
+    -------
+    np.ndarray
+        Two-dimensional float array containing the numeric block extracted
+        from the file.
+    """
     numeric_lines: list[str] = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -305,7 +333,20 @@ def _load_pt_dat_profiles(path: Path) -> list[RothProfile]:
 
 
 def _load_tabular_roth_profile(path: Path) -> RothProfile:
-    """Load a single Roth profile from NPZ, JSON, or CSV."""
+    """Load one tabular Roth profile from NPZ, JSON, or CSV storage.
+
+    Parameters
+    ----------
+    path : Path
+        Source file containing ``pressure_bar`` and ``temperature_k`` arrays,
+        plus optional metadata.
+
+    Returns
+    -------
+    RothProfile
+        One in-memory pressure-temperature profile with any available
+        provenance metadata attached.
+    """
     if path.suffix.lower() == ".npz":
         arrays = np.load(path)
         metadata = json.loads(str(arrays["metadata"].item())) if "metadata" in arrays else {}

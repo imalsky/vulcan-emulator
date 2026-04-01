@@ -62,6 +62,22 @@ def migrate_from_config(
     project_root: Path,
     dry_run: bool = False,
 ) -> Path | None:
-    """Resolve ``raw_root`` from *config* and run the migration."""
+    """Resolve the raw-data directory from config and run consolidation.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated pipeline config containing ``paths.raw_root``.
+    project_root : Path
+        Repository root used to resolve relative config paths.
+    dry_run : bool, default=False
+        When ``True``, only report whether migration would occur.
+
+    Returns
+    -------
+    Path or None
+        Path to the written ``runs.h5`` file, or ``None`` when no per-file
+        runs exist or when running in dry-run mode.
+    """
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
     return migrate_per_file_to_consolidated(raw_root, dry_run=dry_run)

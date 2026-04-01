@@ -34,7 +34,14 @@ def _configure_standard_streams() -> None:
 
 
 def _configure_live_file_logging(root_logger: logging.Logger) -> None:
-    """Attach one live file handler when requested by the launcher environment."""
+    """Attach a live file handler when the launcher requests one.
+
+    Parameters
+    ----------
+    root_logger : logging.Logger
+        Root logger that may receive a shared file handler pointing at the
+        live log path.
+    """
     live_log_path = os.environ.get(_LIVE_LOG_ENV, "").strip()
     if not live_log_path:
         return
@@ -52,7 +59,11 @@ def _configure_live_file_logging(root_logger: logging.Logger) -> None:
 
 
 def _configure_console_logging() -> None:
-    """Configure console logging once and suppress noisy backend discovery logs."""
+    """Configure shared console logging and suppress noisy third-party logs.
+
+    This function is idempotent across repeated logger requests and keeps the
+    project's INFO-level logs visible while muting backend discovery noise.
+    """
     _configure_standard_streams()
     root_logger = logging.getLogger()
     if not root_logger.handlers:

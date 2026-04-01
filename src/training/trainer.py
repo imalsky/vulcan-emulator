@@ -163,7 +163,22 @@ def _warmup_learning_rate(
     base_lr: float,
     warmup_steps: int,
 ) -> float | None:
-    """Return the warmup learning rate for *step*, or None after warmup."""
+    """Return the linear-warmup learning rate for one optimizer step.
+
+    Parameters
+    ----------
+    step : int
+        Zero-based global optimizer step.
+    base_lr : float
+        Peak learning rate reached at the end of warmup.
+    warmup_steps : int
+        Number of warmup steps. A value of zero disables warmup.
+
+    Returns
+    -------
+    float or None
+        Warmup learning rate for the step, or ``None`` once warmup is over.
+    """
     if warmup_steps > 0 and step < warmup_steps:
         return base_lr * float(step + 1) / float(max(warmup_steps, 1))
     return None
@@ -235,7 +250,29 @@ def _update_reduce_on_plateau(
     threshold: float,
     min_lr: float,
 ) -> ReduceOnPlateauState:
-    """Apply one epoch-end reduce-on-plateau update from validation loss."""
+    """Apply one epoch-end reduce-on-plateau scheduler update.
+
+    Parameters
+    ----------
+    state : ReduceOnPlateauState
+        Current scheduler state.
+    metric : float
+        Validation metric to monitor, where lower is better.
+    factor : float
+        Multiplicative learning-rate decay factor.
+    patience : int
+        Number of non-improving epochs to tolerate before decaying.
+    threshold : float
+        Minimum absolute improvement required to reset the bad-epoch counter.
+    min_lr : float
+        Lower bound on the scheduled learning rate.
+
+    Returns
+    -------
+    ReduceOnPlateauState
+        Updated scheduler state after considering the current validation
+        metric.
+    """
     if state.best_metric is None or metric < (state.best_metric - threshold):
         return ReduceOnPlateauState(
             current_lr=state.current_lr,
@@ -268,7 +305,30 @@ def _scheduled_learning_rate(
     scheduler: dict[str, Any],
     plateau_state: ReduceOnPlateauState | None,
 ) -> float:
-    """Compute the active learning rate with warmup plus the selected scheduler."""
+    """Compute the active learning rate for the current training step.
+
+    Parameters
+    ----------
+    step : int
+        Current global optimizer step.
+    total_steps : int
+        Total planned optimizer steps across the full run.
+    base_lr : float
+        Peak learning rate.
+    min_lr : float
+        Minimum learning rate used by cosine / plateau decay.
+    warmup_steps : int
+        Number of linear warmup steps.
+    scheduler : dict[str, Any]
+        Validated scheduler config.
+    plateau_state : ReduceOnPlateauState or None
+        Current reduce-on-plateau state when that scheduler is active.
+
+    Returns
+    -------
+    float
+        Learning rate to apply at this step.
+    """
     warmup_lr = _warmup_learning_rate(
         step=step,
         base_lr=base_lr,
@@ -299,7 +359,29 @@ def _maybe_update_plateau_scheduler(
     warmup_steps: int,
     min_lr: float,
 ) -> ReduceOnPlateauState | None:
-    """Update plateau scheduler state after validation once warmup is complete."""
+    """Update reduce-on-plateau state after validation when applicable.
+
+    Parameters
+    ----------
+    scheduler : dict[str, Any]
+        Validated scheduler config.
+    plateau_state : ReduceOnPlateauState or None
+        Current plateau scheduler state.
+    metric : float
+        Validation metric used for plateau detection.
+    global_step : int
+        Global optimizer step reached at the end of the epoch.
+    warmup_steps : int
+        Number of warmup steps that must finish before plateau updates start.
+    min_lr : float
+        Lower learning-rate bound.
+
+    Returns
+    -------
+    ReduceOnPlateauState or None
+        Updated plateau state, or the original state when the scheduler does
+        not require an update.
+    """
     if scheduler["name"] != "reduce_on_plateau" or plateau_state is None:
         return plateau_state
     if global_step < warmup_steps:
@@ -329,14 +411,68 @@ def make_transformer_train_eval_functions(
     gradient_clip: float,
     weight_decay: float,
 ):
-    """Build JIT train/eval functions for the Transformer architecture."""
+    """Build JIT-compiled train/eval functions for the Transformer model.
+
+    Parameters
+    ----------
+    dims : TransformerDimensions
+        Transformer architecture dimensions.
+    normalization : dict[str, Any]
+        Normalization payload used to recover target-space log10 statistics.
+    loss_cfg : dict[str, float]
+        Loss weights for normalized-space, physical-space, and optional
+        spectrum-reconstruction losses.
+    gradient_clip : float
+        Global L2 gradient-clip threshold.
+    weight_decay : float
+        AdamW decoupled weight-decay coefficient.
+
+    Returns
+    -------
+    tuple[callable, callable]
+        ``(train_step, eval_step)`` closures that consume normalized batch
+        dictionaries.
+    """
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
     def train_step(params, opt_state, batch, learning_rate, dropout_key):
-        """Run one optimizer step for the Transformer model."""
+        """Run one Transformer optimizer step on a normalized batch.
+
+        Parameters
+        ----------
+        params : Any
+            Current Transformer parameter tree.
+        opt_state : dict[str, Any]
+            AdamW optimizer state.
+        batch : dict[str, jax.Array]
+            Normalized batch containing ``sequence``, ``global_inputs``,
+            ``target``, and optional ``spectrum_inputs``.
+        learning_rate : jax.Array
+            Scalar learning rate for this step.
+        dropout_key : jax.Array
+            PRNG key used for hidden-layer dropout.
+
+        Returns
+        -------
+        tuple[Any, dict[str, Any], dict[str, jax.Array]]
+            Updated parameter tree, updated optimizer state, and scalar
+            training metrics.
+        """
         def loss_fn(model_params):
-            """Compute the weighted training loss and metrics."""
+            """Compute weighted Transformer losses and scalar metrics.
+
+            Parameters
+            ----------
+            model_params : Any
+                Transformer parameter tree.
+
+            Returns
+            -------
+            tuple[jax.Array, dict[str, jax.Array]]
+                Combined loss plus a metrics mapping containing normalized,
+                log10-physical, and optional spectrum-reconstruction terms.
+            """
             pred, aux = apply_transformer_model(
                 model_params,
                 batch["sequence"],
@@ -385,7 +521,20 @@ def make_transformer_train_eval_functions(
 
     @jax.jit
     def eval_step(params, batch):
-        """Evaluate the Transformer model on one batch without updates."""
+        """Evaluate the Transformer model on one normalized batch.
+
+        Parameters
+        ----------
+        params : Any
+            Transformer parameter tree.
+        batch : dict[str, jax.Array]
+            Normalized validation or test batch.
+
+        Returns
+        -------
+        dict[str, jax.Array]
+            Scalar evaluation metrics for the batch.
+        """
         pred, aux = apply_transformer_model(
             params,
             batch["sequence"],
@@ -418,7 +567,19 @@ def make_transformer_train_eval_functions(
 
 
 def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
-    """Average a list of scalar metric dictionaries."""
+    """Average a list of scalar metric dictionaries by key.
+
+    Parameters
+    ----------
+    metrics : list[dict[str, float]]
+        Per-batch metric dictionaries with identical scalar keys.
+
+    Returns
+    -------
+    dict[str, float]
+        Mean metric values across the supplied list, or ``NaN`` defaults when
+        the list is empty.
+    """
     if not metrics:
         return {
             "combined_loss": float("nan"),
@@ -434,7 +595,20 @@ def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
 
 
 def _feature_order_matches(contract: dict[str, Any], config: dict[str, Any]) -> bool:
-    """Return True when processed feature orders still match the active config."""
+    """Return whether processed feature orders still match the active config.
+
+    Parameters
+    ----------
+    contract : dict[str, Any]
+        Stored processed-data contract.
+    config : dict[str, Any]
+        Active validated config.
+
+    Returns
+    -------
+    bool
+        ``True`` when both sequence and global feature orders still match.
+    """
     expected_sequence = list(config["data_spec"]["sequence_static_feature_order"])
     expected_globals = list(config["data_spec"]["global_static_feature_order"])
     return (
@@ -462,7 +636,28 @@ def _format_epoch_row(
     learning_rate: float,
     epoch_seconds: float,
 ) -> str:
-    """Format one plain epoch row without logger prefixes."""
+    """Format one plain-text epoch summary row.
+
+    Parameters
+    ----------
+    epoch : int
+        One-based epoch index.
+    epochs : int
+        Total number of configured epochs.
+    train_loss : float
+        Mean training combined loss for the epoch.
+    val_loss : float
+        Mean validation combined loss for the epoch.
+    learning_rate : float
+        Learning rate used at the end of the epoch.
+    epoch_seconds : float
+        Wall-clock duration of the epoch.
+
+    Returns
+    -------
+    str
+        Fixed-width table row for live logging.
+    """
     epoch_label = f"{epoch}/{epochs}"
     return (
         f"{epoch_label:>9}  "
@@ -479,7 +674,13 @@ def _should_early_stop(no_improvement_epochs: int, *, patience: int) -> bool:
 
 
 def _emit_epoch_table_line(line: str) -> None:
-    """Write one plain-text training-table line to stdout and the live PBS log."""
+    """Write one epoch-table line to stdout and the optional live log file.
+
+    Parameters
+    ----------
+    line : str
+        Fully formatted line to emit.
+    """
     print(line, flush=True)
     live_log_path = os.environ.get("VULCAN_LIVE_LOG_PATH", "").strip()
     if not live_log_path:
@@ -490,7 +691,21 @@ def _emit_epoch_table_line(line: str) -> None:
 
 
 def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
-    """Ensure the processed dataset exists and matches the active config."""
+    """Ensure the processed dataset exists and matches the active config.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated config describing the required chemistry, model, and feature
+        order contract.
+    project_root : Path
+        Repository root used to resolve raw and processed paths.
+
+    Returns
+    -------
+    Path
+        Path to a processed dataset compatible with the active config.
+    """
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     contract_path = processed_root / "data_contract.json"
     if contract_path.exists():
@@ -531,7 +746,30 @@ def _checkpoint_payload(
     metrics: dict[str, Any],
     history: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Package training state into a serializable checkpoint dictionary."""
+    """Package model state and training metadata into a checkpoint payload.
+
+    Parameters
+    ----------
+    params : Any
+        Current model parameter tree.
+    dims : Any
+        Model-dimension dataclass.
+    config : dict[str, Any]
+        Validated config to embed in the checkpoint.
+    normalization : dict[str, Any]
+        Normalization payload for downstream export and inference.
+    data_contract : dict[str, Any]
+        Processed-data contract describing tensor ordering.
+    metrics : dict[str, Any]
+        Current summary metrics to store alongside the checkpoint.
+    history : list[dict[str, Any]]
+        Full epoch history accumulated so far.
+
+    Returns
+    -------
+    dict[str, Any]
+        Pickle-serializable checkpoint dictionary.
+    """
     config_payload = {
         key: value
         for key, value in config.items()
@@ -562,14 +800,68 @@ def make_mlp_train_eval_functions(
     gradient_clip: float,
     weight_decay: float,
 ):
-    """Build JIT-compiled train/eval functions for the MLP architecture."""
+    """Build JIT-compiled train/eval functions for the FiLM-MLP.
+
+    Parameters
+    ----------
+    dims : MLPDimensions
+        MLP architecture dimensions.
+    normalization : dict[str, Any]
+        Normalization payload used to recover target-space log10 statistics.
+    loss_cfg : dict[str, float]
+        Loss weights for normalized-space, physical-space, and optional
+        spectrum-reconstruction losses.
+    gradient_clip : float
+        Global L2 gradient-clip threshold.
+    weight_decay : float
+        AdamW decoupled weight-decay coefficient.
+
+    Returns
+    -------
+    tuple[callable, callable]
+        ``(train_step, eval_step)`` closures that consume normalized batch
+        dictionaries.
+    """
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
     def train_step(params, opt_state, batch, learning_rate, dropout_key):
-        """Run one optimizer step for the MLP model."""
+        """Run one FiLM-MLP optimizer step on a normalized batch.
+
+        Parameters
+        ----------
+        params : Any
+            Current MLP parameter tree.
+        opt_state : dict[str, Any]
+            AdamW optimizer state.
+        batch : dict[str, jax.Array]
+            Normalized batch containing ``sequence``, ``global_inputs``,
+            ``target``, and optional ``spectrum_inputs``.
+        learning_rate : jax.Array
+            Scalar learning rate for this step.
+        dropout_key : jax.Array
+            PRNG key used for hidden-layer dropout.
+
+        Returns
+        -------
+        tuple[Any, dict[str, Any], dict[str, jax.Array]]
+            Updated parameter tree, updated optimizer state, and scalar
+            training metrics.
+        """
         def loss_fn(model_params):
-            """Compute the weighted MLP training loss and metrics."""
+            """Compute weighted FiLM-MLP losses and scalar metrics.
+
+            Parameters
+            ----------
+            model_params : Any
+                MLP parameter tree.
+
+            Returns
+            -------
+            tuple[jax.Array, dict[str, jax.Array]]
+                Combined loss plus a metrics mapping containing normalized,
+                log10-physical, and optional spectrum-reconstruction terms.
+            """
             pred, aux = apply_mlp(
                 model_params,
                 batch["sequence"],
@@ -611,7 +903,20 @@ def make_mlp_train_eval_functions(
 
     @jax.jit
     def eval_step(params, batch):
-        """Evaluate the MLP model on one batch without updates."""
+        """Evaluate the FiLM-MLP on one normalized batch.
+
+        Parameters
+        ----------
+        params : Any
+            MLP parameter tree.
+        batch : dict[str, jax.Array]
+            Normalized validation or test batch.
+
+        Returns
+        -------
+        dict[str, jax.Array]
+            Scalar evaluation metrics for the batch.
+        """
         pred, aux = apply_mlp(
             params,
             batch["sequence"],
@@ -648,7 +953,21 @@ def train_model(
     *,
     project_root: Path,
 ) -> TrainingArtifacts:
-    """Train the active chemistry/model combination end to end."""
+    """Train the active chemistry/model combination end to end.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated config describing data paths, model hyperparameters, loss
+        weights, and training schedule.
+    project_root : Path
+        Repository root used to resolve data and checkpoint paths.
+
+    Returns
+    -------
+    TrainingArtifacts
+        Paths to the best checkpoint, epoch history, and final metrics files.
+    """
     processed_root = _ensure_processed(config, project_root=project_root)
     splits, normalization, contract = load_processed_dataset(processed_root)
 

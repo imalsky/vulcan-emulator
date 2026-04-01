@@ -24,7 +24,20 @@ def sha256_text(text: str) -> str:
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    """Hash a file incrementally with SHA-256."""
+    """Hash a file incrementally with SHA-256.
+
+    Parameters
+    ----------
+    path : Path
+        File to hash.
+    chunk_size : int, default=1024 * 1024
+        Number of bytes to read per iteration while streaming the file.
+
+    Returns
+    -------
+    str
+        Hexadecimal SHA-256 digest of the file contents.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while True:

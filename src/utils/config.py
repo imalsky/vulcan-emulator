@@ -169,7 +169,21 @@ def _require_keys(mapping: dict[str, Any], keys: tuple[str, ...] | list[str], sc
 
 
 def _nested_key_present(mapping: dict[str, Any], path: str) -> bool:
-    """Return True when a dotted config path exists in the user payload."""
+    """Return whether a dotted config path exists in a nested mapping.
+
+    Parameters
+    ----------
+    mapping : dict[str, Any]
+        Root user-config payload.
+    path : str
+        Dotted key path such as ``"training.scheduler.name"``.
+
+    Returns
+    -------
+    bool
+        ``True`` when every component of the path exists in the nested
+        mapping structure.
+    """
     current: Any = mapping
     for part in path.split("."):
         if not isinstance(current, dict) or part not in current:
@@ -214,7 +228,20 @@ def _as_nonempty_str(value: Any, field: str) -> str:
 
 
 def _as_string_list(value: Any, field: str) -> list[str]:
-    """Validate and return a deduplicated list of non-empty strings."""
+    """Validate and normalize a deduplicated list of non-empty strings.
+
+    Parameters
+    ----------
+    value : Any
+        Candidate list value from the config payload.
+    field : str
+        Fully qualified config field name used in validation errors.
+
+    Returns
+    -------
+    list[str]
+        Normalized string list with leading/trailing whitespace removed.
+    """
     if not isinstance(value, list) or not value:
         raise ConfigValidationError(f"{field} must be a non-empty list.")
     result = [_as_nonempty_str(item, field) for item in value]
@@ -229,7 +256,23 @@ def _normalized_method_name(
     *,
     allowed: set[str] | None = None,
 ) -> str:
-    """Validate and return one normalization method name."""
+    """Validate and normalize a named method from the config payload.
+
+    Parameters
+    ----------
+    value : Any
+        Candidate method name from the config payload.
+    field : str
+        Fully qualified config field name used in validation errors.
+    allowed : set[str] or None, optional
+        Explicit method-name allow-list. When omitted, the shared
+        normalization-method set is used.
+
+    Returns
+    -------
+    str
+        Lower-cased validated method name.
+    """
     method_name = _as_nonempty_str(value, field).lower()
     allowed_methods = _ALLOWED_NORMALIZATION_METHODS if allowed is None else allowed
     if method_name not in allowed_methods:
@@ -240,7 +283,18 @@ def _normalized_method_name(
 
 
 def get_chemistry_type(config: dict[str, Any]) -> str:
-    """Return the configured chemistry target family."""
+    """Return the validated chemistry target family from the config.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Top-level config payload.
+
+    Returns
+    -------
+    str
+        Lower-cased chemistry type, either ``"fastchem"`` or ``"vulcan"``.
+    """
     chemistry_type = _as_nonempty_str(
         config.get("chemistry_type"),
         "chemistry_type",
@@ -253,7 +307,18 @@ def get_chemistry_type(config: dict[str, Any]) -> str:
 
 
 def get_model_type(config: dict[str, Any]) -> str:
-    """Return the configured prediction architecture family."""
+    """Return the validated prediction architecture family from the config.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Top-level config payload.
+
+    Returns
+    -------
+    str
+        Lower-cased model type, either ``"mlp"`` or ``"transformer"``.
+    """
     model_type = _as_nonempty_str(config.get("model_type"), "model_type").lower()
     if model_type in {"equilibrium", "full_vulcan"}:
         raise ConfigValidationError(
@@ -385,7 +450,21 @@ def global_feature_order(config: dict[str, Any]) -> list[str]:
 
 
 def _validate_mlp_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
-    """Validate the FiLM-MLP config section."""
+    """Validate and normalize the FiLM-MLP model config section.
+
+    Parameters
+    ----------
+    model : dict[str, Any]
+        Raw model config block for the MLP architecture.
+    scope : str
+        Fully qualified config scope used in validation errors.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalized MLP config with concrete numeric types and defaults
+        applied.
+    """
     _require_keys(
         model,
         ["d_hidden", "num_hidden_layers", "conditioning_hidden_dim", "film_clamp"],
@@ -419,7 +498,21 @@ def _validate_mlp_model_config(model: dict[str, Any], scope: str) -> dict[str, A
 
 
 def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
-    """Validate the FiLM-Transformer config section."""
+    """Validate and normalize the FiLM-Transformer config section.
+
+    Parameters
+    ----------
+    model : dict[str, Any]
+        Raw model config block for the Transformer architecture.
+    scope : str
+        Fully qualified config scope used in validation errors.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalized Transformer config with concrete numeric types and
+        defaults applied.
+    """
     _require_keys(
         model,
         [
@@ -474,7 +567,21 @@ def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dic
 
 
 def _validate_training_scheduler(scheduler: Any, scope: str) -> dict[str, Any]:
-    """Validate the optional training scheduler block."""
+    """Validate and normalize the optional training-scheduler block.
+
+    Parameters
+    ----------
+    scheduler : Any
+        Raw scheduler payload, or ``None`` to accept defaults.
+    scope : str
+        Fully qualified config scope used in validation errors.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalized scheduler payload for either cosine decay or
+        reduce-on-plateau scheduling.
+    """
     if scheduler is None:
         scheduler = {}
     if not isinstance(scheduler, dict):
@@ -523,7 +630,22 @@ def _validate_numeric_range(
     *,
     allow_equal: bool = False,
 ) -> list[float]:
-    """Validate a two-number range field and return normalized bounds."""
+    """Validate a two-number range field and return normalized bounds.
+
+    Parameters
+    ----------
+    value : Any
+        Candidate two-element range payload.
+    field : str
+        Fully qualified config field name used in validation errors.
+    allow_equal : bool, default=False
+        Whether equal lower and upper bounds are permitted.
+
+    Returns
+    -------
+    list[float]
+        Normalized ``[lower, upper]`` bounds as floats.
+    """
     if not isinstance(value, list) or len(value) != 2:
         raise ConfigValidationError(f"{field} must be a length-2 list.")
     lower = _as_float(value[0], f"{field}[0]")
@@ -537,7 +659,20 @@ def _validate_numeric_range(
 
 
 def _validate_normal_distribution(spec: Any, field: str) -> dict[str, float]:
-    """Validate a normal-distribution config block."""
+    """Validate a normal-distribution config block.
+
+    Parameters
+    ----------
+    spec : Any
+        Candidate mapping containing ``mean`` and ``std``.
+    field : str
+        Fully qualified config field name used in validation errors.
+
+    Returns
+    -------
+    dict[str, float]
+        Normalized distribution specification with float ``mean`` and ``std``.
+    """
     if not isinstance(spec, dict):
         raise ConfigValidationError(f"{field} must be a mapping.")
     _require_keys(spec, ["mean", "std"], field)
@@ -552,7 +687,22 @@ def _validate_temperature_profile_validation(
     validation_config: Any,
     scope: str,
 ) -> dict[str, float]:
-    """Validate shared temperature-profile bounds."""
+    """Validate the shared temperature-profile bounds block.
+
+    Parameters
+    ----------
+    validation_config : Any
+        Candidate mapping containing minimum and maximum allowed
+        temperatures.
+    scope : str
+        Parent config scope used to construct error messages.
+
+    Returns
+    -------
+    dict[str, float]
+        Normalized validation block with ``min_temperature_k`` and
+        ``max_temperature_k``.
+    """
     field = f"{scope}.validation"
     if not isinstance(validation_config, dict):
         raise ConfigValidationError(f"{field} must be a mapping.")
@@ -745,7 +895,18 @@ def _validate_temperature_profiles(profile_config: Any) -> dict[str, Any]:
 
 
 def _validate_split(split: Any) -> dict[str, Any]:
-    """Validate the train/val/test split policy stored under normalization."""
+    """Validate the train/val/test split policy under ``normalization``.
+
+    Parameters
+    ----------
+    split : Any
+        Candidate split mapping with fractions and RNG seed.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalized split payload with numeric fractions and integer seed.
+    """
     if not isinstance(split, dict):
         raise ConfigValidationError("normalization.split must be a mapping.")
     _require_keys(

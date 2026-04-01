@@ -43,7 +43,21 @@ EXPORT_VERSION = 3
 
 
 def _flatten_params(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
-    """Flatten a nested param tree into ``{dotted.key: ndarray}`` pairs."""
+    """Flatten a nested parameter tree into dotted-key arrays.
+
+    Parameters
+    ----------
+    tree : Any
+        Nested dict/list/array parameter structure.
+    prefix : str, default=""
+        Dotted-key prefix accumulated during recursion.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        Flat mapping from dotted parameter names to NumPy arrays suitable for
+        NPZ serialization.
+    """
     flat: dict[str, np.ndarray] = {}
     if isinstance(tree, dict):
         for key, value in tree.items():
@@ -58,7 +72,19 @@ def _flatten_params(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
 
 
 def _convert_numeric_dicts(node: Any) -> Any:
-    """Convert dicts keyed by contiguous integer strings back into Python lists."""
+    """Convert integer-keyed dict nodes back into Python lists.
+
+    Parameters
+    ----------
+    node : Any
+        Nested structure produced while rebuilding a flattened parameter tree.
+
+    Returns
+    -------
+    Any
+        Structure with contiguous ``{"0": ..., "1": ...}`` mappings restored
+        to list form.
+    """
     if isinstance(node, dict):
         converted = {key: _convert_numeric_dicts(value) for key, value in node.items()}
         if converted and all(key.isdigit() for key in converted):
@@ -70,7 +96,18 @@ def _convert_numeric_dicts(node: Any) -> Any:
 
 
 def _unflatten_params(flat_params: dict[str, np.ndarray]) -> Any:
-    """Reconstruct the nested param tree from dotted keys."""
+    """Reconstruct the nested parameter tree from dotted NPZ keys.
+
+    Parameters
+    ----------
+    flat_params : dict[str, np.ndarray]
+        Flat mapping produced by ``_flatten_params``.
+
+    Returns
+    -------
+    Any
+        Nested parameter tree matching the original dict/list structure.
+    """
     root: dict[str, Any] = {}
     for key, value in flat_params.items():
         cursor = root
@@ -85,7 +122,21 @@ def _restore_block_transform_space_jax(
     x: jax.Array,
     block: dict[str, Any],
 ) -> jax.Array:
-    """Undo only the affine part of a normalization block."""
+    """Undo only the affine part of a normalization block in JAX.
+
+    Parameters
+    ----------
+    x : jax.Array
+        Normalized values in model space.
+    block : dict[str, Any]
+        Normalization block containing ``method``, ``mean``, and ``std``.
+
+    Returns
+    -------
+    jax.Array
+        Values restored to pre-affine transform space. For log-standard
+        blocks this means log10 space, not linear physical space.
+    """
     arr = jnp.asarray(x, dtype=jnp.float32)
     method = str(block["method"]).lower()
     if method == "none":
@@ -98,7 +149,20 @@ def _restore_block_transform_space_jax(
 
 
 def apply_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.Array:
-    """Apply one normalization block in JAX."""
+    """Apply one normalization block using JAX arrays.
+
+    Parameters
+    ----------
+    x : jax.Array or np.ndarray
+        Input values whose last dimension matches the normalization block.
+    block : dict[str, Any]
+        Normalization block with method metadata and fitted statistics.
+
+    Returns
+    -------
+    jax.Array
+        Normalized values in model space.
+    """
     arr = jnp.asarray(x, dtype=jnp.float32)
     method = str(block["method"]).lower()
     if method == "none":
@@ -122,7 +186,21 @@ def inverse_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.A
 
 
 def apply_mixed_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.Array:
-    """Apply a mixed per-feature normalization block in JAX."""
+    """Apply a mixed per-feature normalization block in JAX.
+
+    Parameters
+    ----------
+    x : jax.Array or np.ndarray
+        Input array whose last dimension enumerates feature columns.
+    block : dict[str, Any]
+        Mixed normalization payload with per-column methods, means, stds, and
+        optional floors.
+
+    Returns
+    -------
+    jax.Array
+        Normalized array with the same shape as ``x``.
+    """
     arr = jnp.asarray(x, dtype=jnp.float32)
     outputs: list[jax.Array] = []
     for idx, method in enumerate(block["methods"]):
@@ -147,7 +225,22 @@ def _apply_sequence_static_block_jax(
     sequence_static: jax.Array | np.ndarray,
     payload: dict[str, Any],
 ) -> jax.Array:
-    """Normalize sequence-static features block by block in JAX."""
+    """Normalize sequence-static features block by block in JAX.
+
+    Parameters
+    ----------
+    sequence_static : jax.Array or np.ndarray
+        Sequence feature tensor whose last dimension follows the payload's
+        block order.
+    payload : dict[str, Any]
+        Sequence-static normalization payload containing one block per
+        feature.
+
+    Returns
+    -------
+    jax.Array
+        Normalized sequence tensor with the same shape as ``sequence_static``.
+    """
     arr = jnp.asarray(sequence_static, dtype=jnp.float32)
     parts = [
         apply_block_jax(arr[..., idx : idx + 1], block)
@@ -162,7 +255,23 @@ def _ordered_feature_vector(
     *,
     field_name: str,
 ) -> jax.Array:
-    """Resolve an ordered feature vector from a dict or a 1-D array."""
+    """Resolve one ordered feature vector from dict or array inputs.
+
+    Parameters
+    ----------
+    values : dict[str, float] or array-like
+        Either a name-indexed mapping or a pre-ordered 1-D feature vector.
+    feature_order : list[str]
+        Required feature order for the downstream model contract.
+    field_name : str
+        Human-readable field name used in validation errors.
+
+    Returns
+    -------
+    jax.Array
+        One-dimensional feature vector in the requested order with shape
+        ``(len(feature_order),)``.
+    """
     if isinstance(values, dict):
         missing = [name for name in feature_order if name not in values]
         if missing:
@@ -179,7 +288,21 @@ def _ordered_feature_vector(
 
 
 def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) -> Path:
-    """Write one checkpoint payload to a portable NPZ bundle."""
+    """Write a training checkpoint payload to a portable NPZ bundle.
+
+    Parameters
+    ----------
+    payload : dict[str, Any]
+        Checkpoint dictionary containing model params, dimensions,
+        normalization, data contract, and config.
+    output_path : str or Path
+        Destination ``.npz`` file.
+
+    Returns
+    -------
+    Path
+        Path to the written export bundle.
+    """
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     flat_params = _flatten_params(payload["params"])
@@ -246,7 +369,19 @@ def _resolve_device(device: str | jax.Device | None) -> jax.Device | None:
 def _parse_export_metadata(
     arrays: np.lib.npyio.NpzFile,
 ) -> tuple[str, int, str, str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Parse the JSON metadata payload from an exported NPZ bundle."""
+    """Parse bundle metadata from an exported NPZ file handle.
+
+    Parameters
+    ----------
+    arrays : np.lib.npyio.NpzFile
+        Open NPZ bundle containing ``meta/*`` JSON payloads.
+
+    Returns
+    -------
+    tuple[str, int, str, str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]
+        Export format name, export version, chemistry type, model type, model
+        dimensions, normalization payload, data contract, and config.
+    """
     export_format = str(arrays["meta/export_format"].item()) if "meta/export_format" in arrays else "legacy_npz"
     export_version = int(str(arrays["meta/export_version"].item())) if "meta/export_version" in arrays else 0
     chemistry_type = str(arrays["meta/chemistry_type"].item()) if "meta/chemistry_type" in arrays else ""

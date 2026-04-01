@@ -28,7 +28,14 @@ FASTCHEM_GLOBAL_LABELS = list(FASTCHEM_CONDITIONING_INPUT_ORDER)
 VULCAN_GLOBAL_LABELS = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
 
 def _validate_fastchem_bundle_global_order(bundle: ExportedJAXModel) -> None:
-    """Reject fastchem bundles that do not match the elemental-global contract."""
+    """Reject FastChem bundles that use an outdated global-input ordering.
+
+    Parameters
+    ----------
+    bundle : ExportedJAXModel
+        Loaded export bundle whose ``data_contract`` should match the ExoJAX
+        FastChem elemental-conditioning contract.
+    """
     feature_order = list(bundle.data_contract.get("global_static_feature_order", []))
     if feature_order != FASTCHEM_GLOBAL_LABELS:
         raise ValueError(
@@ -39,7 +46,14 @@ def _validate_fastchem_bundle_global_order(bundle: ExportedJAXModel) -> None:
 
 
 def _validate_vulcan_bundle_global_order(bundle: ExportedJAXModel) -> None:
-    """Reject vulcan bundles that do not match the runtime-knob contract."""
+    """Reject VULCAN bundles that use an outdated global-input ordering.
+
+    Parameters
+    ----------
+    bundle : ExportedJAXModel
+        Loaded export bundle whose ``data_contract`` should match the ExoJAX
+        VULCAN runtime-conditioning contract.
+    """
     feature_order = list(bundle.data_contract.get("global_static_feature_order", []))
     if feature_order != VULCAN_GLOBAL_LABELS:
         raise ValueError(
@@ -50,7 +64,15 @@ def _validate_vulcan_bundle_global_order(bundle: ExportedJAXModel) -> None:
 
 
 def _maybe_require_column_constant(values: Any, *, name: str) -> None:
-    """Reject varying profiles in eager mode for inputs that remain column-constant."""
+    """Reject eager inputs that violate the column-constant ExoJAX contract.
+
+    Parameters
+    ----------
+    values : Any
+        Candidate scalar, 1-D profile, or 2-D stacked profile input.
+    name : str
+        Human-readable field name used in validation errors.
+    """
     if isinstance(values, jax.core.Tracer):
         return
     arr = np.asarray(values, dtype=np.float64)
@@ -70,7 +92,17 @@ def _require_matching_level_shapes(
     pressures: jax.Array,
     name: str = "temperatures_k and pressures_bar",
 ) -> None:
-    """Validate shared 1-D level-grid inputs."""
+    """Validate that paired ExoJAX level-grid inputs share one 1-D grid.
+
+    Parameters
+    ----------
+    temperatures : jax.Array
+        Temperature profile with shape ``(nz,)``.
+    pressures : jax.Array
+        Pressure profile with shape ``(nz,)``.
+    name : str, default="temperatures_k and pressures_bar"
+        Field label used in validation errors.
+    """
     if temperatures.ndim != 1 or pressures.ndim != 1:
         raise ValueError(f"{name} must be 1-D arrays.")
     if temperatures.shape != pressures.shape:
@@ -80,7 +112,21 @@ def _require_matching_level_shapes(
 def make_fastchem_vmr_fn(
     bundle: ExportedJAXModel,
 ) -> tuple[Any, list[str]]:
-    """Create a differentiable FastChem-profile wrapper for ExoJAX."""
+    """Create an ExoJAX-compatible FastChem profile inference callable.
+
+    Parameters
+    ----------
+    bundle : ExportedJAXModel
+        Exported FastChem emulator bundle with physical-unit preprocessing
+        embedded in the wrapper.
+
+    Returns
+    -------
+    tuple[Any, list[str]]
+        Callable ``vmr_fn`` plus the ordered output-species labels. The
+        callable returns linear VMR predictions with shape ``(nz, n_species)``
+        in top-to-bottom level order.
+    """
     if not bundle.uses_fastchem:
         raise ValueError("make_fastchem_vmr_fn requires a fastchem bundle.")
 
@@ -93,7 +139,29 @@ def make_fastchem_vmr_fn(
         global_inputs: dict[str, Any] | jax.Array,  # X/H globals
         gravity_cm_s2: jax.Array | None = None,  # optional shape: (nz,), top -> bottom
     ) -> jax.Array:
-        """Return linear VMRs with shape ``(nz, n_species)`` in top-to-bottom order."""
+        """Predict one FastChem composition profile in ExoJAX ordering.
+
+        Parameters
+        ----------
+        temperatures_k : jax.Array
+            Temperature profile in Kelvin with shape ``(nz,)`` ordered from
+            top to bottom.
+        pressures_bar : jax.Array
+            Pressure profile in bar with shape ``(nz,)`` ordered from top to
+            bottom.
+        global_inputs : dict[str, Any] or jax.Array
+            Elemental conditioning inputs matching
+            ``FASTCHEM_GLOBAL_LABELS``.
+        gravity_cm_s2 : jax.Array or None, optional
+            Optional gravity profile. It is validated for shape compatibility
+            but not consumed by the current FastChem bundle contract.
+
+        Returns
+        -------
+        jax.Array
+            Linear VMR array with shape ``(nz, n_species)`` in top-to-bottom
+            order.
+        """
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
         _require_matching_level_shapes(temperatures=temperatures, pressures=pressures)
@@ -118,7 +186,21 @@ def make_fastchem_vmr_fn(
 def make_vulcan_vmr_fn(
     bundle: ExportedJAXModel,
 ) -> tuple[Any, list[str]]:
-    """Create a differentiable VULCAN-profile wrapper for ExoJAX."""
+    """Create an ExoJAX-compatible VULCAN profile inference callable.
+
+    Parameters
+    ----------
+    bundle : ExportedJAXModel
+        Exported VULCAN emulator bundle with embedded physical-unit
+        preprocessing.
+
+    Returns
+    -------
+    tuple[Any, list[str]]
+        Callable ``vmr_fn`` plus the ordered output-species labels. The
+        callable returns linear VMR predictions with shape ``(nz, n_species)``
+        in top-to-bottom level order.
+    """
     if not bundle.uses_vulcan_chemistry:
         raise ValueError("make_vulcan_vmr_fn requires a vulcan bundle.")
 
@@ -132,7 +214,30 @@ def make_vulcan_vmr_fn(
         global_inputs: dict[str, Any] | jax.Array,
         spectrum_flux: jax.Array,  # shape: (spectrum_dim,)
     ) -> jax.Array:
-        """Return linear VMRs with shape ``(nz, n_species)`` in top-to-bottom order."""
+        """Predict one VULCAN composition profile in ExoJAX ordering.
+
+        Parameters
+        ----------
+        temperatures_k : jax.Array
+            Temperature profile in Kelvin with shape ``(nz,)`` ordered from
+            top to bottom.
+        pressures_bar : jax.Array
+            Pressure profile in bar with shape ``(nz,)`` ordered from top to
+            bottom.
+        kzz_cm2_s : jax.Array
+            Eddy-diffusion profile in ``cm^2 s^-1`` with shape ``(nz,)``.
+        global_inputs : dict[str, Any] or jax.Array
+            Global conditioning inputs matching ``VULCAN_GLOBAL_LABELS``.
+        spectrum_flux : jax.Array
+            Stellar spectrum sampled on the bundle's fixed wavelength grid,
+            shape ``(spectrum_dim,)``.
+
+        Returns
+        -------
+        jax.Array
+            Linear VMR array with shape ``(nz, n_species)`` in top-to-bottom
+            order.
+        """
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
         kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)

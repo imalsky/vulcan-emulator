@@ -27,7 +27,27 @@ def patch_numpy_asarray_copy() -> None:
     original_asarray = np.asarray
 
     def _compat_asarray(a, dtype=None, order=None, *, like=None, copy=None):
-        """Backfill the NumPy 2 ``copy=...`` signature on older releases."""
+        """Backfill the NumPy 2 ``copy=...`` signature on older releases.
+
+        Parameters
+        ----------
+        a : Any
+            Input array-like payload forwarded to ``np.asarray``.
+        dtype : Any, optional
+            Target dtype forwarded to ``np.asarray``.
+        order : Any, optional
+            Optional memory-order argument supported by older NumPy releases.
+        like : Any, optional
+            Optional ``like=`` dispatch target.
+        copy : Any, optional
+            Ignored compatibility argument accepted for NumPy 2 style call
+            sites.
+
+        Returns
+        -------
+        np.ndarray
+            Array produced by the original ``np.asarray`` implementation.
+        """
         del copy
         kwargs = {}
         if order is not None:

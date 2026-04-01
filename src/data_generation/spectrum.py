@@ -49,7 +49,12 @@ class SpectrumRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        """Validate the wavelength/flux arrays for downstream use."""
+        """Validate the in-memory spectrum contract before use downstream.
+
+        Ensures the wavelength and flux arrays are finite, one-dimensional,
+        equal-length, strictly increasing in wavelength, and non-negative in
+        flux so they can be safely resampled and serialized.
+        """
         if self.wavelength_nm.ndim != 1 or self.flux_erg_cm2_s_nm.ndim != 1:
             raise ValueError("Spectrum arrays must be one-dimensional.")
         if self.wavelength_nm.size != self.flux_erg_cm2_s_nm.size:
@@ -103,7 +108,31 @@ def generate_wasp39b_template(
     semi_major_axis_au: float = 0.04858,
     name: str = "wasp39b_template",
 ) -> SpectrumRecord:
-    """Generate the default analytic WASP-39b-like stellar template."""
+    """Generate the default blackbody-based WASP-39b stellar template.
+
+    Parameters
+    ----------
+    num_points : int, default=2401
+        Number of wavelength samples in the generated spectrum.
+    wavelength_min_nm : float, default=100.0
+        Minimum wavelength in nanometres.
+    wavelength_max_nm : float, default=700.0
+        Maximum wavelength in nanometres.
+    teff_k : float, default=5485.0
+        Effective stellar temperature used in the blackbody spectrum.
+    radius_rsun : float, default=0.939
+        Stellar radius recorded in metadata for downstream provenance.
+    semi_major_axis_au : float, default=0.04858
+        Orbital separation recorded in metadata for downstream provenance.
+    name : str, default="wasp39b_template"
+        Record identifier stored in the returned ``SpectrumRecord``.
+
+    Returns
+    -------
+    SpectrumRecord
+        Validated stellar spectrum sampled on a fixed wavelength grid, with
+        metadata describing the analytic template parameters.
+    """
     wavelength_nm = np.linspace(wavelength_min_nm, wavelength_max_nm, int(num_points), dtype=np.float64)
     flux = blackbody_surface_flux(
         wavelength_nm,
@@ -125,7 +154,21 @@ def generate_wasp39b_template(
 
 
 def write_vulcan_spectrum_txt(record: SpectrumRecord, path: str | Path) -> Path:
-    """Write a spectrum in the two-column text format expected by VULCAN."""
+    """Write a spectrum record in VULCAN's two-column text format.
+
+    Parameters
+    ----------
+    record : SpectrumRecord
+        Spectrum to serialize. ``record.validate()`` is called before writing.
+    path : str or Path
+        Destination text file.
+
+    Returns
+    -------
+    Path
+        Resolved output path containing wavelength and flux columns in
+        nanometres and ``erg cm^-2 s^-1 nm^-1``.
+    """
     record.validate()
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +180,21 @@ def write_vulcan_spectrum_txt(record: SpectrumRecord, path: str | Path) -> Path:
 
 
 def read_vulcan_spectrum_txt(path: str | Path, *, name: str | None = None) -> SpectrumRecord:
-    """Read a two-column VULCAN spectrum text file into a record."""
+    """Read a VULCAN text spectrum into a validated ``SpectrumRecord``.
+
+    Parameters
+    ----------
+    path : str or Path
+        Source text file containing at least wavelength and flux columns.
+    name : str or None, optional
+        Override for the record name. When omitted, the file stem is used.
+
+    Returns
+    -------
+    SpectrumRecord
+        Parsed spectrum with wavelength grid, flux values, and source-file
+        provenance metadata.
+    """
     loaded = np.loadtxt(Path(path), comments="#")
     if loaded.ndim != 2 or loaded.shape[1] < 2:
         raise ValueError("Spectrum text file must contain at least two columns.")
@@ -181,7 +238,21 @@ def fixed_wavelength_grid(
 
 
 def save_spectrum_manifest(records: Iterable[SpectrumRecord], output_dir: str | Path) -> Path:
-    """Persist spectra plus a JSON manifest under the output directory."""
+    """Persist a spectrum library and its manifest under one directory.
+
+    Parameters
+    ----------
+    records : Iterable[SpectrumRecord]
+        Spectrum records to validate and serialize as ``.npz`` assets.
+    output_dir : str or Path
+        Destination directory that will receive the per-record files and
+        ``manifest.json``.
+
+    Returns
+    -------
+    Path
+        Path to the written manifest describing the stored spectrum library.
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = {"records": []}
@@ -208,7 +279,19 @@ def save_spectrum_manifest(records: Iterable[SpectrumRecord], output_dir: str | 
 
 
 def load_spectrum_manifest(manifest_path: str | Path) -> dict[str, SpectrumRecord]:
-    """Load a saved spectrum manifest into in-memory records."""
+    """Load a saved spectrum manifest into validated in-memory records.
+
+    Parameters
+    ----------
+    manifest_path : str or Path
+        Path to a manifest produced by ``save_spectrum_manifest``.
+
+    Returns
+    -------
+    dict[str, SpectrumRecord]
+        Mapping from spectrum name to the corresponding validated
+        ``SpectrumRecord`` loaded from disk.
+    """
     manifest_file = Path(manifest_path)
     payload = json.loads(manifest_file.read_text(encoding="utf-8"))
     result: dict[str, SpectrumRecord] = {}
@@ -227,7 +310,19 @@ def load_spectrum_manifest(manifest_path: str | Path) -> dict[str, SpectrumRecor
 
 
 def load_spectrum_records_from_glob(pattern: str) -> dict[str, SpectrumRecord]:
-    """Load one in-memory spectrum library from a file glob."""
+    """Load a spectrum library from a filesystem glob of text spectra.
+
+    Parameters
+    ----------
+    pattern : str
+        Glob pattern matching VULCAN-style text spectra.
+
+    Returns
+    -------
+    dict[str, SpectrumRecord]
+        Dictionary keyed by spectrum name, with each entry parsed from one
+        matched file.
+    """
     result: dict[str, SpectrumRecord] = {}
     matched_paths = [Path(path) for path in sorted(glob_module.glob(pattern, recursive=True))]
     if not matched_paths:
