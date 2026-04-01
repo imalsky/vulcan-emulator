@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -33,3 +36,23 @@ def test_cli_normalization_stage_dispatches_preprocess(monkeypatch, capsys, tmp_
     assert called["config"] is expected_config
     assert called["project_root"] == tmp_path
     assert json.loads(stdout)["processed_root"] == "processed/demo"
+
+
+def test_direct_module_imports_do_not_trigger_cli_circular_imports():
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import src.data_generation.preprocess; "
+                "import src.data_generation.generation; "
+                "from src.utils import main; "
+                "assert callable(main)"
+            ),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

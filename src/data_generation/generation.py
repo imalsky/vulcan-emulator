@@ -1345,7 +1345,7 @@ def run_vulcan_generation(
     backfill = config["generation"].get("backfill", {"enabled": True, "max_retries": 3})
     target_count = num_runs or int(config["generation"]["num_runs"])
 
-    def _sample_and_prepare(n: int, seed: int) -> list[RunSpecification]:
+    def _sample_and_prepare(n: int, seed: int, *, start_index: int) -> list[RunSpecification]:
         specs = sample_run_specifications(
             config=config,
             project_root=project_root,
@@ -1353,10 +1353,11 @@ def run_vulcan_generation(
             seed=seed,
         )
         prepared: list[RunSpecification] = []
-        for spec in specs:
+        for index_offset, spec in enumerate(specs):
+            run_id = f"run_{start_index + index_offset:05d}"
             prepared.append(
                 RunSpecification(
-                    run_id=spec.run_id,
+                    run_id=run_id,
                     pressure_bar=spec.pressure_bar,
                     temperature_k=spec.temperature_k,
                     globals=spec.globals,
@@ -1417,7 +1418,9 @@ def run_vulcan_generation(
 
     # Initial batch.
     base_seed = int(config["generation"]["seed"])
-    prepared_specs = _sample_and_prepare(target_count, base_seed)
+    next_run_index = 0
+    prepared_specs = _sample_and_prepare(target_count, base_seed, start_index=next_run_index)
+    next_run_index += len(prepared_specs)
     run_files, all_failures = _run_batch(prepared_specs)
     all_specs = list(prepared_specs)
 
@@ -1433,7 +1436,12 @@ def run_vulcan_generation(
                 attempt, max_retries, shortfall,
             )
             backfill_seed = base_seed + 1000 * attempt
-            backfill_specs = _sample_and_prepare(shortfall, backfill_seed)
+            backfill_specs = _sample_and_prepare(
+                shortfall,
+                backfill_seed,
+                start_index=next_run_index,
+            )
+            next_run_index += len(backfill_specs)
             new_successes, new_failures = _run_batch(backfill_specs)
             run_files.extend(new_successes)
             all_failures.extend(new_failures)
@@ -1456,7 +1464,8 @@ def run_vulcan_generation(
     consolidated_path = consolidate_runs_to_single_hdf5(
         run_files, raw_root / "runs.h5",
     )
-    successful_specs = [s for s in all_specs if s.run_id not in set(all_failures)]
+    failed_ids = set(all_failures)
+    successful_specs = [s for s in all_specs if s.run_id not in failed_ids]
     manifest_path, coverage_path = _write_generation_metadata(
         raw_root=raw_root,
         run_files=[consolidated_path],

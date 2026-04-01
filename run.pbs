@@ -39,7 +39,7 @@ if [ "${rc}" -ne 0 ]; then
   exit 2
 fi
 
-CONFIG_PATH="${CONFIG_PATH:-config/equilibrium_only_config.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/fastchem_transformer_config.json}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"

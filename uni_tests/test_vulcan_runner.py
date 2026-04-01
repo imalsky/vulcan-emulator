@@ -340,6 +340,79 @@ def test_run_vulcan_generation_fastchem_skips_vulcan_runtime(tmp_path, monkeypat
         handle.file.close()
 
 
+def test_run_vulcan_generation_backfill_assigns_unique_run_ids(tmp_path, monkeypatch):
+    config = _make_equilibrium_config(tmp_path)
+    config["generation"]["num_runs"] = 2
+    config["generation"]["backfill"] = {"enabled": True, "max_retries": 1}
+
+    def _fake_validated_paths(config, *, project_root):
+        del config, project_root
+        return tmp_path, tmp_path / "fastchem"
+
+    def _fake_sample_run_specifications(*, config, project_root, num_runs=None, seed=None):
+        del config, project_root, seed
+        total = int(num_runs or 0)
+        pressure_bar = np.array([1.0, 0.1], dtype=np.float64)
+        temperature_k = np.array([1200.0, 1000.0], dtype=np.float64)
+        elemental_abundances_x_h = np.repeat(
+            np.array([[8.38e-2, 2.95e-4, 5.37e-4, 7.08e-5, 1.41e-5]], dtype=np.float64),
+            pressure_bar.size,
+            axis=0,
+        )
+        gravity_cm_s2 = np.full(pressure_bar.shape, 2.5e3, dtype=np.float64)
+        globals_map = {
+            "metallicity_log10": 0.0,
+            "c_to_o": 0.55,
+            "s_to_o": 0.02,
+            "He_H": 8.38e-2,
+            "C_H": 2.95e-4,
+            "O_H": 5.37e-4,
+            "N_H": 7.08e-5,
+            "S_H": 1.41e-5,
+        }
+        return [
+            generation_module.RunSpecification(
+                run_id=f"run_{idx:05d}",
+                pressure_bar=pressure_bar,
+                temperature_k=temperature_k,
+                globals=dict(globals_map),
+                metadata={},
+                elemental_abundances_x_h=elemental_abundances_x_h,
+                gravity_cm_s2=gravity_cm_s2,
+            )
+            for idx in range(total)
+        ]
+
+    def _fake_fastchem(spec, *, source_root, worker_base, runs_dir, config):
+        del source_root, worker_base
+        if spec.run_id == "run_00000":
+            raise RuntimeError("synthetic failure")
+        nz = spec.pressure_bar.size
+        species = list(config["data_spec"]["output_species"])
+        equilibrium_ymix = np.full((nz, len(species)), 1.0e-8, dtype=np.float64)
+        equilibrium_ymix[:, species.index("H2")] = 0.84
+        equilibrium_ymix[:, species.index("He")] = 0.15
+        equilibrium_ymix[:, species.index("H2O")] = 1.0e-3
+        equilibrium_ymix /= np.sum(equilibrium_ymix, axis=1, keepdims=True)
+        return write_equilibrium_hdf5(
+            runs_dir / f"{spec.run_id}.h5",
+            spec=spec,
+            equilibrium_ymix=equilibrium_ymix,
+            state_species=list(config["data_spec"]["state_species"]),
+            output_species=species,
+        )
+
+    monkeypatch.setattr(generation_module, "_validated_vulcan_paths", _fake_validated_paths)
+    monkeypatch.setattr(generation_module, "sample_run_specifications", _fake_sample_run_specifications)
+    monkeypatch.setattr(generation_module, "_run_single_fastchem_spec", _fake_fastchem)
+
+    artifact = run_vulcan_generation(config, project_root=config["_project_root"])
+
+    assert artifact.consolidated_path is not None and artifact.consolidated_path.exists()
+    with h5py.File(artifact.consolidated_path, "r") as handle:
+        assert sorted(handle.keys()) == ["run_00001", "run_00002"]
+
+
 def test_run_vulcan_generation_hard_fails_on_shortfall(tmp_path, tiny_config, monkeypatch):
     config = copy.deepcopy(tiny_config)
     config["generation"]["mode"] = "vulcan"
