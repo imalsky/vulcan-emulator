@@ -22,7 +22,7 @@ from matplotlib.lines import Line2D
 
 _STYLE = _ROOT / "extras" / "science.mplstyle"
 
-CONFIG_PATH = _ROOT / "config" / "equilibrium_only_config.json"
+CONFIG_PATH = _ROOT / "config" / "fastchem_mlp_config.json"
 PROCESSED_ROOT_OVERRIDE: Path | None = None
 RAW_ROOT_OVERRIDE: Path | None = None
 RUN_ID: str | None = None

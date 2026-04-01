@@ -4,9 +4,9 @@ This module is the first stage of the data pipeline.  It samples
 atmospheric parameters (via ``sampling.sample_run_specifications``),
 then either:
 
-* **equilibrium mode** — calls FastChem to compute chemical equilibrium
+* **fastchem chemistry** — calls FastChem to compute chemical equilibrium
   at each pressure level and writes a simplified HDF5 per run, or
-* **full_vulcan mode** — patches the VULCAN configuration, launches
+* **vulcan chemistry** — patches the VULCAN configuration, launches
   VULCAN as a subprocess, and writes the final converged output state, or
 * **synthetic mode** — generates a heuristic smoke-test final state
   without calling VULCAN at all (useful for pipeline development).
@@ -32,7 +32,14 @@ from typing import Any
 import h5py
 import numpy as np
 
-from ..utils.config import ELEMENT_INPUT_ORDER, is_equilibrium, task_kind
+from ..utils.config import (
+    ELEMENT_INPUT_ORDER,
+    PUBLIC_PHYSICS_TOGGLES,
+    SUPPORTED_ATM_BASES,
+    get_chemistry_type,
+    get_model_type,
+    uses_fastchem,
+)
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
@@ -180,12 +187,12 @@ def _prepare_generation_directory(
                 )
             manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest_mode = str(manifest_payload.get("mode", "")).lower()
-            manifest_task_kind = str(manifest_payload.get("task_kind", "")).lower()
+            manifest_chemistry_type = str(manifest_payload.get("chemistry_type", "")).lower()
             current_mode = str(config["generation"]["mode"]).lower()
-            current_task_kind = task_kind(config)
-            if manifest_mode != current_mode or manifest_task_kind != current_task_kind:
+            current_chemistry_type = get_chemistry_type(config)
+            if manifest_mode != current_mode or manifest_chemistry_type != current_chemistry_type:
                 raise RuntimeError(
-                    "Existing raw runs were generated with a different generation mode or task kind. "
+                    "Existing raw runs were generated with a different generation mode or chemistry_type. "
                     "Set generation.overwrite=true to regenerate a compatible dataset."
                 )
             # Return consolidated path as a single-element list when no per-file runs exist.
@@ -218,7 +225,7 @@ def _sampling_coverage_payload(
     was actually covered by the sampled runs.  Written to
     ``sampling_coverage.json`` for diagnostic inspection.
     """
-    equilibrium = is_equilibrium(config)
+    fastchem = uses_fastchem(config)
     metallicity = np.asarray([spec.globals["metallicity_log10"] for spec in specs], dtype=np.float64)
     c_to_o = np.asarray([spec.globals["c_to_o"] for spec in specs], dtype=np.float64)
     s_to_o = np.asarray([spec.globals.get("s_to_o", 0.026) for spec in specs], dtype=np.float64)
@@ -278,7 +285,7 @@ def _sampling_coverage_payload(
         },
     }
 
-    if not equilibrium:
+    if not fastchem:
         gravity = np.asarray([spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64)
         log10_kzz_rows: list[np.ndarray] = []
         for path in run_files:
@@ -310,8 +317,8 @@ def _sampling_coverage_payload(
 
     return {
         "mode": mode,
-        "task_kind": task_kind(config),
-        "model_type": "equilibrium" if equilibrium else "full_vulcan",
+        "chemistry_type": get_chemistry_type(config),
+        "model_type": get_model_type(config),
         "num_runs": len(specs),
         "configured_ranges": configured_ranges,
         "realized_summary": realized,
@@ -331,7 +338,7 @@ def _write_generation_metadata(
     coverage_path = raw_root / "sampling_coverage.json"
     manifest_payload = {
         "mode": mode,
-        "task_kind": task_kind(config),
+        "chemistry_type": get_chemistry_type(config),
         "run_files": manifest_for_files(run_files),
     }
     manifest_path.write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
@@ -996,21 +1003,35 @@ def _patch_vulcan_cfg(
     runtime = config["vulcan_runtime"]
     spectrum_cfg = config["stellar_spectrum"]
     element_abundances = _element_abundances_from_spec(spec)
+    default_preset = dict(config.get("default_science_preset", {}))
+    default_physics = dict(default_preset.get("physics_toggles", {}))
+    physics = {
+        name: bool(spec.globals.get(name, default_physics.get(name, False)))
+        for name in PUBLIC_PHYSICS_TOGGLES
+    }
+    atm_base = next(
+        (
+            name
+            for name in SUPPORTED_ATM_BASES
+            if float(spec.globals.get(f"atm_base_{name}", 0.0)) > 0.5
+        ),
+        str(default_preset.get("atm_base", runtime.get("atm_base", "H2"))),
+    )
     assignments = dict(runtime.get("cfg_assignments", {}))
     assignments.update(
         {
             "atom_list": _vulcan_atom_list(config),
-            "use_photo": bool(config["physics_toggles"]["use_photochemistry"]),
-            "use_ion": bool(config["physics_toggles"]["use_ion_chemistry"]),
-            "use_Kzz": bool(config["physics_toggles"]["use_eddy_diffusion"]),
-            "use_moldiff": bool(config["physics_toggles"]["use_molecular_diffusion"]),
-            "use_vm_mol": bool(config["physics_toggles"]["use_upwind_molecular_diffusion"]),
-            "use_topflux": bool(config["physics_toggles"]["use_boundary_conditions"]),
-            "use_botflux": bool(config["physics_toggles"]["use_boundary_conditions"]),
-            "use_condense": bool(config["physics_toggles"]["use_condensation"]),
-            "use_settling": bool(config["physics_toggles"]["use_settling"]),
-            "use_ini_cold_trap": bool(config["physics_toggles"]["use_initial_cold_trap"]),
-            "use_sat_surfaceH2O": bool(config["physics_toggles"]["use_sat_surface_h2o"]),
+            "use_photo": physics["use_photochemistry"],
+            "use_ion": physics["use_ion_chemistry"],
+            "use_Kzz": physics["use_eddy_diffusion"],
+            "use_moldiff": physics["use_molecular_diffusion"],
+            "use_vm_mol": physics["use_upwind_molecular_diffusion"],
+            "use_topflux": physics["use_boundary_conditions"],
+            "use_botflux": physics["use_boundary_conditions"],
+            "use_condense": physics["use_condensation"],
+            "use_settling": physics["use_settling"],
+            "use_ini_cold_trap": physics["use_initial_cold_trap"],
+            "use_sat_surfaceH2O": physics["use_sat_surface_h2o"],
             "use_lowT_limit_rates": bool(runtime["use_lowT_limit_rates"]),
             "use_adapt_rtol": bool(runtime["use_adaptive_rtol"]),
             "ini_mix": "EQ",
@@ -1018,7 +1039,7 @@ def _patch_vulcan_cfg(
             "network": str(runtime["chemistry_file"]),
             "atm_file": str(tp_file.relative_to(cfg_file.parent)),
             "sflux_file": str(spectrum_file.relative_to(cfg_file.parent)),
-            "atm_base": str(runtime["atm_base"]),
+            "atm_base": atm_base,
             "atm_type": "file",
             "Kzz_prof": "file",
             "T_cross_sp": list(runtime["t_cross_sp"]),
@@ -1190,7 +1211,7 @@ def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tu
     source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
     if not source_root.exists():
         raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
-    if is_equilibrium(config):
+    if uses_fastchem(config):
         fastchem_root = source_root / "fastchem_vulcan"
         if not fastchem_root.exists():
             raise FileNotFoundError(f"Configured FastChem runtime does not exist: {fastchem_root}")
@@ -1314,13 +1335,13 @@ def run_vulcan_generation(
             coverage_path=coverage_path if coverage_path.exists() else None,
         )
     source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
-    equilibrium = is_equilibrium(config)
+    fastchem = uses_fastchem(config)
     worker_root_key = "vulcan_runtime" if "vulcan_runtime" in config else None
     worker_base = resolve_path(
         config["vulcan_runtime"]["worker_root"] if worker_root_key else "data/vulcan_workers",
         project_root,
     )
-    run_single = _run_single_fastchem_spec if equilibrium else _run_single_vulcan_spec
+    run_single = _run_single_fastchem_spec if fastchem else _run_single_vulcan_spec
     backfill = config["generation"].get("backfill", {"enabled": True, "max_retries": 3})
     target_count = num_runs or int(config["generation"]["num_runs"])
 

@@ -1,11 +1,10 @@
 {
-  "task": {
-    "kind": "full_vulcan"
-  },
+  "chemistry_type": "vulcan",
+  "model_type": "mlp",
   "paths": {
-    "raw_root": "data/raw/full_vulcan",
-    "processed_root": "data/processed/full_vulcan",
-    "checkpoints_root": "models/full_vulcan",
+    "raw_root": "data/raw/vulcan",
+    "processed_root": "data/processed/vulcan_mlp",
+    "checkpoints_root": "models/vulcan_mlp",
     "vulcan_source_root": "../VULCAN-master"
   },
   "data_spec": {
@@ -114,9 +113,11 @@
     },
     "global_methods": {
       "gravity_cm_s2": "log-standard",
-      "metallicity_log10": "standard",
-      "c_to_o": "standard",
-      "s_to_o": "standard",
+      "He_H": "standard",
+      "C_H": "log-standard",
+      "O_H": "log-standard",
+      "N_H": "log-standard",
+      "S_H": "log-standard",
       "use_photochemistry": "none",
       "use_ion_chemistry": "none",
       "use_eddy_diffusion": "none",
@@ -151,27 +152,24 @@
       "threshold": 1e-4
     },
     "weight_decay": 1e-5,
-    "gradient_clip": 1.0,
+    "gradient_clip": 5.0,
     "loss": {
       "lambda_z": 1.0,
       "lambda_phys": 0.25,
       "lambda_spectrum": 0.01
     }
   },
-  "full_vulcan": {
-    "model": {
-      "d_model": 128,
-      "nhead": 8,
-      "num_layers": 6,
-      "dim_feedforward": 512,
-      "conditioning_hidden_dim": 256,
-      "film_clamp": 100.0,
-      "output_head_divisor": 2,
-      "activation": "leaky_relu",
-      "dropout_rate": 0.05
-    },
+  "model": {
+    "activation": "leaky_relu",
+    "dropout_rate": 0.05,
+    "d_hidden": 1024,
+    "num_hidden_layers": 8,
+    "conditioning_hidden_dim": 256,
+    "film_clamp": 100.0
+  },
+  "vulcan": {
     "physics_toggles": {
-      "use_photochemistry": true,
+      "use_photochemistry": false,
       "use_condensation": false,
       "use_ion_chemistry": false,
       "use_eddy_diffusion": true,
@@ -182,7 +180,17 @@
       "use_initial_cold_trap": false,
       "use_sat_surface_h2o": false
     },
-    "vulcan_runtime": {
+    "science_presets": [
+      {
+        "name": "basic_h2",
+        "atm_base": "H2",
+        "physics_toggles": {
+          "use_photochemistry": false,
+          "use_eddy_diffusion": true
+        }
+      }
+    ],
+    "runtime": {
       "chemistry_file": "thermo/SNCHO_photo_network_2024.txt",
       "atm_base": "H2",
       "t_cross_sp": ["H2", "He"]
@@ -191,6 +199,7 @@
       "enabled": true,
       "template_name": "wasp39",
       "template_file": "assets/stellar_spectra/wasp39_phoenix.dat",
+      "library_glob": "assets/stellar_spectra/*.dat",
       "num_bins": 128,
       "latent_dim": 32,
       "hidden_dim": 128,

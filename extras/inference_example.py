@@ -1,4 +1,4 @@
-"""Run inference on a random equilibrium test profile and plot mixing ratios.
+"""Run inference on a random FastChem test profile and plot mixing ratios.
 
 Loads a trained checkpoint and the processed test split, picks one profile
 at random, runs the forward pass, denormalizes predictions back to log10
@@ -29,14 +29,14 @@ import numpy as np
 _STYLE = _ROOT / "extras" / "science.mplstyle"
 
 # -- Configuration -----------------------------------------------------------
-CHECKPOINT = _ROOT / "models/equilibrium_only_silu/best.pt"
-PROCESSED_ROOT = _ROOT / "data/processed/equilibrium_only"
+CHECKPOINT = _ROOT / "models" / "fastchem_mlp" / "best.pt"
+PROCESSED_ROOT = _ROOT / "data/processed/fastchem_mlp"
 # ---------------------------------------------------------------------------
 
 
-def _is_equilibrium(payload: dict[str, Any]) -> bool:
-    """Return True when the checkpoint payload belongs to the equilibrium MLP."""
-    return "d_hidden" in payload["model_dimensions"]
+def _is_fastchem(payload: dict[str, Any]) -> bool:
+    """Return True when the checkpoint payload targets FastChem chemistry."""
+    return str(payload.get("config", {}).get("chemistry_type", "")) == "fastchem"
 
 
 def _restore_target_log10(values: np.ndarray, normalization: dict[str, Any]) -> np.ndarray:
@@ -121,17 +121,23 @@ def _plot_profiles(
     plt.close(fig)
 
 
-def run_equilibrium(payload: dict[str, Any]) -> None:
-    """Inference for an equilibrium model on one random test profile."""
+def run_fastchem(payload: dict[str, Any]) -> None:
+    """Inference for a FastChem model on one random test profile."""
     import jax
     import jax.numpy as jnp
     from src.models.jax_model import (
-        EquilibriumMLPDimensions,
-        apply_equilibrium_mlp,
+        MLPDimensions,
+        TransformerDimensions,
+        apply_mlp,
+        apply_transformer_model,
     )
 
     jax_device = jax.devices("cpu")[0]
-    dims = EquilibriumMLPDimensions.from_dict(payload["model_dimensions"])
+    model_type = str(payload["config"]["model_type"])
+    if model_type == "mlp":
+        dims = MLPDimensions.from_dict(payload["model_dimensions"])
+    else:
+        dims = TransformerDimensions.from_dict(payload["model_dimensions"])
     params = jax.device_put(payload["params"], jax_device)
     normalization = payload["normalization"]
     contract = payload["data_contract"]
@@ -145,12 +151,21 @@ def run_equilibrium(payload: dict[str, Any]) -> None:
     idx = np.random.default_rng().integers(0, seq.shape[0])
     print(f"Selected test profile: {run_ids[idx]} (index {idx}/{seq.shape[0]})")
 
-    pred, _ = apply_equilibrium_mlp(
-        params,
-        jnp.asarray(seq[idx:idx + 1]),
-        jnp.asarray(globs[idx:idx + 1]),
-        dims,
-    )
+    if model_type == "mlp":
+        pred, _ = apply_mlp(
+            params,
+            jnp.asarray(seq[idx:idx + 1]),
+            jnp.asarray(globs[idx:idx + 1]),
+            dims,
+        )
+    else:
+        pred, _ = apply_transformer_model(
+            params,
+            jnp.asarray(seq[idx:idx + 1]),
+            jnp.asarray(globs[idx:idx + 1]),
+            None,
+            dims,
+        )
 
     pred_log10 = _restore_target_log10(np.asarray(pred[0]), normalization)
     true_log10 = _restore_target_log10(targets[idx], normalization)
@@ -168,13 +183,13 @@ def main() -> None:
     with CHECKPOINT.open("rb") as f:
         payload = pickle.load(f)
 
-    if not _is_equilibrium(payload):
+    if not _is_fastchem(payload):
         raise NotImplementedError(
-            "extras/inference_example.py currently supports equilibrium checkpoints only. "
-            "Use the ExoJAX wrapper or a dedicated transition example for full_vulcan bundles."
+            "extras/inference_example.py currently supports FastChem checkpoints only. "
+            "Use the ExoJAX wrapper or a dedicated VULCAN example for vulcan bundles."
         )
-    print("Detected equilibrium model")
-    run_equilibrium(payload)
+    print(f"Detected FastChem {payload['config']['model_type']} model")
+    run_fastchem(payload)
 
 
 if __name__ == "__main__":

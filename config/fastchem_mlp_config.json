@@ -1,11 +1,10 @@
 {
-  "task": {
-    "kind": "equilibrium_only"
-  },
+  "chemistry_type": "fastchem",
+  "model_type": "mlp",
   "paths": {
-    "raw_root": "data/raw/equilibrium_only",
-    "processed_root": "data/processed/equilibrium_only",
-    "checkpoints_root": "models/eq",
+    "raw_root": "data/raw/fastchem",
+    "processed_root": "data/processed/fastchem_mlp",
+    "checkpoints_root": "models/fastchem_mlp",
     "vulcan_source_root": "../VULCAN-master"
   },
   "data_spec": {
@@ -151,9 +150,11 @@
       "temperature_k": "standard"
     },
     "global_methods": {
-      "metallicity_log10": "standard",
-      "c_to_o": "standard",
-      "s_to_o": "standard"
+      "He_H": "standard",
+      "C_H": "log-standard",
+      "O_H": "log-standard",
+      "N_H": "log-standard",
+      "S_H": "log-standard"
     }
   },
   "training": {
@@ -177,14 +178,12 @@
       "lambda_phys": 0.25
     }
   },
-  "equilibrium_only": {
-    "model": {
-      "activation": "leaky_relu",
-      "dropout_rate": 0.05,
-      "d_hidden": 1024,
-      "num_hidden_layers": 8,
-      "conditioning_hidden_dim": 256,
-      "film_clamp": 100.0
-    }
+  "model": {
+    "activation": "leaky_relu",
+    "dropout_rate": 0.05,
+    "d_hidden": 1024,
+    "num_hidden_layers": 8,
+    "conditioning_hidden_dim": 256,
+    "film_clamp": 100.0
   }
 }

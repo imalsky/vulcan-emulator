@@ -12,6 +12,7 @@ externally by VULCAN's ``r_star / orbit_radius`` configuration.
 
 from __future__ import annotations
 
+import glob as glob_module
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -221,5 +222,19 @@ def load_spectrum_manifest(manifest_path: str | Path) -> dict[str, SpectrumRecor
             metadata=json.loads(metadata_text),
         )
         record.validate()
+        result[record.name] = record
+    return result
+
+
+def load_spectrum_records_from_glob(pattern: str) -> dict[str, SpectrumRecord]:
+    """Load one in-memory spectrum library from a file glob."""
+    result: dict[str, SpectrumRecord] = {}
+    matched_paths = [Path(path) for path in sorted(glob_module.glob(pattern, recursive=True))]
+    if not matched_paths:
+        raise FileNotFoundError(f"No stellar spectrum files matched {pattern!r}.")
+    for path in matched_paths:
+        record = read_vulcan_spectrum_txt(path, name=path.stem)
+        if record.name in result:
+            raise ValueError(f"Duplicate stellar spectrum record name {record.name!r} from {path}.")
         result[record.name] = record
     return result

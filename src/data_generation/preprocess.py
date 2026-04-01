@@ -16,11 +16,11 @@ trainer.  The pipeline has four stages:
    ``normalization.json``, ``data_contract.json``, and provenance
    manifests to ``processed_root``.
 
-Two top-level entry points handle the two task kinds:
+Two top-level entry points handle the two chemistry types:
 
-* ``preprocess_equilibrium_dataset`` — for equilibrium-only models
+* ``preprocess_fastchem_dataset`` — for FastChem chemistry
   (no spectrum).
-* ``preprocess_raw_dataset`` — for full-VULCAN models
+* ``preprocess_raw_dataset`` — for VULCAN chemistry
   (final-state + spectrum).
 
 ``PROCESSED_DATA_VERSION`` is bumped whenever the on-disk tensor
@@ -39,9 +39,10 @@ import numpy as np
 
 from ..utils.config import (
     ELEMENT_INPUT_ORDER,
-    is_equilibrium,
+    get_chemistry_type,
+    get_model_type,
     resolve_conditioning_inputs,
-    task_kind,
+    uses_fastchem,
 )
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
@@ -50,8 +51,8 @@ from ..utils.provenance import fingerprint_payload, manifest_for_files
 from .spectrum import SpectrumRecord, fixed_wavelength_grid, resample_spectrum
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
-PROCESSED_DATA_VERSION = 11
-_EQUILIBRIUM_GLOBAL_ORDER = ("metallicity_log10", "c_to_o", "s_to_o")
+PROCESSED_DATA_VERSION = 13
+_EQUILIBRIUM_GLOBAL_ORDER = ELEMENT_INPUT_ORDER
 
 
 @dataclass(frozen=True)
@@ -118,16 +119,37 @@ def _require_column_constant(
         raise ValueError(f"{run_label}: {name} must be vertically constant in the current contract.")
 
 
-def _require_ratio_conditioning_globals(
+def _elemental_conditioning_globals(
+    *,
+    elemental_profile: np.ndarray,
+    run_label: str,
+) -> dict[str, float]:
+    """Resolve one profile-global elemental-abundance vector from the raw inputs."""
+    profile = np.asarray(elemental_profile, dtype=np.float64)
+    if profile.ndim != 2 or profile.shape[1] != len(ELEMENT_INPUT_ORDER):
+        raise ValueError(
+            f"{run_label}: elemental_abundances_x_h must have shape (nz, {len(ELEMENT_INPUT_ORDER)})."
+        )
+    _require_column_constant(profile, name="elemental_abundances_x_h", run_label=run_label)
+    resolved = {
+        name: float(profile[0, idx])
+        for idx, name in enumerate(ELEMENT_INPUT_ORDER)
+    }
+    if not np.all(np.isfinite(list(resolved.values()))):
+        raise ValueError(f"{run_label}: non-finite elemental conditioning globals detected.")
+    return resolved
+
+
+def _require_elemental_conditioning_globals(
     *,
     globals_map: dict[str, float],
     run_label: str,
 ) -> dict[str, float]:
-    """Return the sampled chemistry globals required by the supported training contract."""
+    """Return the sampled elemental-abundance globals required by the training contract."""
     missing = [name for name in _EQUILIBRIUM_GLOBAL_ORDER if name not in globals_map]
     if missing:
         raise ValueError(
-            f"{run_label}: raw globals are missing required ratio-conditioning inputs "
+            f"{run_label}: raw globals are missing required elemental-conditioning inputs "
             f"{missing}. Regenerate raw data with the current chemistry contract."
         )
     resolved = {
@@ -135,7 +157,7 @@ def _require_ratio_conditioning_globals(
         for name in _EQUILIBRIUM_GLOBAL_ORDER
     }
     if not np.all(np.isfinite(list(resolved.values()))):
-        raise ValueError(f"{run_label}: non-finite ratio-conditioning globals detected.")
+        raise ValueError(f"{run_label}: non-finite elemental-conditioning globals detected.")
     return resolved
 
 
@@ -390,15 +412,13 @@ def load_raw_run(
     element_indices = [d["element_input_order"].index(name) for name in element_order]
     elemental_profile = d["elemental_abundances_x_h"][:, element_indices]
     gravity_profile = np.asarray(d["gravity_cm_s2"], dtype=np.float64)
-    _require_column_constant(elemental_profile, name="elemental_abundances_x_h", run_label=label)
     _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
-    reduced_globals = dict(d["globals_map"])
-    reduced_globals.update(
-        _require_ratio_conditioning_globals(
-            globals_map=d["globals_map"],
-            run_label=label,
-        )
+    element_globals = _elemental_conditioning_globals(
+        elemental_profile=elemental_profile,
+        run_label=label,
     )
+    reduced_globals = dict(d["globals_map"])
+    reduced_globals.update(element_globals)
     reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
     final_ymix_output = final_ymix_output[:, output_indices]
     resampled_spectrum = resample_spectrum(
@@ -488,23 +508,20 @@ def _normalization_payload(
         [run.spectrum_flux_erg_cm2_s_nm for run in train_runs],
         axis=0,
     )
-    global_static = np.stack(
-        [
+    required_global_inputs = list(config["data_spec"]["required_global_inputs"])
+    resolved_global_static_rows: list[np.ndarray] = []
+    for run in train_runs:
+        resolved_inputs = resolve_conditioning_inputs(
+            raw_global_inputs=run.globals,
+            required_global_inputs=required_global_inputs,
+        )
+        resolved_global_static_rows.append(
             np.array(
-                [
-                    resolve_conditioning_inputs(
-                        raw_global_inputs=run.globals,
-                        config=config,
-                        required_global_inputs=list(config["data_spec"]["required_global_inputs"]),
-                    )[name]
-                    for name in global_static_order
-                ],
+                [resolved_inputs[name] for name in global_static_order],
                 dtype=np.float64,
             )
-            for run in train_runs
-        ],
-        axis=0,
-    )
+        )
+    global_static = np.stack(resolved_global_static_rows, axis=0)
     global_methods = [
         config["normalization"]["global_methods"][name]
         for name in global_static_order
@@ -604,10 +621,16 @@ def load_raw_equilibrium_run(
         raise ValueError(f"{label}: elemental abundance profile does not match pressure grid.")
     if gravity_profile.shape != pressure_bar.shape:
         raise ValueError(f"{label}: gravity profile does not match pressure grid.")
-    _require_column_constant(elemental_profile, name="elemental_abundances_x_h", run_label=label)
     _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
-    globals_map = _require_ratio_conditioning_globals(
-        globals_map=dict(globals_map),
+    globals_map = dict(globals_map)
+    globals_map.update(
+        _elemental_conditioning_globals(
+            elemental_profile=elemental_profile,
+            run_label=label,
+        )
+    )
+    globals_map = _require_elemental_conditioning_globals(
+        globals_map=globals_map,
         run_label=label,
     )
     output_indices = [stored_output_species.index(name) for name in requested_output_species]
@@ -713,7 +736,9 @@ def preprocess_equilibrium_dataset(
     Also writes ``normalization.json``, ``data_contract.json``,
     ``splits.json``, and ``processed_manifest.json`` to ``processed_root``.
     """
-    LOGGER.info("Preprocessing equilibrium dataset")
+    LOGGER.info("Preprocessing FastChem dataset")
+    chemistry_type = get_chemistry_type(config)
+    model_type = get_model_type(config)
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     ensure_dir(processed_root)
@@ -795,8 +820,8 @@ def preprocess_equilibrium_dataset(
 
         metadata = {
             "processed_data_version": PROCESSED_DATA_VERSION,
-            "task_kind": task_kind(config),
-            "model_type": "equilibrium",
+            "chemistry_type": chemistry_type,
+            "model_type": model_type,
             "split": split_name,
             "num_runs": len(runs),
             "num_levels": nz,
@@ -817,8 +842,8 @@ def preprocess_equilibrium_dataset(
 
     data_contract = {
         "processed_data_version": PROCESSED_DATA_VERSION,
-        "task_kind": task_kind(config),
-        "model_type": "equilibrium",
+        "chemistry_type": chemistry_type,
+        "model_type": model_type,
         "state_species_order": list(config["data_spec"]["state_species"]),
         "output_species_order": list(config["data_spec"]["output_species"]),
         "element_input_order": list(config["data_spec"]["element_input_order"]),
@@ -840,14 +865,14 @@ def preprocess_equilibrium_dataset(
     processed_manifest = {
         "raw_files": manifest_for_files(raw_source_files),
         "splits": split_indices,
-        "task_kind": task_kind(config),
-        "model_type": "equilibrium",
+        "chemistry_type": chemistry_type,
+        "model_type": model_type,
         "normalization_fingerprint": fingerprint_payload(normalization),
     }
     (processed_root / "processed_manifest.json").write_text(
         json.dumps(processed_manifest, indent=2) + "\n", encoding="utf-8",
     )
-    LOGGER.info("Equilibrium preprocessing complete -> %s", processed_root)
+    LOGGER.info("FastChem preprocessing complete -> %s", processed_root)
     return {
         "processed_root": str(processed_root),
         "normalization": normalization,
@@ -861,10 +886,12 @@ def preprocess_raw_dataset(
     *,
     project_root: Path,
 ) -> dict[str, Any]:
-    """Convert raw runs into training tensors. Dispatches by model type."""
-    if is_equilibrium(config):
+    """Convert raw runs into training tensors. Dispatches by chemistry type."""
+    if uses_fastchem(config):
         return preprocess_equilibrium_dataset(config, project_root=project_root)
-    LOGGER.info("Preprocessing full_vulcan dataset")
+    LOGGER.info("Preprocessing VULCAN dataset")
+    chemistry_type = get_chemistry_type(config)
+    model_type = get_model_type(config)
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     ensure_dir(processed_root)
@@ -921,7 +948,6 @@ def preprocess_raw_dataset(
             target_outputs[idx] = apply_block(run.final_ymix_output, normalization["target"]).astype(np.float32)
             static_inputs = resolve_conditioning_inputs(
                 raw_global_inputs=run.globals,
-                config=config,
                 required_global_inputs=list(config["data_spec"]["required_global_inputs"]),
             )
             global_vector = np.array([static_inputs[name] for name in global_static_order], dtype=np.float64)
@@ -931,7 +957,8 @@ def preprocess_raw_dataset(
 
         metadata = {
             "processed_data_version": PROCESSED_DATA_VERSION,
-            "task_kind": task_kind(config),
+            "chemistry_type": chemistry_type,
+            "model_type": model_type,
             "split": split_name,
             "num_runs": len(runs),
             "num_levels": nz,
@@ -951,7 +978,8 @@ def preprocess_raw_dataset(
 
     data_contract = {
         "processed_data_version": PROCESSED_DATA_VERSION,
-        "task_kind": task_kind(config),
+        "chemistry_type": chemistry_type,
+        "model_type": model_type,
         "output_species_order": list(config["data_spec"]["output_species"]),
         "element_input_order": list(config["data_spec"]["element_input_order"]),
         "sequence_static_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
@@ -977,7 +1005,8 @@ def preprocess_raw_dataset(
     processed_manifest = {
         "raw_files": manifest_for_files(raw_source_files),
         "splits": split_indices,
-        "task_kind": task_kind(config),
+        "chemistry_type": chemistry_type,
+        "model_type": model_type,
         "normalization_fingerprint": fingerprint_payload(normalization),
     }
     (processed_root / "processed_manifest.json").write_text(

@@ -2,106 +2,24 @@
 
 ## Overview
 
-This repository supports exactly two emulator tasks:
+The public config surface is now defined by:
+- `chemistry_type`: `fastchem` or `vulcan`
+- `model_type`: `mlp` or `transformer`
 
-- `task.kind = "equilibrium_only"`: FastChem equilibrium chemistry from pressure, temperature, column-global chemistry ratios, and gravity, with the model FiLM-conditioned on `metallicity_log10`, `c_to_o`, and `s_to_o`.
-- `task.kind = "full_vulcan"`: final converged VULCAN chemistry from pressure, temperature, Kzz, gravity, column-global chemistry ratios, stellar spectrum, and public physics knobs.
+Supported combinations:
+- `fastchem + mlp`
+- `fastchem + transformer`
+- `vulcan + mlp`
+- `vulcan + transformer`
 
-There is no timestep control, no live pair sampling, no anchor-state contract, and no trajectory target mode in the supported pipeline.
+`chemistry_type` selects the target contract and learned inputs.
+`model_type` selects the prediction architecture only.
 
-## Public Pipeline
-
-The public CLI stays:
-
-```bash
-python -m src.utils --config <path> --stage generation|normalization|training
-```
-
-The three stages are:
-
-1. `generation`
-2. `normalization`
-3. `training`
-
-`generation` must reach the exact requested number of successful runs. Failed VULCAN runs are never included in the dataset. If backfill retries still leave a shortfall, generation raises an error and writes `failed_runs.json` for debugging.
-
-## Supported Config Surface
-
-Every config contains these shared top-level sections:
-
-- `task`
-- `paths`
-- `data_spec`
-- `sampling`
-- `temperature_profiles`
-- `generation`
-- `normalization`
-- `training`
-
-Exactly one task-specific section must be present:
-
+Removed and rejected legacy config keys:
+- `task.kind`
 - `equilibrium_only`
 - `full_vulcan`
-
-The only supported task kinds are:
-
-- `equilibrium_only`
-- `full_vulcan`
-
-The fixed FastChem-native elemental input order is internal and not user-configurable:
-
-```python
-["He_H", "C_H", "O_H", "N_H", "S_H"]
-```
-
-These are hydrogen-normalized number abundances `n_X / n_H`, not total-gas mixing ratios and not relative-to-solar values.
-They remain internal raw-generation inputs for FastChem and VULCAN, not part of
-the supported public learned-conditioning contract.
-
-## Full-VULCAN Public Knobs
-
-The public full-VULCAN config surface includes:
-
-- atmosphere base: `full_vulcan.vulcan_runtime.atm_base`
-- chemistry network file: `full_vulcan.vulcan_runtime.chemistry_file`
-- cross-section species list: `full_vulcan.vulcan_runtime.t_cross_sp`
-- transport toggles:
-  - `use_eddy_diffusion`
-  - `use_molecular_diffusion`
-  - `use_upwind_molecular_diffusion`
-- boundary-condition toggle:
-  - `use_boundary_conditions`
-- condensation family:
-  - `use_condensation`
-  - `use_settling`
-  - `use_initial_cold_trap`
-  - `use_sat_surface_h2o`
-- chemistry toggles:
-  - `use_photochemistry`
-  - `use_ion_chemistry`
-- stellar/spectrum physical inputs:
-  - template name/file
-  - wavelength range
-  - bin count
-  - zenith angle
-  - diurnal factor
-  - stellar parameters
-  - orbital distance
-
-These runtime controls are internal defaults, not part of the public scientific surface:
-
-- `python_executable`
-- `cfg_file`
-- `worker_root`
-- `regenerate_chem_funs`
-- `cfg_assignments`
-- `use_lowT_limit_rates`
-- `use_adaptive_rtol`
-
-## Removed Legacy Config Keys
-
-These keys are explicitly rejected with migration errors:
-
+- old internal `model_type` values `equilibrium` and `full_vulcan`
 - `training.live_sampling`
 - `sampling.num_time_steps`
 - `sampling.time_step_log10_min_s`
@@ -110,12 +28,153 @@ These keys are explicitly rejected with migration errors:
 - `normalization.state_method`
 - `normalization.log10_dt_method`
 - `full_vulcan.trajectory_sampling`
+- `vulcan.trajectory_sampling`
+
+## Public Pipeline
+
+```bash
+python -m src.utils --config <path> --stage generation|normalization|training
+```
+
+Stages:
+1. `generation`
+2. `normalization`
+3. `training`
+
+`generation` must reach the requested number of successful runs. Failed VULCAN runs are never included in the final dataset.
+
+## Config Surface
+
+Every config contains:
+- `chemistry_type`
+- `model_type`
+- `paths`
+- `data_spec`
+- `sampling`
+- `temperature_profiles`
+- `generation`
+- `normalization`
+- `training`
+- `model`
+
+`vulcan` is required only when `chemistry_type = "vulcan"`.
+`vulcan` is invalid when `chemistry_type = "fastchem"`.
+
+The fixed elemental order is internal and not user-configurable:
+
+```python
+["He_H", "C_H", "O_H", "N_H", "S_H"]
+```
+
+These are hydrogen-normalized absolute abundances `n_X / n_H`.
+
+The generation sampler still draws `[M/H]`, `C/O`, and `S/O`, then converts them into the fixed `X/H` channels before preprocessing and training.
+
+`temperature_profiles.source_mode` supports only:
+- `analytic`
+- `pt_library`
+- `mixed`
+
+Supported PT-library filter keys:
+- numeric: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG`
+- boolean: `TiOVO`
+
+### `model`
+
+If `model_type = "mlp"`, valid keys are:
+- `d_hidden`
+- `num_hidden_layers`
+- `conditioning_hidden_dim`
+- `film_clamp`
+- optional `activation`
+- optional `dropout_rate`
+
+If `model_type = "transformer"`, valid keys are:
+- `d_model`
+- `nhead`
+- `num_layers`
+- `dim_feedforward`
+- `conditioning_hidden_dim`
+- `film_clamp`
+- `output_head_divisor`
+- optional `activation`
+- optional `dropout_rate`
+
+### `vulcan`
+
+Required child keys:
+- `physics_toggles`
+- `runtime`
+- `stellar_spectrum`
+
+Optional child key:
+- `science_presets`
+
+Public physics toggles:
+- `use_photochemistry`
+- `use_ion_chemistry`
+- `use_eddy_diffusion`
+- `use_molecular_diffusion`
+- `use_upwind_molecular_diffusion`
+- `use_boundary_conditions`
+- `use_condensation`
+- `use_settling`
+- `use_initial_cold_trap`
+- `use_sat_surface_h2o`
+
+Supported `atm_base` values:
+- `H2`
+- `N2`
+- `O2`
+- `CO2`
+- `H2O`
+
+`science_presets` is the public mechanism for per-run VULCAN science variation.
+Each preset supports:
+- `name`
+- optional `atm_base`
+- optional `physics_toggles`
+
+Within a preset:
+- omitted toggle values fall back to `vulcan.physics_toggles`
+- omitted `atm_base` falls back to `vulcan.runtime.atm_base`
+
+`vulcan.stellar_spectrum` supports:
+- `enabled`
+- `template_name`
+- `template_file`
+- optional `library_glob`
+- `num_bins`
+- `latent_dim`
+- `hidden_dim`
+- `encoder_mode`
+- `wavelength_min_nm`
+- `wavelength_max_nm`
+- `teff_k`
+- `radius_rsun`
+- `semi_major_axis_au`
+- `diurnal_factor`
+- `zenith_angle_deg`
+
+Supported `encoder_mode` values:
+- `autoencoder`
+- `linear`
+- `none`
+
+`enabled` remains a compatibility flag only. VULCAN chemistry always uses the spectrum conditioning path.
+
+Internal runtime defaults that are not learned public inputs:
+- `python_executable`
+- `cfg_file`
+- `worker_root`
+- `regenerate_chem_funs`
+- `cfg_assignments`
+- `use_lowT_limit_rates`
+- `use_adaptive_rtol`
 
 ## Raw Data Contract
 
-The raw HDF5 layout is final-state-only.
-
-### Equilibrium raw run
+### FastChem raw run
 
 - `inputs/pressure_bar` `(nz,)`
 - `inputs/temperature_k` `(nz,)`
@@ -127,7 +186,7 @@ The raw HDF5 layout is final-state-only.
 - `globals/<name>` scalar datasets
 - `equilibrium/ymix` `(nz, n_output)`
 
-### Full-VULCAN raw run
+### VULCAN raw run
 
 - `inputs/pressure_bar` `(nz,)`
 - `inputs/temperature_k` `(nz,)`
@@ -139,159 +198,144 @@ The raw HDF5 layout is final-state-only.
 - `inputs/output_species` `(n_output,)`
 - `globals/<name>` scalar datasets
 - `final_state/ymix_output` `(nz, n_output)`
-- `spectrum/name` scalar string
+- `spectrum/name`
 - `spectrum/wavelength_nm` `(n_wavelength,)`
 - `spectrum/flux_erg_cm2_s_nm` `(n_wavelength,)`
 
-There is no `trajectory/` group and no `inputs/target_mode`.
+There is no trajectory target mode and no timestep-control learning contract.
 
 ## Processed Data Contract
 
 Processed artifacts are versioned with:
 
 ```python
-PROCESSED_DATA_VERSION = 11
+PROCESSED_DATA_VERSION = 13
 ```
 
-### Equilibrium split files
+All processed datasets write:
+- `normalization.json`
+- `data_contract.json`
+- `splits.json`
+- `processed_manifest.json`
+
+### FastChem processed split
 
 - `sequence_inputs.npy` `(N, nz, 2)` for `[pressure_bar, temperature_k]`
 - `target_outputs.npy` `(N, nz, target_dim)`
-- `global_inputs.npy` `(N, global_dim)`
-- `run_ids.json`
-- `metadata.json`
+- `global_inputs.npy` `(N, 5)` for `[He_H, C_H, O_H, N_H, S_H]`
+- no `spectrum_inputs.npy`
 
-For equilibrium, `global_inputs.npy` stores the FiLM conditioning globals
-`[metallicity_log10, c_to_o, s_to_o]`.
-
-### Full-VULCAN split files
+### VULCAN processed split
 
 - `sequence_inputs.npy` `(N, nz, 3)` for `[pressure_bar, temperature_k, kzz_cm2_s]`
 - `target_outputs.npy` `(N, nz, target_dim)`
 - `global_inputs.npy` `(N, global_dim)`
 - `spectrum_inputs.npy` `(N, spectrum_dim)`
-- `run_ids.json`
-- `metadata.json`
 
-The processed full-VULCAN contract contains only final-state targets plus spectrum and run metadata.
-For full-VULCAN, `global_inputs.npy` stores
-`[gravity_cm_s2, metallicity_log10, c_to_o, s_to_o, ...public toggles/base flags...]`.
+`metadata.json` and `data_contract.json` store explicit:
+- `chemistry_type`
+- `model_type`
+- `sequence_static_feature_order`
+- `global_static_feature_order`
+- `spectrum_dim` when present
 
-## Normalization
+## Training Contract
 
-Normalization is fit on the training split only.
+`training.loss` always requires:
+- `lambda_z`
+- `lambda_phys`
 
-Supported methods:
+`training.loss.lambda_spectrum` is required only for `chemistry_type = "vulcan"` and invalid for `fastchem`.
 
-- `standard`
-- `log-standard`
-- `none`
-- `mixed` for the stored global-conditioning block
+Architecture behavior:
+- `fastchem + mlp`: PT + `X/H`
+- `fastchem + transformer`: PT + `X/H`, no spectrum path
+- `vulcan + mlp`: PT + Kzz + runtime globals + spectrum latent
+- `vulcan + transformer`: PT + Kzz + runtime globals + spectrum latent
 
-Config-selected normalization controls are:
+## Architecture Contract
 
-- `normalization.sequence_methods`
-- `normalization.global_methods`
-- `normalization.target_method`
-- `normalization.spectrum_method` for `full_vulcan`
-- `normalization.state_floor`
-- `normalization.spectrum_floor` for `full_vulcan`
-- `normalization.split`
+Both architectures use **FiLM (Feature-wise Linear Modulation)** to inject
+global context (elemental abundances, gravity, physics toggles, spectrum
+latent) into the per-level prediction pathway.  Layer norms and residual
+connections are architectural defaults, not config-controlled.
 
-The supported learned chemistry globals are the ratio triplet
-`metallicity_log10`, `c_to_o`, and `s_to_o`. Gravity typically uses
-`log-standard`, while the ratio globals typically use `standard`.
+### FiLM Conditioning (shared by both architectures)
 
-## Model Families
+1. **Spectrum encoding** (VULCAN only): compress stellar spectrum to a
+   latent vector via autoencoder, linear projection, or zeros.
+2. **Context MLP**: `[global_inputs, spectrum_latent]` →
+   `act(Linear(conditioning_hidden_dim))` →
+   `Linear(num_layers × 2 × width)` →
+   reshape to `(batch, num_layers, 2, width)` producing per-layer
+   gamma and beta.
+3. **Modulation**: at each layer, `x = x * (1 + clip(gamma)) + clip(beta)`
+   where clip bounds are `[-film_clamp, film_clamp]`.
 
-### Equilibrium model
+### FiLM-Conditioned MLP
 
-- FiLM-conditioned per-level MLP
-- no neighbor coupling between vertical levels
-- input features per level: pressure and temperature
-- global conditioning: derived column chemistry globals `metallicity_log10`, `c_to_o`, and `s_to_o`
-- gravity is accepted by the public wrapper for interface consistency but is not a learned equilibrium feature
+Per-level architecture with shared weights across the vertical grid.
 
-### Full-VULCAN model
-
-- FiLM-conditioned Transformer
-- sequence inputs per level: pressure, temperature, Kzz
-- global conditioning: gravity, `metallicity_log10`, `c_to_o`, `s_to_o`, public physics toggles, atmosphere-base one-hot
-- separate stellar spectrum input
-
-Supported activations for both model families:
-
-- `relu`
-- `gelu`
-- `silu`
-- `tanh`
-- `elu`
-- `selu`
-- `softplus`
-- `leaky_relu`
-
-Default activation for both model families: `leaky_relu`.
-Both model families also support `dropout_rate`; the shipped configs start at `0.05`.
-
-## Export Bundle
-
-Training checkpoints can be exported to NPZ bundles with baked normalization.
-
-The bundle API in `src/models/export_bundle.py` exposes:
-
-- `predict_equilibrium_profile(...)`
-- `predict_full_vulcan_profile(...)`
-
-Both accept physical-unit inputs, apply normalization internally, and return physical mixing-ratio outputs.
-For equilibrium bundles, `predict_equilibrium_profile(...)` expects the derived global chemistry inputs
-`metallicity_log10`, `c_to_o`, and `s_to_o`.
-
-## ExoJAX API
-
-`src/models/exojax_api.py` provides the public differentiable JAX wrapper layer.
-
-### Equilibrium wrapper
-
-```python
-make_equilibrium_vmr_fn(bundle) -> (vmr_fn, species_labels)
-
-vmr_fn(
-    temperatures_k,      # (nz,), top -> bottom
-    pressures_bar,       # (nz,), top -> bottom
-    metallicity_log10,   # scalar
-    c_to_o,              # scalar
-    s_to_o,              # scalar
-    gravity_cm_s2,       # (nz,), top -> bottom
-) -> species_abundances        # (nz, n_species)
+```
+Layer 0:  Linear(sequence_dim → d_hidden) → LayerNorm → FiLM → activation → dropout
+Layer i≥1: Linear(d_hidden → d_hidden) → LayerNorm → FiLM → activation → dropout → residual add
+Output:   Linear(d_hidden → target_dim)
 ```
 
-### Full-VULCAN wrapper
+- **LayerNorm before FiLM**: normalizes activations so gamma/beta operate
+  on a standardized representation (unit variance), making them directly
+  interpretable as relative scale/shift.
+- **Residual connections** (layer ≥ 1): enable gradient flow through deep
+  networks.  Layer 0 changes dimension (`sequence_dim → d_hidden`) so no
+  residual there.
 
-```python
-make_full_vulcan_vmr_fn(bundle) -> (vmr_fn, species_labels)
+### FiLM-Conditioned Transformer
 
-vmr_fn(
-    temperatures_k,      # (nz,), top -> bottom
-    pressures_bar,       # (nz,), top -> bottom
-    kzz_cm2_s,           # (nz,), top -> bottom
-    metallicity_log10,   # scalar
-    c_to_o,              # scalar
-    s_to_o,              # scalar
-    gravity_cm_s2,       # (nz,), top -> bottom
-    spectrum_flux,       # (spectrum_dim,)
-) -> species_abundances        # (nz, n_species)
+Pre-norm transformer with FiLM modulation and post-FiLM stabilization.
+
+```
+Input:    Linear(sequence_dim → d_model) + sinusoidal positional encoding
+
+Per block:
+  a. Pre-norm (ln1) → multi-head self-attention → dropout → residual add
+  b. FiLM: x = x * (1 + gamma) + beta
+  c. Post-FiLM norm (ln_film) → re-stabilize residual stream
+  d. Pre-norm (ln2) → FFN (up-project, activation, dropout, down-project) → residual add
+
+Output head: LayerNorm → activation → Linear(d_model → d_model // output_head_divisor) → dropout → Linear(→ target_dim)
 ```
 
-Contract rules:
+- **Post-FiLM LayerNorm (ln_film)**: re-stabilizes the residual stream
+  after FiLM's affine transform, preventing FiLM scaling from conflicting
+  with the FFN pre-norm.
+- **Pre-norm attention (ln1)** and **pre-norm FFN (ln2)**: standard
+  pre-norm transformer pattern.
+- **Residual connections**: after both the attention and FFN sub-layers.
 
-- public layer order is top-to-bottom
-- internal model order is bottom-to-top
-- wrappers reverse inputs and outputs as needed
-- public chemistry inputs are the column-global ratio scalars `metallicity_log10`, `c_to_o`, and `s_to_o`
-- gravity is required in both APIs
-- the equilibrium wrapper currently ignores gravity after shape validation
-- the full-VULCAN wrapper still assumes a vertically constant gravity profile, so eager wrapper calls reject varying gravity inputs
+## Export and Inference Contract
 
-## Extras
+Export bundles embed explicit:
+- `chemistry_type`
+- `model_type`
+- model dimensions
+- normalization metadata
+- data contract
+- config
 
-The supported utility scripts in `extras/` use the current final-state contract and exported bundle interfaces. They are examples and diagnostics, not part of the public training pipeline.
+Legacy task-based bundles are rejected on load.
+
+`ExportedJAXModel` exposes:
+- `predict_fastchem_profile(...)`
+- `predict_vulcan_profile(...)`
+
+ExoJAX wrappers:
+- `make_fastchem_vmr_fn(bundle) -> (vmr_fn, species_labels)`
+- `make_vulcan_vmr_fn(bundle) -> (vmr_fn, species_labels)`
+
+The public FastChem wrapper expects only profile-global `X/H`.
+The public VULCAN wrapper expects:
+- `kzz_cm2_s`
+- `global_inputs` containing gravity, `X/H`, toggles, and `atm_base_*`
+- `spectrum_flux`
+
+Both wrappers preserve JAX differentiability.

@@ -1,11 +1,11 @@
-"""Configuration loading, validation, and normalization for both task types.
+"""Configuration loading, validation, and normalization for emulator configs.
 
 This module is the single source of truth for config schema validation.  It:
 
 1. Loads a JSON config file from disk.
-2. Validates every field against its expected type, range, and task-specific
-   constraints (equilibrium_only vs full_vulcan).
-3. Derives internal aliases (``model_type``, ``training.model``, ``roth_sampler``)
+2. Validates every field against its expected type, range, and chemistry/model
+   constraints.
+3. Derives internal aliases (``training.model``, ``roth_sampler``)
    so downstream code can rely on a normalized, validated structure.
 4. Returns a dict that is safe to pass to any pipeline stage.
 
@@ -34,28 +34,23 @@ PUBLIC_PHYSICS_TOGGLES = (
     "use_initial_cold_trap",
     "use_sat_surface_h2o",
 )
-TASK_KINDS = ("equilibrium_only", "full_vulcan")
-TASK_KIND_TO_MODEL_TYPE = {
-    "equilibrium_only": "equilibrium",
-    "full_vulcan": "full_vulcan",
-}
+CHEMISTRY_TYPES = ("fastchem", "vulcan")
+MODEL_TYPES = ("mlp", "transformer")
 ELEMENT_INPUT_ORDER = ("He_H", "C_H", "O_H", "N_H", "S_H")
-EQUILIBRIUM_CONDITIONING_INPUT_ORDER = ("metallicity_log10", "c_to_o", "s_to_o")
-FULL_VULCAN_CONDITIONING_INPUT_ORDER = (
+FASTCHEM_CONDITIONING_INPUT_ORDER = ELEMENT_INPUT_ORDER
+VULCAN_CONDITIONING_INPUT_ORDER = (
     "gravity_cm_s2",
-    *EQUILIBRIUM_CONDITIONING_INPUT_ORDER,
+    *FASTCHEM_CONDITIONING_INPUT_ORDER,
 )
-FULL_VULCAN_CORE_GLOBAL_INPUTS = (
-    *FULL_VULCAN_CONDITIONING_INPUT_ORDER,
-)
-EQUILIBRIUM_CORE_GLOBAL_INPUTS = EQUILIBRIUM_CONDITIONING_INPUT_ORDER
-FULL_VULCAN_OPTIONAL_GLOBAL_INPUTS = (
+VULCAN_CORE_GLOBAL_INPUTS = VULCAN_CONDITIONING_INPUT_ORDER
+FASTCHEM_CORE_GLOBAL_INPUTS = FASTCHEM_CONDITIONING_INPUT_ORDER
+VULCAN_OPTIONAL_GLOBAL_INPUTS = (
     *PUBLIC_PHYSICS_TOGGLES,
     *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
 )
 DEFAULT_REQUIRED_GLOBAL_INPUTS = (
-    *FULL_VULCAN_CORE_GLOBAL_INPUTS,
-    *FULL_VULCAN_OPTIONAL_GLOBAL_INPUTS,
+    *VULCAN_CORE_GLOBAL_INPUTS,
+    *VULCAN_OPTIONAL_GLOBAL_INPUTS,
 )
 DEFAULT_STATE_SPECIES = (
     "H2",
@@ -76,7 +71,6 @@ DEFAULT_STATE_SPECIES = (
     "SO2",
     "S2",
 )
-ALLOWED_MODEL_TYPES = tuple(sorted(set(TASK_KIND_TO_MODEL_TYPE.values())))
 _ALLOWED_SPECTRUM_ENCODERS = {"autoencoder", "linear", "none"}
 _ALLOWED_ACTIVATIONS = {
     "elu",
@@ -105,6 +99,15 @@ _ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS = (
     | _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS
 )
 _REMOVED_LEGACY_KEYS = {
+    "task.kind": (
+        "task.kind has been removed. Use top-level chemistry_type and model_type instead."
+    ),
+    "equilibrium_only": (
+        "equilibrium_only has been removed. Use top-level model plus chemistry_type='fastchem'."
+    ),
+    "full_vulcan": (
+        "full_vulcan has been removed. Use top-level model plus a top-level vulcan block."
+    ),
     "training.live_sampling": (
         "training.live_sampling has been removed. The full-VULCAN path now trains "
         "only on final converged outputs."
@@ -122,7 +125,7 @@ _REMOVED_LEGACY_KEYS = {
         "no longer stores sampled trajectories."
     ),
     "generation.target_mode": (
-        "generation.target_mode has been removed. task.kind now fully determines the "
+        "generation.target_mode has been removed. chemistry_type now determines the "
         "supported generation contract."
     ),
     "normalization.state_method": (
@@ -134,7 +137,11 @@ _REMOVED_LEGACY_KEYS = {
         "longer includes timestep control."
     ),
     "full_vulcan.trajectory_sampling": (
-        "full_vulcan.trajectory_sampling has been removed. The supported full-VULCAN "
+        "full_vulcan.trajectory_sampling has been removed. The supported VULCAN "
+        "task is final-state-only."
+    ),
+    "vulcan.trajectory_sampling": (
+        "vulcan.trajectory_sampling has been removed. The supported VULCAN "
         "task is final-state-only."
     ),
 }
@@ -147,6 +154,7 @@ _INTERNAL_VULCAN_RUNTIME_DEFAULTS = {
     "use_lowT_limit_rates": True,
     "use_adaptive_rtol": True,
 }
+_DEFAULT_SCIENCE_PRESET_NAME = "default"
 
 
 class ConfigValidationError(ValueError):
@@ -231,76 +239,134 @@ def _normalized_method_name(
     return method_name
 
 
-def _task_kind(config: dict[str, Any]) -> str:
-    """Return the canonical task kind from the new top-level task block."""
-    task = config.get("task")
-    if not isinstance(task, dict):
-        raise ConfigValidationError("root.task must be a mapping.")
-    kind = _as_nonempty_str(task.get("kind"), "task.kind").lower()
-    if kind not in TASK_KINDS:
-        raise ConfigValidationError(f"task.kind must be one of {TASK_KINDS}, got {kind!r}.")
-    return kind
+def get_chemistry_type(config: dict[str, Any]) -> str:
+    """Return the configured chemistry target family."""
+    chemistry_type = _as_nonempty_str(
+        config.get("chemistry_type"),
+        "chemistry_type",
+    ).lower()
+    if chemistry_type not in CHEMISTRY_TYPES:
+        raise ConfigValidationError(
+            f"chemistry_type must be one of {CHEMISTRY_TYPES}, got {chemistry_type!r}."
+        )
+    return chemistry_type
 
 
 def get_model_type(config: dict[str, Any]) -> str:
-    """Return the normalized internal model type derived from task.kind."""
-    if "task" in config:
-        return TASK_KIND_TO_MODEL_TYPE[_task_kind(config)]
-    model_type = config.get("model_type")
-    if model_type is not None:
-        normalized = _as_nonempty_str(model_type, "model_type").lower()
-        if normalized in ALLOWED_MODEL_TYPES:
-            return normalized
-    raise ConfigValidationError("Config must define task.kind.")
-
-
-def is_equilibrium(config: dict[str, Any]) -> bool:
-    """True when the config describes an equilibrium-only model."""
-    return get_model_type(config) == "equilibrium"
-
-
-def task_kind(config: dict[str, Any]) -> str:
-    """Return the canonical task kind for the active config."""
-    if "task" in config:
-        return _task_kind(config)
-    return "equilibrium_only" if is_equilibrium(config) else "full_vulcan"
-
-
-def static_conditioning_defaults(config: dict[str, Any]) -> dict[str, float]:
-    """Build static conditioning defaults for full-VULCAN models."""
-    if is_equilibrium(config):
-        return {}
-    physics = config["physics_toggles"]
-    runtime = config["vulcan_runtime"]
-    defaults = {name: float(bool(physics[name])) for name in PUBLIC_PHYSICS_TOGGLES}
-    atm_base = _as_nonempty_str(runtime["atm_base"], "full_vulcan.vulcan_runtime.atm_base")
-    if atm_base not in SUPPORTED_ATM_BASES:
+    """Return the configured prediction architecture family."""
+    model_type = _as_nonempty_str(config.get("model_type"), "model_type").lower()
+    if model_type in {"equilibrium", "full_vulcan"}:
         raise ConfigValidationError(
-            f"full_vulcan.vulcan_runtime.atm_base must be one of {SUPPORTED_ATM_BASES}, got {atm_base!r}."
+            "Legacy model_type values 'equilibrium' and 'full_vulcan' are no longer "
+            "supported. Use model_type='mlp' or model_type='transformer'."
         )
-    defaults.update(
-        {
-            f"atm_base_{name}": 1.0 if name == atm_base else 0.0
-            for name in SUPPORTED_ATM_BASES
-        }
-    )
-    return defaults
+    if model_type not in MODEL_TYPES:
+        raise ConfigValidationError(
+            f"model_type must be one of {MODEL_TYPES}, got {model_type!r}."
+        )
+    return model_type
+
+
+def uses_fastchem(config: dict[str, Any]) -> bool:
+    """Return True when the config targets FastChem equilibrium outputs."""
+    return get_chemistry_type(config) == "fastchem"
+
+
+def uses_vulcan_chemistry(config: dict[str, Any]) -> bool:
+    """Return True when the config targets converged VULCAN outputs."""
+    return get_chemistry_type(config) == "vulcan"
+
+
+def uses_mlp(config: dict[str, Any]) -> bool:
+    """Return True when the config selects the FiLM-conditioned MLP."""
+    return get_model_type(config) == "mlp"
+
+
+def uses_transformer(config: dict[str, Any]) -> bool:
+    """Return True when the config selects the FiLM-conditioned Transformer."""
+    return get_model_type(config) == "transformer"
+
+
+def _validate_science_presets(
+    presets: Any,
+    *,
+    default_physics: dict[str, bool],
+    default_atm_base: str,
+    scope: str,
+) -> list[dict[str, Any]]:
+    """Validate curated full-VULCAN science presets.
+
+    Presets may be omitted; in that case a single default preset is synthesized
+    from the section-level ``physics_toggles`` and ``atm_base`` values.
+    """
+    if presets is None:
+        return [
+            {
+                "name": _DEFAULT_SCIENCE_PRESET_NAME,
+                "atm_base": default_atm_base,
+                "physics_toggles": dict(default_physics),
+            }
+        ]
+    if not isinstance(presets, list) or not presets:
+        raise ConfigValidationError(f"{scope} must be a non-empty list when provided.")
+
+    normalized: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for idx, raw_preset in enumerate(presets):
+        preset_scope = f"{scope}[{idx}]"
+        if not isinstance(raw_preset, dict):
+            raise ConfigValidationError(f"{preset_scope} must be a mapping.")
+        name = _as_nonempty_str(raw_preset.get("name"), f"{preset_scope}.name")
+        if name in seen_names:
+            raise ConfigValidationError(f"{scope} contains duplicate preset name {name!r}.")
+        seen_names.add(name)
+        atm_base = _as_nonempty_str(
+            raw_preset.get("atm_base", default_atm_base),
+            f"{preset_scope}.atm_base",
+        )
+        if atm_base not in SUPPORTED_ATM_BASES:
+            raise ConfigValidationError(
+                f"{preset_scope}.atm_base must be one of {SUPPORTED_ATM_BASES}, got {atm_base!r}."
+            )
+        physics_overrides = raw_preset.get("physics_toggles", {})
+        if not isinstance(physics_overrides, dict):
+            raise ConfigValidationError(f"{preset_scope}.physics_toggles must be a mapping.")
+        physics = dict(default_physics)
+        for toggle_name, toggle_value in physics_overrides.items():
+            if toggle_name not in PUBLIC_PHYSICS_TOGGLES:
+                raise ConfigValidationError(
+                    f"{preset_scope}.physics_toggles.{toggle_name} is not a supported public toggle."
+                )
+            physics[toggle_name] = _as_bool(
+                toggle_value,
+                f"{preset_scope}.physics_toggles.{toggle_name}",
+            )
+        normalized.append(
+            {
+                "name": name,
+                "atm_base": atm_base,
+                "physics_toggles": physics,
+            }
+        )
+    return normalized
 
 
 def resolve_conditioning_inputs(
     *,
     raw_global_inputs: dict[str, float],
-    config: dict[str, Any],
     required_global_inputs: list[str],
 ) -> dict[str, float]:
-    """Resolve required global inputs from raw values plus static defaults."""
-    defaults = static_conditioning_defaults(config)
+    """Resolve and validate the required per-run conditioning inputs.
+
+    Missing required inputs are treated as a hard data-contract failure rather
+    than silently backfilled from config defaults. This ensures stale raw data
+    generated under an older contract is rejected and regenerated instead of
+    being mixed into training under guessed runtime settings.
+    """
     resolved: dict[str, float] = {}
     for name in required_global_inputs:
         if name in raw_global_inputs:
             resolved[name] = float(raw_global_inputs[name])
-        elif name in defaults:
-            resolved[name] = float(defaults[name])
         else:
             raise ConfigValidationError(
                 f"Missing required conditioning input {name!r} in raw globals."
@@ -318,8 +384,8 @@ def global_feature_order(config: dict[str, Any]) -> list[str]:
     return list(config["data_spec"]["required_global_inputs"])
 
 
-def _validate_equilibrium_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
-    """Validate the equilibrium-MLP config section."""
+def _validate_mlp_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
+    """Validate the FiLM-MLP config section."""
     _require_keys(
         model,
         ["d_hidden", "num_hidden_layers", "conditioning_hidden_dim", "film_clamp"],
@@ -352,8 +418,8 @@ def _validate_equilibrium_model_config(model: dict[str, Any], scope: str) -> dic
     return normalized
 
 
-def _validate_full_vulcan_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
-    """Validate the full-VULCAN transformer config section."""
+def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
+    """Validate the FiLM-Transformer config section."""
     _require_keys(
         model,
         [
@@ -707,10 +773,10 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     """Load a JSON config file, apply defaults, and validate its full contract.
 
     This is the primary entry point for config loading.  It reads the JSON
-    file, determines the task kind, validates every section (paths, data_spec,
-    sampling, temperature_profiles, generation, normalization, training, and
-    the task-specific block), derives internal aliases, and returns a fully
-    normalized dict.
+    file, validates every section (paths, data_spec, sampling,
+    temperature_profiles, generation, normalization, training, model, and the
+    optional chemistry-specific block), derives internal aliases, and returns
+    a fully normalized dict.
 
     Parameters
     ----------
@@ -732,13 +798,9 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         config = json.load(handle)
     _reject_removed_legacy_keys(config)
 
-    kind = _task_kind(config)
-    equilibrium = kind == "equilibrium_only"
-    config["task"] = {"kind": kind}
-    config["model_type"] = TASK_KIND_TO_MODEL_TYPE[kind]
-
     required_root = [
-        "task",
+        "chemistry_type",
+        "model_type",
         "paths",
         "data_spec",
         "sampling",
@@ -746,15 +808,23 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "generation",
         "normalization",
         "training",
+        "model",
     ]
-    task_section = "equilibrium_only" if equilibrium else "full_vulcan"
-    forbidden_section = "full_vulcan" if equilibrium else "equilibrium_only"
-    required_root.append(task_section)
     _require_keys(config, required_root, "root")
-    if forbidden_section in config:
+    chemistry_type = get_chemistry_type(config)
+    model_type = get_model_type(config)
+    if "task" in config:
         raise ConfigValidationError(
-            f"{forbidden_section} must not be defined when task.kind={kind!r}."
+            "task has been removed. Use top-level chemistry_type and model_type instead."
         )
+    if chemistry_type == "fastchem" and "vulcan" in config:
+        raise ConfigValidationError(
+            "vulcan must not be defined when chemistry_type='fastchem'."
+        )
+    if chemistry_type == "vulcan":
+        _require_keys(config, ["vulcan"], "root")
+    config["chemistry_type"] = chemistry_type
+    config["model_type"] = model_type
 
     paths = config["paths"]
     _require_keys(
@@ -790,8 +860,8 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             "data_spec.element_input_order is derived internally and must not be set in the user config."
         )
     derived_globals = (
-        list(EQUILIBRIUM_CORE_GLOBAL_INPUTS)
-        if equilibrium
+        list(FASTCHEM_CORE_GLOBAL_INPUTS)
+        if chemistry_type == "fastchem"
         else list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
     )
     data_spec["state_species"] = state_species
@@ -809,7 +879,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "c_to_o_range",
         "s_to_o_range",
     ]
-    if not equilibrium:
+    if chemistry_type == "vulcan":
         required_sampling += [
             "gravity_range_cm_s2",
             "kzz_cm2_s",
@@ -836,7 +906,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "c_to_o_range",
         "s_to_o_range",
     ]
-    if not equilibrium:
+    if chemistry_type == "vulcan":
         range_keys.append("gravity_range_cm_s2")
     for key in range_keys:
         values = sampling[key]
@@ -847,7 +917,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         if not low < high:
             raise ConfigValidationError(f"sampling.{key} must be strictly increasing.")
         sampling[key] = [low, high]
-    if not equilibrium:
+    if chemistry_type == "vulcan":
         sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
         if sampling["kzz_cm2_s"] <= 0.0:
             raise ConfigValidationError("sampling.kzz_cm2_s must be positive.")
@@ -897,10 +967,8 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "global_methods",
         "target_method",
     ]
-    if not equilibrium:
-        required_normalization_keys.extend(
-            ["spectrum_floor", "spectrum_method"]
-        )
+    if chemistry_type == "vulcan":
+        required_normalization_keys.extend(["spectrum_floor", "spectrum_method"])
     _require_keys(normalization, required_normalization_keys, "normalization")
     normalization["split"] = _validate_split(normalization["split"])
     normalization["state_floor"] = _as_float(
@@ -913,7 +981,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("normalization.sequence_methods must be a mapping.")
     if not isinstance(normalization["global_methods"], dict):
         raise ConfigValidationError("normalization.global_methods must be a mapping.")
-    if equilibrium:
+    if chemistry_type == "fastchem":
         expected_sequence_methods = {"pressure_bar", "temperature_k"}
     else:
         expected_sequence_methods = {"pressure_bar", "temperature_k", "kzz_cm2_s"}
@@ -946,7 +1014,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             method,
             f"normalization.global_methods.{key}",
         )
-    if not equilibrium:
+    if chemistry_type == "vulcan":
         normalization["spectrum_method"] = _normalized_method_name(
             normalization["spectrum_method"],
             "normalization.spectrum_method",
@@ -992,124 +1060,120 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("training.gradient_clip must be positive.")
     loss = training["loss"]
     loss_required = ["lambda_z", "lambda_phys"]
-    if not equilibrium:
+    if chemistry_type == "vulcan":
         loss_required.append("lambda_spectrum")
     _require_keys(loss, loss_required, "training.loss")
     for key in loss_required:
         loss[key] = _as_float(loss[key], f"training.loss.{key}")
         if loss[key] < 0.0:
             raise ConfigValidationError(f"training.loss.{key} must be non-negative.")
-
-    if equilibrium:
-        section = config["equilibrium_only"]
-        if not isinstance(section, dict):
-            raise ConfigValidationError("equilibrium_only must be a mapping.")
-        _require_keys(section, ["model"], "equilibrium_only")
-        section["model"] = _validate_equilibrium_model_config(
-            section["model"],
-            "equilibrium_only.model",
+    if chemistry_type == "fastchem" and "lambda_spectrum" in loss:
+        raise ConfigValidationError(
+            "training.loss.lambda_spectrum is only valid when chemistry_type='vulcan'."
         )
-        config["equilibrium_only"] = section
-        config["training"]["model"] = dict(section["model"])
-        config["roth_sampler"] = {
-            "enabled": config["temperature_profiles"]["source_mode"] in {"pt_library", "mixed"},
-            "source_mode": (
-                "mixed"
-                if config["temperature_profiles"]["source_mode"] == "mixed"
-                else "roth"
-            ),
-            "analytic_probability": config["temperature_profiles"].get("analytic_probability"),
-            "data_glob": config["temperature_profiles"].get("data_glob", ""),
-            "filters": dict(config["temperature_profiles"]["filters"]),
-        }
+
+    model = config["model"]
+    if not isinstance(model, dict):
+        raise ConfigValidationError("model must be a mapping.")
+    if model_type == "mlp":
+        model = _validate_mlp_model_config(model, "model")
     else:
-        section = config["full_vulcan"]
+        model = _validate_transformer_model_config(model, "model")
+    config["model"] = model
+    config["training"]["model"] = dict(model)
+
+    if chemistry_type == "vulcan":
+        section = config["vulcan"]
         if not isinstance(section, dict):
-            raise ConfigValidationError("full_vulcan must be a mapping.")
+            raise ConfigValidationError("vulcan must be a mapping.")
         _require_keys(
             section,
             [
-                "model",
                 "physics_toggles",
-                "vulcan_runtime",
+                "runtime",
                 "stellar_spectrum",
             ],
-            "full_vulcan",
+            "vulcan",
         )
         physics = section["physics_toggles"]
+        if not isinstance(physics, dict):
+            raise ConfigValidationError("vulcan.physics_toggles must be a mapping.")
         for name in PUBLIC_PHYSICS_TOGGLES:
             physics[name] = _as_bool(
                 physics.get(name, False),
-                f"full_vulcan.physics_toggles.{name}",
+                f"vulcan.physics_toggles.{name}",
             )
-        runtime = section["vulcan_runtime"]
+        runtime = section["runtime"]
         _require_keys(
             runtime,
             [
                 "chemistry_file",
-                "atm_base",
                 "t_cross_sp",
             ],
-            "full_vulcan.vulcan_runtime",
+            "vulcan.runtime",
         )
         runtime["chemistry_file"] = _as_nonempty_str(
             runtime["chemistry_file"],
-            "full_vulcan.vulcan_runtime.chemistry_file",
+            "vulcan.runtime.chemistry_file",
         )
-        runtime["atm_base"] = _as_nonempty_str(
-            runtime["atm_base"],
-            "full_vulcan.vulcan_runtime.atm_base",
-        )
-        if runtime["atm_base"] not in SUPPORTED_ATM_BASES:
-            raise ConfigValidationError(
-                "full_vulcan.vulcan_runtime.atm_base must be one of "
-                f"{SUPPORTED_ATM_BASES}, got {runtime['atm_base']!r}."
-            )
         runtime["t_cross_sp"] = _as_string_list(
             runtime["t_cross_sp"],
-            "full_vulcan.vulcan_runtime.t_cross_sp",
+            "vulcan.runtime.t_cross_sp",
         )
         runtime["python_executable"] = _as_nonempty_str(
             runtime.get("python_executable", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["python_executable"]),
-            "full_vulcan.vulcan_runtime.python_executable",
+            "vulcan.runtime.python_executable",
         )
         runtime["cfg_file"] = _as_nonempty_str(
             runtime.get("cfg_file", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["cfg_file"]),
-            "full_vulcan.vulcan_runtime.cfg_file",
+            "vulcan.runtime.cfg_file",
         )
         runtime["worker_root"] = _as_nonempty_str(
             runtime.get("worker_root", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["worker_root"]),
-            "full_vulcan.vulcan_runtime.worker_root",
+            "vulcan.runtime.worker_root",
         )
         runtime["regenerate_chem_funs"] = _as_bool(
             runtime.get(
                 "regenerate_chem_funs",
                 _INTERNAL_VULCAN_RUNTIME_DEFAULTS["regenerate_chem_funs"],
             ),
-            "full_vulcan.vulcan_runtime.regenerate_chem_funs",
+            "vulcan.runtime.regenerate_chem_funs",
         )
         cfg_assignments = runtime.get(
             "cfg_assignments",
             _INTERNAL_VULCAN_RUNTIME_DEFAULTS["cfg_assignments"],
         )
         if not isinstance(cfg_assignments, dict):
-            raise ConfigValidationError(
-                "full_vulcan.vulcan_runtime.cfg_assignments must be a mapping."
-            )
+            raise ConfigValidationError("vulcan.runtime.cfg_assignments must be a mapping.")
         runtime["cfg_assignments"] = dict(cfg_assignments)
         runtime["use_lowT_limit_rates"] = _as_bool(
             runtime.get(
                 "use_lowT_limit_rates",
                 _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_lowT_limit_rates"],
             ),
-            "full_vulcan.vulcan_runtime.use_lowT_limit_rates",
+            "vulcan.runtime.use_lowT_limit_rates",
         )
         runtime["use_adaptive_rtol"] = _as_bool(
             runtime.get(
                 "use_adaptive_rtol",
                 _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_adaptive_rtol"],
             ),
-            "full_vulcan.vulcan_runtime.use_adaptive_rtol",
+            "vulcan.runtime.use_adaptive_rtol",
+        )
+        default_atm_base = _as_nonempty_str(
+            runtime.get("atm_base", "H2"),
+            "vulcan.runtime.atm_base",
+        )
+        if default_atm_base not in SUPPORTED_ATM_BASES:
+            raise ConfigValidationError(
+                f"vulcan.runtime.atm_base must be one of {SUPPORTED_ATM_BASES}, got {default_atm_base!r}."
+            )
+        runtime["atm_base"] = default_atm_base
+        science_presets = _validate_science_presets(
+            section.get("science_presets"),
+            default_physics=dict(physics),
+            default_atm_base=default_atm_base,
+            scope="vulcan.science_presets",
         )
         spectrum = section["stellar_spectrum"]
         _require_keys(
@@ -1130,99 +1194,91 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 "zenith_angle_deg",
                 "diurnal_factor",
             ],
-            "full_vulcan.stellar_spectrum",
+            "vulcan.stellar_spectrum",
         )
         spectrum["enabled"] = _as_bool(
             spectrum["enabled"],
-            "full_vulcan.stellar_spectrum.enabled",
+            "vulcan.stellar_spectrum.enabled",
         )
         spectrum["template_name"] = _as_nonempty_str(
             spectrum["template_name"],
-            "full_vulcan.stellar_spectrum.template_name",
+            "vulcan.stellar_spectrum.template_name",
         )
         spectrum["template_file"] = _as_nonempty_str(
             spectrum["template_file"],
-            "full_vulcan.stellar_spectrum.template_file",
+            "vulcan.stellar_spectrum.template_file",
         )
+        library_glob = spectrum.get("library_glob")
+        if library_glob is None:
+            spectrum["library_glob"] = None
+        else:
+            spectrum["library_glob"] = _as_nonempty_str(
+                library_glob,
+                "vulcan.stellar_spectrum.library_glob",
+            )
         spectrum["num_bins"] = _as_int(
             spectrum["num_bins"],
-            "full_vulcan.stellar_spectrum.num_bins",
+            "vulcan.stellar_spectrum.num_bins",
         )
         spectrum["latent_dim"] = _as_int(
             spectrum["latent_dim"],
-            "full_vulcan.stellar_spectrum.latent_dim",
+            "vulcan.stellar_spectrum.latent_dim",
         )
         spectrum["hidden_dim"] = _as_int(
             spectrum["hidden_dim"],
-            "full_vulcan.stellar_spectrum.hidden_dim",
+            "vulcan.stellar_spectrum.hidden_dim",
         )
         if spectrum["num_bins"] < 8:
-            raise ConfigValidationError("full_vulcan.stellar_spectrum.num_bins must be >= 8.")
+            raise ConfigValidationError("vulcan.stellar_spectrum.num_bins must be >= 8.")
         if spectrum["latent_dim"] < 1 or spectrum["latent_dim"] > spectrum["num_bins"]:
             raise ConfigValidationError(
-                "full_vulcan.stellar_spectrum.latent_dim must lie in [1, num_bins]."
+                "vulcan.stellar_spectrum.latent_dim must lie in [1, num_bins]."
             )
         spectrum["wavelength_min_nm"] = _as_float(
             spectrum["wavelength_min_nm"],
-            "full_vulcan.stellar_spectrum.wavelength_min_nm",
+            "vulcan.stellar_spectrum.wavelength_min_nm",
         )
         spectrum["wavelength_max_nm"] = _as_float(
             spectrum["wavelength_max_nm"],
-            "full_vulcan.stellar_spectrum.wavelength_max_nm",
+            "vulcan.stellar_spectrum.wavelength_max_nm",
         )
         if spectrum["wavelength_min_nm"] >= spectrum["wavelength_max_nm"]:
             raise ConfigValidationError(
-                "full_vulcan.stellar_spectrum.wavelength_min_nm must be smaller than wavelength_max_nm."
+                "vulcan.stellar_spectrum.wavelength_min_nm must be smaller than wavelength_max_nm."
             )
         spectrum["encoder_mode"] = _as_nonempty_str(
             spectrum["encoder_mode"],
-            "full_vulcan.stellar_spectrum.encoder_mode",
+            "vulcan.stellar_spectrum.encoder_mode",
         ).lower()
         if spectrum["encoder_mode"] not in _ALLOWED_SPECTRUM_ENCODERS:
             raise ConfigValidationError(
-                "full_vulcan.stellar_spectrum.encoder_mode must be one of "
-                f"{_ALLOWED_SPECTRUM_ENCODERS}."
+                f"vulcan.stellar_spectrum.encoder_mode must be one of {_ALLOWED_SPECTRUM_ENCODERS}."
             )
         for key in ("teff_k", "radius_rsun", "semi_major_axis_au", "diurnal_factor"):
             spectrum[key] = _as_float(
                 spectrum[key],
-                f"full_vulcan.stellar_spectrum.{key}",
+                f"vulcan.stellar_spectrum.{key}",
             )
             if spectrum[key] <= 0.0:
-                raise ConfigValidationError(
-                    f"full_vulcan.stellar_spectrum.{key} must be positive."
-                )
+                raise ConfigValidationError(f"vulcan.stellar_spectrum.{key} must be positive.")
         spectrum["zenith_angle_deg"] = _as_float(
             spectrum["zenith_angle_deg"],
-            "full_vulcan.stellar_spectrum.zenith_angle_deg",
+            "vulcan.stellar_spectrum.zenith_angle_deg",
         )
         if spectrum["zenith_angle_deg"] < 0.0 or spectrum["zenith_angle_deg"] >= 90.0:
             raise ConfigValidationError(
-                "full_vulcan.stellar_spectrum.zenith_angle_deg must lie in [0, 90)."
+                "vulcan.stellar_spectrum.zenith_angle_deg must lie in [0, 90)."
             )
-        section["model"] = _validate_full_vulcan_model_config(
-            section["model"],
-            "full_vulcan.model",
-        )
         section["physics_toggles"] = physics
-        section["vulcan_runtime"] = runtime
+        section["science_presets"] = science_presets
+        section["runtime"] = runtime
         section["stellar_spectrum"] = spectrum
-        config["full_vulcan"] = section
-        config["training"]["model"] = dict(section["model"])
+        config["vulcan"] = section
         config["physics_toggles"] = dict(physics)
+        config["science_presets"] = list(science_presets)
+        config["default_science_preset"] = dict(science_presets[0])
         config["vulcan_runtime"] = dict(runtime)
         config["stellar_spectrum"] = dict(spectrum)
-        config["roth_sampler"] = {
-            "enabled": config["temperature_profiles"]["source_mode"] in {"pt_library", "mixed"},
-            "source_mode": (
-                "mixed"
-                if config["temperature_profiles"]["source_mode"] == "mixed"
-                else "roth"
-            ),
-            "analytic_probability": config["temperature_profiles"].get("analytic_probability"),
-            "data_glob": config["temperature_profiles"].get("data_glob", ""),
-            "filters": dict(config["temperature_profiles"]["filters"]),
-        }
 
     config["training"] = {
         "seed": training["seed"],
@@ -1238,10 +1294,21 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "model": training["model"],
         "loss": training["loss"],
     }
+    config["roth_sampler"] = {
+        "enabled": config["temperature_profiles"]["source_mode"] in {"pt_library", "mixed"},
+        "source_mode": (
+            "mixed"
+            if config["temperature_profiles"]["source_mode"] == "mixed"
+            else "roth"
+        ),
+        "analytic_probability": config["temperature_profiles"].get("analytic_probability"),
+        "data_glob": config["temperature_profiles"].get("data_glob", ""),
+        "filters": dict(config["temperature_profiles"]["filters"]),
+    }
 
     config["data_spec"]["state_dim"] = len(state_species)
     config["data_spec"]["target_dim"] = len(output_species)
-    if equilibrium:
+    if chemistry_type == "fastchem":
         config["data_spec"]["sequence_static_feature_order"] = [
             "pressure_bar",
             "temperature_k",

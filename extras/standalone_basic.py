@@ -1,7 +1,7 @@
 """
 standalone_basic.py
 ===================
-The simplest possible example of using the VULCAN equilibrium emulator.
+The simplest possible example of using the FastChem emulator.
 
 Run from the vulcan-emulator root:
 
@@ -24,8 +24,9 @@ patch_numpy_asarray_copy()
 
 import numpy as np
 from src.models.export_bundle import load_exported_model
+from src.utils.config import ELEMENT_INPUT_ORDER
 
-_EXPECTED_GLOBAL_ORDER = ["metallicity_log10", "c_to_o", "s_to_o"]
+_EXPECTED_GLOBAL_ORDER = list(ELEMENT_INPUT_ORDER)
 
 # ---------------------------------------------------------------------------
 # 1. Load the model
@@ -33,12 +34,12 @@ _EXPECTED_GLOBAL_ORDER = ["metallicity_log10", "c_to_o", "s_to_o"]
 # The .npz bundle is entirely self-contained: model weights, architecture,
 # normalisation statistics, and the species/feature ordering are all inside.
 # Nothing from the training codebase is needed.
-model = load_exported_model(_ROOT / "models/equilibrium_only_silu/best_exported.npz")
+model = load_exported_model(_ROOT / "models" / "fastchem_mlp" / "best_exported.npz")
 global_order = list(model.data_contract["global_static_feature_order"])
 if global_order != _EXPECTED_GLOBAL_ORDER:
     raise RuntimeError(
-        "extras/standalone_basic.py requires an exported equilibrium bundle with the "
-        f"current ratio-global contract {_EXPECTED_GLOBAL_ORDER}, "
+        "extras/standalone_basic.py requires an exported FastChem bundle with the "
+        f"current `X/H` contract {_EXPECTED_GLOBAL_ORDER}, "
         f"but the default bundle stores {global_order}. Regenerate the example bundle "
         "from a checkpoint trained with the current pipeline."
     )
@@ -58,17 +59,20 @@ temperature_k = 800.0 + 1200.0 * (pressure_bar / 100.0) ** 0.08
 # ---------------------------------------------------------------------------
 # 3. Call the model
 # ---------------------------------------------------------------------------
-# predict_equilibrium_profile handles all normalization internally.
+# predict_fastchem_profile handles all normalization internally.
 # Inputs are raw physical units in the exported-bundle feature order, and the
-# chemistry globals are the sampled column ratios [M/H], C/O, and S/O.
+# chemistry globals are profile-global elemental abundances in the fixed
+# FastChem/VULCAN order.
 # Outputs are log10 mixing ratios by species.
-mixing_ratios_log10 = model.predict_equilibrium_profile(
+mixing_ratios_log10 = model.predict_fastchem_profile(
     pressure_bar=pressure_bar,
     temperature_k=temperature_k,
     global_inputs={
-        "metallicity_log10": 0.0,  # solar metallicity
-        "c_to_o": 0.549,           # near-solar C/O
-        "s_to_o": 0.0263,          # near-solar S/O
+        "He_H": 8.38e-2,
+        "C_H": 2.95e-4,
+        "O_H": 5.37e-4,
+        "N_H": 7.08e-5,
+        "S_H": 1.41e-5,
     },
     return_log10=True,  # return log10(mixing ratio); set False for linear
 )

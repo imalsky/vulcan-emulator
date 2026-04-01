@@ -21,7 +21,7 @@ temperature-profile sources, selected by ``temperature_profiles.source_mode``:
 
 The module also handles Latin-hypercube sampling of the global conditioning
 scalars (metallicity, C/O, S/O, and optionally gravity) plus stellar-spectrum
-selection for the final-state full-VULCAN task.
+selection for VULCAN chemistry runs.
 """
 
 from __future__ import annotations
@@ -35,9 +35,14 @@ from typing import Any
 import numpy as np
 from scipy.special import expn
 
-from ..utils.config import ELEMENT_INPUT_ORDER, is_equilibrium, static_conditioning_defaults
+from ..utils.config import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SUPPORTED_ATM_BASES, uses_fastchem
 from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
-from .spectrum import SpectrumRecord, load_spectrum_manifest, save_spectrum_manifest
+from .spectrum import (
+    SpectrumRecord,
+    load_spectrum_manifest,
+    load_spectrum_records_from_glob,
+    save_spectrum_manifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -672,17 +677,59 @@ def _ensure_wasp39_template(
     return read_vulcan_spectrum_txt(template_path, name=spectrum_cfg["template_name"])
 
 
+def _resolve_spectrum_library_glob(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+) -> str | None:
+    """Resolve the optional spectrum-library glob against the project root."""
+    library_glob = config["stellar_spectrum"].get("library_glob")
+    if not library_glob:
+        return None
+    glob_path = Path(str(library_glob))
+    if glob_path.is_absolute():
+        return str(glob_path)
+    return str((project_root / glob_path).resolve())
+
+
+def _load_configured_spectrum_records(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+) -> dict[str, SpectrumRecord]:
+    """Load the configured stellar spectrum library for full-VULCAN sampling."""
+    library_glob = _resolve_spectrum_library_glob(project_root=project_root, config=config)
+    if library_glob:
+        return load_spectrum_records_from_glob(library_glob)
+    template = _ensure_wasp39_template(project_root=project_root, config=config)
+    return {template.name: template}
+
+
+def _science_preset_conditioning_inputs(preset: dict[str, Any]) -> dict[str, float]:
+    """Flatten one curated science preset into conditioning scalars."""
+    physics = {
+        name: float(bool(preset["physics_toggles"][name]))
+        for name in PUBLIC_PHYSICS_TOGGLES
+    }
+    atm_base = str(preset["atm_base"])
+    one_hot = {
+        f"atm_base_{name}": 1.0 if name == atm_base else 0.0
+        for name in SUPPORTED_ATM_BASES
+    }
+    return {**physics, **one_hot}
+
+
 def ensure_default_spectrum_library(
     *,
     project_root: Path,
     config: dict[str, Any],
 ) -> Path:
-    """Write the default fixed-grid spectrum library and return its manifest path."""
+    """Write the configured fixed-grid spectrum library and return its manifest path."""
     output_dir = project_root / "data" / "spectra_library"
     output_dir.mkdir(parents=True, exist_ok=True)
-    template = _ensure_wasp39_template(project_root=project_root, config=config)
+    records = _load_configured_spectrum_records(project_root=project_root, config=config)
     manifest_path = output_dir / "manifest.json"
-    save_spectrum_manifest([template], output_dir)
+    save_spectrum_manifest(records.values(), output_dir)
     return manifest_path
 
 
@@ -730,9 +777,9 @@ def sample_run_specifications(
         int(config["generation"]["seed"] if seed is None else seed)
     )
     total_runs = int(config["generation"]["num_runs"] if num_runs is None else num_runs)
-    equilibrium = is_equilibrium(config)
+    fastchem = uses_fastchem(config)
 
-    if equilibrium:
+    if fastchem:
         # LHC over (metallicity, C/O, S/O) — 3 dimensions, no gravity.
         design = _latin_hypercube_unit_samples(
             num_samples=total_runs, num_dimensions=3, rng=rng,
@@ -743,14 +790,16 @@ def sample_run_specifications(
             num_samples=total_runs, num_dimensions=4, rng=rng,
         )
 
-    # Spectrum loading only needed for full-VULCAN models.
+    # Spectrum loading only needed for VULCAN chemistry.
     spectra: dict[str, SpectrumRecord] | None = None
     spectrum_names: list[str] | None = None
-    if not equilibrium:
+    science_presets: list[dict[str, Any]] | None = None
+    if not fastchem:
         spectra = load_default_spectra(project_root=project_root, config=config)
         if not spectra:
             raise RuntimeError("No stellar spectra available for sampling.")
         spectrum_names = sorted(spectra.keys())
+        science_presets = list(config["science_presets"])
 
     pressure_bar = sample_pressure_grid(
         num_levels=int(config["sampling"]["num_levels"]),
@@ -758,9 +807,8 @@ def sample_run_specifications(
         pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
     )
     result: list[RunSpecification] = []
-    physics_defaults = static_conditioning_defaults(config)
     for run_idx in range(total_runs):
-        if equilibrium:
+        if fastchem:
             metallicity = _scale_unit_interval(
                 design[run_idx, 0],
                 *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
@@ -796,7 +844,7 @@ def sample_run_specifications(
             config=config,
             rng=rng,
         )
-        if equilibrium:
+        if fastchem:
             base_globals: dict[str, float] = {
                 "metallicity_log10": float(metallicity),
                 "c_to_o": float(c_to_o),
@@ -825,7 +873,7 @@ def sample_run_specifications(
             num_levels=np.asarray(pressure_bar).size,
         )
 
-        if equilibrium:
+        if fastchem:
             globals_map = {**base_globals, **element_scalars}
             result.append(
                 RunSpecification(
@@ -840,9 +888,10 @@ def sample_run_specifications(
             )
         else:
             kzz = sample_kzz_profile(pressure_bar, config=config, rng=rng)
-            assert spectra is not None and spectrum_names is not None
+            assert spectra is not None and spectrum_names is not None and science_presets is not None
             spectrum_name = spectrum_names[int(rng.integers(0, len(spectrum_names)))]
             template = spectra[spectrum_name]
+            preset = science_presets[int(rng.integers(0, len(science_presets)))]
             spectrum = SpectrumRecord(
                 name=f"{template.name}_run{run_idx:05d}",
                 wavelength_nm=np.asarray(template.wavelength_nm, dtype=np.float64),
@@ -852,7 +901,7 @@ def sample_run_specifications(
             globals_map = {
                 **base_globals,
                 **element_scalars,
-                **{key: float(value) for key, value in physics_defaults.items()},
+                **_science_preset_conditioning_inputs(preset),
             }
             result.append(
                 RunSpecification(
@@ -863,6 +912,7 @@ def sample_run_specifications(
                     metadata={
                         **temperature_metadata,
                         "spectrum_name": spectrum.name,
+                        "science_preset_name": str(preset["name"]),
                     },
                     kzz_cm2_s=np.asarray(kzz, dtype=np.float64),
                     spectrum=spectrum,

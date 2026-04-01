@@ -15,12 +15,13 @@ from src.utils.config import load_and_validate_config  # noqa: E402
 from src.data_generation.spectrum import generate_wasp39b_template, write_vulcan_spectrum_txt  # noqa: E402
 
 
-def _write_full_vulcan_test_config(config_path: Path) -> None:
+def _write_vulcan_transformer_test_config(config_path: Path) -> None:
     fixture_glob = str(ROOT / "uni_tests" / "fixtures" / "pt_profiles" / "*.dat")
     config_path.write_text(
         json.dumps(
             {
-                "task": {"kind": "full_vulcan"},
+                "chemistry_type": "vulcan",
+                "model_type": "transformer",
                 "paths": {
                     "raw_root": "data/raw",
                     "processed_root": "data/processed",
@@ -127,9 +128,11 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                     },
                     "global_methods": {
                         "gravity_cm_s2": "log-standard",
-                        "metallicity_log10": "standard",
-                        "c_to_o": "standard",
-                        "s_to_o": "standard",
+                        "He_H": "standard",
+                        "C_H": "log-standard",
+                        "O_H": "log-standard",
+                        "N_H": "log-standard",
+                        "S_H": "log-standard",
                         "use_photochemistry": "none",
                         "use_ion_chemistry": "none",
                         "use_eddy_diffusion": "none",
@@ -162,16 +165,16 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                         "lambda_spectrum": 0.01,
                     },
                 },
-                "full_vulcan": {
-                    "model": {
-                        "d_model": 128,
-                        "nhead": 8,
-                        "num_layers": 4,
-                        "dim_feedforward": 256,
-                        "conditioning_hidden_dim": 256,
-                        "film_clamp": 1.5,
-                        "output_head_divisor": 2,
-                    },
+                "model": {
+                    "d_model": 128,
+                    "nhead": 8,
+                    "num_layers": 4,
+                    "dim_feedforward": 256,
+                    "conditioning_hidden_dim": 256,
+                    "film_clamp": 1.5,
+                    "output_head_divisor": 2,
+                },
+                "vulcan": {
                     "physics_toggles": {
                         "use_photochemistry": True,
                         "use_ion_chemistry": False,
@@ -184,7 +187,25 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                         "use_initial_cold_trap": False,
                         "use_sat_surface_h2o": False,
                     },
-                    "vulcan_runtime": {
+                    "science_presets": [
+                        {
+                            "name": "photo_h2",
+                            "atm_base": "H2",
+                            "physics_toggles": {
+                                "use_photochemistry": True,
+                                "use_eddy_diffusion": True,
+                            },
+                        },
+                        {
+                            "name": "thermochem_h2",
+                            "atm_base": "H2",
+                            "physics_toggles": {
+                                "use_photochemistry": False,
+                                "use_eddy_diffusion": True,
+                            },
+                        },
+                    ],
+                    "runtime": {
                         "chemistry_file": "thermo/SNCHO_photo_network_2025.txt",
                         "atm_base": "H2",
                         "t_cross_sp": ["H2O", "H2S", "SH", "SO2", "S2"],
@@ -193,6 +214,7 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
                         "enabled": True,
                         "template_name": "wasp39b_frances_surface_flux",
                         "template_file": "assets/spectra/wasp39b/test_surface_flux.txt",
+                        "library_glob": "assets/spectra/library/*.txt",
                         "num_bins": 256,
                         "wavelength_min_nm": 0.05,
                         "wavelength_max_nm": 700.0,
@@ -216,12 +238,15 @@ def _write_full_vulcan_test_config(config_path: Path) -> None:
 
 @pytest.fixture()
 def tiny_config(tmp_path):
-    config_path = tmp_path / "full_vulcan_config.json"
-    _write_full_vulcan_test_config(config_path)
+    config_path = tmp_path / "vulcan_transformer_config.json"
+    _write_vulcan_transformer_test_config(config_path)
     config = load_and_validate_config(config_path)
     config = copy.deepcopy(config)
 
-    spectrum_file = tmp_path / "test_surface_flux.txt"
+    spectrum_dir = tmp_path / "spectra"
+    spectrum_dir.mkdir(parents=True, exist_ok=True)
+    spectrum_file = spectrum_dir / "test_surface_flux.txt"
+    spectrum_file_alt = spectrum_dir / "test_surface_flux_alt.txt"
     write_vulcan_spectrum_txt(
         generate_wasp39b_template(
             num_points=64,
@@ -234,16 +259,30 @@ def tiny_config(tmp_path):
         ),
         spectrum_file,
     )
+    write_vulcan_spectrum_txt(
+        generate_wasp39b_template(
+            num_points=64,
+            wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
+            wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
+            teff_k=float(config["stellar_spectrum"]["teff_k"]) + 250.0,
+            radius_rsun=float(config["stellar_spectrum"]["radius_rsun"]),
+            semi_major_axis_au=float(config["stellar_spectrum"]["semi_major_axis_au"]),
+            name="test_surface_flux_alt",
+        ),
+        spectrum_file_alt,
+    )
 
     config["paths"]["raw_root"] = str(tmp_path / "raw")
     config["paths"]["processed_root"] = str(tmp_path / "processed")
     config["paths"]["checkpoints_root"] = str(tmp_path / "checkpoints")
     config["paths"]["vulcan_source_root"] = str(tmp_path / "VULCAN")
 
-    config["full_vulcan"]["stellar_spectrum"]["template_file"] = str(spectrum_file)
-    config["full_vulcan"]["stellar_spectrum"]["template_name"] = "test_surface_flux"
+    config["vulcan"]["stellar_spectrum"]["template_file"] = str(spectrum_file)
+    config["vulcan"]["stellar_spectrum"]["template_name"] = "test_surface_flux"
+    config["vulcan"]["stellar_spectrum"]["library_glob"] = str(spectrum_dir / "*.txt")
     config["stellar_spectrum"]["template_file"] = str(spectrum_file)
     config["stellar_spectrum"]["template_name"] = "test_surface_flux"
+    config["stellar_spectrum"]["library_glob"] = str(spectrum_dir / "*.txt")
 
     config["_project_root"] = ROOT
     config["generation"]["mode"] = "synthetic"
@@ -252,9 +291,9 @@ def tiny_config(tmp_path):
     config["generation"]["parallel_workers"] = 1
     config["sampling"]["num_levels"] = 12
 
-    config["full_vulcan"]["stellar_spectrum"]["num_bins"] = 32
-    config["full_vulcan"]["stellar_spectrum"]["hidden_dim"] = 16
-    config["full_vulcan"]["stellar_spectrum"]["latent_dim"] = 4
+    config["vulcan"]["stellar_spectrum"]["num_bins"] = 32
+    config["vulcan"]["stellar_spectrum"]["hidden_dim"] = 16
+    config["vulcan"]["stellar_spectrum"]["latent_dim"] = 4
     config["stellar_spectrum"]["num_bins"] = 32
     config["stellar_spectrum"]["hidden_dim"] = 16
     config["stellar_spectrum"]["latent_dim"] = 4
@@ -267,9 +306,9 @@ def tiny_config(tmp_path):
     config["training"]["model"]["dim_feedforward"] = 32
     config["training"]["model"]["conditioning_hidden_dim"] = 32
 
-    config["full_vulcan"]["model"]["d_model"] = 16
-    config["full_vulcan"]["model"]["nhead"] = 4
-    config["full_vulcan"]["model"]["num_layers"] = 1
-    config["full_vulcan"]["model"]["dim_feedforward"] = 32
-    config["full_vulcan"]["model"]["conditioning_hidden_dim"] = 32
+    config["model"]["d_model"] = 16
+    config["model"]["nhead"] = 4
+    config["model"]["num_layers"] = 1
+    config["model"]["dim_feedforward"] = 32
+    config["model"]["conditioning_hidden_dim"] = 32
     return config

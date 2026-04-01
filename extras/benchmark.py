@@ -17,7 +17,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 
 # -- Configuration -----------------------------------------------------------
-CHECKPOINT = _ROOT / "models/equilibrium_only_silu/best.pt"
+CHECKPOINT = _ROOT / "models" / "fastchem_mlp" / "best.pt"
 DEVICES = ["cpu", "gpu"]
 BATCH_SIZES = [1, 8, 32, 128]
 WARMUP_ITERS = 3
@@ -34,25 +34,25 @@ import jax
 import numpy as np
 
 from src.models.jax_model import (
-    EquilibriumMLPDimensions,
-    ModelDimensions,
-    apply_equilibrium_mlp,
-    apply_model,
+    MLPDimensions,
+    TransformerDimensions,
+    apply_mlp,
+    apply_transformer_model,
 )
 
 
-def _is_equilibrium(payload: dict) -> bool:
-    return "d_hidden" in payload["model_dimensions"]
+def _uses_mlp(payload: dict) -> bool:
+    return str(payload.get("config", {}).get("model_type", "")) == "mlp"
 
 
-def _make_dummy_equilibrium(dims: EquilibriumMLPDimensions, batch: int, nz: int = 150):
+def _make_dummy_fastchem(dims: MLPDimensions | TransformerDimensions, batch: int, nz: int = 150):
     k1, k2 = jax.random.split(jax.random.PRNGKey(0))
     seq = jax.random.normal(k1, (batch, nz, dims.sequence_dim))
     globs = jax.random.normal(k2, (batch, dims.global_dim))
     return seq, globs
 
 
-def _make_dummy_transition(dims: ModelDimensions, batch: int, nz: int = 150):
+def _make_dummy_vulcan(dims: MLPDimensions | TransformerDimensions, batch: int, nz: int = 150):
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
     seq = jax.random.normal(k1, (batch, nz, dims.sequence_dim))
     globs = jax.random.normal(k2, (batch, dims.global_dim))
@@ -85,11 +85,15 @@ def _print_row(dev_name: str, bs: int, median_s: float):
           f"{per_ms:>15.4f} {tput:>11.0f} /s")
 
 
-def benchmark_equilibrium(payload: dict):
-    dims = EquilibriumMLPDimensions.from_dict(payload["model_dimensions"])
+def benchmark_fastchem(payload: dict):
+    dims = (
+        MLPDimensions.from_dict(payload["model_dimensions"])
+        if _uses_mlp(payload)
+        else TransformerDimensions.from_dict(payload["model_dimensions"])
+    )
     _print_header(
-        f"Equilibrium MLP  |  d_hidden={dims.d_hidden}  "
-        f"layers={dims.num_hidden_layers}"
+        f"FastChem {payload['config']['model_type']}  |  "
+        f"sequence_dim={dims.sequence_dim}  global_dim={dims.global_dim}"
     )
     for dev_name in DEVICES:
         try:
@@ -99,17 +103,24 @@ def benchmark_equilibrium(payload: dict):
             continue
         params = jax.device_put(payload["params"], device)
         for bs in BATCH_SIZES:
-            seq, globs = _make_dummy_equilibrium(dims, bs)
+            seq, globs = _make_dummy_fastchem(dims, bs)
             seq, globs = jax.device_put((seq, globs), device)
-            fn = lambda: apply_equilibrium_mlp(params, seq, globs, dims)
+            if _uses_mlp(payload):
+                fn = lambda: apply_mlp(params, seq, globs, dims)
+            else:
+                fn = lambda: apply_transformer_model(params, seq, globs, None, dims)
             _print_row(dev_name, bs, _time_fn(fn, WARMUP_ITERS, BENCH_ITERS))
 
 
-def benchmark_transition(payload: dict):
-    dims = ModelDimensions.from_dict(payload["model_dimensions"])
+def benchmark_vulcan(payload: dict):
+    dims = (
+        MLPDimensions.from_dict(payload["model_dimensions"])
+        if _uses_mlp(payload)
+        else TransformerDimensions.from_dict(payload["model_dimensions"])
+    )
     _print_header(
-        f"Transformer  |  d_model={dims.d_model}  "
-        f"layers={dims.num_layers}  heads={dims.nhead}"
+        f"VULCAN {payload['config']['model_type']}  |  "
+        f"sequence_dim={dims.sequence_dim}  global_dim={dims.global_dim}"
     )
     for dev_name in DEVICES:
         try:
@@ -119,9 +130,12 @@ def benchmark_transition(payload: dict):
             continue
         params = jax.device_put(payload["params"], device)
         for bs in BATCH_SIZES:
-            seq, globs, spec = _make_dummy_transition(dims, bs)
+            seq, globs, spec = _make_dummy_vulcan(dims, bs)
             seq, globs, spec = jax.device_put((seq, globs, spec), device)
-            fn = lambda: apply_model(params, seq, globs, spec, dims)
+            if _uses_mlp(payload):
+                fn = lambda: apply_mlp(params, seq, globs, dims, spec)
+            else:
+                fn = lambda: apply_transformer_model(params, seq, globs, spec, dims)
             _print_row(dev_name, bs, _time_fn(fn, WARMUP_ITERS, BENCH_ITERS))
 
 
@@ -132,10 +146,10 @@ def main():
     print(f"JAX version: {jax.__version__}")
     print(f"Available devices: {jax.devices()}")
 
-    if _is_equilibrium(payload):
-        benchmark_equilibrium(payload)
+    if str(payload.get("config", {}).get("chemistry_type", "")) == "fastchem":
+        benchmark_fastchem(payload)
     else:
-        benchmark_transition(payload)
+        benchmark_vulcan(payload)
 
 
 if __name__ == "__main__":

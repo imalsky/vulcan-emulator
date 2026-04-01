@@ -8,8 +8,8 @@ This module provides two main capabilities:
    data contract, and config — everything needed for standalone inference.
 
 2. **Physical-unit inference**: ``ExportedJAXModel`` wraps the exported
-   bundle and provides ``predict_equilibrium_profile()`` and
-   ``predict_full_vulcan_profile()`` methods that accept raw physical
+   bundle and provides ``predict_fastchem_profile()`` and
+   ``predict_vulcan_profile()`` methods that accept raw physical
    inputs (pressure in bar, temperature in K, etc.), normalize them
    internally, run the JAX forward pass, and return predictions in
    physical space (mixing ratios or log10 mixing ratios).
@@ -31,15 +31,15 @@ import jax.numpy as jnp
 import numpy as np
 
 from .jax_model import (
-    EquilibriumMLPDimensions,
-    ModelDimensions,
-    apply_equilibrium_mlp,
-    apply_model,
+    MLPDimensions,
+    TransformerDimensions,
+    apply_mlp,
+    apply_transformer_model,
 )
 
 
 EXPORT_FORMAT = "jax_physical_bundle"
-EXPORT_VERSION = 1
+EXPORT_VERSION = 3
 
 
 def _flatten_params(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
@@ -186,6 +186,8 @@ def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) 
     metadata = {
         "export_format": EXPORT_FORMAT,
         "export_version": str(EXPORT_VERSION),
+        "chemistry_type": str(payload["config"]["chemistry_type"]),
+        "model_type": str(payload["config"]["model_type"]),
         "model_dimensions": json.dumps(payload["model_dimensions"]),
         "normalization": json.dumps(payload["normalization"]),
         "data_contract": json.dumps(payload["data_contract"]),
@@ -241,15 +243,28 @@ def _resolve_device(device: str | jax.Device | None) -> jax.Device | None:
     return device
 
 
-def _parse_export_metadata(arrays: np.lib.npyio.NpzFile) -> tuple[str, int, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _parse_export_metadata(
+    arrays: np.lib.npyio.NpzFile,
+) -> tuple[str, int, str, str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Parse the JSON metadata payload from an exported NPZ bundle."""
     export_format = str(arrays["meta/export_format"].item()) if "meta/export_format" in arrays else "legacy_npz"
     export_version = int(str(arrays["meta/export_version"].item())) if "meta/export_version" in arrays else 0
+    chemistry_type = str(arrays["meta/chemistry_type"].item()) if "meta/chemistry_type" in arrays else ""
+    model_type = str(arrays["meta/model_type"].item()) if "meta/model_type" in arrays else ""
     model_dimensions = json.loads(str(arrays["meta/model_dimensions"].item()))
     normalization = json.loads(str(arrays["meta/normalization"].item()))
     data_contract = json.loads(str(arrays["meta/data_contract"].item()))
     config = json.loads(str(arrays["meta/config"].item()))
-    return export_format, export_version, model_dimensions, normalization, data_contract, config
+    return (
+        export_format,
+        export_version,
+        chemistry_type,
+        model_type,
+        model_dimensions,
+        normalization,
+        data_contract,
+        config,
+    )
 
 
 @dataclass(frozen=True)
@@ -257,19 +272,36 @@ class ExportedJAXModel:
     """Portable JAX model bundle with physical-units inference helpers."""
 
     params: Any
-    dims: ModelDimensions | EquilibriumMLPDimensions
+    dims: TransformerDimensions | MLPDimensions
     normalization: dict[str, Any]
     data_contract: dict[str, Any]
     config: dict[str, Any]
     export_format: str
     export_version: int
+    chemistry_type: str
+    model_type: str
 
     @property
-    def is_equilibrium(self) -> bool:
-        """Return whether this bundle wraps the equilibrium MLP."""
-        return isinstance(self.dims, EquilibriumMLPDimensions)
+    def uses_fastchem(self) -> bool:
+        """Return whether this bundle targets FastChem chemistry."""
+        return self.chemistry_type == "fastchem"
 
-    def predict_equilibrium_profile(
+    @property
+    def uses_vulcan_chemistry(self) -> bool:
+        """Return whether this bundle targets converged VULCAN chemistry."""
+        return self.chemistry_type == "vulcan"
+
+    @property
+    def uses_mlp(self) -> bool:
+        """Return whether this bundle wraps the FiLM-MLP."""
+        return self.model_type == "mlp"
+
+    @property
+    def uses_transformer(self) -> bool:
+        """Return whether this bundle wraps the FiLM-Transformer."""
+        return self.model_type == "transformer"
+
+    def predict_fastchem_profile(
         self,
         *,
         pressure_bar: jax.Array | np.ndarray,
@@ -277,7 +309,7 @@ class ExportedJAXModel:
         global_inputs: dict[str, float] | jax.Array | np.ndarray,
         return_log10: bool = False,
     ) -> jax.Array:
-        """Run equilibrium inference directly from physical-unit inputs.
+        """Run FastChem inference directly from physical-unit inputs.
 
         Handles all normalization internally: sequence-static features are
         normalized per-column (log-standard for pressure, standard for
@@ -294,7 +326,7 @@ class ExportedJAXModel:
         global_inputs : dict or array-like
             Global conditioning scalars.  If a dict, keys must match
             ``data_contract["global_static_feature_order"]`` (e.g.,
-            ``{"metallicity_log10": 0.0, "c_to_o": 0.55, "s_to_o": 0.026}``).
+            ``{"He_H": 8.38e-2, "C_H": 3.6e-4, "O_H": 5.37e-4, "N_H": 8.5e-5, "S_H": 1.8e-5}``).
             If an array, must have shape ``(global_dim,)`` in the correct order.
         return_log10 : bool
             If True, return log10 mixing ratios instead of linear.
@@ -304,8 +336,8 @@ class ExportedJAXModel:
         jax.Array
             Predicted mixing ratios, shape ``(nz, target_dim)``.
         """
-        if not self.is_equilibrium:
-            raise ValueError("predict_equilibrium_profile requires an equilibrium export bundle.")
+        if not self.uses_fastchem:
+            raise ValueError("predict_fastchem_profile requires a fastchem export bundle.")
 
         pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
         temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
@@ -327,13 +359,22 @@ class ExportedJAXModel:
             self.normalization["global_static"],
         )  # shape: (1, global_dim)
 
-        pred_norm, _ = apply_equilibrium_mlp(self.params, sequence, globals_norm, self.dims)
+        if self.uses_mlp:
+            pred_norm, _ = apply_mlp(self.params, sequence, globals_norm, self.dims)
+        else:
+            pred_norm, _ = apply_transformer_model(
+                self.params,
+                sequence,
+                globals_norm,
+                None,
+                self.dims,
+            )
         pred_norm = pred_norm[0]
         if return_log10:
             return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
         return inverse_block_jax(pred_norm, self.normalization["target"])
 
-    def predict_full_vulcan_profile(
+    def predict_vulcan_profile(
         self,
         *,
         pressure_bar: jax.Array | np.ndarray,
@@ -343,7 +384,7 @@ class ExportedJAXModel:
         spectrum_flux: jax.Array | np.ndarray,
         return_log10: bool = False,
     ) -> jax.Array:
-        """Run full-VULCAN inference directly from physical-unit inputs.
+        """Run VULCAN inference directly from physical-unit inputs.
 
         Normalizes sequence-static features (pressure, temperature, Kzz),
         global conditioning scalars, and stellar spectrum internally.
@@ -358,8 +399,8 @@ class ExportedJAXModel:
         kzz_cm2_s : array-like
             Eddy diffusion coefficient in cm^2/s, shape ``(nz,)``.
         global_inputs : dict or array-like
-            Global conditioning scalars (gravity, ``metallicity_log10``,
-            ``c_to_o``, ``s_to_o``, plus any physics toggles and
+            Global conditioning scalars (gravity, profile-global ``X/H``
+            elemental abundances, plus any physics toggles and
             atmosphere-base flags).
         spectrum_flux : array-like
             Stellar spectrum flux values, shape ``(spectrum_dim,)``.
@@ -371,8 +412,8 @@ class ExportedJAXModel:
         jax.Array
             Predicted mixing ratios, shape ``(nz, target_dim)``.
         """
-        if self.is_equilibrium:
-            raise ValueError("predict_full_vulcan_profile requires a full_vulcan export bundle.")
+        if not self.uses_vulcan_chemistry:
+            raise ValueError("predict_vulcan_profile requires a vulcan export bundle.")
 
         pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
         temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
@@ -405,18 +446,26 @@ class ExportedJAXModel:
         )  # shape: (1, global_dim)
 
         spectrum_norm = apply_block_jax(spectrum[None, :], self.normalization["spectrum"])
-        pred_norm, _ = apply_model(
-            self.params,
-            sequence,
-            globals_norm,
-            spectrum_norm,
-            self.dims,
-        )
+        if self.uses_mlp:
+            pred_norm, _ = apply_mlp(
+                self.params,
+                sequence,
+                globals_norm,
+                self.dims,
+                spectrum_norm,
+            )
+        else:
+            pred_norm, _ = apply_transformer_model(
+                self.params,
+                sequence,
+                globals_norm,
+                spectrum_norm,
+                self.dims,
+            )
         pred_norm = pred_norm[0]
         if return_log10:
             return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
         return inverse_block_jax(pred_norm, self.normalization["target"])
-
 
 def load_exported_model(
     bundle_path: str | Path,
@@ -425,9 +474,8 @@ def load_exported_model(
 ) -> ExportedJAXModel:
     """Load an exported NPZ bundle and return an ``ExportedJAXModel`` instance.
 
-    Automatically detects whether the bundle contains an equilibrium MLP or
-    a full-VULCAN Transformer based on the presence of ``d_hidden`` in the
-    serialized model dimensions.
+    The bundle stores explicit chemistry/model metadata, so loading does not
+    infer architecture from dimension keys.
 
     Parameters
     ----------
@@ -440,14 +488,21 @@ def load_exported_model(
     Returns
     -------
     ExportedJAXModel
-        Ready-to-use model with ``predict_equilibrium_profile()`` or
-        ``predict_full_vulcan_profile()`` methods.
+        Ready-to-use model with ``predict_fastchem_profile()`` or
+        ``predict_vulcan_profile()`` methods.
     """
     bundle = Path(bundle_path)
     with np.load(bundle, allow_pickle=False) as arrays:
-        export_format, export_version, model_dimensions, normalization, data_contract, config = _parse_export_metadata(
-            arrays
-        )
+        (
+            export_format,
+            export_version,
+            chemistry_type,
+            model_type,
+            model_dimensions,
+            normalization,
+            data_contract,
+            config,
+        ) = _parse_export_metadata(arrays)
         flat_params = {
             name.split("/", 1)[1]: np.asarray(arrays[name])
             for name in arrays.files
@@ -460,11 +515,20 @@ def load_exported_model(
         lambda x: jax.device_put(jnp.asarray(x), target_device) if target_device is not None else jnp.asarray(x),
         params,
     )
-    dims: ModelDimensions | EquilibriumMLPDimensions
-    if "d_hidden" in model_dimensions:
-        dims = EquilibriumMLPDimensions.from_dict(model_dimensions)
+    chemistry_type = chemistry_type or str(data_contract.get("chemistry_type", "")).lower()
+    model_type = model_type or str(data_contract.get("model_type", "")).lower()
+    if chemistry_type not in {"fastchem", "vulcan"} or model_type not in {"mlp", "transformer"}:
+        raise ValueError(
+            "This export bundle uses the legacy task-based contract. Re-export a model trained "
+            "with the chemistry_type × model_type config surface."
+        )
+    dims: TransformerDimensions | MLPDimensions
+    if model_type == "mlp":
+        dims = MLPDimensions.from_dict(model_dimensions)
+    elif model_type == "transformer":
+        dims = TransformerDimensions.from_dict(model_dimensions)
     else:
-        dims = ModelDimensions.from_dict(model_dimensions)
+        raise ValueError(f"Unsupported exported model_type: {model_type!r}.")
     return ExportedJAXModel(
         params=params,
         dims=dims,
@@ -473,4 +537,6 @@ def load_exported_model(
         config=config,
         export_format=export_format,
         export_version=export_version,
+        chemistry_type=chemistry_type,
+        model_type=model_type,
     )

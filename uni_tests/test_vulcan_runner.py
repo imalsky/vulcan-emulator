@@ -34,9 +34,9 @@ def _open_first_run(artifact) -> h5py.Group:
 
 
 def _make_equilibrium_config(tmp_path: Path) -> dict:
-    """Build one small equilibrium config suitable for unit tests."""
+    """Build one small FastChem config suitable for unit tests."""
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "equilibrium_only_config.json")
+    config = load_and_validate_config(root / "config" / "fastchem_mlp_config.json")
     config = copy.deepcopy(config)
     config["paths"]["raw_root"] = str(tmp_path / "raw")
     config["paths"]["processed_root"] = str(tmp_path / "processed")
@@ -48,6 +48,13 @@ def _make_equilibrium_config(tmp_path: Path) -> dict:
     config["temperature_profiles"]["source_mode"] = "analytic"
     config["temperature_profiles"].pop("data_glob", None)
     config["temperature_profiles"].pop("analytic_probability", None)
+    config["roth_sampler"] = {
+        "enabled": False,
+        "source_mode": "roth",
+        "analytic_probability": None,
+        "data_glob": "",
+        "filters": {},
+    }
     config["_project_root"] = root
     return config
 
@@ -107,9 +114,12 @@ def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
 
 def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_config):
     config = copy.deepcopy(tiny_config)
+    config["stellar_spectrum"]["library_glob"] = None
+    config["vulcan"]["stellar_spectrum"]["library_glob"] = None
     config["stellar_spectrum"]["template_file"] = str(
         tiny_config["_project_root"] / "does_not_exist_surface_flux.txt"
     )
+    config["vulcan"]["stellar_spectrum"]["template_file"] = config["stellar_spectrum"]["template_file"]
     with pytest.raises(FileNotFoundError):
         generate_synthetic_raw_runs(config, project_root=config["_project_root"])
 
@@ -149,9 +159,14 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
     )
 
     patched = cfg_file.read_text(encoding="utf-8")
+    expected_atm_base = next(
+        name for name in ("H2", "N2", "O2", "CO2", "H2O")
+        if float(spec.globals.get(f"atm_base_{name}", 0.0)) > 0.5
+    )
     assert "atm_type = 'file'" in patched
     assert "Kzz_prof = 'file'" in patched
     assert "T_cross_sp = ['H2O', 'H2S', 'SH', 'SO2', 'S2']" in patched
+    assert f"atm_base = '{expected_atm_base}'" in patched
     assert "use_lowT_limit_rates = True" in patched
     assert "use_adapt_rtol = True" in patched
 
@@ -277,7 +292,7 @@ def test_copy_fastchem_runtime_copies_minimal_runtime(tmp_path):
     assert not (copied_root / "obj").exists()
 
 
-def test_run_vulcan_generation_equilibrium_only_skips_vulcan_runtime(tmp_path, monkeypatch):
+def test_run_vulcan_generation_fastchem_skips_vulcan_runtime(tmp_path, monkeypatch):
     config = _make_equilibrium_config(tmp_path)
 
     fastchem_root = Path(config["paths"]["vulcan_source_root"]) / "fastchem_vulcan"
@@ -291,7 +306,7 @@ def test_run_vulcan_generation_equilibrium_only_skips_vulcan_runtime(tmp_path, m
     )
 
     def _unexpected_vulcan(*args, **kwargs):
-        raise AssertionError("Equilibrium generation should not invoke the VULCAN runtime.")
+        raise AssertionError("FastChem generation should not invoke the VULCAN runtime.")
 
     def _fake_fastchem(spec, *, source_root, worker_base, runs_dir, config):
         del source_root, worker_base

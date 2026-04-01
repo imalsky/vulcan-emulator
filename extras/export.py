@@ -14,7 +14,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 
 # -- Configuration -----------------------------------------------------------
-CHECKPOINT = _ROOT / "models/equilibrium_only_silu/best.pt"
+CHECKPOINT = _ROOT / "models" / "eq" / "best.pt"
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, str(_ROOT))
@@ -24,21 +24,30 @@ from src.utils.numpy_compat import patch_numpy_asarray_copy
 patch_numpy_asarray_copy()
 
 from src.models.export_bundle import export_checkpoint_to_npz
+from src.utils.config import DEFAULT_REQUIRED_GLOBAL_INPUTS, ELEMENT_INPUT_ORDER
 
-_EXPECTED_EQUILIBRIUM_GLOBAL_ORDER = ["metallicity_log10", "c_to_o", "s_to_o"]
+_EXPECTED_EQUILIBRIUM_GLOBAL_ORDER = list(ELEMENT_INPUT_ORDER)
+_EXPECTED_FULL_VULCAN_GLOBAL_ORDER = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
 
 
 def _validate_checkpoint_contract(checkpoint_path: Path) -> None:
-    """Reject equilibrium checkpoints that do not match the current export contract."""
+    """Reject checkpoints that do not match the current exported input contracts."""
     with checkpoint_path.open("rb") as handle:
         payload = pickle.load(handle)
     contract = payload.get("data_contract", {})
     global_order = list(contract.get("global_static_feature_order", []))
-    model_type = str(contract.get("model_type", ""))
-    if model_type == "equilibrium" and global_order != _EXPECTED_EQUILIBRIUM_GLOBAL_ORDER:
+    chemistry_type = str(contract.get("chemistry_type", payload.get("config", {}).get("chemistry_type", "")))
+    if chemistry_type == "fastchem" and global_order != _EXPECTED_EQUILIBRIUM_GLOBAL_ORDER:
         raise RuntimeError(
-            "extras/export.py requires an equilibrium checkpoint with the current "
-            f"ratio-global contract {_EXPECTED_EQUILIBRIUM_GLOBAL_ORDER}, but "
+            "extras/export.py requires a FastChem checkpoint with the current "
+            f"`X/H` contract {_EXPECTED_EQUILIBRIUM_GLOBAL_ORDER}, but "
+            f"the selected checkpoint stores {global_order}. Regenerate the checkpoint "
+            "with the current pipeline before exporting."
+        )
+    if chemistry_type == "vulcan" and global_order != _EXPECTED_FULL_VULCAN_GLOBAL_ORDER:
+        raise RuntimeError(
+            "extras/export.py requires a VULCAN checkpoint with the current "
+            f"runtime-conditioning contract {_EXPECTED_FULL_VULCAN_GLOBAL_ORDER}, but "
             f"the selected checkpoint stores {global_order}. Regenerate the checkpoint "
             "with the current pipeline before exporting."
         )

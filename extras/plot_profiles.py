@@ -7,7 +7,7 @@ Overlays all three types on a single panel with distinct line styles:
 
 Usage:
     python extras/plot_profiles.py
-    python extras/plot_profiles.py --config config/equilibrium_only_config.json --seed 42 -n 20
+    python extras/plot_profiles.py --config config/fastchem_mlp_config.json --seed 42 -n 20
 """
 
 from __future__ import annotations
@@ -172,7 +172,7 @@ def _select_diverse_roth_files(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Plot sampled PT profiles.")
-    parser.add_argument("--config", default="config/equilibrium_only_config.json")
+    parser.add_argument("--config", default="config/fastchem_mlp_config.json")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("-n", "--num-profiles", type=int, default=5,
                         help="Number of profiles per type (radiative, convective, Roth)")

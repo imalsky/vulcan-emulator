@@ -1,13 +1,11 @@
-"""Training loops for both task types: AdamW, LR scheduling, checkpointing.
+"""Training loops for all chemistry/model combinations.
 
-This module provides the complete training pipeline for both emulator tasks:
+This module provides the complete training pipeline for the emulator matrix:
 
-- **Equilibrium MLP** (``train_equilibrium_model``): Trains a FiLM-conditioned
-  per-level MLP on (P, T, globals) -> equilibrium mixing ratios.
-
-- **Full-VULCAN Transformer** (``train_full_vulcan_model``): Trains a
-  FiLM-conditioned Transformer on (P, T, Kzz, globals, spectrum) ->
-  final converged VULCAN mixing ratios.
+- **FastChem / MLP**
+- **FastChem / Transformer**
+- **VULCAN / MLP**
+- **VULCAN / Transformer**
 
 Both paths share the same optimizer (AdamW with decoupled weight decay),
 gradient clipping (global L2 norm), and checkpointing logic (save best by
@@ -37,20 +35,18 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..data_generation.data_loader import (
-    iter_equilibrium_batches,
-    iter_full_vulcan_batches,
-    load_equilibrium_dataset,
-    load_full_vulcan_dataset,
+    iter_batches,
+    load_processed_dataset,
 )
 from ..data_generation.generation import generate_raw_dataset
 from ..data_generation.preprocess import PROCESSED_DATA_VERSION, preprocess_raw_dataset
 from ..models.jax_model import (
-    apply_equilibrium_mlp,
-    apply_model,
+    apply_mlp,
+    apply_transformer_model,
     count_parameters,
     initialize_model,
 )
-from ..utils.config import is_equilibrium, task_kind
+from ..utils.config import get_chemistry_type, get_model_type, uses_mlp
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
@@ -325,7 +321,7 @@ def _state_stats(normalization: dict[str, Any]) -> tuple[jax.Array, jax.Array]:
     return mean, std
 
 
-def make_train_eval_functions(
+def make_transformer_train_eval_functions(
     *,
     dims,
     normalization: dict[str, Any],
@@ -333,19 +329,19 @@ def make_train_eval_functions(
     gradient_clip: float,
     weight_decay: float,
 ):
-    """Build the full-VULCAN JIT train/eval functions."""
+    """Build JIT train/eval functions for the Transformer architecture."""
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
     def train_step(params, opt_state, batch, learning_rate, dropout_key):
-        """Run one optimizer step for the full-VULCAN model."""
+        """Run one optimizer step for the Transformer model."""
         def loss_fn(model_params):
-            """Compute the weighted full-VULCAN training loss and metrics."""
-            pred, aux = apply_model(
+            """Compute the weighted training loss and metrics."""
+            pred, aux = apply_transformer_model(
                 model_params,
                 batch["sequence"],
                 batch["global_inputs"],
-                batch["spectrum_inputs"],
+                batch.get("spectrum_inputs"),
                 dims,
                 dropout_key=dropout_key,
                 training=True,
@@ -359,13 +355,14 @@ def make_train_eval_functions(
             # Spectrum autoencoder reconstruction loss (zero if encoder is not autoencoder).
             spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
             reconstruction = aux["spectrum_reconstruction"]
-            if reconstruction is not None:
-                spectrum_loss = jnp.mean((reconstruction - batch["spectrum_inputs"]) ** 2)
+            spectrum_inputs = batch.get("spectrum_inputs")
+            if reconstruction is not None and spectrum_inputs is not None:
+                spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
             # Weighted combination of the three loss components.
             total = (
                 float(loss_cfg["lambda_z"]) * mse_norm
                 + float(loss_cfg["lambda_phys"]) * mse_log10
-                + float(loss_cfg["lambda_spectrum"]) * spectrum_loss
+                + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
             )
             metrics = {
                 "combined_loss": total,
@@ -388,12 +385,12 @@ def make_train_eval_functions(
 
     @jax.jit
     def eval_step(params, batch):
-        """Evaluate the full-VULCAN model on one batch without updates."""
-        pred, aux = apply_model(
+        """Evaluate the Transformer model on one batch without updates."""
+        pred, aux = apply_transformer_model(
             params,
             batch["sequence"],
             batch["global_inputs"],
-            batch["spectrum_inputs"],
+            batch.get("spectrum_inputs"),
             dims,
         )
         mse_norm = jnp.mean((pred - batch["target"]) ** 2)
@@ -402,12 +399,13 @@ def make_train_eval_functions(
         mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
         spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
         reconstruction = aux["spectrum_reconstruction"]
-        if reconstruction is not None:
-            spectrum_loss = jnp.mean((reconstruction - batch["spectrum_inputs"]) ** 2)
+        spectrum_inputs = batch.get("spectrum_inputs")
+        if reconstruction is not None and spectrum_inputs is not None:
+            spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
         total = (
             float(loss_cfg["lambda_z"]) * mse_norm
             + float(loss_cfg["lambda_phys"]) * mse_log10
-            + float(loss_cfg["lambda_spectrum"]) * spectrum_loss
+            + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
         )
         return {
             "combined_loss": total,
@@ -495,26 +493,18 @@ def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
     """Ensure the processed dataset exists and matches the active config."""
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     contract_path = processed_root / "data_contract.json"
-    equilibrium = is_equilibrium(config)
     if contract_path.exists():
         try:
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
             version_ok = int(contract.get("processed_data_version", -1)) == PROCESSED_DATA_VERSION
-            task_ok = str(contract.get("task_kind", "")).lower() == task_kind(config)
+            chemistry_ok = str(contract.get("chemistry_type", "")).lower() == get_chemistry_type(config)
+            model_ok = str(contract.get("model_type", "")).lower() == get_model_type(config)
             feature_order_ok = _feature_order_matches(contract, config)
-            if equilibrium:
-                mode_ok = contract.get("model_type") == "equilibrium"
-                required_files_ok = all(
-                    (processed_root / split / "target_outputs.npy").exists()
-                    for split in ("train", "val", "test")
-                )
-            else:
-                mode_ok = True
-                required_files_ok = all(
-                    (processed_root / split / "target_outputs.npy").exists()
-                    for split in ("train", "val", "test")
-                )
-            if version_ok and task_ok and feature_order_ok and mode_ok and required_files_ok:
+            required_files_ok = all(
+                (processed_root / split / "target_outputs.npy").exists()
+                for split in ("train", "val", "test")
+            )
+            if version_ok and chemistry_ok and model_ok and feature_order_ok and required_files_ok:
                 LOGGER.info("Using existing processed dataset at %s", processed_root)
                 return processed_root
         except (OSError, ValueError, TypeError):
@@ -564,7 +554,7 @@ def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def make_equilibrium_train_eval_functions(
+def make_mlp_train_eval_functions(
     *,
     dims,
     normalization: dict[str, Any],
@@ -572,19 +562,20 @@ def make_equilibrium_train_eval_functions(
     gradient_clip: float,
     weight_decay: float,
 ):
-    """Build JIT-compiled train/eval functions for the equilibrium MLP."""
+    """Build JIT-compiled train/eval functions for the MLP architecture."""
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
     def train_step(params, opt_state, batch, learning_rate, dropout_key):
-        """Run one optimizer step for the equilibrium model."""
+        """Run one optimizer step for the MLP model."""
         def loss_fn(model_params):
-            """Compute the weighted equilibrium-training loss and metrics."""
-            pred, _aux = apply_equilibrium_mlp(
+            """Compute the weighted MLP training loss and metrics."""
+            pred, aux = apply_mlp(
                 model_params,
                 batch["sequence"],
                 batch["global_inputs"],
                 dims,
+                batch.get("spectrum_inputs"),
                 dropout_key=dropout_key,
                 training=True,
             )
@@ -592,14 +583,21 @@ def make_equilibrium_train_eval_functions(
             pred_log10 = pred * target_std + target_mean
             target_log10 = batch["target"] * target_std + target_mean
             mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
+            spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            reconstruction = aux["spectrum_reconstruction"]
+            spectrum_inputs = batch.get("spectrum_inputs")
+            if reconstruction is not None and spectrum_inputs is not None:
+                spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
             total = (
                 float(loss_cfg["lambda_z"]) * mse_norm
                 + float(loss_cfg["lambda_phys"]) * mse_log10
+                + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
             )
             metrics = {
                 "combined_loss": total,
                 "mse_norm": mse_norm,
                 "mse_log10": mse_log10,
+                "spectrum_recon_mse": spectrum_loss,
             }
             return total, metrics
 
@@ -613,424 +611,36 @@ def make_equilibrium_train_eval_functions(
 
     @jax.jit
     def eval_step(params, batch):
-        """Evaluate the equilibrium model on one batch without updates."""
-        pred, _aux = apply_equilibrium_mlp(
-            params, batch["sequence"], batch["global_inputs"], dims,
+        """Evaluate the MLP model on one batch without updates."""
+        pred, aux = apply_mlp(
+            params,
+            batch["sequence"],
+            batch["global_inputs"],
+            dims,
+            batch.get("spectrum_inputs"),
         )
         mse_norm = jnp.mean((pred - batch["target"]) ** 2)
         pred_log10 = pred * target_std + target_mean
         target_log10 = batch["target"] * target_std + target_mean
         mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
+        spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        reconstruction = aux["spectrum_reconstruction"]
+        spectrum_inputs = batch.get("spectrum_inputs")
+        if reconstruction is not None and spectrum_inputs is not None:
+            spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
         total = (
             float(loss_cfg["lambda_z"]) * mse_norm
             + float(loss_cfg["lambda_phys"]) * mse_log10
+            + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
         )
         return {
             "combined_loss": total,
             "mse_norm": mse_norm,
             "mse_log10": mse_log10,
+            "spectrum_recon_mse": spectrum_loss,
         }
 
     return train_step, eval_step
-
-
-def train_equilibrium_model(
-    config: dict[str, Any],
-    *,
-    project_root: Path,
-) -> TrainingArtifacts:
-    """Train the equilibrium chemistry emulator (FiLM-MLP).
-
-    Full pipeline: ensure processed data exists, load splits, initialize
-    model, train with AdamW plus the configured LR schedule, save best/last
-    checkpoints, evaluate on test split, and write history + metrics.
-    """
-    processed_root = _ensure_processed(config, project_root=project_root)
-    splits, normalization, contract = load_equilibrium_dataset(processed_root)
-
-    train_split = splits["train"]
-    val_split = splits["val"]
-    test_split = splits.get("test", val_split)
-
-    dims, params = initialize_model(config, contract, seed=int(config["training"]["seed"]))
-    LOGGER.info("Initialized equilibrium model with %d parameters.", count_parameters(params))
-    opt_state = _init_adamw_state(params)
-    train_step, eval_step = make_equilibrium_train_eval_functions(
-        dims=dims,
-        normalization=normalization,
-        loss_cfg=config["training"]["loss"],
-        gradient_clip=float(config["training"]["gradient_clip"]),
-        weight_decay=float(config["training"]["weight_decay"]),
-    )
-
-    checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
-    ensure_dir(checkpoints_root)
-
-    batch_size = int(config["training"]["batch_size"])
-    epochs = int(config["training"]["epochs"])
-    history: list[dict[str, Any]] = []
-    best_payload: dict[str, Any] | None = None
-    best_val = float("inf")
-    best_epoch = 0
-    no_improvement_epochs = 0
-    global_step = 0
-    scheduler = config["training"]["scheduler"]
-    early_stopping_patience = int(config["training"]["early_stopping_patience"])
-    base_lr = float(config["training"]["learning_rate"])
-    min_lr = float(config["training"]["min_lr"])
-    plateau_state = (
-        _init_reduce_on_plateau_state(base_lr)
-        if scheduler["name"] == "reduce_on_plateau"
-        else None
-    )
-
-    # Estimate total steps for LR schedule.
-    steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
-    warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
-    total_steps = epochs * steps_per_epoch
-    LOGGER.info(
-        "Training equilibrium model from %s | runs train/val/test=%d/%d/%d | steps/epoch=%d",
-        processed_root,
-        train_split.num_runs,
-        val_split.num_runs,
-        test_split.num_runs,
-        steps_per_epoch,
-    )
-    _emit_epoch_table_line(_epoch_table_header())
-    _emit_epoch_table_line(_epoch_table_rule())
-
-    rng = np.random.default_rng(int(config["training"]["seed"]))
-    dropout_rng = jax.random.PRNGKey(int(config["training"]["seed"]))
-
-    for epoch in range(epochs):
-        epoch_t0 = time.monotonic()
-        train_batches = iter_equilibrium_batches(train_split, batch_size=batch_size, rng=rng)
-        train_metrics_epoch: list[dict[str, float]] = []
-        train_steps = 0
-
-        for batch in train_batches:
-            lr = _scheduled_learning_rate(
-                step=global_step,
-                total_steps=total_steps,
-                base_lr=base_lr,
-                min_lr=min_lr,
-                warmup_steps=warmup_steps,
-                scheduler=scheduler,
-                plateau_state=plateau_state,
-            )
-            # Move the host batch onto the accelerator immediately before the train step.
-            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-            dropout_rng, step_dropout_key = jax.random.split(dropout_rng)
-            params, opt_state, metrics = train_step(
-                params,
-                opt_state,
-                device_batch,
-                jnp.asarray(lr, dtype=jnp.float32),
-                step_dropout_key,
-            )
-            train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
-            global_step += 1
-            train_steps += 1
-
-        # Validation.
-        val_batches = iter_equilibrium_batches(val_split, batch_size=batch_size, rng=rng)
-        val_metrics_epoch: list[dict[str, float]] = []
-        val_steps = 0
-        for batch in val_batches:
-            # Evaluation uses the same device transfer path without optimizer updates.
-            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-            metrics = eval_step(params, device_batch)
-            val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
-            val_steps += 1
-
-        epoch_dt = time.monotonic() - epoch_t0
-        train_summary = _mean_metrics(train_metrics_epoch)
-        val_summary = _mean_metrics(val_metrics_epoch)
-        plateau_state = _maybe_update_plateau_scheduler(
-            scheduler=scheduler,
-            plateau_state=plateau_state,
-            metric=val_summary["combined_loss"],
-            global_step=global_step,
-            warmup_steps=warmup_steps,
-            min_lr=min_lr,
-        )
-        current_lr = float(
-            plateau_state.current_lr if plateau_state is not None and scheduler["name"] == "reduce_on_plateau" else lr
-        )
-        record = {
-            "epoch": epoch + 1,
-            "learning_rate": current_lr,
-            "epoch_seconds": float(epoch_dt),
-            "train_steps": train_steps,
-            "val_steps": val_steps,
-            "train": train_summary,
-            "val": val_summary,
-        }
-        history.append(record)
-        _emit_epoch_table_line(
-            _format_epoch_row(
-                epoch=epoch + 1,
-                epochs=epochs,
-                train_loss=train_summary["combined_loss"],
-                val_loss=val_summary["combined_loss"],
-                learning_rate=current_lr,
-                epoch_seconds=epoch_dt,
-            )
-        )
-
-        current_payload = _checkpoint_payload(
-            params=params, dims=dims, config=config,
-            normalization=normalization, data_contract=contract,
-            metrics={"epoch": epoch + 1, "train": train_summary, "val": val_summary},
-            history=history,
-        )
-        _write_checkpoint(checkpoints_root / "last.pt", current_payload)
-        if val_summary["combined_loss"] < best_val:
-            best_val = val_summary["combined_loss"]
-            best_epoch = epoch + 1
-            no_improvement_epochs = 0
-            best_payload = current_payload
-            _write_checkpoint(checkpoints_root / "best.pt", current_payload)
-        else:
-            no_improvement_epochs += 1
-            if _should_early_stop(no_improvement_epochs, patience=early_stopping_patience):
-                LOGGER.info(
-                    "Early stopping at epoch %d after %d epochs without validation improvement. Best epoch: %d.",
-                    epoch + 1,
-                    no_improvement_epochs,
-                    best_epoch,
-                )
-                break
-
-    if best_payload is None:
-        raise RuntimeError("Training completed without producing a best checkpoint.")
-
-    # Test evaluation.
-    best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
-    test_batches = iter_equilibrium_batches(test_split, batch_size=batch_size, rng=rng)
-    test_metrics_epoch: list[dict[str, float]] = []
-    for batch in test_batches:
-        device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-        metrics = eval_step(best_params, device_batch)
-        test_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
-
-    final_metrics = {
-        "best_val_combined_loss": float(best_val),
-        "test": _mean_metrics(test_metrics_epoch),
-        "num_train_runs": train_split.num_runs,
-        "num_val_runs": val_split.num_runs,
-        "num_test_runs": test_split.num_runs,
-        "parameter_count": int(count_parameters(best_params)),
-    }
-    (checkpoints_root / "history.json").write_text(
-        json.dumps(history, indent=2) + "\n", encoding="utf-8",
-    )
-    (checkpoints_root / "metrics.json").write_text(
-        json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8",
-    )
-    return TrainingArtifacts(
-        checkpoint_path=checkpoints_root / "best.pt",
-        history_path=checkpoints_root / "history.json",
-        metrics_path=checkpoints_root / "metrics.json",
-    )
-
-
-def train_full_vulcan_model(
-    config: dict[str, Any],
-    *,
-    project_root: Path,
-) -> TrainingArtifacts:
-    """Train the full-VULCAN chemistry emulator (FiLM-Transformer).
-
-    Full pipeline: ensure processed data exists, load splits, initialize
-    model, train with AdamW plus the configured LR schedule, save best/last
-    checkpoints, evaluate on test split, and write history + metrics.
-    """
-    processed_root = _ensure_processed(config, project_root=project_root)
-    splits, normalization, contract = load_full_vulcan_dataset(processed_root)
-
-    train_split = splits["train"]
-    val_split = splits["val"]
-    test_split = splits.get("test", val_split)
-
-    dims, params = initialize_model(config, contract, seed=int(config["training"]["seed"]))
-    LOGGER.info("Initialized full-VULCAN model with %d parameters.", count_parameters(params))
-    opt_state = _init_adamw_state(params)
-    train_step, eval_step = make_train_eval_functions(
-        dims=dims,
-        normalization=normalization,
-        loss_cfg=config["training"]["loss"],
-        gradient_clip=float(config["training"]["gradient_clip"]),
-        weight_decay=float(config["training"]["weight_decay"]),
-    )
-
-    checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
-    ensure_dir(checkpoints_root)
-
-    batch_size = int(config["training"]["batch_size"])
-    epochs = int(config["training"]["epochs"])
-    history: list[dict[str, Any]] = []
-    best_payload: dict[str, Any] | None = None
-    best_val = float("inf")
-    best_epoch = 0
-    no_improvement_epochs = 0
-    global_step = 0
-    scheduler = config["training"]["scheduler"]
-    early_stopping_patience = int(config["training"]["early_stopping_patience"])
-    base_lr = float(config["training"]["learning_rate"])
-    min_lr = float(config["training"]["min_lr"])
-    plateau_state = (
-        _init_reduce_on_plateau_state(base_lr)
-        if scheduler["name"] == "reduce_on_plateau"
-        else None
-    )
-
-    steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
-    warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
-    total_steps = epochs * steps_per_epoch
-    LOGGER.info(
-        "Training full-VULCAN model from %s | runs train/val/test=%d/%d/%d | steps/epoch=%d",
-        processed_root,
-        train_split.num_runs,
-        val_split.num_runs,
-        test_split.num_runs,
-        steps_per_epoch,
-    )
-    _emit_epoch_table_line(_epoch_table_header())
-    _emit_epoch_table_line(_epoch_table_rule())
-
-    rng = np.random.default_rng(int(config["training"]["seed"]))
-    dropout_rng = jax.random.PRNGKey(int(config["training"]["seed"]))
-
-    for epoch in range(epochs):
-        epoch_t0 = time.monotonic()
-        train_batches = iter_full_vulcan_batches(train_split, batch_size=batch_size, rng=rng)
-        train_metrics_epoch: list[dict[str, float]] = []
-        train_steps = 0
-
-        for batch in train_batches:
-            lr = _scheduled_learning_rate(
-                step=global_step,
-                total_steps=total_steps,
-                base_lr=base_lr,
-                min_lr=min_lr,
-                warmup_steps=warmup_steps,
-                scheduler=scheduler,
-                plateau_state=plateau_state,
-            )
-            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-            dropout_rng, step_dropout_key = jax.random.split(dropout_rng)
-            params, opt_state, metrics = train_step(
-                params,
-                opt_state,
-                device_batch,
-                jnp.asarray(lr, dtype=jnp.float32),
-                step_dropout_key,
-            )
-            train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
-            global_step += 1
-            train_steps += 1
-
-        # Validation.
-        val_batches = iter_full_vulcan_batches(val_split, batch_size=batch_size, rng=rng)
-        val_metrics_epoch: list[dict[str, float]] = []
-        val_steps = 0
-        for batch in val_batches:
-            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-            metrics = eval_step(params, device_batch)
-            val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
-            val_steps += 1
-
-        epoch_dt = time.monotonic() - epoch_t0
-        train_summary = _mean_metrics(train_metrics_epoch)
-        val_summary = _mean_metrics(val_metrics_epoch)
-        plateau_state = _maybe_update_plateau_scheduler(
-            scheduler=scheduler,
-            plateau_state=plateau_state,
-            metric=val_summary["combined_loss"],
-            global_step=global_step,
-            warmup_steps=warmup_steps,
-            min_lr=min_lr,
-        )
-        current_lr = float(
-            plateau_state.current_lr if plateau_state is not None and scheduler["name"] == "reduce_on_plateau" else lr
-        )
-        record = {
-            "epoch": epoch + 1,
-            "learning_rate": current_lr,
-            "epoch_seconds": float(epoch_dt),
-            "train_steps": train_steps,
-            "val_steps": val_steps,
-            "train": train_summary,
-            "val": val_summary,
-        }
-        history.append(record)
-        _emit_epoch_table_line(
-            _format_epoch_row(
-                epoch=epoch + 1,
-                epochs=epochs,
-                train_loss=train_summary["combined_loss"],
-                val_loss=val_summary["combined_loss"],
-                learning_rate=current_lr,
-                epoch_seconds=epoch_dt,
-            )
-        )
-
-        current_payload = _checkpoint_payload(
-            params=params, dims=dims, config=config,
-            normalization=normalization, data_contract=contract,
-            metrics={"epoch": epoch + 1, "train": train_summary, "val": val_summary},
-            history=history,
-        )
-        _write_checkpoint(checkpoints_root / "last.pt", current_payload)
-        if val_summary["combined_loss"] < best_val:
-            best_val = val_summary["combined_loss"]
-            best_epoch = epoch + 1
-            no_improvement_epochs = 0
-            best_payload = current_payload
-            _write_checkpoint(checkpoints_root / "best.pt", current_payload)
-        else:
-            no_improvement_epochs += 1
-            if _should_early_stop(no_improvement_epochs, patience=early_stopping_patience):
-                LOGGER.info(
-                    "Early stopping at epoch %d after %d epochs without validation improvement. Best epoch: %d.",
-                    epoch + 1,
-                    no_improvement_epochs,
-                    best_epoch,
-                )
-                break
-
-    if best_payload is None:
-        raise RuntimeError("Training completed without producing a best checkpoint.")
-
-    # Test evaluation.
-    best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
-    test_batches = iter_full_vulcan_batches(test_split, batch_size=batch_size, rng=rng)
-    test_metrics_epoch: list[dict[str, float]] = []
-    for batch in test_batches:
-        device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-        metrics = eval_step(best_params, device_batch)
-        test_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
-
-    final_metrics = {
-        "best_val_combined_loss": float(best_val),
-        "test": _mean_metrics(test_metrics_epoch),
-        "num_train_runs": train_split.num_runs,
-        "num_val_runs": val_split.num_runs,
-        "num_test_runs": test_split.num_runs,
-        "parameter_count": int(count_parameters(best_params)),
-    }
-    (checkpoints_root / "history.json").write_text(
-        json.dumps(history, indent=2) + "\n", encoding="utf-8",
-    )
-    (checkpoints_root / "metrics.json").write_text(
-        json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8",
-    )
-    return TrainingArtifacts(
-        checkpoint_path=checkpoints_root / "best.pt",
-        history_path=checkpoints_root / "history.json",
-        metrics_path=checkpoints_root / "metrics.json",
-    )
 
 
 def train_model(
@@ -1038,11 +648,208 @@ def train_model(
     *,
     project_root: Path,
 ) -> TrainingArtifacts:
-    """Train the active model family (equilibrium MLP or full-VULCAN Transformer).
+    """Train the active chemistry/model combination end to end."""
+    processed_root = _ensure_processed(config, project_root=project_root)
+    splits, normalization, contract = load_processed_dataset(processed_root)
 
-    Dispatches to ``train_equilibrium_model`` for equilibrium tasks
-    and ``train_full_vulcan_model`` for full-VULCAN tasks.
-    """
-    if is_equilibrium(config):
-        return train_equilibrium_model(config, project_root=project_root)
-    return train_full_vulcan_model(config, project_root=project_root)
+    train_split = splits["train"]
+    val_split = splits["val"]
+    test_split = splits.get("test", val_split)
+
+    dims, params = initialize_model(config, contract, seed=int(config["training"]["seed"]))
+    LOGGER.info(
+        "Initialized %s/%s model with %d parameters.",
+        get_chemistry_type(config),
+        get_model_type(config),
+        count_parameters(params),
+    )
+    opt_state = _init_adamw_state(params)
+    if uses_mlp(config):
+        train_step, eval_step = make_mlp_train_eval_functions(
+            dims=dims,
+            normalization=normalization,
+            loss_cfg=config["training"]["loss"],
+            gradient_clip=float(config["training"]["gradient_clip"]),
+            weight_decay=float(config["training"]["weight_decay"]),
+        )
+    else:
+        train_step, eval_step = make_transformer_train_eval_functions(
+            dims=dims,
+            normalization=normalization,
+            loss_cfg=config["training"]["loss"],
+            gradient_clip=float(config["training"]["gradient_clip"]),
+            weight_decay=float(config["training"]["weight_decay"]),
+        )
+
+    checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
+    ensure_dir(checkpoints_root)
+
+    batch_size = int(config["training"]["batch_size"])
+    epochs = int(config["training"]["epochs"])
+    history: list[dict[str, Any]] = []
+    best_payload: dict[str, Any] | None = None
+    best_val = float("inf")
+    best_epoch = 0
+    no_improvement_epochs = 0
+    global_step = 0
+    scheduler = config["training"]["scheduler"]
+    early_stopping_patience = int(config["training"]["early_stopping_patience"])
+    base_lr = float(config["training"]["learning_rate"])
+    min_lr = float(config["training"]["min_lr"])
+    plateau_state = (
+        _init_reduce_on_plateau_state(base_lr)
+        if scheduler["name"] == "reduce_on_plateau"
+        else None
+    )
+
+    steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
+    warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
+    total_steps = epochs * steps_per_epoch
+    LOGGER.info(
+        "Training %s/%s model from %s | runs train/val/test=%d/%d/%d | steps/epoch=%d",
+        get_chemistry_type(config),
+        get_model_type(config),
+        processed_root,
+        train_split.num_runs,
+        val_split.num_runs,
+        test_split.num_runs,
+        steps_per_epoch,
+    )
+    _emit_epoch_table_line(_epoch_table_header())
+    _emit_epoch_table_line(_epoch_table_rule())
+
+    rng = np.random.default_rng(int(config["training"]["seed"]))
+    dropout_rng = jax.random.PRNGKey(int(config["training"]["seed"]))
+
+    for epoch in range(epochs):
+        epoch_t0 = time.monotonic()
+        train_batches = iter_batches(train_split, batch_size=batch_size, rng=rng)
+        train_metrics_epoch: list[dict[str, float]] = []
+        train_steps = 0
+
+        for batch in train_batches:
+            lr = _scheduled_learning_rate(
+                step=global_step,
+                total_steps=total_steps,
+                base_lr=base_lr,
+                min_lr=min_lr,
+                warmup_steps=warmup_steps,
+                scheduler=scheduler,
+                plateau_state=plateau_state,
+            )
+            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+            dropout_rng, step_dropout_key = jax.random.split(dropout_rng)
+            params, opt_state, metrics = train_step(
+                params,
+                opt_state,
+                device_batch,
+                jnp.asarray(lr, dtype=jnp.float32),
+                step_dropout_key,
+            )
+            train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            global_step += 1
+            train_steps += 1
+
+        val_batches = iter_batches(val_split, batch_size=batch_size, rng=rng)
+        val_metrics_epoch: list[dict[str, float]] = []
+        val_steps = 0
+        for batch in val_batches:
+            device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+            metrics = eval_step(params, device_batch)
+            val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            val_steps += 1
+
+        epoch_dt = time.monotonic() - epoch_t0
+        train_summary = _mean_metrics(train_metrics_epoch)
+        val_summary = _mean_metrics(val_metrics_epoch)
+        plateau_state = _maybe_update_plateau_scheduler(
+            scheduler=scheduler,
+            plateau_state=plateau_state,
+            metric=val_summary["combined_loss"],
+            global_step=global_step,
+            warmup_steps=warmup_steps,
+            min_lr=min_lr,
+        )
+        current_lr = float(
+            plateau_state.current_lr
+            if plateau_state is not None and scheduler["name"] == "reduce_on_plateau"
+            else lr
+        )
+        record = {
+            "epoch": epoch + 1,
+            "learning_rate": current_lr,
+            "epoch_seconds": float(epoch_dt),
+            "train_steps": train_steps,
+            "val_steps": val_steps,
+            "train": train_summary,
+            "val": val_summary,
+        }
+        history.append(record)
+        _emit_epoch_table_line(
+            _format_epoch_row(
+                epoch=epoch + 1,
+                epochs=epochs,
+                train_loss=train_summary["combined_loss"],
+                val_loss=val_summary["combined_loss"],
+                learning_rate=current_lr,
+                epoch_seconds=epoch_dt,
+            )
+        )
+
+        current_payload = _checkpoint_payload(
+            params=params,
+            dims=dims,
+            config=config,
+            normalization=normalization,
+            data_contract=contract,
+            metrics={"epoch": epoch + 1, "train": train_summary, "val": val_summary},
+            history=history,
+        )
+        _write_checkpoint(checkpoints_root / "last.pt", current_payload)
+        if val_summary["combined_loss"] < best_val:
+            best_val = val_summary["combined_loss"]
+            best_epoch = epoch + 1
+            no_improvement_epochs = 0
+            best_payload = current_payload
+            _write_checkpoint(checkpoints_root / "best.pt", current_payload)
+        else:
+            no_improvement_epochs += 1
+            if _should_early_stop(no_improvement_epochs, patience=early_stopping_patience):
+                LOGGER.info(
+                    "Early stopping at epoch %d after %d epochs without validation improvement. Best epoch: %d.",
+                    epoch + 1,
+                    no_improvement_epochs,
+                    best_epoch,
+                )
+                break
+
+    if best_payload is None:
+        raise RuntimeError("Training completed without producing a best checkpoint.")
+
+    best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
+    test_batches = iter_batches(test_split, batch_size=batch_size, rng=rng)
+    test_metrics_epoch: list[dict[str, float]] = []
+    for batch in test_batches:
+        device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
+        metrics = eval_step(best_params, device_batch)
+        test_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+
+    final_metrics = {
+        "best_val_combined_loss": float(best_val),
+        "test": _mean_metrics(test_metrics_epoch),
+        "num_train_runs": train_split.num_runs,
+        "num_val_runs": val_split.num_runs,
+        "num_test_runs": test_split.num_runs,
+        "parameter_count": int(count_parameters(best_params)),
+    }
+    (checkpoints_root / "history.json").write_text(
+        json.dumps(history, indent=2) + "\n", encoding="utf-8",
+    )
+    (checkpoints_root / "metrics.json").write_text(
+        json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8",
+    )
+    return TrainingArtifacts(
+        checkpoint_path=checkpoints_root / "best.pt",
+        history_path=checkpoints_root / "history.json",
+        metrics_path=checkpoints_root / "metrics.json",
+    )

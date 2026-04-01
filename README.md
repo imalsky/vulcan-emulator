@@ -1,52 +1,54 @@
 # vulcan_emulator_photochem
 
-JAX-first VULCAN emulator pipeline with one shared data workflow and two explicit tasks:
+JAX-first VULCAN emulator pipeline with one shared workflow and a configurable `chemistry_type × model_type` surface.
 
-- `full_vulcan`: trajectory emulation with `dt`, stellar-spectrum conditioning, and a Transformer.
-- `equilibrium_only`: direct equilibrium prediction with an MLP.
+Supported chemistry targets:
+- `fastchem`: FastChem equilibrium chemistry from PT and profile-global `X/H`
+- `vulcan`: final converged VULCAN chemistry from PT, Kzz, gravity, profile-global `X/H`, runtime science knobs, atmosphere-base flags, and stellar spectrum
 
-Both tasks share the same generation, normalization, split, and artifact conventions. The
-active task is selected by `task.kind` in the config.
+Supported model families:
+- `mlp`
+- `transformer`
 
-## Shipped Config
+Shipped example configs:
+- `config/fastchem_mlp_config.json`
+- `config/fastchem_transformer_config.json`
+- `config/vulcan_mlp_config.json`
+- `config/vulcan_transformer_config.json`
 
-- `config/equilibrium_only_config.json`
-
-## CLI
-
-The CLI accepts exactly two parser arguments:
+CLI:
 
 ```bash
-python -m src.utils --config config/equilibrium_only_config.json --stage generation
-python -m src.utils --config config/equilibrium_only_config.json --stage normalization
-python -m src.utils --config config/equilibrium_only_config.json --stage training
+python -m src.utils --config config/fastchem_mlp_config.json --stage generation
+python -m src.utils --config config/fastchem_mlp_config.json --stage normalization
+python -m src.utils --config config/fastchem_mlp_config.json --stage training
 ```
 
-`--stage normalization` performs the full raw-to-processed step: split creation,
-train-only normalization fitting, and processed tensor writing.
+`--stage normalization` performs the full raw-to-processed step: split creation, train-only normalization fitting, and processed tensor writing.
 
-## Layout
+Chemistry contract:
+- generation still samples chemistry in `[M/H]`, `C/O`, and `S/O`
+- preprocessing converts those draws into fixed FastChem/VULCAN element order:
 
-- `assets/`: immutable external inputs such as Roth/PT libraries and stellar spectra templates.
-- `config/`: canonical JSON configs and schema notes.
-- `data/`: generated raw runs, processed tensors, manifests, and derived spectrum libraries.
-- `models/`: checkpoints and exported model bundles.
-- `src/models/`: model architecture, inference, and export logic.
-- `src/training/`: training loops and live transition sampling.
-- `src/data_generation/`: PT/spectrum loading, raw generation, preprocessing, and dataset I/O.
-- `src/utils/`: config validation, CLI, logging, paths, and provenance helpers.
-- `uni_tests/fixtures/`: tiny tracked fixtures used by tests.
+```python
+["He_H", "C_H", "O_H", "N_H", "S_H"]
+```
 
-## Temperature-Profile Handling
+- these are hydrogen-normalized absolute abundances `n_X / n_H`
 
-`temperature_profiles` controls how the pipeline samples TP inputs. For PT-library `.dat`
-files, each `(lon, lat)` column is treated as a valid 1D starting profile. The profile is
-interpolated onto the emulator/VULCAN pressure grid in log-pressure space, and its source
-metadata is preserved through generation artifacts. The analytic branch uses the exposed
-`temperature_profiles.analytic_sampler` Line/Robinson-style PT parameterization rather than
-the older placeholder logistic profile.
+Shipped defaults:
+- the VULCAN example configs use one basic thermochemical `basic_h2` preset
+- photochemistry is off
+- eddy diffusion is on
+- Kzz is depth-constant from `sampling.kzz_cm2_s`
 
-## Asset Policy
-
-Production PT libraries and spectra belong under `assets/` and are intentionally not tracked
-in git. Tests use small synthetic fixtures under `uni_tests/fixtures/`.
+Layout:
+- `assets/`: external PT libraries and stellar spectra
+- `config/`: canonical JSON configs and helper notes
+- `data/`: generated raw runs, processed tensors, manifests, and derived spectrum libraries
+- `models/`: checkpoints and exported bundles
+- `src/models/`: architecture, inference, and export logic
+- `src/training/`: training loops and evaluation utilities
+- `src/data_generation/`: sampling, raw generation, preprocessing, and dataset I/O
+- `src/utils/`: config validation, CLI, logging, paths, and provenance helpers
+- `uni_tests/fixtures/`: tiny tracked fixtures used by tests

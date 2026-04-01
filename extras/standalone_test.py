@@ -20,7 +20,7 @@ What this script shows
 
                       a) jax.grad   — sensitivity of water abundance to T
                       b) jax.jacobian — how every species responds to chemistry globals
-                      c) gradient descent — recover a known in-range C/O target
+                      c) gradient descent — recover a known in-range C/H target
 
 Run from the vulcan-emulator root:
 
@@ -59,14 +59,15 @@ import jax.numpy as jnp
 # functions, which is exactly what makes them compatible with jax.grad /
 # jax.jacobian / jax.jit without any special wrappers.
 from src.models.export_bundle import (
-    _apply_sequence_static_block_jax,   # normalise per-level P, T (and Kzz for transition)
+    _apply_sequence_static_block_jax,   # normalise per-level P and T
     _restore_block_transform_space_jax, # undo z-score but keep log10 space
     apply_mixed_block_jax,              # normalise global scalars (per-feature mixed methods)
     load_exported_model,                # load .npz bundle into ExportedJAXModel
 )
-from src.models.jax_model import apply_equilibrium_mlp  # the FiLM-conditioned MLP
+from src.models.jax_model import apply_mlp  # the FiLM-conditioned MLP
+from src.utils.config import ELEMENT_INPUT_ORDER
 
-_EXPECTED_GLOBAL_ORDER = ["metallicity_log10", "c_to_o", "s_to_o"]
+_EXPECTED_GLOBAL_ORDER = list(ELEMENT_INPUT_ORDER)
 _SOLAR_ELEMENT_ABUNDANCES = {
     "O_H": 5.37e-4,
     "C_H": 2.95e-4,
@@ -79,7 +80,7 @@ _SOLAR_ELEMENT_ABUNDANCES = {
 # Paths — adjust BUNDLE_PATH if your model lives in a different directory.
 # VULCAN_SOURCE_ROOT only matters for the optional FastChem comparison.
 # ---------------------------------------------------------------------------
-BUNDLE_PATH        = _ROOT / "models" / "equilibrium_only_silu" / "best_exported.npz"
+BUNDLE_PATH        = _ROOT / "models" / "fastchem_mlp" / "best_exported.npz"
 VULCAN_SOURCE_ROOT = _ROOT.parent / "VULCAN-master"   # only needed for FastChem
 OUTPUT_DIR         = _ROOT / "extras" / "standalone_plots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -103,13 +104,13 @@ print("=" * 72)
 #                  data contract (species list, feature order), and config.
 #
 # load_exported_model re-assembles these into an ExportedJAXModel dataclass
-# whose .predict_equilibrium_profile() method accepts raw physical inputs.  The training
+# whose .predict_fastchem_profile() method accepts raw physical inputs.  The training
 # codebase is NOT required to load or run this bundle.
 model = load_exported_model(BUNDLE_PATH)
-if not model.is_equilibrium:
+if not model.uses_fastchem:
     raise RuntimeError(
-        "extras/standalone_test.py supports equilibrium export bundles only; "
-        f"got a non-equilibrium bundle at {BUNDLE_PATH}."
+        "extras/standalone_test.py supports FastChem export bundles only; "
+        f"got a non-FastChem bundle at {BUNDLE_PATH}."
     )
 
 # The data contract records the species order and feature metadata that were
@@ -120,8 +121,8 @@ n_species     = len(species)
 global_order  = list(contract["global_static_feature_order"])
 if global_order != _EXPECTED_GLOBAL_ORDER:
     raise RuntimeError(
-        "extras/standalone_test.py requires an exported equilibrium bundle with the "
-        f"current ratio-global contract {_EXPECTED_GLOBAL_ORDER}, "
+        "extras/standalone_test.py requires an exported FastChem bundle with the "
+        f"current `X/H` contract {_EXPECTED_GLOBAL_ORDER}, "
         f"but the selected bundle stores {global_order}. Regenerate the example bundle "
         "from a checkpoint trained with the current pipeline."
     )
@@ -145,28 +146,27 @@ def _globals_vector(
 def _global_label(name: str) -> str:
     """Map exported global feature names to compact plot/table labels."""
     labels = {
-        "metallicity_log10": "[M/H]",
-        "c_to_o": "C/O",
-        "s_to_o": "S/O",
+        "He_H": "He/H",
+        "C_H": "C/H",
+        "O_H": "O/H",
+        "N_H": "N/H",
+        "S_H": "S/H",
     }
     return labels.get(name, name)
 
 
 def _fastchem_element_globals(globals_map: dict[str, float]) -> dict[str, float]:
-    """Convert the ratio-global chemistry contract to explicit FastChem abundances."""
-    oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * (10.0 ** float(globals_map["metallicity_log10"]))
-    return {
-        "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
-        "C_H": float(oxygen_h * float(globals_map["c_to_o"])),
-        "O_H": float(oxygen_h),
-        "N_H": float(_SOLAR_ELEMENT_ABUNDANCES["N_H"] * (10.0 ** float(globals_map["metallicity_log10"]))),
-        "S_H": float(oxygen_h * float(globals_map["s_to_o"])),
-    }
+    """Return explicit FastChem elemental abundances from the exported `X/H` globals."""
+    required = list(ELEMENT_INPUT_ORDER)
+    missing = [name for name in required if name not in globals_map]
+    if missing:
+        raise ValueError(f"global_inputs is missing required elemental abundances: {missing}")
+    return {name: float(globals_map[name]) for name in required}
 
 
 global_labels = [_global_label(name) for name in global_order]
 
-print("  Model type      : equilibrium MLP")
+print(f"  Model type      : FastChem {model.model_type}")
 print(f"  Bundle version  : {model.export_version}")
 print(f"  Output species  : {', '.join(species)}")
 print(f"  Global features : {global_order}")
@@ -182,7 +182,7 @@ print("=" * 72)
 
 # ------- Pressure grid -------------------------------------------------------
 # 50 levels log-spaced from 100 bar (deep photosphere) to 10^-5 bar (top).
-# This standalone script calls ExportedJAXModel.predict_equilibrium_profile
+# This standalone script calls ExportedJAXModel.predict_fastchem_profile
 # directly, so it uses the repository's internal bottom-to-top ordering
 # (high pressure -> low pressure).  The ExoJAX wrapper layer is the separate
 # public top-to-bottom interface.
@@ -210,13 +210,14 @@ print(f"  Pressure grid   : {pressure_bar[-1]:.1e} − {pressure_bar[0]:.1f} bar
 print(f"  Temperature     : {temperature_k[-1]:.0f} K (top layer) − {temperature_k[0]:.0f} K (bottom)")
 
 # ------- Global chemistry parameters ----------------------------------------
-# The learned chemistry inputs are the sampled column-global ratios [M/H],
-# C/O, and S/O. The raw-generation pipeline still converts these to explicit
-# elemental abundances internally for FastChem.
+# The learned chemistry inputs are the profile-global FastChem/VULCAN
+# elemental abundances in hydrogen-normalized `X/H` form.
 global_inputs = {
-    "metallicity_log10": 0.0,
-    "c_to_o": 2.95e-4 / 5.37e-4,
-    "s_to_o": 1.41e-5 / 5.37e-4,
+    "He_H": _SOLAR_ELEMENT_ABUNDANCES["He_H"],
+    "C_H": _SOLAR_ELEMENT_ABUNDANCES["C_H"],
+    "O_H": _SOLAR_ELEMENT_ABUNDANCES["O_H"],
+    "N_H": _SOLAR_ELEMENT_ABUNDANCES["N_H"],
+    "S_H": _SOLAR_ELEMENT_ABUNDANCES["S_H"],
 }
 print(f"  Global inputs   : {global_inputs}")
 
@@ -229,16 +230,16 @@ print("\n" + "=" * 72)
 print("SECTION 3 — Running equilibrium inference (JAX forward pass)")
 print("=" * 72)
 
-# predict_equilibrium_profile bundles the full pipeline in one call:
+# predict_fastchem_profile bundles the full pipeline in one call:
 #   1. Normalise pressure (log-standard: log10 then z-score)
 #   2. Normalise temperature (standard: z-score only)
 #   3. Normalise global scalars (mixed per-feature methods)
-#   4. Run apply_equilibrium_mlp  → normalised log10 mixing ratios
+#   4. Run apply_mlp              → normalised log10 mixing ratios
 #   5. Inverse-normalise          → physical mixing ratios (or log10 if asked)
 #
 # return_log10=True keeps predictions in log10 space, which avoids underflow
 # for trace-abundance species and is more convenient for plotting.
-mixing_ratios_log10 = model.predict_equilibrium_profile(
+mixing_ratios_log10 = model.predict_fastchem_profile(
     pressure_bar=pressure_bar,
     temperature_k=temperature_k,
     global_inputs=global_inputs,
@@ -272,9 +273,8 @@ print("=" * 72)
 # emulator was trained to reproduce.
 #
 # The FastChem setup below mirrors what VULCAN does internally.  The compare
-# helper expects explicit FastChem-native elemental abundances, so this script
-# converts the ratio-global contract back to He/H, C/H, O/H, N/H, and S/H
-# locally for the optional reference-solver call.
+# helper expects explicit FastChem-native elemental abundances, and the
+# exported equilibrium contract already supplies exactly those `X/H` values.
 #
 # This section is entirely optional — the script continues gracefully if the
 # VULCAN-master source tree is absent or FastChem fails to run.
@@ -341,7 +341,7 @@ print("=" * 72)
 # Build a *pure JAX forward function* that accepts JAX arrays and returns
 # JAX arrays.  This is what jax.grad / jax.jacobian need.
 #
-# We replicate the four normalisation steps that predict_equilibrium_profile
+# We replicate the four normalisation steps that predict_fastchem_profile
 # does internally, but expressed as function arguments so that JAX can trace
 # gradients through all of them.
 #
@@ -378,14 +378,14 @@ def _forward_log10(
 
     # ---- Step 2: normalise global scalars ----------------------------------
     # apply_mixed_block_jax applies the stored per-feature normalisation
-    # methods for the exported ratio-global chemistry features.
+    # methods for the exported elemental-abundance features.
     globals_norm = apply_mixed_block_jax(globals_vec[None, :], _norm["global_static"])  # (1, n_global)
 
     # ---- Step 3: run the FiLM-conditioned MLP ------------------------------
-    # apply_equilibrium_mlp is a pure JAX function.  It returns predictions in
+    # apply_mlp is a pure JAX function.  It returns predictions in
     # the model's *normalised* output space (z-scored log10 mixing ratios).
     # All parameters (_params) are constants w.r.t. differentiation here.
-    pred_norm, _ = apply_equilibrium_mlp(_params, sequence, globals_norm, _dims)
+    pred_norm, _ = apply_mlp(_params, sequence, globals_norm, _dims)
     pred_norm = pred_norm[0]   # remove batch dim → (nz, n_species)
 
     # ---- Step 4: undo z-score, stay in log10 space -------------------------
@@ -465,43 +465,45 @@ for name in ["H2", "H2O", "CO", "CO2", "CH4", "NH3", "H2S", "SO2", "S2"]:
         print(f"    {name:>6}{row}")
 
 
-# ---- Demo 5c: gradient descent — recover a known in-range C/O target -------
-print("\n  Demo 5c — Gradient descent: recover a known C/O from its H2O target")
+# ---- Demo 5c: gradient descent — recover a known in-range C/H target -------
+print("\n  Demo 5c — Gradient descent: recover a known C/H from its H2O target")
 print("  ─" * 35)
 print("  (This is a toy in-range inversion demo solved with backprop.)")
 
-# We derive a target column-averaged log10(H2O) from a known in-range C/O value,
-# then start from a different in-range C/O and use gradient descent to recover
+# We derive a target column-averaged log10(H2O) from a known in-range C/H value,
+# then start from a different in-range C/H and use gradient descent to recover
 # the target.  This keeps the demo inside the bundle's training support.
 #
-# Physical intuition: at fixed metallicity, higher C/O tends to tie up more oxygen in
-# CO rather than H2O.  If we want more H2O, the optimizer should move C/O down.
+# Physical intuition: at fixed O/H, higher C/H tends to tie up more oxygen in
+# CO rather than H2O.  If we want more H2O, the optimizer should move C/H down.
 #
 # We project every update back into the configured training range so the toy
 # retrieval stays in-distribution for the exported bundle.
-c_to_o_min, c_to_o_max = [float(x) for x in model.config["sampling"]["c_to_o_range"]]
-if c_to_o_min >= c_to_o_max:
+C_TO_O_MIN, C_TO_O_MAX = [float(x) for x in model.config["sampling"]["c_to_o_range"]]
+if C_TO_O_MIN >= C_TO_O_MAX:
     raise RuntimeError(
         "Expected the C/O support implied by sampling.c_to_o_range "
-        f"to have distinct increasing bounds, got [{c_to_o_min}, {c_to_o_max}]."
+        f"to have distinct increasing bounds, got [{C_TO_O_MIN}, {C_TO_O_MAX}]."
     )
 
-co_span = c_to_o_max - c_to_o_min
-c_to_o_start = c_to_o_min + 0.75 * co_span
-target_c_to_o = c_to_o_min + 0.375 * co_span
+C_H_MIN = float(global_inputs["O_H"] * C_TO_O_MIN)
+C_H_MAX = float(global_inputs["O_H"] * C_TO_O_MAX)
+c_h_span = C_H_MAX - C_H_MIN
+c_h_start = C_H_MIN + 0.75 * c_h_span
+target_c_h = C_H_MIN + 0.375 * c_h_span
 TARGET_H2O_LOG10 = float(
     _column_mean_log10(
-        _globals_vector(global_inputs, {"c_to_o": target_c_to_o})
+        _globals_vector(global_inputs, {"C_H": target_c_h})
     )[h2o_idx]
 )
-LR            = 0.1     # gradient-descent learning rate in C/O space
+LR            = 1.0e2   # gradient-descent learning rate in C/H space
 N_STEPS       = 60      # number of update steps
-MAX_GRAD      = 5.0     # gradient clip threshold in the scalar optimization space
+MAX_GRAD      = 1.0e-3  # gradient clip threshold in the scalar optimization space
 H2O_TOL_DEX   = 0.01    # report convergence only within this residual tolerance
 
-def _h2o_loss(c_to_o_scalar: jax.Array) -> jax.Array:
-    """Scalar MSE loss: recover the target H2O abundance by varying C/O only."""
-    globals_vec = _globals_vector(global_inputs, {"c_to_o": c_to_o_scalar})
+def _h2o_loss(c_h_scalar: jax.Array) -> jax.Array:
+    """Scalar MSE loss: recover the target H2O abundance by varying C/H only."""
+    globals_vec = _globals_vector(global_inputs, {"C_H": c_h_scalar})
     log10_ratios = _forward_log10(pressure_jax, temperature_jax, globals_vec)
     predicted    = jnp.mean(log10_ratios[:, h2o_idx])     # scalar
     return (predicted - TARGET_H2O_LOG10) ** 2
@@ -510,12 +512,12 @@ def _h2o_loss(c_to_o_scalar: jax.Array) -> jax.Array:
 # pass — more efficient than calling them separately.
 loss_and_grad = jax.jit(jax.value_and_grad(_h2o_loss))
 
-co_opt = jnp.asarray(c_to_o_start, dtype=jnp.float32)
+co_opt = jnp.asarray(c_h_start, dtype=jnp.float32)
 
-print(f"    C/O training slice: [{c_to_o_min:.3f}, {c_to_o_max:.3f}]")
-print(f"    Target C/O        : {target_c_to_o:.3f}  (used to define the target H2O abundance)")
+print(f"    C/H training slice: [{C_H_MIN:.3e}, {C_H_MAX:.3e}]")
+print(f"    Target C/H        : {target_c_h:.3e}  (used to define the target H2O abundance)")
 print(f"    Target log10(H2O) : {TARGET_H2O_LOG10:.3f} dex")
-print(f"    Starting C/O      : {c_to_o_start:.3f}")
+print(f"    Starting C/H      : {c_h_start:.3e}")
 print()
 
 for step in range(N_STEPS):
@@ -527,24 +529,24 @@ for step in range(N_STEPS):
     grad_clipped = jnp.clip(grad, -MAX_GRAD, MAX_GRAD)
 
     # Plain gradient descent with projection back into the training support.
-    co_opt = jnp.clip(co_opt - LR * grad_clipped, c_to_o_min, c_to_o_max)
+    co_opt = jnp.clip(co_opt - LR * grad_clipped, C_H_MIN, C_H_MAX)
 
     if step % 10 == 0 or step == N_STEPS - 1:
-        current_c_to_o = float(co_opt)
+        current_c_h = float(co_opt)
         cur_h2o = float(
-            _column_mean_log10(_globals_vector(global_inputs, {"c_to_o": current_c_to_o}))[h2o_idx]
+            _column_mean_log10(_globals_vector(global_inputs, {"C_H": current_c_h}))[h2o_idx]
         )
         print(f"    step {step:3d}: loss = {float(loss_val):.2e}  "
-              f"C/O = {current_c_to_o:.4f}  "
+              f"C/H = {current_c_h:.3e}  "
               f"H2O = {cur_h2o:.4f} dex")
 
-final_c_to_o = float(co_opt)
+final_c_h = float(co_opt)
 final_h2o = float(
-    _column_mean_log10(_globals_vector(global_inputs, {"c_to_o": final_c_to_o}))[h2o_idx]
+    _column_mean_log10(_globals_vector(global_inputs, {"C_H": final_c_h}))[h2o_idx]
 )
 final_residual = final_h2o - TARGET_H2O_LOG10
 
-print(f"\n    Final C/O        : {final_c_to_o:.4f}  (target {target_c_to_o:.4f})")
+print(f"\n    Final C/H        : {final_c_h:.3e}  (target {target_c_h:.3e})")
 print(f"    Final log10(H2O) : {final_h2o:.4f} dex")
 print(f"    Final residual   : {final_residual:+.4f} dex")
 if abs(final_residual) <= H2O_TOL_DEX:
@@ -638,9 +640,9 @@ try:
 
     fig.suptitle(
         rf"Hot-Jupiter equilibrium chemistry  "
-        rf"([M/H]={global_inputs['metallicity_log10']:.2f},  "
-        rf"C/O={global_inputs['c_to_o']:.2f},  "
-        rf"S/O={global_inputs['s_to_o']:.3f})",
+        rf"(He/H={global_inputs['He_H']:.3e},  "
+        rf"C/H={global_inputs['C_H']:.3e},  "
+        rf"O/H={global_inputs['O_H']:.3e})",
         fontsize=11,
     )
     fig.tight_layout()

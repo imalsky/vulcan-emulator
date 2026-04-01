@@ -12,6 +12,7 @@ from src.data_generation.sampling import (
     _sample_temperature_profile_record,
     sample_kzz_profile,
     sample_pressure_grid,
+    sample_run_specifications,
     sample_temperature_profile,
 )
 
@@ -85,9 +86,31 @@ def test_kzz_sampling_is_constant_with_depth(tiny_config):
     np.testing.assert_allclose(kzz[0], float(tiny_config["sampling"]["kzz_cm2_s"]))
 
 
+def test_full_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config):
+    specs = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=16,
+        seed=3,
+    )
+
+    preset_names = {spec.metadata["science_preset_name"] for spec in specs}
+    assert preset_names == {preset["name"] for preset in tiny_config["science_presets"]}
+    assert len({spec.metadata["spectrum_name"] for spec in specs}) >= 2
+    for spec in specs:
+        assert spec.elemental_abundances_x_h.shape[-1] == len(tiny_config["data_spec"]["element_input_order"])
+        for name in ("He_H", "C_H", "O_H", "N_H", "S_H"):
+            assert name in spec.globals
+        assert "gravity_cm_s2" in spec.globals
+        assert sum(
+            int(float(spec.globals[f"atm_base_{name}"]) > 0.5)
+            for name in ("H2", "N2", "O2", "CO2", "H2O")
+        ) == 1
+
+
 def test_shipped_equilibrium_config_uses_fixture_temperature_profiles():
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "equilibrium_only_config.json")
+    config = load_and_validate_config(root / "config" / "fastchem_mlp_config.json")
     config["_project_root"] = root
     config["temperature_profiles"]["data_glob"] = str(FIXTURE_PT_PATH)
     config["temperature_profiles"]["filters"] = {"Teq": (1200.0, 1200.0), "LogMet": 0.0, "TiOVO": False}
