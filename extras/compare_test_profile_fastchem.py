@@ -23,7 +23,7 @@ import h5py  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
-from src.data_generation.generation import _copy_fastchem_runtime  # noqa: E402
+from src.data_generation.generation import _copy_fastchem_runtime, list_run_ids_from_consolidated  # noqa: E402
 from src.utils.config import dataset_run_root, load_and_validate_config  # noqa: E402
 from src.utils.helpers import resolve_path, resolve_project_root  # noqa: E402
 
@@ -95,12 +95,32 @@ def _decode_labels(values: np.ndarray) -> list[str]:
     return [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in values]
 
 
-def _load_test_run_ids(run_root: Path) -> list[str]:
-    """Load processed test-split run IDs from the canonical dataset layout."""
-    run_ids_path = run_root / "test" / "run_ids.json"
-    if not run_ids_path.exists():
-        raise FileNotFoundError(f"Processed test run IDs not found: {run_ids_path}")
-    return list(json.loads(run_ids_path.read_text(encoding="utf-8")))
+def _load_test_run_ids(run_root: Path, raw_root: Path) -> list[str]:
+    """Load comparison candidate run IDs from processed or raw dataset layouts."""
+    candidate_paths = (
+        run_root / "processed" / "test" / "run_ids.json",
+        run_root / "test" / "run_ids.json",
+    )
+    for run_ids_path in candidate_paths:
+        if run_ids_path.exists():
+            return list(json.loads(run_ids_path.read_text(encoding="utf-8")))
+
+    consolidated_path = raw_root / "runs.h5"
+    if consolidated_path.exists():
+        run_ids = list_run_ids_from_consolidated(consolidated_path)
+        if run_ids:
+            return run_ids
+
+    legacy_runs_dir = raw_root / "runs"
+    if legacy_runs_dir.exists():
+        run_ids = sorted(path.stem for path in legacy_runs_dir.glob("run_*.h5"))
+        if run_ids:
+            return run_ids
+
+    raise FileNotFoundError(
+        "No candidate run IDs found in processed or raw dataset locations: "
+        + ", ".join(str(path) for path in (*candidate_paths, consolidated_path, legacy_runs_dir))
+    )
 
 
 def _extract_raw_profile(handle: h5py.Group, run_id: str) -> RawEquilibriumProfile:
@@ -131,21 +151,29 @@ def _extract_raw_profile(handle: h5py.Group, run_id: str) -> RawEquilibriumProfi
 
 
 def _load_raw_equilibrium_profile(raw_root: Path, run_id: str) -> RawEquilibriumProfile:
-    """Load one raw equilibrium profile from the consolidated ``runs.h5`` file."""
+    """Load one raw equilibrium profile from consolidated or per-file raw layout."""
     consolidated_path = raw_root / "runs.h5"
-    if not consolidated_path.exists():
-        raise FileNotFoundError(f"Consolidated raw runs file not found: {consolidated_path}")
-    with h5py.File(consolidated_path, "r") as handle:
-        if run_id not in handle:
-            raise KeyError(f"Run ID {run_id!r} not found in {consolidated_path}")
-        return _extract_raw_profile(handle[run_id], run_id)
+    if consolidated_path.exists():
+        with h5py.File(consolidated_path, "r") as handle:
+            if run_id not in handle:
+                raise KeyError(f"Run ID {run_id!r} not found in {consolidated_path}")
+            return _extract_raw_profile(handle[run_id], run_id)
+
+    legacy_path = raw_root / "runs" / f"{run_id}.h5"
+    if legacy_path.exists():
+        with h5py.File(legacy_path, "r") as handle:
+            return _extract_raw_profile(handle, run_id)
+
+    raise FileNotFoundError(
+        f"Raw profile {run_id!r} not found in either {consolidated_path} or {legacy_path}"
+    )
 
 
 def _select_run_id(run_ids: list[str], *, run_id: str | None) -> str:
-    """Select an explicit or random run ID from the processed test split."""
+    """Select an explicit or random run ID from the available candidate set."""
     if run_id is not None:
         if run_id not in run_ids:
-            raise KeyError(f"Requested run ID {run_id!r} is not present in the processed test split.")
+            raise KeyError(f"Requested run ID {run_id!r} is not present in the available run set.")
         return run_id
     rng = np.random.default_rng()
     return str(run_ids[int(rng.integers(0, len(run_ids)))])
@@ -365,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
     raw_root = run_root / "raw"
     source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
 
-    test_run_ids = _load_test_run_ids(run_root)
+    test_run_ids = _load_test_run_ids(run_root, raw_root)
     selected_run_id = _select_run_id(test_run_ids, run_id=args.run_id)
     profile = _load_raw_equilibrium_profile(raw_root, selected_run_id)
     fastchem_ymix = _run_fastchem_online(
