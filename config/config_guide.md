@@ -16,7 +16,7 @@ The four supported combinations are:
 - `vulcan + transformer`
 
 Shipped example configs:
-- `config/eq.json` (fastchem + mlp, ready to run)
+- `config/fastchem_mlp_config.json`
 - `config/fastchem_transformer_config.json`
 - `config/vulcan_mlp_config.json`
 - `config/vulcan_transformer_config.json`
@@ -24,9 +24,9 @@ Shipped example configs:
 CLI:
 
 ```bash
-python -m src.utils --config config/eq.json --stage generation
-python -m src.utils --config config/eq.json --stage normalization
-python -m src.utils --config config/eq.json --stage training
+python -m src.utils --config config/fastchem_mlp_config.json --stage generation
+python -m src.utils --config config/fastchem_mlp_config.json --stage normalization
+python -m src.utils --config config/fastchem_mlp_config.json --stage training
 ```
 
 ---
@@ -66,10 +66,11 @@ Removed and rejected legacy keys: `task.kind`, `equilibrium_only`, `full_vulcan`
 ### VULCAN (full kinetic)
 
 - Sequence inputs: `[pressure_bar, temperature_k, kzz_cm2_s]` (nz, 3)
-- Global inputs: `[gravity_cm_s2, planet_radius_cm, He_H, C_H, O_H, N_H, S_H]` + 10 physics toggles + 5 atm_base one-hots (22 total)
-- Spectrum inputs: stellar flux resampled to `num_bins` wavelength bins
+- Global inputs: `[gravity_cm_s2, planet_radius_cm, He_H, C_H, O_H, N_H, S_H, r_star_rsun, semi_major_axis_au, zenith_angle_deg, diurnal_factor]` + 10 physics toggles + 5 atm_base one-hots (26 total)
+- Spectrum inputs: padded native-grid `(wavelengths, fluxes, mask)` tokens up to `max_tokens`
 - Target: converged VULCAN `final_state/ymix_output`
 - Raw VULCAN HDF5 stores the layerwise gravity profile under `inputs/gravity_cm_s2`, but the learned contract uses scalar surface gravity and scalar planet radius from `globals/*`
+- The stellar spectrum carries stellar-type / SED information; sampled irradiation geometry is learned through the four global inputs above
 
 The fixed elemental order is internal and not configurable:
 
@@ -103,16 +104,18 @@ Output:    Linear(d_hidden -> target_dim)
 
 ### Transformer
 
-Pre-norm FiLM-conditioned Transformer with post-FiLM stabilization.
+Pre-norm FiLM-conditioned Transformer with dual spectrum pathways:
+mean-pooled FiLM conditioning plus per-block cross-attention to the
+Perceiver latent tokens.
 
 ```
 Input: Linear(sequence_dim -> d_model) + sinusoidal positional encoding
 
 Per block:
   a. Pre-norm (ln1) -> multi-head self-attention -> dropout -> residual add
-  b. FiLM: x = x * (1 + gamma) + beta
-  c. Post-FiLM norm (ln_film) -> re-stabilize residual stream
-  d. Pre-norm (ln2) -> FFN (up-project, activation, dropout, down-project) -> residual add
+  b. Pre-norm (ln_cross) -> cross-attention(Q=sequence, KV=spectrum_latent_tokens) -> dropout -> residual add   [VULCAN only]
+  c. FiLM: x = x * (1 + gamma) + beta
+  d. Pre-norm (ln_ffn) -> FFN (up-project, activation, dropout, down-project) -> residual add
 
 Output head: LayerNorm -> activation -> bottleneck -> dropout -> Linear(-> target_dim)
 ```
@@ -125,21 +128,19 @@ Output head: LayerNorm -> activation -> bottleneck -> dropout -> Linear(-> targe
 
 | Key | Description |
 |-----|-------------|
-| `raw_root` | Raw dataset directory. Use `data/<run_name>/raw` |
-| `processed_root` | Processed dataset directory. Use the sibling path `data/<run_name>/processed`, containing `train/`, `val/`, `test/`, and shared metadata in `info/` |
+| `run_root` | Dataset run directory. Use `data/<run_name>` |
 | `checkpoints_root` | Directory for model checkpoints |
 | `vulcan_source_root` | Path to VULCAN-master (needed for generation) |
 
-`paths.raw_root` and `paths.processed_root` are validated as sibling directories under one run root. The canonical layout is:
+`paths.run_root` is the only supported dataset path key. The dataset layout is:
 
 ```text
 data/<run_name>/
   raw/
-  processed/
-    info/
-    train/
-    val/
-    test/
+  info/
+  train/
+  val/
+  test/
 ```
 
 ### `data_spec`
@@ -162,6 +163,10 @@ data/<run_name>/
 | `s_to_o_range` | both | [min, max] S/O ratio |
 | `gravity_range_cm_s2` | vulcan only | [min, max] surface gravity (cm/s^2) |
 | `planet_radius_range_cm` | vulcan only | [min, max] planet radius (cm) |
+| `stellar_radius_range_rsun` | vulcan only | [min, max] stellar radius (solar radii); equal endpoints keep it fixed |
+| `semi_major_axis_range_au` | vulcan only | [min, max] orbital separation (AU); equal endpoints keep it fixed |
+| `zenith_angle_range_deg` | vulcan only | [min, max] stellar zenith angle in degrees; equal endpoints keep it fixed |
+| `diurnal_factor_range` | vulcan only | [min, max] diurnal averaging factor; equal endpoints keep it fixed |
 | `kzz_cm2_s` | vulcan only | Constant eddy diffusion coefficient |
 
 ### `temperature_profiles`
@@ -202,8 +207,7 @@ gravity or planet radius.
 | `target_method` | Normalization method for targets (`"log-standard"`) |
 | `sequence_methods` | Per-feature methods: `pressure_bar`, `temperature_k`, optionally `kzz_cm2_s` |
 | `global_methods` | Per-feature methods for all global inputs |
-| `spectrum_floor` | Floor for spectrum normalization (vulcan only) |
-| `spectrum_method` | Spectrum normalization method (vulcan only) |
+| `spectrum_floor` | Positive floor used by on-the-fly spectrum log-flux normalization (vulcan only) |
 
 Normalization methods:
 - `"standard"`: z-score `(x - mean) / std`
@@ -232,9 +236,6 @@ Normalization methods:
 |-----|-------------|-------------|
 | `lambda_z` | both | Weight on MSE in normalized space (primary signal) |
 | `lambda_phys` | both | Weight on MSE in log10 physical space |
-| `lambda_spectrum` | vulcan only | Weight on spectrum autoencoder reconstruction loss |
-
-`lambda_spectrum` is invalid for `fastchem`.
 
 ### `model` (MLP)
 
@@ -304,18 +305,38 @@ Optional list of per-run science variations. Each preset supports:
 
 | Key | Description |
 |-----|-------------|
-| `enabled` | Compatibility flag (VULCAN always uses spectrum path) |
+| `enabled` | Boolean gate for stellar-spectrum conditioning in VULCAN configs |
 | `template_name` | Name of default stellar spectrum |
 | `template_file` | Path to default spectrum .dat file |
 | `library_glob` | Optional glob for spectrum library |
-| `num_bins` | Number of wavelength bins for resampling |
+| `max_tokens` | Maximum number of packed spectrum tokens |
 | `latent_dim` | Spectrum encoder latent dimension |
 | `hidden_dim` | Spectrum encoder hidden width |
-| `encoder_mode` | `"autoencoder"`, `"linear"`, or `"none"` |
+| `num_latents` | Number of learned Perceiver latent queries |
+| `num_layers` | Number of latent self-attention blocks |
+| `num_heads` | Number of spectrum-attention heads |
+| `fourier_features` | Number of log-wavelength Fourier feature pairs |
+| `encoder_mode` | `"perceiver"` |
 | `wavelength_min_nm` | Minimum wavelength (nm) |
 | `wavelength_max_nm` | Maximum wavelength (nm) |
-| `teff_k` | Stellar effective temperature (K) |
-| `radius_rsun` | Stellar radius (solar radii) |
-| `semi_major_axis_au` | Orbital semi-major axis (AU) |
-| `diurnal_factor` | Diurnal averaging factor |
-| `zenith_angle_deg` | Zenith angle (degrees) |
+| `teff_k` | Optional provenance/template-generation metadata only |
+| `radius_rsun` | Optional legacy fixed stellar radius; backfilled to `sampling.stellar_radius_range_rsun = [x, x]` |
+| `semi_major_axis_au` | Optional legacy fixed orbital distance; backfilled to `sampling.semi_major_axis_range_au = [x, x]` |
+| `diurnal_factor` | Optional legacy fixed diurnal factor; backfilled to `sampling.diurnal_factor_range = [x, x]` |
+| `zenith_angle_deg` | Optional legacy fixed zenith angle; backfilled to `sampling.zenith_angle_range_deg = [x, x]` |
+
+The spectrum pipeline preserves native wavelength grids through raw generation
+and preprocessing. At training time, each spectrum is sanitized, clipped to the
+configured wavelength interval, optionally compressed with flux-conserving
+log-space bins when it exceeds `max_tokens`, and stored as padded wavelength,
+flux, and mask arrays. The model normalizes spectra on-the-fly in log-flux
+space and keeps absolute-scale summary scalars in the encoder head.
+
+For variable-star training, the spectrum library is selected through
+`library_glob` and the per-run irradiation geometry is sampled from the
+`sampling.*range*` controls. Recommended `normalization.global_methods` for
+those learned geometry inputs are:
+- `r_star_rsun`: `log-standard`
+- `semi_major_axis_au`: `log-standard`
+- `zenith_angle_deg`: `standard`
+- `diurnal_factor`: `standard`

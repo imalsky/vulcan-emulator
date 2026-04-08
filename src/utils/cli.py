@@ -1,7 +1,7 @@
-"""CLI entry point dispatching the three pipeline stages.
+"""CLI entry point dispatching the emulator stages.
 
 Invoked via ``python -m src.utils --config <path> --stage <stage>``.
-The three stages form a sequential pipeline:
+The CLI exposes four sequential pipeline stages:
 
 1. **generation** — sample atmospheric parameters and produce raw
    HDF5 runs (calls ``generation.generate_raw_dataset``).
@@ -10,6 +10,8 @@ The three stages form a sequential pipeline:
    (calls ``preprocess.preprocess_raw_dataset``).
 3. **training** — train the JAX model on the processed data
    (calls ``trainer.train_model``).
+4. **export** — convert the best checkpoint to a portable NPZ bundle
+   (calls ``export_bundle.export_checkpoint_to_npz``).
 
 Each stage prints a JSON summary of produced artefacts to stdout.
 """
@@ -21,12 +23,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..data_generation.generation import generate_raw_dataset
+from ..data_generation.preprocess import preprocess_raw_dataset
+from ..models.export_bundle import export_checkpoint_to_npz
+from ..training.trainer import train_model
 from .config import load_and_validate_config
 from .helpers import get_logger, resolve_project_root
-from ..data_generation.migrate import migrate_from_config
-from ..data_generation.preprocess import preprocess_raw_dataset
-from ..data_generation.generation import generate_raw_dataset
-from ..training.trainer import train_model
 
 LOGGER = get_logger(__name__)
 
@@ -79,14 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=("generation", "normalization", "training", "migrate"),
+        choices=("generation", "normalization", "training", "export"),
         help="Pipeline stage to execute.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=False,
-        help="For migrate: report what would happen without making changes.",
     )
 
     args = parser.parse_args(argv)
@@ -97,12 +93,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.stage == "generation":
         artifact = generate_raw_dataset(config, project_root=project_root)
-        LOGGER.info("Generation complete: %d runs", len(artifact.run_files))
+        LOGGER.info("Generation complete: %d runs", len(artifact.run_ids))
         print(
             json.dumps(
                 {
-                    "raw_root": str(artifact.raw_root),
-                    "num_runs": len(artifact.run_files),
+                    "run_root": str(artifact.run_root),
+                    "num_runs": len(artifact.run_ids),
                     "manifest_path": str(artifact.manifest_path) if artifact.manifest_path is not None else None,
                     "coverage_path": str(artifact.coverage_path) if artifact.coverage_path is not None else None,
                 },
@@ -131,14 +127,17 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         return 0
-    if args.stage == "migrate":
-        result = migrate_from_config(config, project_root=project_root, dry_run=args.dry_run)
-        if result is not None:
-            LOGGER.info("Migration complete: %s", result)
-            print(json.dumps({"consolidated_path": str(result)}, indent=2), flush=True)
-        else:
-            LOGGER.info("Nothing to migrate.")
-            print(json.dumps({"consolidated_path": None}, indent=2), flush=True)
+    if args.stage == "export":
+        checkpoints_root = Path(config["paths"]["checkpoints_root"])
+        if not checkpoints_root.is_absolute():
+            checkpoints_root = project_root / checkpoints_root
+        best_checkpoint = checkpoints_root / "best.pt"
+        if not best_checkpoint.exists():
+            LOGGER.error("No best checkpoint found at %s", best_checkpoint)
+            return 1
+        bundle_path = export_checkpoint_to_npz(best_checkpoint)
+        LOGGER.info("Export complete: %s", bundle_path)
+        print(json.dumps({"bundle_path": str(bundle_path)}, indent=2), flush=True)
         return 0
     raise ValueError(f"Unhandled stage: {args.stage}")
 

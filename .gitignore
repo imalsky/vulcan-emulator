@@ -45,10 +45,7 @@ assets/**
 
 # Vulcan-emulator generated artifacts (data, models, logs)
 data/*
-data/raw/
-data/processed/
 data/**/raw/
-data/**/processed/
 data/**/dataset_manifest.json
 data/**/splits.json
 /models/
@@ -73,3 +70,5 @@ logs/
 
 # Generated plot outputs
 plots/
+extras/plots/
+extras/standalone_plots/

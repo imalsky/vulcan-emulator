@@ -13,10 +13,10 @@ validation combined loss). Learning-rate scheduling keeps linear warmup for
 all runs, defaults to reduce-on-plateau after warmup, and retains the
 pre-existing cosine-annealing path when explicitly requested in the config.
 
-The combined loss is ``lambda_z * MSE_norm + lambda_phys * MSE_log10
-[+ lambda_spectrum * spectrum_recon_MSE]``.  The normalized-space MSE is the
-primary gradient signal; the log10-space MSE is a physical-scale diagnostic
-that improves low-abundance species accuracy.
+The combined loss is ``lambda_z * MSE_norm + lambda_phys * MSE_log10``. The
+normalized-space MSE is the primary gradient signal; the log10-space MSE is a
+physical-scale auxiliary term that keeps the optimization focused on mixing
+ratio accuracy without adding any spectrum-reconstruction objective.
 """
 
 from __future__ import annotations
@@ -497,7 +497,7 @@ def make_transformer_train_eval_functions(
             AdamW optimizer state.
         batch : dict[str, jax.Array]
             Normalized batch containing ``sequence``, ``global_inputs``,
-            ``target``, and optional ``spectrum_inputs``.
+            ``target``, plus optional ``spectrum_wavelengths_nm``, ``spectrum_fluxes_erg_cm2_s_nm``, and ``spectrum_mask``.
         learning_rate : jax.Array
             Scalar learning rate for this step.
         dropout_key : jax.Array
@@ -527,7 +527,9 @@ def make_transformer_train_eval_functions(
                 model_params,
                 batch["sequence"],
                 batch["global_inputs"],
-                batch.get("spectrum_inputs"),
+                batch.get("spectrum_wavelengths_nm"),
+                batch.get("spectrum_fluxes_erg_cm2_s_nm"),
+                batch.get("spectrum_mask"),
                 dims,
                 dropout_key=dropout_key,
                 training=True,
@@ -538,23 +540,14 @@ def make_transformer_train_eval_functions(
             pred_log10 = pred * target_std + target_mean
             target_log10 = batch["target"] * target_std + target_mean
             mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
-            # Spectrum autoencoder reconstruction loss (zero if encoder is not autoencoder).
-            spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            reconstruction = aux["spectrum_reconstruction"]
-            spectrum_inputs = batch.get("spectrum_inputs")
-            if reconstruction is not None and spectrum_inputs is not None:
-                spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
-            # Weighted combination of the three loss components.
             total = (
                 float(loss_cfg["lambda_z"]) * mse_norm
                 + float(loss_cfg["lambda_phys"]) * mse_log10
-                + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
             )
             metrics = {
                 "combined_loss": total,
                 "mse_norm": mse_norm,
                 "mse_log10": mse_log10,
-                "spectrum_recon_mse": spectrum_loss,
             }
             return total, metrics
 
@@ -589,28 +582,23 @@ def make_transformer_train_eval_functions(
             params,
             batch["sequence"],
             batch["global_inputs"],
-            batch.get("spectrum_inputs"),
+            batch.get("spectrum_wavelengths_nm"),
+            batch.get("spectrum_fluxes_erg_cm2_s_nm"),
+            batch.get("spectrum_mask"),
             dims,
         )
         mse_norm = jnp.mean((pred - batch["target"]) ** 2)
         pred_log10 = pred * target_std + target_mean
         target_log10 = batch["target"] * target_std + target_mean
         mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
-        spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
-        reconstruction = aux["spectrum_reconstruction"]
-        spectrum_inputs = batch.get("spectrum_inputs")
-        if reconstruction is not None and spectrum_inputs is not None:
-            spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
         total = (
             float(loss_cfg["lambda_z"]) * mse_norm
             + float(loss_cfg["lambda_phys"]) * mse_log10
-            + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
         )
         return {
             "combined_loss": total,
             "mse_norm": mse_norm,
             "mse_log10": mse_log10,
-            "spectrum_recon_mse": spectrum_loss,
         }
 
     return train_step, eval_step
@@ -635,7 +623,6 @@ def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
             "combined_loss": float("nan"),
             "mse_norm": float("nan"),
             "mse_log10": float("nan"),
-            "spectrum_recon_mse": float("nan"),
         }
     keys = metrics[0].keys()
     return {
@@ -929,7 +916,7 @@ def make_mlp_train_eval_functions(
             AdamW optimizer state.
         batch : dict[str, jax.Array]
             Normalized batch containing ``sequence``, ``global_inputs``,
-            ``target``, and optional ``spectrum_inputs``.
+            ``target``, plus optional ``spectrum_wavelengths_nm``, ``spectrum_fluxes_erg_cm2_s_nm``, and ``spectrum_mask``.
         learning_rate : jax.Array
             Scalar learning rate for this step.
         dropout_key : jax.Array
@@ -960,7 +947,9 @@ def make_mlp_train_eval_functions(
                 batch["sequence"],
                 batch["global_inputs"],
                 dims,
-                batch.get("spectrum_inputs"),
+                batch.get("spectrum_wavelengths_nm"),
+                batch.get("spectrum_fluxes_erg_cm2_s_nm"),
+                batch.get("spectrum_mask"),
                 dropout_key=dropout_key,
                 training=True,
             )
@@ -968,21 +957,14 @@ def make_mlp_train_eval_functions(
             pred_log10 = pred * target_std + target_mean
             target_log10 = batch["target"] * target_std + target_mean
             mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
-            spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            reconstruction = aux["spectrum_reconstruction"]
-            spectrum_inputs = batch.get("spectrum_inputs")
-            if reconstruction is not None and spectrum_inputs is not None:
-                spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
             total = (
                 float(loss_cfg["lambda_z"]) * mse_norm
                 + float(loss_cfg["lambda_phys"]) * mse_log10
-                + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
             )
             metrics = {
                 "combined_loss": total,
                 "mse_norm": mse_norm,
                 "mse_log10": mse_log10,
-                "spectrum_recon_mse": spectrum_loss,
             }
             return total, metrics
 
@@ -1015,27 +997,22 @@ def make_mlp_train_eval_functions(
             batch["sequence"],
             batch["global_inputs"],
             dims,
-            batch.get("spectrum_inputs"),
+            batch.get("spectrum_wavelengths_nm"),
+            batch.get("spectrum_fluxes_erg_cm2_s_nm"),
+            batch.get("spectrum_mask"),
         )
         mse_norm = jnp.mean((pred - batch["target"]) ** 2)
         pred_log10 = pred * target_std + target_mean
         target_log10 = batch["target"] * target_std + target_mean
         mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
-        spectrum_loss = jnp.asarray(0.0, dtype=jnp.float32)
-        reconstruction = aux["spectrum_reconstruction"]
-        spectrum_inputs = batch.get("spectrum_inputs")
-        if reconstruction is not None and spectrum_inputs is not None:
-            spectrum_loss = jnp.mean((reconstruction - spectrum_inputs) ** 2)
         total = (
             float(loss_cfg["lambda_z"]) * mse_norm
             + float(loss_cfg["lambda_phys"]) * mse_log10
-            + float(loss_cfg.get("lambda_spectrum", 0.0)) * spectrum_loss
         )
         return {
             "combined_loss": total,
             "mse_norm": mse_norm,
             "mse_log10": mse_log10,
-            "spectrum_recon_mse": spectrum_loss,
         }
 
     return train_step, eval_step

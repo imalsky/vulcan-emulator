@@ -11,8 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.data_generation.spectrum import (  # noqa: E402
+    generate_wasp39b_template,
+    write_vulcan_spectrum_txt,
+)
 from src.utils.config import load_and_validate_config  # noqa: E402
-from src.data_generation.spectrum import generate_wasp39b_template, write_vulcan_spectrum_txt  # noqa: E402
 
 
 def _write_vulcan_transformer_test_config(config_path: Path) -> None:
@@ -23,8 +26,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                 "chemistry_type": "vulcan",
                 "model_type": "transformer",
                 "paths": {
-                    "raw_root": "data/test_vulcan_transformer/raw",
-                    "processed_root": "data/test_vulcan_transformer/processed",
+                    "run_root": "data/test_vulcan_transformer",
                     "checkpoints_root": "models/default",
                     "vulcan_source_root": "../VULCAN-master",
                 },
@@ -121,7 +123,6 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "state_floor": 1e-30,
                     "spectrum_floor": 1e-30,
                     "target_method": "log-standard",
-                    "spectrum_method": "log-standard",
                     "sequence_methods": {
                         "pressure_bar": "log-standard",
                         "temperature_k": "standard",
@@ -135,6 +136,10 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                         "O_H": "log-standard",
                         "N_H": "log-standard",
                         "S_H": "log-standard",
+                        "r_star_rsun": "log-standard",
+                        "semi_major_axis_au": "log-standard",
+                        "zenith_angle_deg": "standard",
+                        "diurnal_factor": "none",
                         "use_photochemistry": "none",
                         "use_ion_chemistry": "none",
                         "use_eddy_diffusion": "none",
@@ -164,7 +169,6 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "loss": {
                         "lambda_z": 1.0,
                         "lambda_phys": 0.1,
-                        "lambda_spectrum": 0.01,
                     },
                 },
                 "model": {
@@ -214,16 +218,19 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                         "t_cross_sp": ["H2O", "H2S", "SH", "SO2", "S2"],
                     },
                     "stellar_spectrum": {
-                        "enabled": True,
                         "template_name": "wasp39b_frances_surface_flux",
                         "template_file": "assets/spectra/wasp39b/test_surface_flux.txt",
                         "library_glob": "assets/spectra/library/*.txt",
-                        "num_bins": 256,
-                        "wavelength_min_nm": 0.05,
-                        "wavelength_max_nm": 700.0,
-                        "encoder_mode": "autoencoder",
+                        "max_tokens": 32,
+                        "wavelength_min_nm": 400.0,
+                        "wavelength_max_nm": 450.0,
+                        "encoder_mode": "perceiver",
                         "latent_dim": 16,
                         "hidden_dim": 64,
+                        "num_latents": 8,
+                        "num_layers": 2,
+                        "num_heads": 4,
+                        "fourier_features": 16,
                         "teff_k": 5485.0,
                         "radius_rsun": 0.939,
                         "semi_major_axis_au": 0.04858,
@@ -275,8 +282,8 @@ def tiny_config(tmp_path):
         spectrum_file_alt,
     )
 
-    config["paths"]["raw_root"] = str(tmp_path / "raw")
-    config["paths"]["processed_root"] = str(tmp_path / "processed")
+    config["paths"]["raw_root"] = str(tmp_path / "dataset" / "raw")
+    config["paths"]["processed_root"] = str(tmp_path / "dataset" / "processed")
     config["paths"]["checkpoints_root"] = str(tmp_path / "checkpoints")
     config["paths"]["vulcan_source_root"] = str(tmp_path / "VULCAN")
 
@@ -294,12 +301,20 @@ def tiny_config(tmp_path):
     config["generation"]["parallel_workers"] = 1
     config["sampling"]["num_levels"] = 12
 
-    config["vulcan"]["stellar_spectrum"]["num_bins"] = 32
+    config["vulcan"]["stellar_spectrum"]["max_tokens"] = 32
     config["vulcan"]["stellar_spectrum"]["hidden_dim"] = 16
     config["vulcan"]["stellar_spectrum"]["latent_dim"] = 4
-    config["stellar_spectrum"]["num_bins"] = 32
+    config["vulcan"]["stellar_spectrum"]["num_latents"] = 4
+    config["vulcan"]["stellar_spectrum"]["num_layers"] = 1
+    config["vulcan"]["stellar_spectrum"]["num_heads"] = 4
+    config["vulcan"]["stellar_spectrum"]["fourier_features"] = 8
+    config["stellar_spectrum"]["max_tokens"] = 32
     config["stellar_spectrum"]["hidden_dim"] = 16
     config["stellar_spectrum"]["latent_dim"] = 4
+    config["stellar_spectrum"]["num_latents"] = 4
+    config["stellar_spectrum"]["num_layers"] = 1
+    config["stellar_spectrum"]["num_heads"] = 4
+    config["stellar_spectrum"]["fourier_features"] = 8
 
     config["training"]["batch_size"] = 4
     config["training"]["epochs"] = 1

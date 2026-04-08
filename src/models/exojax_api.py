@@ -10,7 +10,8 @@ top-to-bottom level order and the same named ``global_inputs`` contract used
 by ``ExportedJAXModel.predict_*_profile()``. FastChem bundles expect
 profile-global elemental abundances in fixed ``X/H`` order, while VULCAN
 bundles expect surface gravity, planet radius, the same elemental globals,
-curated science knobs, and atmosphere-base one-hot flags.
+sampled irradiation geometry, curated science knobs, and atmosphere-base
+one-hot flags.
 """
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..utils.config import DEFAULT_REQUIRED_GLOBAL_INPUTS, FASTCHEM_CONDITIONING_INPUT_ORDER
+from ..utils.config import (
+    DEFAULT_REQUIRED_GLOBAL_INPUTS,
+    FASTCHEM_CONDITIONING_INPUT_ORDER,
+)
 from .export_bundle import ExportedJAXModel
 
 FASTCHEM_GLOBAL_LABELS = list(FASTCHEM_CONDITIONING_INPUT_ORDER)
@@ -236,7 +240,8 @@ def make_vulcan_vmr_fn(
         pressures_bar: jax.Array,  # shape: (nz,), top -> bottom
         kzz_cm2_s: jax.Array,  # shape: (nz,), top -> bottom
         global_inputs: dict[str, Any] | jax.Array,
-        spectrum_flux: jax.Array,  # shape: (spectrum_dim,)
+        spectrum_wavelength_nm: jax.Array,  # shape: (n_spectrum,)
+        spectrum_flux_erg_cm2_s_nm: jax.Array,  # shape: (n_spectrum,)
     ) -> jax.Array:
         """Predict one VULCAN composition profile in ExoJAX ordering.
 
@@ -252,9 +257,12 @@ def make_vulcan_vmr_fn(
             Eddy-diffusion profile in ``cm^2 s^-1`` with shape ``(nz,)``.
         global_inputs : dict[str, Any] or jax.Array
             Global conditioning inputs matching ``VULCAN_GLOBAL_LABELS``.
-        spectrum_flux : jax.Array
-            Stellar spectrum sampled on the bundle's fixed wavelength grid,
-            shape ``(spectrum_dim,)``.
+        spectrum_wavelength_nm : jax.Array
+            Stellar-spectrum wavelength samples in nanometres with shape
+            ``(n_spectrum,)``.
+        spectrum_flux_erg_cm2_s_nm : jax.Array
+            Stellar-spectrum flux density values aligned to
+            ``spectrum_wavelength_nm`` with shape ``(n_spectrum,)``.
 
         Returns
         -------
@@ -281,7 +289,8 @@ def make_vulcan_vmr_fn(
             temperature_k=internal_temperatures,
             kzz_cm2_s=internal_kzz,
             global_inputs=global_inputs,
-            spectrum_flux=spectrum_flux,
+            spectrum_wavelength_nm=spectrum_wavelength_nm,
+            spectrum_flux_erg_cm2_s_nm=spectrum_flux_erg_cm2_s_nm,
         )
         return vmr_internal[::-1, :]
 

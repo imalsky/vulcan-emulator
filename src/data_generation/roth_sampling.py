@@ -31,7 +31,6 @@ from typing import Any
 
 import numpy as np
 
-
 RothFilterValue = float | tuple[float, float] | bool
 RothFilterConfig = dict[str, RothFilterValue]
 

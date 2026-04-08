@@ -20,25 +20,20 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from src.utils.numpy_compat import patch_numpy_asarray_copy
-
-patch_numpy_asarray_copy()
-
-import matplotlib.pyplot as plt
-import numpy as np
-
-from src.utils.config import load_and_validate_config
-from src.data_generation.roth_sampling import (
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from src.data_generation.roth_sampling import (  # noqa: E402
     RothProfile,
     _matches_filters,
     _parse_pt_profile_filename,
     load_roth_profiles,
 )
-from src.data_generation.sampling import (
-    sample_pressure_grid,
+from src.data_generation.sampling import (  # noqa: E402
     _sample_analytic_temperature_profile_record,
     _validate_temperature_profile,
+    sample_pressure_grid,
 )
+from src.utils.config import load_and_validate_config  # noqa: E402
 
 _STYLE = _ROOT / "extras" / "science.mplstyle"
 

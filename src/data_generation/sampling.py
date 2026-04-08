@@ -20,8 +20,9 @@ temperature-profile sources, selected by ``temperature_profiles.source_mode``:
   GCM-derived profiles.
 
 The module also handles Latin-hypercube sampling of the global conditioning
-scalars (metallicity, C/O, S/O, and optionally surface gravity plus planet
-radius) and stellar-spectrum selection for VULCAN chemistry runs.
+scalars (metallicity, C/O, S/O, and for VULCAN also surface gravity, planet
+radius, and irradiation geometry) plus stellar-spectrum selection for VULCAN
+chemistry runs.
 """
 
 from __future__ import annotations
@@ -35,7 +36,12 @@ from typing import Any
 import numpy as np
 from scipy.special import expn
 
-from ..utils.config import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SUPPORTED_ATM_BASES, uses_fastchem
+from ..utils.config import (
+    ELEMENT_INPUT_ORDER,
+    PUBLIC_PHYSICS_TOGGLES,
+    SUPPORTED_ATM_BASES,
+    uses_fastchem,
+)
 from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
 from .spectrum import (
     SpectrumRecord,
@@ -1038,10 +1044,11 @@ def sample_run_specifications(
     """Sample the full set of atmospheric configurations used to generate raw runs.
 
     Uses Latin-hypercube sampling (LHC) to stratify the global conditioning
-    scalars (metallicity, C/O, S/O, and optionally surface gravity plus planet
-    radius) over the configured ranges. For each run, a temperature profile is
-    independently drawn from the configured source (analytic, PT-library, or
-    mixed).
+    scalars (metallicity, C/O, S/O, and for VULCAN also surface gravity,
+    planet radius, stellar radius, orbital separation, zenith angle, and
+    diurnal factor) over the configured ranges. For each run, a temperature
+    profile is independently drawn from the configured source (analytic,
+    PT-library, or mixed).
 
     Parameters
     ----------
@@ -1071,9 +1078,10 @@ def sample_run_specifications(
             num_samples=total_runs, num_dimensions=3, rng=rng,
         )
     else:
-        # LHC over (surface gravity, planet radius, metallicity, C/O, S/O).
+        # LHC over (surface gravity, planet radius, stellar radius, orbit,
+        # zenith angle, diurnal factor, metallicity, C/O, S/O).
         design = _latin_hypercube_unit_samples(
-            num_samples=total_runs, num_dimensions=5, rng=rng,
+            num_samples=total_runs, num_dimensions=9, rng=rng,
         )
 
     # Spectrum loading only needed for VULCAN chemistry.
@@ -1116,16 +1124,32 @@ def sample_run_specifications(
                 design[run_idx, 1],
                 *[float(x) for x in config["sampling"]["planet_radius_range_cm"]],
             )
-            metallicity = _scale_unit_interval(
+            stellar_radius_rsun = _scale_unit_interval(
                 design[run_idx, 2],
+                *[float(x) for x in config["sampling"]["stellar_radius_range_rsun"]],
+            )
+            semi_major_axis_au = _scale_unit_interval(
+                design[run_idx, 3],
+                *[float(x) for x in config["sampling"]["semi_major_axis_range_au"]],
+            )
+            zenith_angle_deg = _scale_unit_interval(
+                design[run_idx, 4],
+                *[float(x) for x in config["sampling"]["zenith_angle_range_deg"]],
+            )
+            diurnal_factor = _scale_unit_interval(
+                design[run_idx, 5],
+                *[float(x) for x in config["sampling"]["diurnal_factor_range"]],
+            )
+            metallicity = _scale_unit_interval(
+                design[run_idx, 6],
                 *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
             )
             c_to_o = _scale_unit_interval(
-                design[run_idx, 3],
+                design[run_idx, 7],
                 *[float(x) for x in config["sampling"]["c_to_o_range"]],
             )
             s_to_o = _scale_unit_interval(
-                design[run_idx, 4],
+                design[run_idx, 8],
                 *[float(x) for x in config["sampling"]["s_to_o_range"]],
             )
 
@@ -1149,6 +1173,10 @@ def sample_run_specifications(
             base_globals = {
                 "gravity_cm_s2": float(gravity),
                 "planet_radius_cm": float(planet_radius_cm),
+                "r_star_rsun": float(stellar_radius_rsun),
+                "semi_major_axis_au": float(semi_major_axis_au),
+                "zenith_angle_deg": float(zenith_angle_deg),
+                "diurnal_factor": float(diurnal_factor),
                 "metallicity_log10": float(metallicity),
                 "c_to_o": float(c_to_o),
                 "s_to_o": float(s_to_o),

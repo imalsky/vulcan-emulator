@@ -48,8 +48,9 @@ Shipped defaults:
 Data layout:
 - each config now uses a single dataset root under `data/<run_name>/`
 - raw files live in `data/<run_name>/raw`
-- processed tensors live in `data/<run_name>/processed`
-- processed outputs still contain `info/`, `train/`, `val/`, and `test/`
+- shared metadata lives in `data/<run_name>/info`
+- processed split tensors live directly in `data/<run_name>/train`, `data/<run_name>/val`, and `data/<run_name>/test`
+- training artifacts stay under `models/`
 
 Contract notes:
 - raw VULCAN runs store the layerwise gravity profile in `inputs/gravity_cm_s2`
@@ -59,7 +60,7 @@ Contract notes:
 Layout:
 - `assets/`: external PT libraries and stellar spectra
 - `config/`: canonical JSON configs and helper notes
-- `data/`: generated raw runs, processed tensors, manifests, and derived spectrum libraries
+- `data/`: dataset runs with `raw/`, `info/`, `train/`, `val/`, `test/`, and derived spectrum libraries
 - `models/`: checkpoints and exported bundles
 - `src/models/`: architecture, inference, and export logic
 - `src/training/`: training loops and evaluation utilities

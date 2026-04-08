@@ -2,8 +2,7 @@
   "chemistry_type": "vulcan",
   "model_type": "transformer",
   "paths": {
-    "raw_root": "data/vulcan_transformer/raw",
-    "processed_root": "data/vulcan_transformer/processed",
+    "run_root": "data/vulcan_transformer",
     "checkpoints_root": "models/vulcan_transformer",
     "vulcan_source_root": "../VULCAN-master"
   },
@@ -51,21 +50,61 @@
     "num_levels": 64,
     "pressure_top_bar": 1e-07,
     "pressure_bottom_bar": 100.0,
-    "temperature_range_k": [1.0, 3000.0],
-    "metallicity_log10_range": [0.0, 1.0],
-    "c_to_o_range": [0.45, 0.85],
-    "s_to_o_range": [0.01, 0.03],
-    "gravity_range_cm_s2": [500.0, 5000.0],
-    "planet_radius_range_cm": [7000000000.0, 12000000000.0],
-    "kzz_cm2_s": 1e9
+    "temperature_range_k": [
+      1.0,
+      3000.0
+    ],
+    "metallicity_log10_range": [
+      0.0,
+      1.0
+    ],
+    "c_to_o_range": [
+      0.45,
+      0.85
+    ],
+    "s_to_o_range": [
+      0.01,
+      0.03
+    ],
+    "gravity_range_cm_s2": [
+      500.0,
+      5000.0
+    ],
+    "planet_radius_range_cm": [
+      7000000000.0,
+      12000000000.0
+    ],
+    "stellar_radius_range_rsun": [
+      0.7,
+      1.3
+    ],
+    "semi_major_axis_range_au": [
+      0.03,
+      0.08
+    ],
+    "zenith_angle_range_deg": [
+      30.0,
+      75.0
+    ],
+    "diurnal_factor_range": [
+      0.25,
+      0.75
+    ],
+    "kzz_cm2_s": 1000000000.0
   },
   "temperature_profiles": {
     "source_mode": "mixed",
     "analytic_probability": 0.5,
     "data_glob": "assets/PTprofiles/*.dat",
     "filters": {
-      "Teq": [1400.0, 2200.0],
-      "LogMet": [0.0, 0.7],
+      "Teq": [
+        1400.0,
+        2200.0
+      ],
+      "LogMet": [
+        0.0,
+        0.7
+      ],
       "TiOVO": false
     },
     "validation": {
@@ -74,16 +113,43 @@
     },
     "analytic_sampler": {
       "reference_gravity_m_s2": 25,
-      "t_int_k_normal": {"mean": 500.0, "std": 20.0},
-      "t_irr_k_normal": {"mean": 1800.0, "std": 500.0},
-      "log10_kappa_ir_m2_kg_normal": {"mean": -2.5, "std": 2.5},
-      "power_law_n_range": [0.5, 2.0],
-      "log10_gamma_1_range": [-2.0, 2.0],
-      "log10_gamma_2_range": [-2.0, 2.0],
-      "alpha_range": [0.0, 1.0],
-      "temperature_shift_k_range": [-500.0, 500.0],
+      "t_int_k_normal": {
+        "mean": 500.0,
+        "std": 20.0
+      },
+      "t_irr_k_normal": {
+        "mean": 1800.0,
+        "std": 500.0
+      },
+      "log10_kappa_ir_m2_kg_normal": {
+        "mean": -2.5,
+        "std": 2.5
+      },
+      "power_law_n_range": [
+        0.5,
+        2.0
+      ],
+      "log10_gamma_1_range": [
+        -2.0,
+        2.0
+      ],
+      "log10_gamma_2_range": [
+        -2.0,
+        2.0
+      ],
+      "alpha_range": [
+        0.0,
+        1.0
+      ],
+      "temperature_shift_k_range": [
+        -500.0,
+        500.0
+      ],
       "convection_probability": 0.333,
-      "adiabatic_gradient_range": [0.25, 0.35]
+      "adiabatic_gradient_range": [
+        0.25,
+        0.35
+      ]
     }
   },
   "generation": {
@@ -108,7 +174,7 @@
     "state_floor": 1e-30,
     "target_method": "log-standard",
     "sequence_methods": {
-      "pressure_bar": "log-standard",
+      "pressure_bar": "log-minmax",
       "temperature_k": "standard",
       "kzz_cm2_s": "log-standard"
     },
@@ -120,6 +186,10 @@
       "O_H": "log-standard",
       "N_H": "log-standard",
       "S_H": "log-standard",
+      "r_star_rsun": "log-standard",
+      "semi_major_axis_au": "log-standard",
+      "zenith_angle_deg": "standard",
+      "diurnal_factor": "standard",
       "use_photochemistry": "none",
       "use_ion_chemistry": "none",
       "use_eddy_diffusion": "none",
@@ -136,29 +206,27 @@
       "atm_base_CO2": "none",
       "atm_base_H2O": "none"
     },
-    "spectrum_floor": 1e-30,
-    "spectrum_method": "log-standard"
+    "spectrum_floor": 1e-30
   },
   "training": {
     "seed": 123,
     "batch_size": 64,
     "epochs": 300,
-    "learning_rate": 3e-4,
-    "min_lr": 1e-6,
+    "learning_rate": 0.0003,
+    "min_lr": 1e-06,
     "warmup_epochs": 10,
     "early_stopping_patience": 30,
     "scheduler": {
       "name": "reduce_on_plateau",
       "factor": 0.5,
       "patience": 10,
-      "threshold": 1e-4
+      "threshold": 0.0001
     },
-    "weight_decay": 1e-5,
+    "weight_decay": 1e-05,
     "gradient_clip": 1.0,
     "loss": {
       "lambda_z": 1.0,
-      "lambda_phys": 0.25,
-      "lambda_spectrum": 0.01
+      "lambda_phys": 0.25
     }
   },
   "model": {
@@ -174,7 +242,7 @@
   },
   "vulcan": {
     "physics_toggles": {
-      "use_photochemistry": false,
+      "use_photochemistry": true,
       "use_condensation": false,
       "use_ion_chemistry": false,
       "use_eddy_diffusion": true,
@@ -190,7 +258,7 @@
         "name": "basic_h2",
         "atm_base": "H2",
         "physics_toggles": {
-          "use_photochemistry": false,
+          "use_photochemistry": true,
           "use_eddy_diffusion": true
         }
       }
@@ -199,24 +267,28 @@
       "chemistry_file": "thermo/SNCHO_photo_network_2024.txt",
       "rocky": false,
       "atm_base": "H2",
-      "t_cross_sp": ["H2", "He"]
+      "t_cross_sp": [
+        "H2",
+        "He"
+      ]
     },
     "stellar_spectrum": {
-      "enabled": true,
       "template_name": "wasp39",
       "template_file": "assets/stellar_spectra/wasp39_phoenix.dat",
       "library_glob": "assets/stellar_spectra/*.dat",
-      "num_bins": 128,
       "latent_dim": 32,
       "hidden_dim": 128,
-      "teff_k": 5485.0,
-      "radius_rsun": 0.895,
-      "semi_major_axis_au": 0.0486,
-      "diurnal_factor": 0.5,
-      "wavelength_min_nm": 10.0,
-      "wavelength_max_nm": 800.0,
-      "encoder_mode": "autoencoder",
-      "zenith_angle_deg": 48.19
+      "wavelength_min_nm": 2.0,
+      "wavelength_max_nm": 700.0,
+      "dbin1_nm": 0.1,
+      "dbin2_nm": 2.0,
+      "dbin_12trans_nm": 240.0,
+      "encoder_mode": "perceiver",
+      "max_tokens": 2610,
+      "num_latents": 16,
+      "num_layers": 2,
+      "num_heads": 4,
+      "fourier_features": 16
     }
   }
 }

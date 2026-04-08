@@ -1,3 +1,3 @@
-from __future__ import annotations
-
 """Training orchestration and checkpointing."""
+
+from __future__ import annotations

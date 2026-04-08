@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
-
-import numpy as np
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-
+import numpy as np
+import pytest
 from src.data_generation.preprocess import apply_block, apply_mixed_block, inverse_block
+from src.data_generation.spectrum import pack_spectrum_tokens
 from src.models.export_bundle import export_checkpoint_payload, load_exported_model
 from src.models.jax_model import (
     MLPDimensions,
@@ -39,6 +39,10 @@ def _vulcan_globals() -> dict[str, float]:
         "gravity_cm_s2": 900.0,
         "planet_radius_cm": 9.0e9,
         **_element_globals(),
+        "r_star_rsun": 0.939,
+        "semi_major_axis_au": 0.04858,
+        "zenith_angle_deg": 48.0,
+        "diurnal_factor": 1.0,
         "use_photochemistry": 0.0,
         "use_ion_chemistry": 0.0,
         "use_eddy_diffusion": 1.0,
@@ -122,51 +126,116 @@ def _vulcan_normalization() -> dict:
             "floor": [1.0e-30, 1.0e-30, None, 1.0e-30, 1.0e-30, 1.0e-30, 1.0e-30]
             + [None] * (len(VULCAN_GLOBAL_ORDER) - 7),
         },
-        "spectrum": {
-            "method": "log-standard",
-            "mean": [1.0, 1.2, 1.1, 0.9],
-            "std": [0.3, 0.25, 0.35, 0.4],
+        "spectrum_processing": {
             "floor": 1.0e-30,
+            "wavelength_min_nm": 400.0,
+            "wavelength_max_nm": 410.0,
+            "max_tokens": 8,
         },
     }
+
+
+def _fastchem_mlp_dims() -> MLPDimensions:
+    return MLPDimensions(
+        sequence_dim=2,
+        global_dim=len(FASTCHEM_GLOBAL_ORDER),
+        spectrum_max_tokens=0,
+        spectrum_latent_dim=0,
+        spectrum_hidden_dim=0,
+        spectrum_num_latents=0,
+        spectrum_num_layers=0,
+        spectrum_num_heads=1,
+        spectrum_fourier_features=0,
+        spectrum_encoder_mode="none",
+        spectrum_floor=1.0e-30,
+        target_dim=2,
+        d_hidden=8,
+        num_hidden_layers=2,
+        conditioning_hidden_dim=6,
+        film_clamp=1.5,
+        activation="silu",
+    )
+
+
+def _fastchem_transformer_dims() -> TransformerDimensions:
+    return TransformerDimensions(
+        sequence_dim=2,
+        global_dim=len(FASTCHEM_GLOBAL_ORDER),
+        spectrum_max_tokens=0,
+        target_dim=2,
+        d_model=8,
+        nhead=2,
+        num_layers=1,
+        dim_feedforward=16,
+        conditioning_hidden_dim=8,
+        film_clamp=1.5,
+        output_head_divisor=2,
+        spectrum_latent_dim=0,
+        spectrum_hidden_dim=0,
+        spectrum_num_latents=0,
+        spectrum_num_layers=0,
+        spectrum_num_heads=1,
+        spectrum_fourier_features=0,
+        spectrum_encoder_mode="none",
+        spectrum_floor=1.0e-30,
+        activation="gelu",
+    )
+
+
+def _vulcan_mlp_dims() -> MLPDimensions:
+    return MLPDimensions(
+        sequence_dim=3,
+        global_dim=len(VULCAN_GLOBAL_ORDER),
+        spectrum_max_tokens=8,
+        spectrum_latent_dim=2,
+        spectrum_hidden_dim=8,
+        spectrum_num_latents=2,
+        spectrum_num_layers=1,
+        spectrum_num_heads=2,
+        spectrum_fourier_features=4,
+        spectrum_encoder_mode="perceiver",
+        spectrum_floor=1.0e-30,
+        target_dim=2,
+        d_hidden=8,
+        num_hidden_layers=2,
+        conditioning_hidden_dim=6,
+        film_clamp=1.5,
+        activation="silu",
+    )
+
+
+def _vulcan_transformer_dims() -> TransformerDimensions:
+    return TransformerDimensions(
+        sequence_dim=3,
+        global_dim=len(VULCAN_GLOBAL_ORDER),
+        spectrum_max_tokens=8,
+        target_dim=2,
+        d_model=8,
+        nhead=2,
+        num_layers=1,
+        dim_feedforward=16,
+        conditioning_hidden_dim=8,
+        film_clamp=1.5,
+        output_head_divisor=2,
+        spectrum_latent_dim=2,
+        spectrum_hidden_dim=8,
+        spectrum_num_latents=2,
+        spectrum_num_layers=1,
+        spectrum_num_heads=2,
+        spectrum_fourier_features=4,
+        spectrum_encoder_mode="perceiver",
+        spectrum_floor=1.0e-30,
+        activation="gelu",
+    )
 
 
 def _make_fastchem_payload(model_type: str) -> tuple[dict, dict, MLPDimensions | TransformerDimensions]:
     normalization = _fastchem_normalization()
     if model_type == "mlp":
-        dims: MLPDimensions | TransformerDimensions = MLPDimensions(
-            sequence_dim=2,
-            global_dim=len(FASTCHEM_GLOBAL_ORDER),
-            spectrum_dim=0,
-            spectrum_latent_dim=0,
-            spectrum_hidden_dim=0,
-            spectrum_encoder_mode="none",
-            target_dim=2,
-            d_hidden=8,
-            num_hidden_layers=2,
-            conditioning_hidden_dim=6,
-            film_clamp=1.5,
-            activation="silu",
-        )
+        dims: MLPDimensions | TransformerDimensions = _fastchem_mlp_dims()
         params = init_mlp_params(jax.random.PRNGKey(0), dims)
     else:
-        dims = TransformerDimensions(
-            sequence_dim=2,
-            global_dim=len(FASTCHEM_GLOBAL_ORDER),
-            spectrum_dim=0,
-            target_dim=2,
-            d_model=8,
-            nhead=2,
-            num_layers=1,
-            dim_feedforward=16,
-            conditioning_hidden_dim=8,
-            film_clamp=1.5,
-            output_head_divisor=2,
-            spectrum_latent_dim=0,
-            spectrum_hidden_dim=0,
-            spectrum_encoder_mode="none",
-            activation="gelu",
-        )
+        dims = _fastchem_transformer_dims()
         params = init_transformer_params(jax.random.PRNGKey(1), dims)
     payload = {
         "params": jax.tree_util.tree_map(np.asarray, params),
@@ -186,39 +255,10 @@ def _make_fastchem_payload(model_type: str) -> tuple[dict, dict, MLPDimensions |
 def _make_vulcan_payload(model_type: str) -> tuple[dict, dict, MLPDimensions | TransformerDimensions]:
     normalization = _vulcan_normalization()
     if model_type == "mlp":
-        dims: MLPDimensions | TransformerDimensions = MLPDimensions(
-            sequence_dim=3,
-            global_dim=len(VULCAN_GLOBAL_ORDER),
-            spectrum_dim=4,
-            spectrum_latent_dim=2,
-            spectrum_hidden_dim=4,
-            spectrum_encoder_mode="linear",
-            target_dim=2,
-            d_hidden=8,
-            num_hidden_layers=2,
-            conditioning_hidden_dim=6,
-            film_clamp=1.5,
-            activation="silu",
-        )
+        dims: MLPDimensions | TransformerDimensions = _vulcan_mlp_dims()
         params = init_mlp_params(jax.random.PRNGKey(2), dims)
     else:
-        dims = TransformerDimensions(
-            sequence_dim=3,
-            global_dim=len(VULCAN_GLOBAL_ORDER),
-            spectrum_dim=4,
-            target_dim=2,
-            d_model=8,
-            nhead=2,
-            num_layers=1,
-            dim_feedforward=16,
-            conditioning_hidden_dim=8,
-            film_clamp=1.5,
-            output_head_divisor=2,
-            spectrum_latent_dim=2,
-            spectrum_hidden_dim=4,
-            spectrum_encoder_mode="linear",
-            activation="gelu",
-        )
+        dims = _vulcan_transformer_dims()
         params = init_transformer_params(jax.random.PRNGKey(3), dims)
     payload = {
         "params": jax.tree_util.tree_map(np.asarray, params),
@@ -228,10 +268,25 @@ def _make_vulcan_payload(model_type: str) -> tuple[dict, dict, MLPDimensions | T
             "chemistry_type": "vulcan",
             "model_type": model_type,
             "global_static_feature_order": list(VULCAN_GLOBAL_ORDER),
-            "spectrum_dim": 4,
+            "spectrum_max_tokens": 8,
+            "spectrum_wavelength_min_nm": 400.0,
+            "spectrum_wavelength_max_nm": 410.0,
             "output_species_order": ["H2O", "CO"],
         },
-        "config": {"chemistry_type": "vulcan", "model_type": model_type},
+        "config": {
+            "chemistry_type": "vulcan",
+            "model_type": model_type,
+            "normalization": {"spectrum_floor": 1.0e-30},
+            "stellar_spectrum": {
+                "latent_dim": dims.spectrum_latent_dim,
+                "hidden_dim": dims.spectrum_hidden_dim,
+                "num_latents": dims.spectrum_num_latents,
+                "num_layers": dims.spectrum_num_layers,
+                "num_heads": dims.spectrum_num_heads,
+                "fourier_features": dims.spectrum_fourier_features,
+                "encoder_mode": dims.spectrum_encoder_mode,
+            },
+        },
     }
     return payload, normalization, dims
 
@@ -263,6 +318,8 @@ def _expected_fastchem_prediction(
             jnp.asarray(sequence_norm[None, :, :], dtype=jnp.float32),
             jnp.asarray(globals_norm, dtype=jnp.float32),
             None,
+            None,
+            None,
             dims,
         )
     expected_physical = inverse_block(np.asarray(expected_norm[0]), normalization["target"])
@@ -282,7 +339,8 @@ def _expected_vulcan_prediction(
     temperature_k: np.ndarray,
     kzz_cm2_s: np.ndarray,
     global_inputs: dict[str, float],
-    spectrum_flux: np.ndarray,
+    spectrum_wavelength_nm: np.ndarray,
+    spectrum_flux_erg_cm2_s_nm: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     static_inputs = np.stack([pressure_bar, temperature_k, kzz_cm2_s], axis=-1)
     sequence_norm = _sequence_static_numpy(static_inputs, normalization["sequence_static"]["blocks"])
@@ -290,21 +348,31 @@ def _expected_vulcan_prediction(
         np.array([[global_inputs[name] for name in VULCAN_GLOBAL_ORDER]], dtype=np.float64),
         normalization["global_static"],
     )
-    spectrum_norm = apply_block(spectrum_flux[None, :], normalization["spectrum"])
+    packed_wavelengths_nm, packed_fluxes, packed_mask = pack_spectrum_tokens(
+        spectrum_wavelength_nm,
+        spectrum_flux_erg_cm2_s_nm,
+        wavelength_min_nm=400.0,
+        wavelength_max_nm=410.0,
+        max_tokens=dims.spectrum_max_tokens,
+    )
     if isinstance(dims, MLPDimensions):
         expected_norm, _ = apply_mlp(
             params,
             jnp.asarray(sequence_norm[None, :, :], dtype=jnp.float32),
             jnp.asarray(globals_norm, dtype=jnp.float32),
             dims,
-            jnp.asarray(spectrum_norm, dtype=jnp.float32),
+            jnp.asarray(packed_wavelengths_nm[None, :], dtype=jnp.float32),
+            jnp.asarray(packed_fluxes[None, :], dtype=jnp.float32),
+            jnp.asarray(packed_mask[None, :], dtype=bool),
         )
     else:
         expected_norm, _ = apply_transformer_model(
             params,
             jnp.asarray(sequence_norm[None, :, :], dtype=jnp.float32),
             jnp.asarray(globals_norm, dtype=jnp.float32),
-            jnp.asarray(spectrum_norm, dtype=jnp.float32),
+            jnp.asarray(packed_wavelengths_nm[None, :], dtype=jnp.float32),
+            jnp.asarray(packed_fluxes[None, :], dtype=jnp.float32),
+            jnp.asarray(packed_mask[None, :], dtype=bool),
             dims,
         )
     expected_physical = inverse_block(np.asarray(expected_norm[0]), normalization["target"])
@@ -318,8 +386,7 @@ def _expected_vulcan_prediction(
 
 def test_exported_fastchem_mlp_bundle_predicts_from_physical_inputs(tmp_path):
     payload, normalization, dims = _make_fastchem_payload("mlp")
-    bundle_path = export_checkpoint_payload(payload, tmp_path / "fastchem_mlp_export.npz")
-    bundle = load_exported_model(bundle_path)
+    bundle = load_exported_model(export_checkpoint_payload(payload, tmp_path / "fastchem_mlp_export.npz"))
 
     pressure_bar = np.array([100.0, 10.0, 1.0, 0.1], dtype=np.float32)
     temperature_k = np.array([1450.0, 1300.0, 1050.0, 900.0], dtype=np.float32)
@@ -351,8 +418,7 @@ def test_exported_fastchem_mlp_bundle_predicts_from_physical_inputs(tmp_path):
 
 def test_exported_fastchem_transformer_bundle_predicts_from_physical_inputs(tmp_path):
     payload, normalization, dims = _make_fastchem_payload("transformer")
-    bundle_path = export_checkpoint_payload(payload, tmp_path / "fastchem_transformer_export.npz")
-    bundle = load_exported_model(bundle_path)
+    bundle = load_exported_model(export_checkpoint_payload(payload, tmp_path / "fastchem_transformer_export.npz"))
 
     pressure_bar = np.array([100.0, 10.0, 1.0, 0.1], dtype=np.float32)
     temperature_k = np.array([1450.0, 1300.0, 1050.0, 900.0], dtype=np.float32)
@@ -382,16 +448,16 @@ def test_exported_fastchem_transformer_bundle_predicts_from_physical_inputs(tmp_
     np.testing.assert_allclose(np.asarray(predicted_log10), expected_log10, rtol=1.0e-5, atol=1.0e-6)
 
 
-def test_exported_vulcan_mlp_bundle_predicts_from_physical_inputs(tmp_path):
+def test_exported_vulcan_mlp_bundle_predicts_from_unseen_physical_spectrum(tmp_path):
     payload, normalization, dims = _make_vulcan_payload("mlp")
-    bundle_path = export_checkpoint_payload(payload, tmp_path / "vulcan_mlp_export.npz")
-    bundle = load_exported_model(bundle_path)
+    bundle = load_exported_model(export_checkpoint_payload(payload, tmp_path / "vulcan_mlp_export.npz"))
 
     pressure_bar = np.array([100.0, 10.0, 1.0], dtype=np.float32)
     temperature_k = np.array([1500.0, 1200.0, 950.0], dtype=np.float32)
     kzz_cm2_s = np.array([1.0e8, 1.0e8, 1.0e8], dtype=np.float32)
     global_inputs = _vulcan_globals()
-    spectrum_flux = np.array([15.0, 20.0, 18.0, 12.0], dtype=np.float32)
+    spectrum_wavelength_nm = np.array([401.0, 403.0, 405.0, 407.0, 409.0], dtype=np.float32)
+    spectrum_flux = np.array([15.0, 20.0, 18.0, 12.0, 5.0], dtype=np.float32)
     expected_physical, expected_log10 = _expected_vulcan_prediction(
         dims,
         payload["params"],
@@ -400,6 +466,7 @@ def test_exported_vulcan_mlp_bundle_predicts_from_physical_inputs(tmp_path):
         temperature_k,
         kzz_cm2_s,
         global_inputs,
+        spectrum_wavelength_nm,
         spectrum_flux,
     )
 
@@ -408,14 +475,16 @@ def test_exported_vulcan_mlp_bundle_predicts_from_physical_inputs(tmp_path):
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
         global_inputs=global_inputs,
-        spectrum_flux=spectrum_flux,
+        spectrum_wavelength_nm=spectrum_wavelength_nm,
+        spectrum_flux_erg_cm2_s_nm=spectrum_flux,
     )
     predicted_log10 = bundle.predict_vulcan_profile(
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
         global_inputs=global_inputs,
-        spectrum_flux=spectrum_flux,
+        spectrum_wavelength_nm=spectrum_wavelength_nm,
+        spectrum_flux_erg_cm2_s_nm=spectrum_flux,
         return_log10=True,
     )
 
@@ -423,16 +492,16 @@ def test_exported_vulcan_mlp_bundle_predicts_from_physical_inputs(tmp_path):
     np.testing.assert_allclose(np.asarray(predicted_log10), expected_log10, rtol=1.0e-5, atol=1.0e-6)
 
 
-def test_exported_vulcan_transformer_bundle_predicts_from_physical_inputs(tmp_path):
+def test_exported_vulcan_transformer_bundle_predicts_from_unseen_physical_spectrum(tmp_path):
     payload, normalization, dims = _make_vulcan_payload("transformer")
-    bundle_path = export_checkpoint_payload(payload, tmp_path / "vulcan_transformer_export.npz")
-    bundle = load_exported_model(bundle_path)
+    bundle = load_exported_model(export_checkpoint_payload(payload, tmp_path / "vulcan_transformer_export.npz"))
 
     pressure_bar = np.array([100.0, 10.0, 1.0], dtype=np.float32)
     temperature_k = np.array([1500.0, 1200.0, 950.0], dtype=np.float32)
     kzz_cm2_s = np.array([1.0e8, 1.0e8, 1.0e8], dtype=np.float32)
     global_inputs = _vulcan_globals()
-    spectrum_flux = np.array([15.0, 20.0, 18.0, 12.0], dtype=np.float32)
+    spectrum_wavelength_nm = np.array([401.0, 403.0, 405.0, 407.0, 409.0], dtype=np.float32)
+    spectrum_flux = np.array([15.0, 20.0, 18.0, 12.0, 5.0], dtype=np.float32)
     expected_physical, expected_log10 = _expected_vulcan_prediction(
         dims,
         payload["params"],
@@ -441,6 +510,7 @@ def test_exported_vulcan_transformer_bundle_predicts_from_physical_inputs(tmp_pa
         temperature_k,
         kzz_cm2_s,
         global_inputs,
+        spectrum_wavelength_nm,
         spectrum_flux,
     )
 
@@ -449,38 +519,27 @@ def test_exported_vulcan_transformer_bundle_predicts_from_physical_inputs(tmp_pa
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
         global_inputs=global_inputs,
-        spectrum_flux=spectrum_flux,
+        spectrum_wavelength_nm=spectrum_wavelength_nm,
+        spectrum_flux_erg_cm2_s_nm=spectrum_flux,
     )
     predicted_log10 = bundle.predict_vulcan_profile(
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
         global_inputs=global_inputs,
-        spectrum_flux=spectrum_flux,
+        spectrum_wavelength_nm=spectrum_wavelength_nm,
+        spectrum_flux_erg_cm2_s_nm=spectrum_flux,
         return_log10=True,
     )
 
     np.testing.assert_allclose(np.asarray(predicted_physical), expected_physical, rtol=1.0e-5, atol=1.0e-6)
     np.testing.assert_allclose(np.asarray(predicted_log10), expected_log10, rtol=1.0e-5, atol=1.0e-6)
     assert bundle.export_format == "jax_physical_bundle"
-    assert bundle.export_version == 3
+    assert bundle.export_version == 4
 
 
 def test_export_loader_rejects_legacy_task_based_bundle(tmp_path):
-    dims = MLPDimensions(
-        sequence_dim=2,
-        global_dim=len(FASTCHEM_GLOBAL_ORDER),
-        spectrum_dim=0,
-        spectrum_latent_dim=0,
-        spectrum_hidden_dim=0,
-        spectrum_encoder_mode="none",
-        target_dim=2,
-        d_hidden=8,
-        num_hidden_layers=2,
-        conditioning_hidden_dim=6,
-        film_clamp=1.5,
-        activation="silu",
-    )
+    dims = _fastchem_mlp_dims()
     params = init_mlp_params(jax.random.PRNGKey(11), dims)
     payload = {
         "params": jax.tree_util.tree_map(np.asarray, params),
@@ -509,9 +568,5 @@ def test_export_loader_rejects_legacy_task_based_bundle(tmp_path):
     legacy_path = tmp_path / "legacy_export_missing_metadata.npz"
     np.savez(legacy_path, **rewritten)
 
-    try:
+    with pytest.raises(ValueError, match="legacy task-based contract"):
         load_exported_model(legacy_path)
-    except ValueError as exc:
-        assert "legacy task-based contract" in str(exc)
-    else:
-        raise AssertionError("Expected legacy export loading to fail.")

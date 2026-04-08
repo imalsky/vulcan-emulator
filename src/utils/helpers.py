@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 PROJECT_MARKERS = ("pyproject.toml", "spec.md")
 
@@ -27,6 +26,11 @@ _LIVE_LOG_ENV = "VULCAN_LIVE_LOG_PATH"
 
 def _configure_standard_streams() -> None:
     """Enable line-buffered stdout and stderr when the runtime supports it.
+
+    Parameters
+    ----------
+    None
+        Stream reconfiguration operates on the process-global standard streams.
 
     Returns
     -------
@@ -48,6 +52,11 @@ def _configure_live_file_logging(root_logger: logging.Logger) -> None:
     root_logger : logging.Logger
         Root logger that may receive a shared file handler pointing at the
         live log path.
+
+    Returns
+    -------
+    None
+        The logger is updated in place when live-file logging is requested.
     """
     live_log_path = os.environ.get(_LIVE_LOG_ENV, "").strip()
     if not live_log_path:
@@ -70,6 +79,17 @@ def _configure_console_logging() -> None:
 
     This function is idempotent across repeated logger requests and keeps the
     project's INFO-level logs visible while muting backend discovery noise.
+
+    Parameters
+    ----------
+    None
+        Logging is configured through process-global logger state.
+
+    Returns
+    -------
+    None
+        Root logging handlers and third-party logger levels are normalized in
+        place.
     """
     _configure_standard_streams()
     root_logger = logging.getLogger()
@@ -124,6 +144,17 @@ def resolve_project_root(start: Path | None = None) -> Path:
     Looks for ``pyproject.toml`` and ``spec.md`` as co-located root
     indicators.  Raises ``FileNotFoundError`` if neither the start
     directory nor any of its parents contain both markers.
+
+    Parameters
+    ----------
+    start : Path or None, optional
+        Starting filesystem path. Files are resolved to their parent
+        directory; ``None`` starts from the current working directory.
+
+    Returns
+    -------
+    Path
+        Resolved repository root containing the configured project markers.
     """
     cursor = (start or Path.cwd()).resolve()
     if cursor.is_file():
@@ -139,6 +170,18 @@ def resolve_path(path_like: str | Path, project_root: Path) -> Path:
 
     Absolute paths are returned unchanged; relative paths are joined
     to ``project_root`` and resolved.
+
+    Parameters
+    ----------
+    path_like : str or Path
+        Candidate path from config or caller input.
+    project_root : Path
+        Repository root used to resolve relative paths.
+
+    Returns
+    -------
+    Path
+        Absolute resolved filesystem path.
     """
     path = Path(path_like)
     if path.is_absolute():

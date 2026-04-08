@@ -25,6 +25,7 @@ import pickle
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,16 +37,19 @@ from ..utils.config import (
     ELEMENT_INPUT_ORDER,
     PUBLIC_PHYSICS_TOGGLES,
     SUPPORTED_ATM_BASES,
+    dataset_info_root,
+    dataset_raw_root,
+    dataset_run_root,
     get_chemistry_type,
     get_model_type,
     uses_fastchem,
 )
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
-
-LOGGER = get_logger(__name__)
 from ..utils.provenance import manifest_for_files
 from .sampling import RunSpecification, sample_run_specifications
 from .spectrum import write_vulcan_spectrum_txt
+
+LOGGER = get_logger(__name__)
 
 # Solar photospheric abundances (Asplund et al. 2009) expressed as
 # number ratios relative to hydrogen.  These are scaled by 10^[M/H]
@@ -79,9 +83,10 @@ _FASTCHEM_METALLICITY_SCALED_ELEMENTS = {
 @dataclass(frozen=True)
 class GeneratedRawDataset:
     """Paths describing one completed raw-data generation run."""
+    run_root: Path
     raw_root: Path
-    run_files: list[Path]
-    consolidated_path: Path | None = None
+    run_ids: list[str]
+    consolidated_path: Path
     manifest_path: Path | None = None
     coverage_path: Path | None = None
 
@@ -147,8 +152,7 @@ def consolidate_runs_to_single_hdf5(
     Parameters
     ----------
     run_files : list[Path]
-        Per-run HDF5 files to merge, typically ``run_*.h5`` files under the
-        raw ``runs/`` directory.
+        Per-run HDF5 files to merge from a temporary staging directory.
     output_path : Path
         Destination consolidated HDF5 file, usually ``runs.h5``.
     delete_originals : bool, default=True
@@ -158,8 +162,8 @@ def consolidate_runs_to_single_hdf5(
     Returns
     -------
     Path
-        Path to the consolidated HDF5 file where each original run is stored as
-        a top-level group named after the source file stem.
+        Path to the consolidated HDF5 file where each original run is stored
+        as a top-level group named after the source file stem.
     """
     ensure_dir(output_path.parent)
     with h5py.File(output_path, "w") as dest:
@@ -221,7 +225,7 @@ def _prepare_generation_directory(
     *,
     project_root: Path,
     num_runs: int | None,
-) -> tuple[Path, Path, list[Path] | None]:
+) -> tuple[Path, Path, Path, Path | None, Path | None]:
     """Prepare the raw-data output directory and resolve reuse semantics.
 
     Parameters
@@ -236,31 +240,56 @@ def _prepare_generation_directory(
 
     Returns
     -------
-    tuple[Path, Path, list[Path] | None]
-        Raw dataset root, per-run staging directory, and either ``None`` when
-        new generation should proceed or a list of reusable raw-run files /
-        consolidated files when reuse is allowed.
+    tuple[Path, Path, Path, Path | None, Path | None]
+        Run root, raw-data root, metadata root, temporary per-run staging
+        directory outside ``data/``, and either ``None`` when new generation
+        should proceed or the reusable consolidated ``runs.h5`` path when
+        reuse is allowed.
     """
-    raw_root = resolve_path(config["paths"]["raw_root"], project_root)
-    runs_dir = ensure_dir(raw_root / "runs")
+    run_root = resolve_path(dataset_run_root(config), project_root)
+    raw_root = resolve_path(dataset_raw_root(config), project_root)
+    info_root = resolve_path(dataset_info_root(config), project_root)
+    ensure_dir(run_root)
+    ensure_dir(raw_root)
+    ensure_dir(info_root)
+    staging_root = ensure_dir(project_root / "runtime" / "raw_staging")
+    legacy_runs_dir = raw_root / "runs"
+    if legacy_runs_dir.exists() and not any(legacy_runs_dir.iterdir()):
+        legacy_runs_dir.rmdir()
     requested_runs = _requested_run_count(config, num_runs)
     consolidated_path = raw_root / "runs.h5"
-    existing_files = sorted(runs_dir.glob("run_*.h5"))
+    existing_files = sorted(legacy_runs_dir.glob("run_*.h5")) if legacy_runs_dir.exists() else []
+
+    def _make_staging_dir() -> Path:
+        return Path(tempfile.mkdtemp(prefix=f"{run_root.name}_", dir=str(staging_root)))
+
     # Also count runs inside a consolidated file, if present.
     consolidated_count = 0
     if consolidated_path.exists():
         consolidated_count = len(list_run_ids_from_consolidated(consolidated_path))
     if bool(config["generation"]["overwrite"]):
-        for path in existing_files:
-            path.unlink()
+        if legacy_runs_dir.exists():
+            shutil.rmtree(legacy_runs_dir)
         if consolidated_path.exists():
             consolidated_path.unlink()
-        return raw_root, runs_dir, None
-    # Prefer consolidated file over per-file layout for reuse.
+        for metadata_path in (
+            info_root / "generation_manifest.json",
+            info_root / "sampling_coverage.json",
+            info_root / "failed_runs.json",
+        ):
+            if metadata_path.exists():
+                metadata_path.unlink()
+        return run_root, raw_root, info_root, _make_staging_dir(), None
+    # Reuse only the canonical consolidated raw-data layout.
     total_existing = consolidated_count + len(existing_files)
     if total_existing > 0:
-        if bool(config["generation"]["reuse_raw_if_present"]) and total_existing == requested_runs:
-            manifest_path = raw_root / "generation_manifest.json"
+        if existing_files:
+            raise RuntimeError(
+                "Found legacy per-file raw runs under raw/runs/. "
+                "Set generation.overwrite=true to regenerate the dataset in the current format."
+            )
+        if bool(config["generation"]["reuse_raw_if_present"]) and consolidated_count == requested_runs:
+            manifest_path = info_root / "generation_manifest.json"
             if not manifest_path.exists():
                 raise RuntimeError(
                     "Existing raw runs cannot be safely reused because generation_manifest.json is missing. "
@@ -276,15 +305,12 @@ def _prepare_generation_directory(
                     "Existing raw runs were generated with a different generation mode or chemistry_type. "
                     "Set generation.overwrite=true to regenerate a compatible dataset."
                 )
-            # Return consolidated path as a single-element list when no per-file runs exist.
-            reuse_files = existing_files if existing_files else [consolidated_path]
-            return raw_root, runs_dir, reuse_files
+            return run_root, raw_root, info_root, None, consolidated_path
         raise RuntimeError(
-            f"Found {total_existing} existing raw runs (per-file: {len(existing_files)}, "
-            f"consolidated: {consolidated_count}). "
+            f"Found {total_existing} existing raw runs (consolidated: {consolidated_count}). "
             "Set generation.overwrite=true or align generation.num_runs with the existing dataset."
         )
-    return raw_root, runs_dir, None
+    return run_root, raw_root, info_root, _make_staging_dir(), None
 
 
 def _coverage_fraction(low: float, high: float, observed_low: float, observed_high: float) -> float:
@@ -456,7 +482,7 @@ def _sampling_coverage_payload(
 
 def _write_generation_metadata(
     *,
-    raw_root: Path,
+    info_root: Path,
     run_files: list[Path],
     specs: list[RunSpecification],
     config: dict[str, Any],
@@ -466,8 +492,8 @@ def _write_generation_metadata(
 
     Parameters
     ----------
-    raw_root : Path
-        Raw dataset directory that receives the metadata files.
+    info_root : Path
+        Shared metadata directory that receives the generation metadata files.
     run_files : list[Path]
         Raw HDF5 artefacts included in the manifest.
     specs : list[RunSpecification]
@@ -483,8 +509,8 @@ def _write_generation_metadata(
         Paths to ``generation_manifest.json`` and
         ``sampling_coverage.json``.
     """
-    manifest_path = raw_root / "generation_manifest.json"
-    coverage_path = raw_root / "sampling_coverage.json"
+    manifest_path = info_root / "generation_manifest.json"
+    coverage_path = info_root / "sampling_coverage.json"
     manifest_payload = {
         "mode": mode,
         "chemistry_type": get_chemistry_type(config),
@@ -767,7 +793,7 @@ def write_raw_run_hdf5(
     final_ymix_output: np.ndarray,
     output_species: list[str] | None = None,
 ) -> Path:
-    """Write one full-VULCAN raw run in the repository HDF5 contract.
+    """Write one VULCAN raw run in the repository HDF5 contract.
 
     Parameters
     ----------
@@ -1176,21 +1202,26 @@ def generate_synthetic_raw_runs(
         summary.
     """
     LOGGER.info("Synthetic generation starting (num_runs=%s)", num_runs or "config default")
-    raw_root, runs_dir, reusable_files = _prepare_generation_directory(
+    run_root, raw_root, info_root, runs_dir, reusable_path = _prepare_generation_directory(
         config,
         project_root=project_root,
         num_runs=num_runs,
     )
-    if reusable_files is not None:
-        LOGGER.info("Reusing %d existing runs from %s", len(reusable_files), raw_root)
-        manifest_path = raw_root / "generation_manifest.json"
-        coverage_path = raw_root / "sampling_coverage.json"
+    if reusable_path is not None:
+        run_ids = list_run_ids_from_consolidated(reusable_path)
+        LOGGER.info("Reusing %d existing runs from %s", len(run_ids), raw_root)
+        manifest_path = info_root / "generation_manifest.json"
+        coverage_path = info_root / "sampling_coverage.json"
         return GeneratedRawDataset(
+            run_root=run_root,
             raw_root=raw_root,
-            run_files=reusable_files,
+            run_ids=run_ids,
+            consolidated_path=reusable_path,
             manifest_path=manifest_path if manifest_path.exists() else None,
             coverage_path=coverage_path if coverage_path.exists() else None,
         )
+    if runs_dir is None:
+        raise RuntimeError("Synthetic generation requires a writable staging directory.")
     specs = sample_run_specifications(
         config=config,
         project_root=project_root,
@@ -1220,43 +1251,48 @@ def generate_synthetic_raw_runs(
         )
     worker_count = _generation_worker_count(config, len(prepared_specs))
     run_files: list[Path] = []
-    if worker_count == 1:
-        for spec in prepared_specs:
-            run_files.append(
-                _generate_single_synthetic_run(
-                    spec,
-                    runs_dir=runs_dir,
-                    output_species=output_species,
+    try:
+        if worker_count == 1:
+            for spec in prepared_specs:
+                run_files.append(
+                    _generate_single_synthetic_run(
+                        spec,
+                        runs_dir=runs_dir,
+                        output_species=output_species,
+                    )
                 )
-            )
-    else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
-                    _generate_single_synthetic_run,
-                    spec,
-                    runs_dir=runs_dir,
-                    output_species=output_species,
-                )
-                for spec in prepared_specs
-            ]
-            for future in futures:
-                run_files.append(future.result())
-    run_files = sorted(run_files)
-    LOGGER.info("Synthetic generation complete: %d runs written to %s", len(run_files), runs_dir)
-    consolidated_path = consolidate_runs_to_single_hdf5(
-        run_files, raw_root / "runs.h5",
-    )
+        else:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(
+                        _generate_single_synthetic_run,
+                        spec,
+                        runs_dir=runs_dir,
+                        output_species=output_species,
+                    )
+                    for spec in prepared_specs
+                ]
+                for future in futures:
+                    run_files.append(future.result())
+        run_files = sorted(run_files)
+        LOGGER.info("Synthetic generation complete: %d runs written to %s", len(run_files), runs_dir)
+        consolidated_path = consolidate_runs_to_single_hdf5(
+            run_files, raw_root / "runs.h5",
+        )
+    finally:
+        if runs_dir.exists():
+            shutil.rmtree(runs_dir, ignore_errors=True)
     manifest_path, coverage_path = _write_generation_metadata(
-        raw_root=raw_root,
+        info_root=info_root,
         run_files=[consolidated_path],
         specs=prepared_specs,
         config=config,
         mode="synthetic",
     )
     return GeneratedRawDataset(
+        run_root=run_root,
         raw_root=raw_root,
-        run_files=run_files,
+        run_ids=[spec.run_id for spec in prepared_specs],
         consolidated_path=consolidated_path,
         manifest_path=manifest_path,
         coverage_path=coverage_path,
@@ -1283,6 +1319,22 @@ def _copy_vulcan_source(source_root: Path, worker_root: Path) -> None:
     if worker_root.exists():
         shutil.rmtree(worker_root)
     shutil.copytree(source_root, worker_root)
+
+
+def _cleanup_worker_root(worker_root: Path) -> None:
+    """Remove one worker-local runtime tree after a run completes.
+
+    Parameters
+    ----------
+    worker_root : Path
+        Worker-local directory to delete.
+
+    Returns
+    -------
+    None
+        The worker directory is removed when it exists.
+    """
+    shutil.rmtree(worker_root, ignore_errors=True)
 
 
 def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
@@ -1454,7 +1506,6 @@ def _patch_vulcan_cfg(
     """
     text = cfg_file.read_text(encoding="utf-8")
     runtime = config["vulcan_runtime"]
-    spectrum_cfg = config["stellar_spectrum"]
     element_abundances = _element_abundances_from_spec(spec)
     default_preset = dict(config.get("default_science_preset", {}))
     default_physics = dict(default_preset.get("physics_toggles", {}))
@@ -1504,10 +1555,10 @@ def _patch_vulcan_cfg(
             "gs": float(spec.globals["gravity_cm_s2"]),
             "Rp": float(spec.globals["planet_radius_cm"]),
             "rocky": bool(runtime["rocky"]),
-            "r_star": float(spectrum_cfg["radius_rsun"]),
-            "orbit_radius": float(spectrum_cfg["semi_major_axis_au"]),
-            "sl_angle": float(np.deg2rad(spectrum_cfg["zenith_angle_deg"])),
-            "f_diurnal": float(spectrum_cfg["diurnal_factor"]),
+            "r_star": float(spec.globals["r_star_rsun"]),
+            "orbit_radius": float(spec.globals["semi_major_axis_au"]),
+            "sl_angle": float(np.deg2rad(spec.globals["zenith_angle_deg"])),
+            "f_diurnal": float(spec.globals["diurnal_factor"]),
             "save_evolution": True,
             "save_evo_frq": 1,
             "use_live_plot": False,
@@ -1646,14 +1697,9 @@ def convert_vulcan_output_to_hdf5(
         gravity_profile_runtime = None
 
     # Extract the final converged mixing ratios from VULCAN output.
-    if "ymix_time" in _fetch(data, "variable"):
-        ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
-    elif "y_time" in _fetch(data, "variable") and "n_0" in _fetch(data, "atm"):
-        y_time = np.asarray(_fetch(data, "variable", "y_time"), dtype=np.float64)
-        n0 = np.asarray(_fetch(data, "atm", "n_0"), dtype=np.float64)
-        ymix_time = y_time / n0[None, :, None]
-    else:
-        raise ValueError("VULCAN output is missing both ymix_time and the y_time/n_0 fallback.")
+    if "ymix_time" not in _fetch(data, "variable"):
+        raise ValueError("VULCAN output is missing variable.ymix_time required by the current raw-data contract.")
+    ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
     output_species = list(config["data_spec"]["output_species"])
     output_indices = [species.index(name) for name in output_species]
     # Take the last timestep as the final converged state.
@@ -1823,38 +1869,43 @@ def _run_single_vulcan_spec(
         Path to the written raw-run HDF5 file.
     """
     worker_root = worker_base / spec.run_id
-    _copy_vulcan_source(source_root, worker_root)
-    tp_file, spectrum_file = _write_worker_inputs(worker_root, spec)
-    cfg_file = worker_root / config["vulcan_runtime"]["cfg_file"]
-    _patch_vulcan_cfg(
-        cfg_file,
-        spec=spec,
-        config=config,
-        tp_file=tp_file,
-        spectrum_file=spectrum_file,
-    )
-    python_executable = str(config["vulcan_runtime"]["python_executable"])
-    if bool(config["vulcan_runtime"]["regenerate_chem_funs"]):
-        subprocess.run(
-            [python_executable, "make_chem_funs.py"],
-            cwd=worker_root,
-            check=True,
+    try:
+        _copy_vulcan_source(source_root, worker_root)
+        tp_file, spectrum_file = _write_worker_inputs(worker_root, spec)
+        cfg_file = worker_root / config["vulcan_runtime"]["cfg_file"]
+        _patch_vulcan_cfg(
+            cfg_file,
+            spec=spec,
+            config=config,
+            tp_file=tp_file,
+            spectrum_file=spectrum_file,
         )
-        vulcan_cmd = [python_executable, "vulcan.py", "-n"]
-    else:
-        vulcan_cmd = [python_executable, "vulcan.py"]
-    subprocess.run(vulcan_cmd, cwd=worker_root, check=True)
+        python_executable = str(config["vulcan_runtime"]["python_executable"])
+        if bool(config["vulcan_runtime"]["regenerate_chem_funs"]):
+            subprocess.run(
+                [python_executable, "make_chem_funs.py"],
+                cwd=worker_root,
+                check=True,
+            )
+            vulcan_cmd = [python_executable, "vulcan.py", "-n"]
+        else:
+            vulcan_cmd = [python_executable, "vulcan.py"]
+        subprocess.run(vulcan_cmd, cwd=worker_root, check=True)
 
-    output_candidates = sorted((worker_root / "output").glob("*.vul"))
-    if not output_candidates:
-        raise FileNotFoundError(f"No VULCAN output file found for run {spec.run_id} under {worker_root / 'output'}.")
-    output_h5 = runs_dir / f"{spec.run_id}.h5"
-    return convert_vulcan_output_to_hdf5(
-        output_candidates[-1],
-        output_h5_path=output_h5,
-        spec=spec,
-        config=config,
-    )
+        output_candidates = sorted((worker_root / "output").glob("*.vul"))
+        if not output_candidates:
+            raise FileNotFoundError(
+                f"No VULCAN output file found for run {spec.run_id} under {worker_root / 'output'}."
+            )
+        output_h5 = runs_dir / f"{spec.run_id}.h5"
+        return convert_vulcan_output_to_hdf5(
+            output_candidates[-1],
+            output_h5_path=output_h5,
+            spec=spec,
+            config=config,
+        )
+    finally:
+        _cleanup_worker_root(worker_root)
 
 
 def _run_single_fastchem_spec(
@@ -1886,24 +1937,29 @@ def _run_single_fastchem_spec(
         Path to the written equilibrium raw-run HDF5 file.
     """
     worker_root = worker_base / spec.run_id
-    fastchem_root = _copy_fastchem_runtime(source_root, worker_root)
-    _write_fastchem_element_abundances(
-        fastchem_root,
-        spec=spec,
-        config=config,
-    )
-    _write_fastchem_tp_profile(fastchem_root, spec)
-    subprocess.run(["./fastchem", "input/config.input"], cwd=fastchem_root, check=True)
-    fastchem_output = fastchem_root / "output" / "vulcan_EQ.dat"
-    if not fastchem_output.exists():
-        raise FileNotFoundError(f"No FastChem equilibrium output found for run {spec.run_id} under {fastchem_output}.")
-    output_h5 = runs_dir / f"{spec.run_id}.h5"
-    return convert_fastchem_output_to_hdf5(
-        fastchem_output,
-        output_h5_path=output_h5,
-        spec=spec,
-        config=config,
-    )
+    try:
+        fastchem_root = _copy_fastchem_runtime(source_root, worker_root)
+        _write_fastchem_element_abundances(
+            fastchem_root,
+            spec=spec,
+            config=config,
+        )
+        _write_fastchem_tp_profile(fastchem_root, spec)
+        subprocess.run(["./fastchem", "input/config.input"], cwd=fastchem_root, check=True)
+        fastchem_output = fastchem_root / "output" / "vulcan_EQ.dat"
+        if not fastchem_output.exists():
+            raise FileNotFoundError(
+                f"No FastChem equilibrium output found for run {spec.run_id} under {fastchem_output}."
+            )
+        output_h5 = runs_dir / f"{spec.run_id}.h5"
+        return convert_fastchem_output_to_hdf5(
+            fastchem_output,
+            output_h5_path=output_h5,
+            spec=spec,
+            config=config,
+        )
+    finally:
+        _cleanup_worker_root(worker_root)
 
 
 def run_vulcan_generation(
@@ -1929,26 +1985,33 @@ def run_vulcan_generation(
         Paths describing the generated raw dataset and its provenance files.
     """
     LOGGER.info("VULCAN generation starting (num_runs=%s)", num_runs or "config default")
-    raw_root, runs_dir, reusable_files = _prepare_generation_directory(
+    run_root, raw_root, info_root, runs_dir, reusable_path = _prepare_generation_directory(
         config,
         project_root=project_root,
         num_runs=num_runs,
     )
-    if reusable_files is not None:
-        LOGGER.info("Reusing %d existing runs from %s", len(reusable_files), raw_root)
-        manifest_path = raw_root / "generation_manifest.json"
-        coverage_path = raw_root / "sampling_coverage.json"
+    if reusable_path is not None:
+        run_ids = list_run_ids_from_consolidated(reusable_path)
+        LOGGER.info("Reusing %d existing runs from %s", len(run_ids), raw_root)
+        manifest_path = info_root / "generation_manifest.json"
+        coverage_path = info_root / "sampling_coverage.json"
         return GeneratedRawDataset(
+            run_root=run_root,
             raw_root=raw_root,
-            run_files=reusable_files,
+            run_ids=run_ids,
+            consolidated_path=reusable_path,
             manifest_path=manifest_path if manifest_path.exists() else None,
             coverage_path=coverage_path if coverage_path.exists() else None,
         )
+    if runs_dir is None:
+        raise RuntimeError("VULCAN generation requires a writable staging directory.")
     source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
     fastchem = uses_fastchem(config)
     worker_root_key = "vulcan_runtime" if "vulcan_runtime" in config else None
     worker_base = resolve_path(
-        config["vulcan_runtime"]["worker_root"] if worker_root_key else "data/vulcan_workers",
+        config["vulcan_runtime"]["worker_root"]
+        if worker_root_key
+        else "runtime/vulcan_workers",
         project_root,
     )
     run_single = _run_single_fastchem_spec if fastchem else _run_single_vulcan_spec
@@ -2059,61 +2122,66 @@ def run_vulcan_generation(
     next_run_index = 0
     prepared_specs = _sample_and_prepare(target_count, base_seed, start_index=next_run_index)
     next_run_index += len(prepared_specs)
-    run_files, all_failures = _run_batch(prepared_specs)
-    all_specs = list(prepared_specs)
+    try:
+        run_files, all_failures = _run_batch(prepared_specs)
+        all_specs = list(prepared_specs)
 
-    # Backfill rounds.
-    if backfill.get("enabled", True) and all_failures:
-        max_retries = int(backfill.get("max_retries", 3))
-        for attempt in range(1, max_retries + 1):
+        # Backfill rounds.
+        if backfill.get("enabled", True) and all_failures:
+            max_retries = int(backfill.get("max_retries", 3))
+            for attempt in range(1, max_retries + 1):
+                shortfall = target_count - len(run_files)
+                if shortfall <= 0:
+                    break
+                LOGGER.info(
+                    "Backfill attempt %d/%d: %d runs needed",
+                    attempt, max_retries, shortfall,
+                )
+                backfill_seed = base_seed + 1000 * attempt
+                backfill_specs = _sample_and_prepare(
+                    shortfall,
+                    backfill_seed,
+                    start_index=next_run_index,
+                )
+                next_run_index += len(backfill_specs)
+                new_successes, new_failures = _run_batch(backfill_specs)
+                run_files.extend(new_successes)
+                all_failures.extend(new_failures)
+                all_specs.extend(backfill_specs)
+                if not new_failures:
+                    break
+
+        if all_failures:
+            failed_log = info_root / "failed_runs.json"
+            failed_log.write_text(json.dumps(all_failures, indent=2), encoding="utf-8")
             shortfall = target_count - len(run_files)
-            if shortfall <= 0:
-                break
-            LOGGER.info(
-                "Backfill attempt %d/%d: %d runs needed",
-                attempt, max_retries, shortfall,
-            )
-            backfill_seed = base_seed + 1000 * attempt
-            backfill_specs = _sample_and_prepare(
-                shortfall,
-                backfill_seed,
-                start_index=next_run_index,
-            )
-            next_run_index += len(backfill_specs)
-            new_successes, new_failures = _run_batch(backfill_specs)
-            run_files.extend(new_successes)
-            all_failures.extend(new_failures)
-            all_specs.extend(backfill_specs)
-            if not new_failures:
-                break
+            if shortfall > 0:
+                raise RuntimeError(
+                    f"Generation finished {shortfall} successful runs short of the requested total. "
+                    f"See {failed_log} for failed run IDs."
+                )
 
-    if all_failures:
-        failed_log = raw_root / "failed_runs.json"
-        failed_log.write_text(json.dumps(all_failures, indent=2), encoding="utf-8")
-        shortfall = target_count - len(run_files)
-        if shortfall > 0:
-            raise RuntimeError(
-                f"Generation finished {shortfall} successful runs short of the requested total. "
-                f"See {failed_log} for failed run IDs."
-            )
-
-    run_files = sorted(run_files)
-    LOGGER.info("VULCAN generation complete: %d runs written to %s", len(run_files), runs_dir)
-    consolidated_path = consolidate_runs_to_single_hdf5(
-        run_files, raw_root / "runs.h5",
-    )
+        run_files = sorted(run_files)
+        LOGGER.info("VULCAN generation complete: %d runs written to %s", len(run_files), runs_dir)
+        consolidated_path = consolidate_runs_to_single_hdf5(
+            run_files, raw_root / "runs.h5",
+        )
+    finally:
+        if runs_dir.exists():
+            shutil.rmtree(runs_dir, ignore_errors=True)
     failed_ids = set(all_failures)
     successful_specs = [s for s in all_specs if s.run_id not in failed_ids]
     manifest_path, coverage_path = _write_generation_metadata(
-        raw_root=raw_root,
+        info_root=info_root,
         run_files=[consolidated_path],
         specs=successful_specs,
         config=config,
         mode="vulcan",
     )
     return GeneratedRawDataset(
+        run_root=run_root,
         raw_root=raw_root,
-        run_files=run_files,
+        run_ids=[spec.run_id for spec in successful_specs],
         consolidated_path=consolidated_path,
         manifest_path=manifest_path,
         coverage_path=coverage_path,

@@ -36,10 +36,11 @@ from .jax_model import (
     apply_mlp,
     apply_transformer_model,
 )
+from ..data_generation.spectrum import pack_spectrum_tokens
 
 
 EXPORT_FORMAT = "jax_physical_bundle"
-EXPORT_VERSION = 3
+EXPORT_VERSION = 4
 
 
 def _flatten_params(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
@@ -141,6 +142,10 @@ def _restore_block_transform_space_jax(
     method = str(block["method"]).lower()
     if method == "none":
         return arr
+    if method == "log-minmax":
+        log10_min = jnp.asarray(block["log10_min"], dtype=arr.dtype)
+        span = jnp.asarray(block["span"], dtype=arr.dtype)
+        return arr * span + log10_min
     mean = jnp.asarray(block["mean"], dtype=arr.dtype)
     std = jnp.asarray(block["std"], dtype=arr.dtype)
     if method in {"standard", "log-standard"}:
@@ -167,6 +172,11 @@ def apply_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.Arr
     method = str(block["method"]).lower()
     if method == "none":
         return arr
+    if method == "log-minmax":
+        floor = jnp.asarray(float(block["floor"]), dtype=arr.dtype)
+        log10_min = jnp.asarray(block["log10_min"], dtype=arr.dtype)
+        span = jnp.asarray(block["span"], dtype=arr.dtype)
+        return (jnp.log10(jnp.maximum(arr, floor)) - log10_min) / span
     mean = jnp.asarray(block["mean"], dtype=arr.dtype)
     std = jnp.asarray(block["std"], dtype=arr.dtype)
     if method == "standard":
@@ -196,7 +206,7 @@ def inverse_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.A
         units.
     """
     restored = _restore_block_transform_space_jax(jnp.asarray(x, dtype=jnp.float32), block)
-    if str(block["method"]).lower() == "log-standard":
+    if str(block["method"]).lower() in {"log-standard", "log-minmax"}:
         return jnp.power(10.0, restored)
     return restored
 
@@ -230,6 +240,10 @@ def apply_mixed_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> j
             outputs.append((column - mean) / std)
             continue
         if method == "log-standard":
+            floor = jnp.asarray(float(block["floor"][idx]), dtype=arr.dtype)
+            outputs.append((jnp.log10(jnp.maximum(column, floor)) - mean) / std)
+            continue
+        if method == "log-minmax":
             floor = jnp.asarray(float(block["floor"][idx]), dtype=arr.dtype)
             outputs.append((jnp.log10(jnp.maximum(column, floor)) - mean) / std)
             continue
@@ -300,6 +314,48 @@ def _ordered_feature_vector(
             f"{field_name} must have shape ({len(feature_order)},), got {tuple(arr.shape)}."
         )
     return arr
+
+
+def _is_traced_array(value: Any) -> bool:
+    """Return whether an input is a JAX tracer inside a transformed context."""
+    return isinstance(value, jax.core.Tracer)
+
+
+def _pack_native_spectrum_tokens_jax(
+    wavelength_nm: jax.Array,
+    flux_erg_cm2_s_nm: jax.Array,
+    *,
+    wavelength_min_nm: float,
+    wavelength_max_nm: float,
+    max_tokens: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Pad an already-valid native-grid spectrum without leaving JAX.
+
+    This helper is intentionally narrow: it does not sanitize, clip, sort, or
+    rebin traced inputs. The caller must provide a one-dimensional, strictly
+    increasing native spectrum whose wavelength coverage already lies within
+    ``[wavelength_min_nm, wavelength_max_nm]`` and whose length is at most
+    ``max_tokens``.
+    """
+    del wavelength_min_nm, wavelength_max_nm
+    wavelength = jnp.asarray(wavelength_nm, dtype=jnp.float32)
+    flux = jnp.asarray(flux_erg_cm2_s_nm, dtype=jnp.float32)
+    if wavelength.ndim != 1 or flux.ndim != 1:
+        raise ValueError("JAX-native VULCAN spectra must be 1-D arrays.")
+    if wavelength.shape != flux.shape:
+        raise ValueError("JAX-native VULCAN wavelength and flux arrays must share the same shape.")
+    num_tokens = int(wavelength.shape[0])
+    if num_tokens < 2:
+        raise ValueError("JAX-native VULCAN spectra must contain at least two samples.")
+    if num_tokens > int(max_tokens):
+        raise ValueError(
+            "JAX-native VULCAN spectra must satisfy len(spectrum) <= spectrum_max_tokens."
+        )
+    pad_width = int(max_tokens) - num_tokens
+    padded_wavelength = jnp.pad(wavelength, (0, pad_width))
+    padded_flux = jnp.pad(flux, (0, pad_width))
+    mask = jnp.arange(int(max_tokens)) < num_tokens
+    return padded_wavelength, padded_flux, mask
 
 
 
@@ -548,12 +604,22 @@ class ExportedJAXModel:
         )  # shape: (1, global_dim)
 
         if self.uses_mlp:
-            pred_norm, _ = apply_mlp(self.params, sequence, globals_norm, self.dims)
+            pred_norm, _ = apply_mlp(
+                self.params,
+                sequence,
+                globals_norm,
+                self.dims,
+                None,
+                None,
+                None,
+            )
         else:
             pred_norm, _ = apply_transformer_model(
                 self.params,
                 sequence,
                 globals_norm,
+                None,
+                None,
                 None,
                 self.dims,
             )
@@ -562,6 +628,7 @@ class ExportedJAXModel:
             return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
         return inverse_block_jax(pred_norm, self.normalization["target"])
 
+
     def predict_vulcan_profile(
         self,
         *,
@@ -569,36 +636,17 @@ class ExportedJAXModel:
         temperature_k: jax.Array | np.ndarray,
         kzz_cm2_s: jax.Array | np.ndarray,
         global_inputs: dict[str, float] | jax.Array | np.ndarray,
-        spectrum_flux: jax.Array | np.ndarray,
+        spectrum_wavelength_nm: jax.Array | np.ndarray,
+        spectrum_flux_erg_cm2_s_nm: jax.Array | np.ndarray,
         return_log10: bool = False,
     ) -> jax.Array:
         """Run VULCAN inference directly from physical-unit inputs.
 
-        Normalizes sequence-static features (pressure, temperature, Kzz),
-        global conditioning scalars, and stellar spectrum internally.
-        Predictions are inverse-normalized back to physical mixing ratios.
-
-        Parameters
-        ----------
-        pressure_bar : array-like
-            Pressure grid in bar, shape ``(nz,)``.
-        temperature_k : array-like
-            Temperature profile in Kelvin, shape ``(nz,)``.
-        kzz_cm2_s : array-like
-            Eddy diffusion coefficient in cm^2/s, shape ``(nz,)``.
-        global_inputs : dict or array-like
-            Global conditioning scalars (surface gravity, planet radius,
-            profile-global ``X/H`` elemental abundances, plus any physics
-            toggles and atmosphere-base flags).
-        spectrum_flux : array-like
-            Stellar spectrum flux values, shape ``(spectrum_dim,)``.
-        return_log10 : bool
-            If True, return log10 mixing ratios instead of linear.
-
-        Returns
-        -------
-        jax.Array
-            Predicted mixing ratios, shape ``(nz, target_dim)``.
+        Eager inputs may use arbitrary valid wavelength grids and are sanitized
+        and packed through the NumPy preprocessing path. JAX-traced spectrum
+        inputs must already be valid native-grid spectra with static
+        ``len(spectrum) <= spectrum_max_tokens``; in that case the method pads
+        them inside JAX without sorting, clipping, or rebinning.
         """
         if not self.uses_vulcan_chemistry:
             raise ValueError("predict_vulcan_profile requires a vulcan export bundle.")
@@ -606,22 +654,16 @@ class ExportedJAXModel:
         pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
         temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
         kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)
-        spectrum = jnp.asarray(spectrum_flux, dtype=jnp.float32)
         if pressure.ndim != 1 or temperature.ndim != 1 or kzz.ndim != 1:
             raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must be 1-D arrays.")
         if not (pressure.shape == temperature.shape == kzz.shape):
             raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must share the same shape.")
-        if spectrum.ndim != 1 or spectrum.shape[0] != int(self.data_contract["spectrum_dim"]):
-            raise ValueError(
-                "spectrum_flux must be a 1-D array with length "
-                f"{int(self.data_contract['spectrum_dim'])}."
-            )
 
-        static_inputs = jnp.stack([pressure, temperature, kzz], axis=-1)  # shape: (nz, 3)
+        static_inputs = jnp.stack([pressure, temperature, kzz], axis=-1)
         sequence = _apply_sequence_static_block_jax(
             static_inputs,
             self.normalization["sequence_static"],
-        )[None, :, :]  # shape: (1, nz, 3)
+        )[None, :, :]
 
         global_vector = _ordered_feature_vector(
             global_inputs,
@@ -631,23 +673,58 @@ class ExportedJAXModel:
         globals_norm = apply_mixed_block_jax(
             global_vector[None, :],
             self.normalization["global_static"],
-        )  # shape: (1, global_dim)
+        )
 
-        spectrum_norm = apply_block_jax(spectrum[None, :], self.normalization["spectrum"])
+        if _is_traced_array(spectrum_wavelength_nm) or _is_traced_array(spectrum_flux_erg_cm2_s_nm):
+            packed_wavelengths_nm, packed_fluxes, packed_mask = _pack_native_spectrum_tokens_jax(
+                spectrum_wavelength_nm,
+                spectrum_flux_erg_cm2_s_nm,
+                wavelength_min_nm=float(self.data_contract["spectrum_wavelength_min_nm"]),
+                wavelength_max_nm=float(self.data_contract["spectrum_wavelength_max_nm"]),
+                max_tokens=int(self.data_contract["spectrum_max_tokens"]),
+            )
+            spectrum_wavelengths = packed_wavelengths_nm[None, :]
+            spectrum_fluxes = packed_fluxes[None, :]
+            spectrum_mask = packed_mask[None, :]
+        else:
+            wavelength_np = np.asarray(spectrum_wavelength_nm, dtype=np.float64).reshape(-1)
+            flux_np = np.asarray(spectrum_flux_erg_cm2_s_nm, dtype=np.float64).reshape(-1)
+            if wavelength_np.size != flux_np.size:
+                raise ValueError(
+                    "spectrum_wavelength_nm and spectrum_flux_erg_cm2_s_nm must have the same length."
+                )
+            packed_wavelengths_nm, packed_fluxes, packed_mask = pack_spectrum_tokens(
+                wavelength_np,
+                flux_np,
+                wavelength_min_nm=float(self.data_contract["spectrum_wavelength_min_nm"]),
+                wavelength_max_nm=float(self.data_contract["spectrum_wavelength_max_nm"]),
+                max_tokens=int(self.data_contract["spectrum_max_tokens"]),
+                dbin1_nm=float(self.data_contract.get("spectrum_dbin1_nm", 0.1)),
+                dbin2_nm=float(self.data_contract.get("spectrum_dbin2_nm", 2.0)),
+                dbin_12trans_nm=float(self.data_contract.get("spectrum_dbin_12trans_nm", 240.0)),
+            )
+            spectrum_wavelengths = jnp.asarray(packed_wavelengths_nm[None, :], dtype=jnp.float32)
+            spectrum_fluxes = jnp.asarray(packed_fluxes[None, :], dtype=jnp.float32)
+            spectrum_mask = jnp.asarray(packed_mask[None, :], dtype=bool)
+
         if self.uses_mlp:
             pred_norm, _ = apply_mlp(
                 self.params,
                 sequence,
                 globals_norm,
                 self.dims,
-                spectrum_norm,
+                spectrum_wavelengths,
+                spectrum_fluxes,
+                spectrum_mask,
             )
         else:
             pred_norm, _ = apply_transformer_model(
                 self.params,
                 sequence,
                 globals_norm,
-                spectrum_norm,
+                spectrum_wavelengths,
+                spectrum_fluxes,
+                spectrum_mask,
                 self.dims,
             )
         pred_norm = pred_norm[0]

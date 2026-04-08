@@ -15,7 +15,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.15",
+]
 
 [tool.setuptools.packages.find]
 include = ["src*"]
@@ -23,3 +26,10 @@ include = ["src*"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["uni_tests"]
+
+[tool.ruff]
+src = ["src", "uni_tests"]
+target-version = "py39"
+
+[tool.ruff.lint]
+extend-select = ["I"]

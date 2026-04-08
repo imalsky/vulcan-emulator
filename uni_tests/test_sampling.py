@@ -5,8 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
-from src.utils.config import load_and_validate_config
 from src.data_generation.roth_sampling import _interpolate_profile, load_roth_profiles
 from src.data_generation.sampling import (
     _sample_temperature_profile_record,
@@ -15,7 +13,7 @@ from src.data_generation.sampling import (
     sample_run_specifications,
     sample_temperature_profile,
 )
-
+from src.utils.config import load_and_validate_config
 
 FIXTURE_PT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -86,7 +84,7 @@ def test_kzz_sampling_is_constant_with_depth(tiny_config):
     np.testing.assert_allclose(kzz[0], float(tiny_config["sampling"]["kzz_cm2_s"]))
 
 
-def test_full_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config):
+def test_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config):
     specs = sample_run_specifications(
         config=tiny_config,
         project_root=tiny_config["_project_root"],

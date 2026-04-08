@@ -45,12 +45,19 @@ VULCAN_CONDITIONING_INPUT_ORDER = (
 )
 VULCAN_CORE_GLOBAL_INPUTS = VULCAN_CONDITIONING_INPUT_ORDER
 FASTCHEM_CORE_GLOBAL_INPUTS = FASTCHEM_CONDITIONING_INPUT_ORDER
+VULCAN_STELLAR_GLOBAL_INPUTS = (
+    "r_star_rsun",
+    "semi_major_axis_au",
+    "zenith_angle_deg",
+    "diurnal_factor",
+)
 VULCAN_OPTIONAL_GLOBAL_INPUTS = (
     *PUBLIC_PHYSICS_TOGGLES,
     *tuple(f"atm_base_{name}" for name in SUPPORTED_ATM_BASES),
 )
 DEFAULT_REQUIRED_GLOBAL_INPUTS = (
     *VULCAN_CORE_GLOBAL_INPUTS,
+    *VULCAN_STELLAR_GLOBAL_INPUTS,
     *VULCAN_OPTIONAL_GLOBAL_INPUTS,
 )
 DEFAULT_STATE_SPECIES = (
@@ -72,7 +79,7 @@ DEFAULT_STATE_SPECIES = (
     "SO2",
     "S2",
 )
-_ALLOWED_SPECTRUM_ENCODERS = {"autoencoder", "linear", "none"}
+_ALLOWED_SPECTRUM_ENCODERS = {"perceiver", "none"}
 _ALLOWED_ACTIVATIONS = {
     "elu",
     "gelu",
@@ -85,7 +92,7 @@ _ALLOWED_ACTIVATIONS = {
 }
 _ALLOWED_LR_SCHEDULERS = {"cosine", "reduce_on_plateau"}
 _ALLOWED_TEMPERATURE_PROFILE_SOURCE_MODES = {"analytic", "pt_library", "mixed"}
-_ALLOWED_NORMALIZATION_METHODS = {"standard", "log-standard", "none"}
+_ALLOWED_NORMALIZATION_METHODS = {"standard", "log-standard", "log-minmax", "none"}
 _ALLOWED_TEMPERATURE_PROFILE_NUMERIC_FILTER_KEYS = {
     "Teq",
     "LogMet",
@@ -145,6 +152,21 @@ _REMOVED_LEGACY_KEYS = {
         "vulcan.trajectory_sampling has been removed. The supported VULCAN "
         "task is final-state-only."
     ),
+    "vulcan.stellar_spectrum.enabled": (
+        "vulcan.stellar_spectrum.enabled has been removed. The stellar spectrum "
+        "encoder is always active when a vulcan block is present."
+    ),
+    "vulcan.stellar_spectrum.num_bins": (
+        "vulcan.stellar_spectrum.num_bins has been removed. Use max_tokens instead."
+    ),
+    "normalization.spectrum_method": (
+        "normalization.spectrum_method has been removed. Spectra are normalized "
+        "on-the-fly inside the encoder."
+    ),
+    "training.loss.lambda_spectrum": (
+        "training.loss.lambda_spectrum has been removed. Spectrum loss is no "
+        "longer a separate training objective."
+    ),
 }
 _INTERNAL_VULCAN_RUNTIME_DEFAULTS = {
     "python_executable": "python",
@@ -159,6 +181,12 @@ _INTERNAL_VULCAN_RUNTIME_DEFAULTS = {
     "bot_bc_flux_file": None,
 }
 _DEFAULT_SCIENCE_PRESET_NAME = "default"
+_LEGACY_VULCAN_STELLAR_GEOMETRY_ALIASES = {
+    "radius_rsun": "stellar_radius_range_rsun",
+    "semi_major_axis_au": "semi_major_axis_range_au",
+    "zenith_angle_deg": "zenith_angle_range_deg",
+    "diurnal_factor": "diurnal_factor_range",
+}
 
 
 class ConfigValidationError(ValueError):
@@ -630,6 +658,21 @@ def global_feature_order(config: dict[str, Any]) -> list[str]:
         :func:`global_static_feature_order`.
     """
     return list(config["data_spec"]["required_global_inputs"])
+
+
+def dataset_raw_root(config: dict[str, Any]) -> str:
+    """Return the configured raw-data root for the active dataset."""
+    return str(config["paths"]["raw_root"])
+
+
+def dataset_run_root(config: dict[str, Any]) -> str:
+    """Return the shared dataset run root containing raw, processed, and info."""
+    return str(Path(config["paths"]["raw_root"]).parent)
+
+
+def dataset_info_root(config: dict[str, Any]) -> str:
+    """Return the shared dataset metadata directory adjacent to raw/processed."""
+    return str(Path(config["paths"]["raw_root"]).parent / "info")
 
 
 def _validate_mlp_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
@@ -1127,6 +1170,29 @@ def _validate_split(split: Any) -> dict[str, Any]:
     return normalized
 
 
+def _seed_vulcan_sampling_geometry_ranges(config: dict[str, Any]) -> None:
+    """Backfill new sampling geometry ranges from legacy fixed config keys.
+
+    Older VULCAN configs stored irradiation geometry under
+    ``vulcan.stellar_spectrum`` as fixed scalars. The current contract samples
+    those values per run from ``sampling`` ranges instead. This helper mirrors
+    any legacy fixed values into equal-endpoint sampling ranges before the main
+    sampling schema is validated.
+    """
+    if config.get("chemistry_type") != "vulcan":
+        return
+    sampling = config.get("sampling")
+    vulcan = config.get("vulcan")
+    if not isinstance(sampling, dict) or not isinstance(vulcan, dict):
+        return
+    spectrum = vulcan.get("stellar_spectrum")
+    if not isinstance(spectrum, dict):
+        return
+    for legacy_key, sampling_key in _LEGACY_VULCAN_STELLAR_GEOMETRY_ALIASES.items():
+        if sampling_key not in sampling and legacy_key in spectrum:
+            sampling[sampling_key] = [spectrum[legacy_key], spectrum[legacy_key]]
+
+
 def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     """Load a JSON config file, apply defaults, and validate its full contract.
 
@@ -1183,33 +1249,21 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         _require_keys(config, ["vulcan"], "root")
     config["chemistry_type"] = chemistry_type
     config["model_type"] = model_type
+    _seed_vulcan_sampling_geometry_ranges(config)
 
     paths = config["paths"]
-    _require_keys(
-        paths,
-        [
-            "raw_root",
-            "processed_root",
-            "checkpoints_root",
-            "vulcan_source_root",
-        ],
-        "paths",
-    )
+    if "raw_root" in paths or "processed_root" in paths:
+        raise ConfigValidationError(
+            "paths.raw_root and paths.processed_root are no longer supported. "
+            "Use run_root only (e.g. 'data/fastchem_mlp'). The validator auto-expands "
+            "it to run_root/raw and run_root/processed."
+        )
+    _require_keys(paths, ["run_root", "checkpoints_root", "vulcan_source_root"], "paths")
     for key in paths:
         paths[key] = _as_nonempty_str(paths[key], f"paths.{key}")
-    raw_root_path = Path(paths["raw_root"])
-    processed_root_path = Path(paths["processed_root"])
-    if raw_root_path.name != "raw" or processed_root_path.name != "processed":
-        raise ConfigValidationError(
-            "paths.raw_root and paths.processed_root must end with '/raw' and '/processed' "
-            "under a shared run directory (for example, data/<run_name>/raw and "
-            "data/<run_name>/processed)."
-        )
-    if raw_root_path.parent != processed_root_path.parent:
-        raise ConfigValidationError(
-            "paths.raw_root and paths.processed_root must share the same parent run directory "
-            "(for example, data/<run_name>/raw and data/<run_name>/processed)."
-        )
+    run_root = paths.pop("run_root")
+    paths["raw_root"] = str(Path(run_root) / "raw")
+    paths["processed_root"] = str(Path(run_root) / "processed")
 
     data_spec = config["data_spec"]
     if not isinstance(data_spec, dict):
@@ -1254,6 +1308,10 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         required_sampling += [
             "gravity_range_cm_s2",
             "planet_radius_range_cm",
+            "stellar_radius_range_rsun",
+            "semi_major_axis_range_au",
+            "zenith_angle_range_deg",
+            "diurnal_factor_range",
             "kzz_cm2_s",
         ]
     _require_keys(sampling, required_sampling, "sampling")
@@ -1289,20 +1347,48 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "s_to_o_range",
     ]
     if chemistry_type == "vulcan":
-        range_keys.extend(["gravity_range_cm_s2", "planet_radius_range_cm"])
+        range_keys.extend(
+            [
+                "gravity_range_cm_s2",
+                "planet_radius_range_cm",
+                "stellar_radius_range_rsun",
+                "semi_major_axis_range_au",
+                "zenith_angle_range_deg",
+                "diurnal_factor_range",
+            ]
+        )
+    allow_equal_range_keys = {
+        "stellar_radius_range_rsun",
+        "semi_major_axis_range_au",
+        "zenith_angle_range_deg",
+        "diurnal_factor_range",
+    }
     for key in range_keys:
         values = sampling[key]
         if not isinstance(values, list) or len(values) != 2:
             raise ConfigValidationError(f"sampling.{key} must be a length-2 list.")
         low = _as_float(values[0], f"sampling.{key}[0]")
         high = _as_float(values[1], f"sampling.{key}[1]")
-        if not low < high:
+        if key in allow_equal_range_keys:
+            if low > high:
+                raise ConfigValidationError(f"sampling.{key} must be non-decreasing.")
+        elif not low < high:
             raise ConfigValidationError(f"sampling.{key} must be strictly increasing.")
         sampling[key] = [low, high]
     if chemistry_type == "vulcan":
-        for key in ("gravity_range_cm_s2", "planet_radius_range_cm"):
+        for key in (
+            "gravity_range_cm_s2",
+            "planet_radius_range_cm",
+            "stellar_radius_range_rsun",
+            "semi_major_axis_range_au",
+            "diurnal_factor_range",
+        ):
             if sampling[key][0] <= 0.0:
                 raise ConfigValidationError(f"sampling.{key} must be strictly positive.")
+        if sampling["zenith_angle_range_deg"][0] < 0.0 or sampling["zenith_angle_range_deg"][1] >= 90.0:
+            raise ConfigValidationError(
+                "sampling.zenith_angle_range_deg must lie within [0, 90)."
+            )
     if chemistry_type == "vulcan":
         sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
         if sampling["kzz_cm2_s"] <= 0.0:
@@ -1345,6 +1431,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("generation.backfill.max_retries must be >= 0.")
     generation["backfill"] = backfill
 
+
     normalization = config["normalization"]
     required_normalization_keys = [
         "split",
@@ -1354,7 +1441,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "target_method",
     ]
     if chemistry_type == "vulcan":
-        required_normalization_keys.extend(["spectrum_floor", "spectrum_method"])
+        required_normalization_keys.append("spectrum_floor")
     _require_keys(normalization, required_normalization_keys, "normalization")
     normalization["split"] = _validate_split(normalization["split"])
     normalization["state_floor"] = _as_float(
@@ -1377,6 +1464,11 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         )
         if normalization["spectrum_floor"] <= 0.0:
             raise ConfigValidationError("normalization.spectrum_floor must be positive.")
+        if "spectrum_method" in normalization and normalization["spectrum_method"] is not None:
+            normalization["spectrum_method"] = _normalized_method_name(
+                normalization["spectrum_method"],
+                "normalization.spectrum_method",
+            )
     if set(normalization["sequence_methods"].keys()) != expected_sequence_methods:
         raise ConfigValidationError(
             f"normalization.sequence_methods must define exactly {expected_sequence_methods}."
@@ -1400,11 +1492,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             method,
             f"normalization.global_methods.{key}",
         )
-    if chemistry_type == "vulcan":
-        normalization["spectrum_method"] = _normalized_method_name(
-            normalization["spectrum_method"],
-            "normalization.spectrum_method",
-        )
+
 
     training = config["training"]
     _require_keys(
@@ -1446,19 +1534,23 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         raise ConfigValidationError("training.gradient_clip must be positive.")
     loss = training["loss"]
     loss_required = ["lambda_z", "lambda_phys"]
-    if chemistry_type == "vulcan":
-        loss_required.append("lambda_spectrum")
     _require_keys(loss, loss_required, "training.loss")
     for key in loss_required:
         loss[key] = _as_float(loss[key], f"training.loss.{key}")
         if loss[key] < 0.0:
             raise ConfigValidationError(f"training.loss.{key} must be non-negative.")
-    if chemistry_type == "fastchem" and "lambda_spectrum" in loss:
-        raise ConfigValidationError(
-            "training.loss.lambda_spectrum is only valid when chemistry_type='vulcan'."
+    if "lambda_spectrum" in loss:
+        loss["lambda_spectrum"] = _as_float(
+            loss["lambda_spectrum"],
+            "training.loss.lambda_spectrum",
         )
+        if loss["lambda_spectrum"] < 0.0:
+            raise ConfigValidationError("training.loss.lambda_spectrum must be non-negative.")
+    else:
+        loss["lambda_spectrum"] = 0.0
 
     model = config["model"]
+
     if not isinstance(model, dict):
         raise ConfigValidationError("model must be a mapping.")
     if model_type == "mlp":
@@ -1583,30 +1675,25 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             default_atm_base=default_atm_base,
             scope="vulcan.science_presets",
         )
+
         spectrum = section["stellar_spectrum"]
         _require_keys(
             spectrum,
             [
-                "enabled",
                 "template_name",
                 "template_file",
-                "num_bins",
+                "max_tokens",
                 "wavelength_min_nm",
                 "wavelength_max_nm",
                 "encoder_mode",
                 "latent_dim",
                 "hidden_dim",
-                "teff_k",
-                "radius_rsun",
-                "semi_major_axis_au",
-                "zenith_angle_deg",
-                "diurnal_factor",
+                "num_latents",
+                "num_layers",
+                "num_heads",
+                "fourier_features",
             ],
             "vulcan.stellar_spectrum",
-        )
-        spectrum["enabled"] = _as_bool(
-            spectrum["enabled"],
-            "vulcan.stellar_spectrum.enabled",
         )
         spectrum["template_name"] = _as_nonempty_str(
             spectrum["template_name"],
@@ -1624,9 +1711,9 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 library_glob,
                 "vulcan.stellar_spectrum.library_glob",
             )
-        spectrum["num_bins"] = _as_int(
-            spectrum["num_bins"],
-            "vulcan.stellar_spectrum.num_bins",
+        spectrum["max_tokens"] = _as_int(
+            spectrum["max_tokens"],
+            "vulcan.stellar_spectrum.max_tokens",
         )
         spectrum["latent_dim"] = _as_int(
             spectrum["latent_dim"],
@@ -1636,12 +1723,40 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             spectrum["hidden_dim"],
             "vulcan.stellar_spectrum.hidden_dim",
         )
-        if spectrum["num_bins"] < 8:
-            raise ConfigValidationError("vulcan.stellar_spectrum.num_bins must be >= 8.")
-        if spectrum["latent_dim"] < 1 or spectrum["latent_dim"] > spectrum["num_bins"]:
+        spectrum["num_latents"] = _as_int(
+            spectrum["num_latents"],
+            "vulcan.stellar_spectrum.num_latents",
+        )
+        spectrum["num_layers"] = _as_int(
+            spectrum["num_layers"],
+            "vulcan.stellar_spectrum.num_layers",
+        )
+        spectrum["num_heads"] = _as_int(
+            spectrum["num_heads"],
+            "vulcan.stellar_spectrum.num_heads",
+        )
+        spectrum["fourier_features"] = _as_int(
+            spectrum["fourier_features"],
+            "vulcan.stellar_spectrum.fourier_features",
+        )
+        if spectrum["max_tokens"] < 8:
+            raise ConfigValidationError("vulcan.stellar_spectrum.max_tokens must be >= 8.")
+        if spectrum["latent_dim"] < 1:
+            raise ConfigValidationError("vulcan.stellar_spectrum.latent_dim must be >= 1.")
+        if spectrum["hidden_dim"] < 8:
+            raise ConfigValidationError("vulcan.stellar_spectrum.hidden_dim must be >= 8.")
+        if spectrum["num_latents"] < 1:
+            raise ConfigValidationError("vulcan.stellar_spectrum.num_latents must be >= 1.")
+        if spectrum["num_layers"] < 1:
+            raise ConfigValidationError("vulcan.stellar_spectrum.num_layers must be >= 1.")
+        if spectrum["num_heads"] < 1:
+            raise ConfigValidationError("vulcan.stellar_spectrum.num_heads must be >= 1.")
+        if spectrum["hidden_dim"] % spectrum["num_heads"] != 0:
             raise ConfigValidationError(
-                "vulcan.stellar_spectrum.latent_dim must lie in [1, num_bins]."
+                "vulcan.stellar_spectrum.hidden_dim must be divisible by num_heads."
             )
+        if spectrum["fourier_features"] < 1:
+            raise ConfigValidationError("vulcan.stellar_spectrum.fourier_features must be >= 1.")
         spectrum["wavelength_min_nm"] = _as_float(
             spectrum["wavelength_min_nm"],
             "vulcan.stellar_spectrum.wavelength_min_nm",
@@ -1654,6 +1769,25 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             raise ConfigValidationError(
                 "vulcan.stellar_spectrum.wavelength_min_nm must be smaller than wavelength_max_nm."
             )
+        spectrum.setdefault("dbin1_nm", 0.1)
+        spectrum["dbin1_nm"] = _as_float(
+            spectrum["dbin1_nm"],
+            "vulcan.stellar_spectrum.dbin1_nm",
+        )
+        spectrum.setdefault("dbin2_nm", 2.0)
+        spectrum["dbin2_nm"] = _as_float(
+            spectrum["dbin2_nm"],
+            "vulcan.stellar_spectrum.dbin2_nm",
+        )
+        spectrum.setdefault("dbin_12trans_nm", 240.0)
+        spectrum["dbin_12trans_nm"] = _as_float(
+            spectrum["dbin_12trans_nm"],
+            "vulcan.stellar_spectrum.dbin_12trans_nm",
+        )
+        if spectrum["dbin1_nm"] <= 0.0:
+            raise ConfigValidationError("vulcan.stellar_spectrum.dbin1_nm must be positive.")
+        if spectrum["dbin2_nm"] <= 0.0:
+            raise ConfigValidationError("vulcan.stellar_spectrum.dbin2_nm must be positive.")
         spectrum["encoder_mode"] = _as_nonempty_str(
             spectrum["encoder_mode"],
             "vulcan.stellar_spectrum.encoder_mode",
@@ -1662,21 +1796,46 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             raise ConfigValidationError(
                 f"vulcan.stellar_spectrum.encoder_mode must be one of {_ALLOWED_SPECTRUM_ENCODERS}."
             )
-        for key in ("teff_k", "radius_rsun", "semi_major_axis_au", "diurnal_factor"):
-            spectrum[key] = _as_float(
-                spectrum[key],
-                f"vulcan.stellar_spectrum.{key}",
+        if "teff_k" in spectrum and spectrum["teff_k"] is not None:
+            spectrum["teff_k"] = _as_float(
+                spectrum["teff_k"],
+                "vulcan.stellar_spectrum.teff_k",
             )
-            if spectrum[key] <= 0.0:
-                raise ConfigValidationError(f"vulcan.stellar_spectrum.{key} must be positive.")
-        spectrum["zenith_angle_deg"] = _as_float(
-            spectrum["zenith_angle_deg"],
-            "vulcan.stellar_spectrum.zenith_angle_deg",
-        )
-        if spectrum["zenith_angle_deg"] < 0.0 or spectrum["zenith_angle_deg"] >= 90.0:
-            raise ConfigValidationError(
-                "vulcan.stellar_spectrum.zenith_angle_deg must lie in [0, 90)."
+            if spectrum["teff_k"] <= 0.0:
+                raise ConfigValidationError("vulcan.stellar_spectrum.teff_k must be positive.")
+        else:
+            spectrum["teff_k"] = None
+        if "radius_rsun" in spectrum:
+            spectrum["radius_rsun"] = _as_float(
+                spectrum["radius_rsun"],
+                "vulcan.stellar_spectrum.radius_rsun",
             )
+            if spectrum["radius_rsun"] <= 0.0:
+                raise ConfigValidationError("vulcan.stellar_spectrum.radius_rsun must be positive.")
+        if "semi_major_axis_au" in spectrum:
+            spectrum["semi_major_axis_au"] = _as_float(
+                spectrum["semi_major_axis_au"],
+                "vulcan.stellar_spectrum.semi_major_axis_au",
+            )
+            if spectrum["semi_major_axis_au"] <= 0.0:
+                raise ConfigValidationError("vulcan.stellar_spectrum.semi_major_axis_au must be positive.")
+        if "diurnal_factor" in spectrum:
+            spectrum["diurnal_factor"] = _as_float(
+                spectrum["diurnal_factor"],
+                "vulcan.stellar_spectrum.diurnal_factor",
+            )
+            if spectrum["diurnal_factor"] <= 0.0:
+                raise ConfigValidationError("vulcan.stellar_spectrum.diurnal_factor must be positive.")
+        if "zenith_angle_deg" in spectrum:
+            spectrum["zenith_angle_deg"] = _as_float(
+                spectrum["zenith_angle_deg"],
+                "vulcan.stellar_spectrum.zenith_angle_deg",
+            )
+            if spectrum["zenith_angle_deg"] < 0.0 or spectrum["zenith_angle_deg"] >= 90.0:
+                raise ConfigValidationError(
+                    "vulcan.stellar_spectrum.zenith_angle_deg must lie in [0, 90)."
+                )
+
         section["physics_toggles"] = physics
         section["science_presets"] = science_presets
         section["runtime"] = runtime

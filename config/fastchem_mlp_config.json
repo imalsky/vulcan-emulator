@@ -2,8 +2,7 @@
   "chemistry_type": "fastchem",
   "model_type": "mlp",
   "paths": {
-    "raw_root": "data/fastchem_mlp/raw",
-    "processed_root": "data/fastchem_mlp/processed",
+    "run_root": "data/fastchem_mlp",
     "checkpoints_root": "models/fastchem_mlp",
     "vulcan_source_root": "../VULCAN-master"
   },
@@ -146,7 +145,7 @@
     "state_floor": 1e-30,
     "target_method": "log-standard",
     "sequence_methods": {
-      "pressure_bar": "log-standard",
+      "pressure_bar": "log-minmax",
       "temperature_k": "standard"
     },
     "global_methods": {

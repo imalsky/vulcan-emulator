@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from src.utils.config import (
     DEFAULT_REQUIRED_GLOBAL_INPUTS,
     DEFAULT_STATE_SPECIES,
@@ -12,7 +11,6 @@ from src.utils.config import (
     load_and_validate_config,
     resolve_conditioning_inputs,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FASTCHEM_GLOBAL_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
@@ -81,6 +79,11 @@ def test_shipped_configs_load_with_expected_contract(
     assert config["data_spec"]["required_global_inputs"] == global_order
     assert config["data_spec"]["sequence_static_feature_order"] == sequence_order
     assert config["data_spec"]["global_static_feature_order"] == global_order
+    assert "run_root" not in config["paths"]
+    assert "raw_root" in config["paths"]
+    assert "processed_root" in config["paths"]
+    assert config["paths"]["raw_root"].endswith("/raw")
+    assert config["paths"]["processed_root"].endswith("/processed")
     assert config["normalization"]["target_method"] == "log-standard"
     assert config["training"]["scheduler"] == {
         "name": "reduce_on_plateau",
@@ -101,13 +104,10 @@ def test_shipped_configs_load_with_expected_contract(
 )
 def test_shipped_configs_use_single_dataset_root_layout(filename: str):
     raw_config = _load_raw_json(ROOT / "config" / filename)
-    raw_root = Path(raw_config["paths"]["raw_root"])
-    processed_root = Path(raw_config["paths"]["processed_root"])
+    run_root = Path(raw_config["paths"]["run_root"])
 
-    assert raw_root.name == "raw"
-    assert processed_root.name == "processed"
-    assert raw_root.parent == processed_root.parent
-    assert raw_root.parent.name == filename.removesuffix("_config.json")
+    assert run_root.name == filename.removesuffix("_config.json")
+    assert run_root.parent.name == "data"
 
 
 def test_shipped_fastchem_config_defaults_are_correct():
@@ -136,12 +136,19 @@ def test_shipped_fastchem_config_defaults_are_correct():
     assert config["training"]["early_stopping_patience"] == 30
 
 
-def test_config_rejects_split_data_roots(tmp_path):
+def test_config_rejects_legacy_data_root_keys(tmp_path):
     payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
     payload["paths"]["raw_root"] = "data/raw/fastchem"
     payload["paths"]["processed_root"] = "data/processed/fastchem_mlp"
-    with pytest.raises(ConfigValidationError, match="/raw'.*'/processed'|shared run directory"):
+    with pytest.raises(ConfigValidationError, match="no longer supported|run_root only"):
         load_and_validate_config(_write_config(tmp_path, "split_roots.json", payload))
+
+
+def test_config_requires_run_root(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload["paths"].pop("run_root")
+    with pytest.raises(ConfigValidationError, match="Missing required keys in paths"):
+        load_and_validate_config(_write_config(tmp_path, "missing_run_root.json", payload))
 
 
 def test_shipped_vulcan_config_defaults_are_correct():
@@ -149,6 +156,7 @@ def test_shipped_vulcan_config_defaults_are_correct():
     assert "python_executable" not in raw_config["vulcan"]["runtime"]
     assert "cfg_file" not in raw_config["vulcan"]["runtime"]
     assert raw_config["vulcan"]["runtime"]["rocky"] is False
+    assert "enabled" not in raw_config["vulcan"]["stellar_spectrum"]
 
     config = load_and_validate_config(ROOT / "config" / "vulcan_transformer_config.json")
     assert config["normalization"]["global_methods"]["gravity_cm_s2"] == "log-standard"
@@ -164,8 +172,14 @@ def test_shipped_vulcan_config_defaults_are_correct():
     assert len(config["science_presets"]) == 1
     assert config["science_presets"][0]["name"] == "basic_h2"
     assert config["science_presets"][0]["atm_base"] == "H2"
-    assert config["science_presets"][0]["physics_toggles"]["use_photochemistry"] is False
+    assert config["science_presets"][0]["physics_toggles"]["use_photochemistry"] is True
     assert config["stellar_spectrum"]["library_glob"] == "assets/stellar_spectra/*.dat"
+    assert config["stellar_spectrum"]["encoder_mode"] == "perceiver"
+    assert config["stellar_spectrum"]["max_tokens"] == 2610
+    assert config["stellar_spectrum"]["num_latents"] == 16
+    assert config["stellar_spectrum"]["num_layers"] == 2
+    assert config["stellar_spectrum"]["num_heads"] == 4
+    assert config["stellar_spectrum"]["fourier_features"] == 16
 
 
 def test_resolve_conditioning_inputs_rejects_missing_vulcan_runtime_inputs():
@@ -180,6 +194,10 @@ def test_resolve_conditioning_inputs_rejects_missing_vulcan_runtime_inputs():
                 "O_H": 5.37e-4,
                 "N_H": 7.08e-5,
                 "S_H": 1.41e-5,
+                "r_star_rsun": 0.939,
+                "semi_major_axis_au": 0.04858,
+                "zenith_angle_deg": 48.0,
+                "diurnal_factor": 1.0,
             },
             required_global_inputs=list(config["data_spec"]["required_global_inputs"]),
         )
@@ -275,16 +293,11 @@ def test_invalid_early_stopping_patience_is_rejected(tmp_path):
         load_and_validate_config(_write_config(tmp_path, "invalid_patience.json", payload))
 
 
-def test_lambda_spectrum_validation_depends_on_chemistry_type(tmp_path):
-    fastchem = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
-    fastchem["training"]["loss"]["lambda_spectrum"] = 0.01
-    with pytest.raises(ConfigValidationError, match="lambda_spectrum"):
-        load_and_validate_config(_write_config(tmp_path, "fastchem_lambda_spectrum.json", fastchem))
-
-    vulcan = _load_raw_json(ROOT / "config" / "vulcan_mlp_config.json")
-    vulcan["training"]["loss"].pop("lambda_spectrum")
-    with pytest.raises(ConfigValidationError, match="lambda_spectrum"):
-        load_and_validate_config(_write_config(tmp_path, "vulcan_missing_lambda_spectrum.json", vulcan))
+def test_vulcan_requires_lambda_z_and_lambda_phys_only(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_mlp_config.json")
+    payload["training"]["loss"].pop("lambda_phys")
+    with pytest.raises(ConfigValidationError, match="lambda_phys"):
+        load_and_validate_config(_write_config(tmp_path, "vulcan_missing_lambda_phys.json", payload))
 
 
 def test_vulcan_requires_planet_radius_sampling_range(tmp_path):
@@ -366,13 +379,22 @@ def test_explicit_cosine_scheduler_is_preserved(tmp_path):
         (("generation", "target_mode"), "generation.target_mode"),
         (("normalization", "state_method"), "normalization.state_method"),
         (("vulcan", "trajectory_sampling"), "vulcan.trajectory_sampling"),
+        (("vulcan", "stellar_spectrum", "enabled"), "vulcan.stellar_spectrum.enabled"),
+        (("vulcan", "stellar_spectrum", "num_bins"), "vulcan.stellar_spectrum.num_bins"),
+        (("normalization", "spectrum_method"), "normalization.spectrum_method"),
+        (("training", "loss", "lambda_spectrum"), "training.loss.lambda_spectrum"),
     ],
 )
-def test_removed_legacy_keys_raise_targeted_errors(tmp_path, path: tuple[str, str], message: str):
+def test_removed_legacy_keys_raise_targeted_errors(tmp_path, path: tuple[str, ...], message: str):
     payload = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
     cursor = payload
     for key in path[:-1]:
         cursor = cursor[key]
-    cursor[path[-1]] = {"legacy": True} if path[-1] == "trajectory_sampling" else 1
+    if path[-1] == "trajectory_sampling":
+        cursor[path[-1]] = {"legacy": True}
+    elif path[-1] == "spectrum_method":
+        cursor[path[-1]] = "log-standard"
+    else:
+        cursor[path[-1]] = 1
     with pytest.raises(ConfigValidationError, match=message):
         load_and_validate_config(_write_config(tmp_path, "legacy_key.json", payload))

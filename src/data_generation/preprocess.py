@@ -49,10 +49,10 @@ from ..utils.helpers import ensure_dir, get_logger, resolve_path
 LOGGER = get_logger(__name__)
 from ..utils.provenance import fingerprint_payload, manifest_for_files
 from .data_loader import processed_info_dir
-from .spectrum import SpectrumRecord, fixed_wavelength_grid, resample_spectrum
+from .spectrum import pack_spectrum_tokens, sanitize_spectrum_arrays
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
-PROCESSED_DATA_VERSION = 14
+PROCESSED_DATA_VERSION = 17
 _EQUILIBRIUM_GLOBAL_ORDER = ELEMENT_INPUT_ORDER
 _LEGACY_PROCESSED_INFO_FILES = (
     "normalization.json",
@@ -316,6 +316,42 @@ def _fit_log_standard(arr: np.ndarray, *, floor: float) -> dict[str, Any]:
     }
 
 
+def _fit_log_minmax(arr: np.ndarray, *, floor: float) -> dict[str, Any]:
+    """Fit min-max scaling in log10 space.
+
+    The forward transform is:
+
+        normalized = (log10(clip(x, floor)) - log10_min) / (log10_max - log10_min)
+
+    This maps the smallest values to 0 and the largest to 1.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array whose last dimension enumerates feature columns.
+    floor : float
+        Lower bound applied before taking ``log10``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalization payload with per-column log-space min and max values.
+    """
+    arr2 = np.reshape(np.clip(arr, floor, None), (-1, arr.shape[-1]))
+    log10_arr = np.log10(arr2)
+    log10_min = np.min(log10_arr, axis=0)
+    log10_max = np.max(log10_arr, axis=0)
+    span = log10_max - log10_min
+    span = np.where(span < 1.0e-8, 1.0, span)
+    return {
+        "method": "log-minmax",
+        "log10_min": log10_min.tolist(),
+        "log10_max": log10_max.tolist(),
+        "span": span.tolist(),
+        "floor": float(floor),
+    }
+
+
 def apply_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
     """Apply one normalization block (forward direction) to an array.
 
@@ -333,10 +369,16 @@ def apply_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
         Normalized array with the same shape as ``x``.
     """
     method = block["method"]
-    mean = np.asarray(block["mean"], dtype=np.float64)
-    std = np.asarray(block["std"], dtype=np.float64)
     if method == "none":
         return np.asarray(x, dtype=np.float64)
+    if method == "log-minmax":
+        floor = float(block["floor"])
+        log10_min = np.asarray(block["log10_min"], dtype=np.float64)
+        span = np.asarray(block["span"], dtype=np.float64)
+        transformed = np.log10(np.clip(np.asarray(x, dtype=np.float64), floor, None))
+        return (transformed - log10_min) / span
+    mean = np.asarray(block["mean"], dtype=np.float64)
+    std = np.asarray(block["std"], dtype=np.float64)
     if method == "standard":
         return (np.asarray(x, dtype=np.float64) - mean) / std
     if method == "log-standard":
@@ -363,10 +405,15 @@ def inverse_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
         Array with the same shape as ``x`` restored to physical units.
     """
     method = block["method"]
-    mean = np.asarray(block["mean"], dtype=np.float64)
-    std = np.asarray(block["std"], dtype=np.float64)
     if method == "none":
         return np.asarray(x, dtype=np.float64)
+    if method == "log-minmax":
+        log10_min = np.asarray(block["log10_min"], dtype=np.float64)
+        span = np.asarray(block["span"], dtype=np.float64)
+        log10_x = np.asarray(x, dtype=np.float64) * span + log10_min
+        return np.power(10.0, log10_x)
+    mean = np.asarray(block["mean"], dtype=np.float64)
+    std = np.asarray(block["std"], dtype=np.float64)
     if method == "standard":
         return np.asarray(x, dtype=np.float64) * std + mean
     if method == "log-standard":
@@ -405,6 +452,10 @@ def _fit_block_by_method(
         if floor is None:
             raise ValueError("log-standard normalization requires a positive floor.")
         return _fit_log_standard(arr, floor=float(floor))
+    if method == "log-minmax":
+        if floor is None:
+            raise ValueError("log-minmax normalization requires a positive floor.")
+        return _fit_log_minmax(arr, floor=float(floor))
     if method == "none":
         return _fit_none(arr)
     raise ValueError(f"Unsupported normalization method: {method}")
@@ -457,6 +508,16 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
             stds.append(std)
             floors.append(floor)
             transformed_columns.append((log_column - mean) / std)
+        elif method == "log-minmax":
+            floor = 1.0e-30
+            log_column = np.log10(np.clip(column, floor, None))
+            log_min = float(np.min(log_column))
+            log_max = float(np.max(log_column))
+            span = max(log_max - log_min, 1.0e-8)
+            means.append(log_min)
+            stds.append(span)
+            floors.append(floor)
+            transformed_columns.append((log_column - log_min) / span)
         else:
             raise ValueError(f"Unsupported mixed normalization method: {method}")
     return {"method": "mixed", "methods": methods, "mean": means, "std": stds, "floor": floors}
@@ -490,6 +551,8 @@ def apply_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
         elif method == "standard":
             outputs.append((column - mean) / std)
         elif method == "log-standard":
+            outputs.append((np.log10(np.clip(column, float(floor), None)) - mean) / std)
+        elif method == "log-minmax":
             outputs.append((np.log10(np.clip(column, float(floor), None)) - mean) / std)
         else:
             raise ValueError(f"Unsupported mixed normalization method: {method}")
@@ -525,56 +588,30 @@ def inverse_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
             outputs.append(column * std + mean)
         elif method == "log-standard":
             outputs.append(np.power(10.0, column * std + mean))
+        elif method == "log-minmax":
+            outputs.append(np.power(10.0, column * std + mean))
         else:
             raise ValueError(f"Unsupported mixed normalization method: {method}")
     return np.stack(outputs, axis=-1)
+
 
 
 def load_raw_run(
     source: str | Path | h5py.Group,
     *,
     config: dict[str, Any],
-    spectrum_grid_nm: np.ndarray,
     run_id: str | None = None,
 ) -> RawRun:
     """Load one raw HDF5 full-VULCAN run and align it to the configured species contract.
 
-    Parameters
-    ----------
-    source : str, Path, or h5py.Group
-        Raw run source expressed as a legacy per-file path or an already opened
-        group from ``runs.h5``.
-    config : dict[str, Any]
-        Validated config defining the requested species and conditioning-input
-        contract.
-    spectrum_grid_nm : np.ndarray
-        Fixed wavelength grid used to resample the stored stellar spectrum.
-    run_id : str or None, optional
-        Explicit run ID required when ``source`` is an ``h5py.Group``.
-
-    Returns
-    -------
-    RawRun
-        Loaded raw run aligned to the configured output-species order and
-        reduced global-input contract.
+    The stellar spectrum is preserved on its native wavelength grid. Only
+    basic sanitation is applied here: non-finite rows are dropped, negative
+    fluxes are clipped to zero, duplicate wavelengths are averaged, and the
+    arrays are clipped to the configured wavelength interval.
     """
     requested_output_species = list(config["data_spec"]["output_species"])
 
     def _extract(handle: h5py.Group) -> dict[str, Any]:
-        """Extract one raw VULCAN run payload from an open HDF5 group.
-
-        Parameters
-        ----------
-        handle : h5py.Group
-            Group containing the raw run contract under ``inputs``,
-            ``globals``, ``final_state``, and ``spectrum``.
-
-        Returns
-        -------
-        dict[str, Any]
-            Dictionary of NumPy arrays and Python containers holding the raw
-            profiles, stored species order, globals, and stellar spectrum.
-        """
         return {
             "pressure_bar": np.asarray(handle["inputs/pressure_bar"], dtype=np.float64),
             "temperature_k": np.asarray(handle["inputs/temperature_k"], dtype=np.float64),
@@ -639,14 +676,15 @@ def load_raw_run(
     if "gravity_cm_s2" not in reduced_globals:
         reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
     final_ymix_output = final_ymix_output[:, output_indices]
-    resampled_spectrum = resample_spectrum(
-        SpectrumRecord(
-            name=d["spectrum_name"],
-            wavelength_nm=d["spectrum_wavelength_nm"],
-            flux_erg_cm2_s_nm=d["spectrum_flux"],
-        ),
-        spectrum_grid_nm,
+
+    clean_wavelength_nm, clean_flux = sanitize_spectrum_arrays(
+        d["spectrum_wavelength_nm"],
+        d["spectrum_flux"],
+        wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
+        wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
+        min_points=2,
     )
+
     return RawRun(
         run_id=run_id or label,
         pressure_bar=pressure_bar,
@@ -655,8 +693,8 @@ def load_raw_run(
         final_ymix_output=final_ymix_output,
         globals=reduced_globals,
         spectrum_name=d["spectrum_name"],
-        spectrum_wavelength_nm=np.asarray(spectrum_grid_nm, dtype=np.float64),
-        spectrum_flux_erg_cm2_s_nm=np.asarray(resampled_spectrum, dtype=np.float64),
+        spectrum_wavelength_nm=clean_wavelength_nm.astype(np.float64),
+        spectrum_flux_erg_cm2_s_nm=clean_flux.astype(np.float64),
         elemental_abundances_x_h=elemental_profile,
         gravity_cm_s2=gravity_profile,
     )
@@ -700,31 +738,18 @@ def _split_indices(num_runs: int, *, config: dict[str, Any]) -> dict[str, list[i
     }
 
 
+
 def _normalization_payload(
     train_runs: list[RawRun],
     *,
     config: dict[str, Any],
     global_static_order: list[str],
-    spectrum_grid_nm: np.ndarray,
 ) -> dict[str, Any]:
     """Fit all normalization blocks for the full-VULCAN pipeline.
 
-    Parameters
-    ----------
-    train_runs : list[RawRun]
-        Training-only raw runs used to fit normalization statistics.
-    config : dict[str, Any]
-        Validated config defining normalization methods and floors.
-    global_static_order : list[str]
-        Ordered global-input feature contract.
-    spectrum_grid_nm : np.ndarray
-        Fixed wavelength grid shared by the processed dataset.
-
-    Returns
-    -------
-    dict[str, Any]
-        Normalization payload containing fitted blocks for sequence-static
-        inputs, targets, global inputs, and stellar spectra.
+    Stellar spectra are *not* dataset-normalized here. They are stored in
+    physical units and normalized on-the-fly inside the spectrum encoder so
+    that inference remains valid for variable native wavelength grids.
     """
     state_floor = float(config["normalization"]["state_floor"])
     spectrum_floor = float(config["normalization"]["spectrum_floor"])
@@ -740,10 +765,6 @@ def _normalization_payload(
     )
     target_values = np.concatenate(
         [run.final_ymix_output for run in train_runs],
-        axis=0,
-    )
-    spectrum_values = np.stack(
-        [run.spectrum_flux_erg_cm2_s_nm for run in train_runs],
         axis=0,
     )
     required_global_inputs = list(config["data_spec"]["required_global_inputs"])
@@ -774,6 +795,8 @@ def _normalization_payload(
             sequence_blocks.append(_fit_standard(feature))
         elif method == "log-standard":
             sequence_blocks.append(_fit_log_standard(feature, floor=1.0e-30))
+        elif method == "log-minmax":
+            sequence_blocks.append(_fit_log_minmax(feature, floor=1.0e-30))
         elif method == "none":
             sequence_blocks.append(_fit_none(feature))
         else:
@@ -790,12 +813,12 @@ def _normalization_payload(
             floor=state_floor,
         ),
         "global_static": _fit_mixed_block(global_static, global_methods),
-        "spectrum": _fit_block_by_method(
-            spectrum_values,
-            method=config["normalization"]["spectrum_method"],
-            floor=spectrum_floor,
-        ),
-        "spectrum_wavelength_nm": spectrum_grid_nm.tolist(),
+        "spectrum_processing": {
+            "floor": spectrum_floor,
+            "wavelength_min_nm": float(config["stellar_spectrum"]["wavelength_min_nm"]),
+            "wavelength_max_nm": float(config["stellar_spectrum"]["wavelength_max_nm"]),
+            "max_tokens": int(config["stellar_spectrum"]["max_tokens"]),
+        },
     }
 
 
@@ -981,6 +1004,8 @@ def _equilibrium_normalization_payload(
             sequence_blocks.append(_fit_standard(feature))
         elif method == "log-standard":
             sequence_blocks.append(_fit_log_standard(feature, floor=1.0e-30))
+        elif method == "log-minmax":
+            sequence_blocks.append(_fit_log_minmax(feature, floor=1.0e-30))
         elif method == "none":
             sequence_blocks.append(_fit_none(feature))
         else:
@@ -1221,11 +1246,13 @@ def preprocess_raw_dataset(
     info_dir = ensure_dir(processed_info_dir(processed_root))
     _remove_legacy_processed_info_files(processed_root)
 
-    spectrum_grid_nm = fixed_wavelength_grid(
-        float(config["stellar_spectrum"]["wavelength_min_nm"]),
-        float(config["stellar_spectrum"]["wavelength_max_nm"]),
-        int(config["stellar_spectrum"]["num_bins"]),
-    )
+
+    spectrum_max_tokens = int(config["stellar_spectrum"]["max_tokens"])
+    spectrum_wavelength_min_nm = float(config["stellar_spectrum"]["wavelength_min_nm"])
+    spectrum_wavelength_max_nm = float(config["stellar_spectrum"]["wavelength_max_nm"])
+    spectrum_dbin1_nm = float(config["stellar_spectrum"].get("dbin1_nm", 0.1))
+    spectrum_dbin2_nm = float(config["stellar_spectrum"].get("dbin2_nm", 2.0))
+    spectrum_dbin_12trans_nm = float(config["stellar_spectrum"].get("dbin_12trans_nm", 240.0))
 
     consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
     if consolidated_path is not None:
@@ -1233,7 +1260,7 @@ def preprocess_raw_dataset(
         raw_source_files: list[Path] = [consolidated_path]
         with h5py.File(consolidated_path, "r") as f:
             raw_runs = [
-                load_raw_run(f[rid], config=config, spectrum_grid_nm=spectrum_grid_nm, run_id=rid)
+                load_raw_run(f[rid], config=config, run_id=rid)
                 for rid in consolidated_ids
             ]
     else:
@@ -1244,7 +1271,7 @@ def preprocess_raw_dataset(
             )
         LOGGER.info("Found %d raw run files in %s", len(raw_run_files), raw_root / "runs")
         raw_source_files = list(raw_run_files)
-        raw_runs = [load_raw_run(path, config=config, spectrum_grid_nm=spectrum_grid_nm) for path in raw_run_files]
+        raw_runs = [load_raw_run(path, config=config) for path in raw_run_files]
     split_indices = _split_indices(len(raw_runs), config=config)
     train_runs = [raw_runs[i] for i in split_indices["train"]]
     global_static_order = list(config["data_spec"]["global_static_feature_order"])
@@ -1252,7 +1279,6 @@ def preprocess_raw_dataset(
         train_runs,
         config=config,
         global_static_order=global_static_order,
-        spectrum_grid_nm=spectrum_grid_nm,
     )
 
     for split_name, indices in split_indices.items():
@@ -1264,20 +1290,43 @@ def preprocess_raw_dataset(
         sequence_inputs = np.zeros((len(runs), nz, 3), dtype=np.float32)
         target_outputs = np.zeros((len(runs), nz, target_dim), dtype=np.float32)
         global_inputs = np.zeros((len(runs), len(global_static_order)), dtype=np.float32)
-        spectrum_inputs = np.zeros((len(runs), spectrum_grid_nm.size), dtype=np.float32)
+        spectrum_wavelengths_nm = np.zeros((len(runs), spectrum_max_tokens), dtype=np.float32)
+        spectrum_fluxes_erg_cm2_s_nm = np.zeros((len(runs), spectrum_max_tokens), dtype=np.float32)
+        spectrum_mask = np.zeros((len(runs), spectrum_max_tokens), dtype=bool)
         run_ids: list[str] = []
 
         for idx, run in enumerate(runs):
             static = np.stack([run.pressure_bar, run.temperature_k, run.kzz_cm2_s], axis=-1)
-            sequence_inputs[idx] = _apply_sequence_static_normalization(static, normalization["sequence_static"]).astype(np.float32)
-            target_outputs[idx] = apply_block(run.final_ymix_output, normalization["target"]).astype(np.float32)
+            sequence_inputs[idx] = _apply_sequence_static_normalization(
+                static,
+                normalization["sequence_static"],
+            ).astype(np.float32)
+            target_outputs[idx] = apply_block(run.final_ymix_output, normalization["target"]).astype(
+                np.float32
+            )
             static_inputs = resolve_conditioning_inputs(
                 raw_global_inputs=run.globals,
                 required_global_inputs=list(config["data_spec"]["required_global_inputs"]),
             )
             global_vector = np.array([static_inputs[name] for name in global_static_order], dtype=np.float64)
-            global_inputs[idx] = apply_mixed_block(global_vector[None, :], normalization["global_static"])[0].astype(np.float32)
-            spectrum_inputs[idx] = apply_block(run.spectrum_flux_erg_cm2_s_nm[None, :], normalization["spectrum"])[0].astype(np.float32)
+            global_inputs[idx] = apply_mixed_block(
+                global_vector[None, :],
+                normalization["global_static"],
+            )[0].astype(np.float32)
+
+            packed_wavelengths_nm, packed_fluxes, packed_mask = pack_spectrum_tokens(
+                run.spectrum_wavelength_nm,
+                run.spectrum_flux_erg_cm2_s_nm,
+                wavelength_min_nm=spectrum_wavelength_min_nm,
+                wavelength_max_nm=spectrum_wavelength_max_nm,
+                max_tokens=spectrum_max_tokens,
+                dbin1_nm=spectrum_dbin1_nm,
+                dbin2_nm=spectrum_dbin2_nm,
+                dbin_12trans_nm=spectrum_dbin_12trans_nm,
+            )
+            spectrum_wavelengths_nm[idx] = packed_wavelengths_nm
+            spectrum_fluxes_erg_cm2_s_nm[idx] = packed_fluxes
+            spectrum_mask[idx] = packed_mask
             run_ids.append(run.run_id)
 
         metadata = {
@@ -1292,12 +1341,19 @@ def preprocess_raw_dataset(
             "element_input_order": list(config["data_spec"]["element_input_order"]),
             "global_feature_order": list(config["data_spec"]["global_feature_order"]),
             "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
-            "spectrum_num_bins": int(spectrum_grid_nm.size),
+            "spectrum_max_tokens": spectrum_max_tokens,
+            "spectrum_wavelength_min_nm": spectrum_wavelength_min_nm,
+            "spectrum_wavelength_max_nm": spectrum_wavelength_max_nm,
+            "spectrum_dbin1_nm": spectrum_dbin1_nm,
+            "spectrum_dbin2_nm": spectrum_dbin2_nm,
+            "spectrum_dbin_12trans_nm": spectrum_dbin_12trans_nm,
         }
         np.save(split_dir / "sequence_inputs.npy", sequence_inputs)
         np.save(split_dir / "target_outputs.npy", target_outputs)
         np.save(split_dir / "global_inputs.npy", global_inputs)
-        np.save(split_dir / "spectrum_inputs.npy", spectrum_inputs)
+        np.save(split_dir / "spectrum_wavelengths_nm.npy", spectrum_wavelengths_nm)
+        np.save(split_dir / "spectrum_fluxes_erg_cm2_s_nm.npy", spectrum_fluxes_erg_cm2_s_nm)
+        np.save(split_dir / "spectrum_mask.npy", spectrum_mask)
         (split_dir / "run_ids.json").write_text(json.dumps(run_ids, indent=2) + "\n", encoding="utf-8")
         (split_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -1312,8 +1368,13 @@ def preprocess_raw_dataset(
         "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
         "sequence_dim": 3,
         "target_dim": len(config["data_spec"]["output_species"]),
-        "spectrum_dim": int(spectrum_grid_nm.size),
-        "spectrum_wavelength_nm": spectrum_grid_nm.tolist(),
+        "spectrum_max_tokens": spectrum_max_tokens,
+        "spectrum_wavelength_min_nm": spectrum_wavelength_min_nm,
+        "spectrum_wavelength_max_nm": spectrum_wavelength_max_nm,
+        "spectrum_dbin1_nm": spectrum_dbin1_nm,
+        "spectrum_dbin2_nm": spectrum_dbin2_nm,
+        "spectrum_dbin_12trans_nm": spectrum_dbin_12trans_nm,
+        "spectrum_variable_length": True,
     }
     (info_dir / "normalization.json").write_text(
         json.dumps(normalization, indent=2) + "\n",

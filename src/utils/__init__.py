@@ -1,10 +1,7 @@
-from __future__ import annotations
-
 """CLI, configuration, and shared utilities."""
 
-from .numpy_compat import patch_numpy_asarray_copy as _patch
-_patch()
-del _patch
+from __future__ import annotations
+
 
 def main(argv: list[str] | None = None) -> int:
     """Dispatch the package CLI while keeping import side effects minimal.

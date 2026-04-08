@@ -1,16 +1,24 @@
 {
   "chemistry_type": "fastchem",
   "model_type": "transformer",
+
   "paths": {
-    "raw_root": "data/fastchem_transformer/raw",
-    "processed_root": "data/fastchem_transformer/processed",
+    "run_root": "data/fastchem_transformer",
     "checkpoints_root": "models/fastchem_transformer",
     "vulcan_source_root": "../VULCAN-master"
   },
+
   "data_spec": {
-    "state_species": ["H2", "He", "H", "O", "OH", "H2O", "CO", "CO2", "CH4", "N2", "NH3", "H2S", "SH", "S", "SO", "SO2", "S2"],
-    "output_species": ["H2", "He", "H", "O", "OH", "H2O", "CO", "CO2", "CH4", "N2", "NH3", "H2S", "SH", "S", "SO", "SO2", "S2"]
+    "state_species": [
+      "H2", "He", "H", "O", "OH", "H2O", "CO", "CO2", "CH4",
+      "N2", "NH3", "H2S", "SH", "S", "SO", "SO2", "S2"
+    ],
+    "output_species": [
+      "H2", "He", "H", "O", "OH", "H2O", "CO", "CO2", "CH4",
+      "N2", "NH3", "H2S", "SH", "S", "SO", "SO2", "S2"
+    ]
   },
+
   "sampling": {
     "num_levels": 50,
     "pressure_top_bar": 1e-07,
@@ -20,6 +28,7 @@
     "c_to_o_range": [0.45, 0.85],
     "s_to_o_range": [0.01, 0.03]
   },
+
   "temperature_profiles": {
     "source_mode": "mixed",
     "analytic_probability": 0.5,
@@ -29,7 +38,10 @@
       "LogMet": [0.0, 0.7],
       "TiOVO": false
     },
-    "validation": {"min_temperature_k": 1.0, "max_temperature_k": 3000.0},
+    "validation": {
+      "min_temperature_k": 1.0,
+      "max_temperature_k": 3000.0
+    },
     "analytic_sampler": {
       "reference_gravity_m_s2": 25,
       "t_int_k_normal": {"mean": 500.0, "std": 20.0},
@@ -44,6 +56,7 @@
       "adiabatic_gradient_range": [0.25, 0.35]
     }
   },
+
   "generation": {
     "mode": "vulcan",
     "num_runs": 100000,
@@ -52,6 +65,7 @@
     "reuse_raw_if_present": false,
     "parallel_workers": 64
   },
+
   "normalization": {
     "split": {
       "train_fraction": 0.8,
@@ -62,7 +76,7 @@
     "state_floor": 1e-30,
     "target_method": "log-standard",
     "sequence_methods": {
-      "pressure_bar": "log-standard",
+      "pressure_bar": "log-minmax",
       "temperature_k": "standard"
     },
     "global_methods": {
@@ -73,6 +87,7 @@
       "S_H": "log-standard"
     }
   },
+
   "training": {
     "seed": 123,
     "batch_size": 128,
@@ -81,11 +96,20 @@
     "min_lr": 1e-6,
     "warmup_epochs": 10,
     "early_stopping_patience": 30,
-    "scheduler": {"name": "reduce_on_plateau", "factor": 0.5, "patience": 10, "threshold": 1e-4},
+    "scheduler": {
+      "name": "reduce_on_plateau",
+      "factor": 0.5,
+      "patience": 10,
+      "threshold": 1e-4
+    },
     "weight_decay": 1e-5,
     "gradient_clip": 5.0,
-    "loss": {"lambda_z": 1.0, "lambda_phys": 0.5}
+    "loss": {
+      "lambda_z": 1.0,
+      "lambda_phys": 0.5
+    }
   },
+
   "model": {
     "d_model": 256,
     "nhead": 4,

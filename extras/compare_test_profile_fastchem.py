@@ -1,32 +1,34 @@
+"""Compare one processed test profile against a fresh FastChem rerun.
+
+Usage:
+    python extras/compare_test_profile_fastchem.py
+    python extras/compare_test_profile_fastchem.py --run-id run_00042
+    python extras/compare_test_profile_fastchem.py --config config/fastchem_mlp_config.json
+"""
+
 from __future__ import annotations
 
+import argparse
 import json
-import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-import sys
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 
-from src.utils.numpy_compat import patch_numpy_asarray_copy
-
-patch_numpy_asarray_copy()
-
-import h5py
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.lines import Line2D
+import h5py  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
+from src.data_generation.generation import _copy_fastchem_runtime  # noqa: E402
+from src.utils.config import dataset_run_root, load_and_validate_config  # noqa: E402
+from src.utils.helpers import resolve_path, resolve_project_root  # noqa: E402
 
 _STYLE = _ROOT / "extras" / "science.mplstyle"
-
-CONFIG_PATH = _ROOT / "config" / "fastchem_mlp_config.json"
-PROCESSED_ROOT_OVERRIDE: Path | None = None
-RAW_ROOT_OVERRIDE: Path | None = None
-RUN_ID: str | None = None
-OUTPUT_PATH: Path | None = None
+_DEFAULT_CONFIG = _ROOT / "config" / "fastchem_mlp_config.json"
 
 _SOLAR_ELEMENT_ABUNDANCES: dict[str, float] = {
     "O_H": 5.37e-4,
@@ -67,56 +69,90 @@ class RawEquilibriumProfile:
     globals: dict[str, float]
 
 
-def _load_json(path: Path) -> dict:
-    """Load one JSON file into a Python mapping.
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments for the FastChem comparison utility."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default=str(_DEFAULT_CONFIG),
+        help="Path to a FastChem config file.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional explicit run ID from the processed test split.",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional output path for the saved comparison figure.",
+    )
+    return parser.parse_args(argv)
 
-    Parameters
-    ----------
-    path : Path
-        JSON file to read.
 
-    Returns
-    -------
-    dict
-        Parsed JSON object.
-    """
-    return json.loads(path.read_text(encoding="utf-8"))
+def _decode_labels(values: np.ndarray) -> list[str]:
+    """Decode an HDF5 string array into Python strings."""
+    return [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in values]
 
 
-def _resolve_path(value: str | Path) -> Path:
-    """Resolve an absolute path or a repository-relative path value.
+def _load_test_run_ids(run_root: Path) -> list[str]:
+    """Load processed test-split run IDs from the canonical dataset layout."""
+    run_ids_path = run_root / "test" / "run_ids.json"
+    if not run_ids_path.exists():
+        raise FileNotFoundError(f"Processed test run IDs not found: {run_ids_path}")
+    return list(json.loads(run_ids_path.read_text(encoding="utf-8")))
 
-    Parameters
-    ----------
-    value : str or Path
-        Path-like config value to resolve.
 
-    Returns
-    -------
-    Path
-        Absolute resolved path.
-    """
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return (_ROOT / path).resolve()
+def _extract_raw_profile(handle: h5py.Group, run_id: str) -> RawEquilibriumProfile:
+    """Extract one raw equilibrium profile from an open HDF5 group."""
+    pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
+    temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
+    output_species = _decode_labels(np.asarray(handle["inputs/output_species"]))
+    equilibrium_ymix = np.asarray(handle["equilibrium/ymix"], dtype=np.float64)
+
+    globals_map = {
+        key: float(np.asarray(handle[f"globals/{key}"]))
+        for key in handle["globals"].keys()
+    }
+    if "inputs/element_input_order" in handle and "inputs/elemental_abundances_x_h" in handle:
+        element_labels = _decode_labels(np.asarray(handle["inputs/element_input_order"]))
+        element_profile = np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64)
+        for index, label in enumerate(element_labels):
+            globals_map[label] = float(element_profile[0, index])
+
+    return RawEquilibriumProfile(
+        run_id=run_id,
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        equilibrium_ymix=equilibrium_ymix,
+        output_species=output_species,
+        globals=globals_map,
+    )
+
+
+def _load_raw_equilibrium_profile(raw_root: Path, run_id: str) -> RawEquilibriumProfile:
+    """Load one raw equilibrium profile from the consolidated ``runs.h5`` file."""
+    consolidated_path = raw_root / "runs.h5"
+    if not consolidated_path.exists():
+        raise FileNotFoundError(f"Consolidated raw runs file not found: {consolidated_path}")
+    with h5py.File(consolidated_path, "r") as handle:
+        if run_id not in handle:
+            raise KeyError(f"Run ID {run_id!r} not found in {consolidated_path}")
+        return _extract_raw_profile(handle[run_id], run_id)
+
+
+def _select_run_id(run_ids: list[str], *, run_id: str | None) -> str:
+    """Select an explicit or random run ID from the processed test split."""
+    if run_id is not None:
+        if run_id not in run_ids:
+            raise KeyError(f"Requested run ID {run_id!r} is not present in the processed test split.")
+        return run_id
+    rng = np.random.default_rng()
+    return str(run_ids[int(rng.integers(0, len(run_ids)))])
 
 
 def _element_abundances_from_globals(globals_map: dict[str, float]) -> dict[str, float]:
-    """Map one profile's globals to the elemental abundances expected by FastChem.
-
-    Parameters
-    ----------
-    globals_map : dict[str, float]
-        Global conditioning values loaded from a raw equilibrium run.
-
-    Returns
-    -------
-    dict[str, float]
-        Explicit elemental abundances plus the auxiliary
-        ``fastchem_met_scale`` scalar.
-    """
-
+    """Map profile globals to the elemental abundances expected by FastChem."""
     explicit_keys = ("He_H", "C_H", "O_H", "N_H", "S_H")
     missing = [key for key in explicit_keys if key not in globals_map]
     if missing:
@@ -141,32 +177,14 @@ def _write_fastchem_tp_profile(
     pressure_bar: np.ndarray,
     temperature_k: np.ndarray,
 ) -> Path:
-    """Write a FastChem TP profile file for the selected test run.
-
-    Parameters
-    ----------
-    fastchem_root : Path
-        Temporary FastChem runtime directory.
-    pressure_bar : np.ndarray
-        Pressure profile in bar.
-    temperature_k : np.ndarray
-        Temperature profile in Kelvin.
-
-    Returns
-    -------
-    Path
-        Path to the written ``vulcan_TP.dat`` file.
-    """
-
+    """Write a FastChem TP profile file for the selected test run."""
     tp_dir = fastchem_root / "input" / "vulcan_TP"
     tp_dir.mkdir(parents=True, exist_ok=True)
     tp_path = tp_dir / "vulcan_TP.dat"
-
     with tp_path.open("w", encoding="utf-8") as handle:
         handle.write("#p (bar)    T (K)\n")
         for pressure_value, temperature_value in zip(pressure_bar, temperature_k):
             handle.write(f"{pressure_value:.3e}\t{temperature_value:.1f}\n")
-
     return tp_path
 
 
@@ -175,27 +193,12 @@ def _write_fastchem_element_abundances(
     *,
     globals_map: dict[str, float],
 ) -> Path:
-    """Write elemental abundances using the same layout VULCAN gives FastChem.
-
-    Parameters
-    ----------
-    fastchem_root : Path
-        Temporary FastChem runtime directory.
-    globals_map : dict[str, float]
-        Raw run globals providing the explicit elemental abundances.
-
-    Returns
-    -------
-    Path
-        Path to the written ``element_abundances_vulcan.dat`` file.
-    """
-
+    """Write FastChem elemental abundances using the repository's ``X/H`` globals."""
     input_dir = fastchem_root / "input"
     parameters_src = input_dir / "parameters_wo_ion.dat"
     if not parameters_src.exists():
         raise FileNotFoundError(f"FastChem parameters file not found: {parameters_src}")
-
-    shutil.copyfile(parameters_src, input_dir / "parameters.dat")
+    (input_dir / "parameters.dat").write_text(parameters_src.read_text(encoding="utf-8"), encoding="utf-8")
 
     element_abundances = _element_abundances_from_globals(globals_map)
     metallicity_offset = float(np.log10(element_abundances["fastchem_met_scale"]))
@@ -205,100 +208,42 @@ def _write_fastchem_element_abundances(
         raise FileNotFoundError(f"FastChem solar abundance table not found: {solar_file}")
 
     output_lines: list[str] = []
-    with solar_file.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            if not raw_line.strip() or raw_line.startswith("#"):
-                output_lines.append(raw_line)
-                continue
-
-            parts = raw_line.split()
-            species_name = parts[0]
-
-            if species_name in {"O", "C", "N", "S"}:
-                key = f"{species_name}_H"
-                new_value = np.log10(element_abundances[key]) + 12.0
-                output_lines.append(f"{species_name}\t{new_value:.4f}\n")
-            elif species_name == "He":
-                new_value = np.log10(element_abundances["He_H"]) + 12.0
-                output_lines.append(f"{species_name}\t{new_value:.4f}\n")
-            elif species_name in _FASTCHEM_METALLICITY_SCALED_ELEMENTS:
-                old_value = float(parts[1])
-                new_value = old_value + metallicity_offset
-                output_lines.append(f"{species_name}\t{new_value:.4f}\n")
-            else:
-                output_lines.append(raw_line)
+    for raw_line in solar_file.read_text(encoding="utf-8").splitlines(keepends=True):
+        if not raw_line.strip() or raw_line.startswith("#"):
+            output_lines.append(raw_line)
+            continue
+        parts = raw_line.split()
+        species_name = parts[0]
+        if species_name in {"O", "C", "N", "S"}:
+            key = f"{species_name}_H"
+            new_value = np.log10(element_abundances[key]) + 12.0
+            output_lines.append(f"{species_name}\t{new_value:.4f}\n")
+        elif species_name == "He":
+            new_value = np.log10(element_abundances["He_H"]) + 12.0
+            output_lines.append(f"{species_name}\t{new_value:.4f}\n")
+        elif species_name in _FASTCHEM_METALLICITY_SCALED_ELEMENTS:
+            new_value = float(parts[1]) + metallicity_offset
+            output_lines.append(f"{species_name}\t{new_value:.4f}\n")
+        else:
+            output_lines.append(raw_line)
 
     output_path = input_dir / "element_abundances_vulcan.dat"
     output_path.write_text("".join(output_lines), encoding="utf-8")
     return output_path
 
 
-def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
-    """Copy the bundled FastChem runtime into a temporary worker directory.
-
-    Parameters
-    ----------
-    source_root : Path
-        Repository checkout containing ``fastchem_vulcan``.
-    worker_root : Path
-        Temporary directory that will receive the copied runtime.
-
-    Returns
-    -------
-    Path
-        Path to the worker-local ``fastchem_vulcan`` directory.
-    """
-
-    fastchem_src_root = source_root / "fastchem_vulcan"
-    if not fastchem_src_root.exists():
-        raise FileNotFoundError(f"Bundled FastChem source not found: {fastchem_src_root}")
-
-    fastchem_root = worker_root / "fastchem_vulcan"
-    fastchem_root.mkdir(parents=True, exist_ok=True)
-
-    shutil.copy2(fastchem_src_root / "fastchem", fastchem_root / "fastchem")
-    shutil.copytree(fastchem_src_root / "input", fastchem_root / "input")
-    shutil.copytree(
-        fastchem_src_root / "fastchem_src" / "chem_input",
-        fastchem_root / "fastchem_src" / "chem_input",
-    )
-    (fastchem_root / "output").mkdir(parents=True, exist_ok=True)
-
-    return fastchem_root
-
-
 def _load_fastchem_output(output_path: Path, output_species: list[str]) -> np.ndarray:
-    """Load the FastChem equilibrium table in the repository species order.
-
-    Parameters
-    ----------
-    output_path : Path
-        Path to FastChem's ``vulcan_EQ.dat`` output file.
-    output_species : list[str]
-        Species labels required by the repository contract.
-
-    Returns
-    -------
-    np.ndarray
-        Equilibrium mixing-ratio matrix with shape
-        ``(nz, len(output_species))``.
-    """
-
+    """Load the FastChem equilibrium table in the repository species order."""
     if not output_path.exists():
         raise FileNotFoundError(f"FastChem output file not found: {output_path}")
-
     payload = np.genfromtxt(output_path, names=True, dtype=None, encoding=None)
     if payload.dtype.names is None:
         raise ValueError(f"FastChem output at {output_path} does not contain a named header.")
-
     rows = np.atleast_1d(payload)
     missing = [name for name in output_species if name not in rows.dtype.names]
     if missing:
         raise ValueError(f"FastChem output is missing requested species columns: {missing}")
-
-    return np.column_stack(
-        [np.asarray(rows[name], dtype=np.float64) for name in output_species]
-    )
+    return np.column_stack([np.asarray(rows[name], dtype=np.float64) for name in output_species])
 
 
 def _run_fastchem_online(
@@ -309,41 +254,16 @@ def _run_fastchem_online(
     globals_map: dict[str, float],
     output_species: list[str],
 ) -> np.ndarray:
-    """Rerun the bundled FastChem executable for one selected raw test profile.
-
-    Parameters
-    ----------
-    source_root : Path
-        Repository checkout containing the bundled FastChem runtime.
-    pressure_bar : np.ndarray
-        Pressure profile in bar.
-    temperature_k : np.ndarray
-        Temperature profile in Kelvin.
-    globals_map : dict[str, float]
-        Explicit elemental abundances and any auxiliary globals.
-    output_species : list[str]
-        Species labels required in the returned equilibrium table.
-
-    Returns
-    -------
-    np.ndarray
-        Fresh FastChem equilibrium output aligned to ``output_species``.
-    """
-
+    """Rerun the bundled FastChem executable for one selected raw test profile."""
     with tempfile.TemporaryDirectory(prefix="fastchem_compare_") as tmpdir:
         worker_root = Path(tmpdir)
         fastchem_root = _copy_fastchem_runtime(source_root, worker_root)
-
-        _write_fastchem_element_abundances(
-            fastchem_root,
-            globals_map=globals_map,
-        )
+        _write_fastchem_element_abundances(fastchem_root, globals_map=globals_map)
         _write_fastchem_tp_profile(
             fastchem_root,
             pressure_bar=pressure_bar,
             temperature_k=temperature_k,
         )
-
         result = subprocess.run(
             ["./fastchem", "input/config.input"],
             cwd=fastchem_root,
@@ -353,154 +273,12 @@ def _run_fastchem_online(
             text=True,
         )
         if result.returncode != 0:
-            raise RuntimeError(
-                "FastChem execution failed.\n"
-                f"Command output:\n{result.stdout}"
-            )
-
-        return _load_fastchem_output(
-            fastchem_root / "output" / "vulcan_EQ.dat",
-            output_species,
-        )
-
-
-def _load_test_run_ids(processed_root: Path) -> list[str]:
-    """Load processed test-split run IDs from the configured processed dataset.
-
-    Parameters
-    ----------
-    processed_root : Path
-        Processed dataset root.
-
-    Returns
-    -------
-    list[str]
-        Run IDs present in the processed test split.
-    """
-    run_ids_path = processed_root / "test" / "run_ids.json"
-    if not run_ids_path.exists():
-        raise FileNotFoundError(f"Processed test run IDs not found: {run_ids_path}")
-    return list(json.loads(run_ids_path.read_text(encoding="utf-8")))
-
-
-def _load_raw_equilibrium_profile(raw_root: Path, run_id: str) -> RawEquilibriumProfile:
-    """Load one raw equilibrium profile from either consolidated or per-file layout.
-
-    Parameters
-    ----------
-    raw_root : Path
-        Raw dataset root.
-    run_id : str
-        Run identifier to load.
-
-    Returns
-    -------
-    RawEquilibriumProfile
-        Raw physical-unit profile and associated global inputs.
-    """
-
-    consolidated_path = raw_root / "runs.h5"
-    if consolidated_path.exists():
-        with h5py.File(consolidated_path, "r") as handle:
-            if run_id not in handle:
-                raise KeyError(f"Run ID {run_id!r} not found in {consolidated_path}")
-            source = handle[run_id]
-            return _extract_raw_profile(source, run_id)
-
-    legacy_path = raw_root / "runs" / f"{run_id}.h5"
-    if not legacy_path.exists():
-        raise FileNotFoundError(
-            f"Run ID {run_id!r} not found in {consolidated_path} or {legacy_path}"
-        )
-
-    with h5py.File(legacy_path, "r") as handle:
-        return _extract_raw_profile(handle, run_id)
-
-
-def _extract_raw_profile(handle: h5py.Group, run_id: str) -> RawEquilibriumProfile:
-    """Extract one raw equilibrium profile from an open HDF5 group.
-
-    Parameters
-    ----------
-    handle : h5py.Group
-        Open HDF5 group containing one raw equilibrium run.
-    run_id : str
-        Run identifier to attach to the returned dataclass.
-
-    Returns
-    -------
-    RawEquilibriumProfile
-        Physical-unit profile plus output-species labels and globals.
-    """
-    pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
-    temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
-    output_species = [
-        item.decode("utf-8") if isinstance(item, bytes) else str(item)
-        for item in np.asarray(handle["inputs/output_species"])
-    ]
-    equilibrium_ymix = np.asarray(handle["equilibrium/ymix"], dtype=np.float64)
-    globals_map = {
-        key: float(np.asarray(handle[f"globals/{key}"]))
-        for key in handle["globals"].keys()
-    }
-    if "inputs/elemental_abundances_x_h" in handle and "inputs/element_input_order" in handle:
-        element_labels = [
-            item.decode("utf-8") if isinstance(item, bytes) else str(item)
-            for item in np.asarray(handle["inputs/element_input_order"])
-        ]
-        element_profile = np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64)
-        for index, label in enumerate(element_labels):
-            globals_map[label] = float(element_profile[0, index])
-
-    return RawEquilibriumProfile(
-        run_id=run_id,
-        pressure_bar=pressure_bar,
-        temperature_k=temperature_k,
-        equilibrium_ymix=equilibrium_ymix,
-        output_species=output_species,
-        globals=globals_map,
-    )
-
-
-def _select_run_id(run_ids: list[str], *, run_id: str | None) -> str:
-    """Select an explicit or random run ID from the processed test split.
-
-    Parameters
-    ----------
-    run_ids : list[str]
-        Available processed test-split run IDs.
-    run_id : str or None
-        Optional explicit run ID override.
-
-    Returns
-    -------
-    str
-        Selected run ID.
-    """
-    if run_id is not None:
-        if run_id not in run_ids:
-            raise KeyError(
-                f"Requested run ID {run_id!r} is not present in the processed test split."
-            )
-        return run_id
-
-    rng = np.random.default_rng()
-    return str(run_ids[int(rng.integers(0, len(run_ids)))])
+            raise RuntimeError(f"FastChem execution failed.\nCommand output:\n{result.stdout}")
+        return _load_fastchem_output(fastchem_root / "output" / "vulcan_EQ.dat", output_species)
 
 
 def _mixing_ratio_xlim(values: list[np.ndarray]) -> tuple[float, float]:
-    """Choose a stable log-scale x-axis range for mixing-ratio profile plots.
-
-    Parameters
-    ----------
-    values : list[np.ndarray]
-        Mixing-ratio arrays that will be plotted on the x-axis.
-
-    Returns
-    -------
-    tuple[float, float]
-        Lower and upper x-axis limits in physical mixing-ratio space.
-    """
+    """Choose a stable log-scale x-axis range for mixing-ratio profile plots."""
     clipped = [np.clip(array, 1.0e-30, None) for array in values]
     minimum = min(float(np.min(array)) for array in clipped)
     lower = 10.0 ** np.floor(np.log10(max(minimum, 1.0e-30)))
@@ -513,27 +291,11 @@ def _plot_profile_comparison(
     fastchem_ymix: np.ndarray,
     output_path: Path,
 ) -> None:
-    """Render and save a comparison plot between stored and rerun FastChem profiles.
-
-    Parameters
-    ----------
-    profile : RawEquilibriumProfile
-        Stored raw equilibrium profile from the test set.
-    fastchem_ymix : np.ndarray
-        Fresh FastChem equilibrium output aligned to ``profile.output_species``.
-    output_path : Path
-        Destination figure path.
-
-    Returns
-    -------
-    None
-        The comparison figure is written to disk and closed.
-    """
+    """Render and save a comparison plot between stored and rerun FastChem profiles."""
     if _STYLE.exists():
         plt.style.use(str(_STYLE))
 
     fig, (ax_pt, ax_mix, ax_delta) = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
-
     colors = plt.cm.tab20(np.linspace(0, 1, len(profile.output_species)))
     clipped_truth = np.clip(profile.equilibrium_ymix, 1.0e-30, None)
     clipped_fastchem = np.clip(fastchem_ymix, 1.0e-30, None)
@@ -548,31 +310,10 @@ def _plot_profile_comparison(
 
     for species_index, species_name in enumerate(profile.output_species):
         color = colors[species_index]
-
-        ax_mix.plot(
-            clipped_truth[:, species_index],
-            profile.pressure_bar,
-            color=color,
-            lw=1.6,
-            label=species_name,
-        )
-        ax_mix.plot(
-            clipped_fastchem[:, species_index],
-            profile.pressure_bar,
-            color=color,
-            lw=1.2,
-            ls="--",
-        )
-
-        residual = np.log10(clipped_fastchem[:, species_index]) - np.log10(
-            clipped_truth[:, species_index]
-        )
-        ax_delta.plot(
-            residual,
-            profile.pressure_bar,
-            color=color,
-            lw=1.3,
-        )
+        ax_mix.plot(clipped_truth[:, species_index], profile.pressure_bar, color=color, lw=1.6, label=species_name)
+        ax_mix.plot(clipped_fastchem[:, species_index], profile.pressure_bar, color=color, lw=1.2, ls="--")
+        residual = np.log10(clipped_fastchem[:, species_index]) - np.log10(clipped_truth[:, species_index])
+        ax_delta.plot(residual, profile.pressure_bar, color=color, lw=1.3)
 
     x_min, x_max = _mixing_ratio_xlim([clipped_truth, clipped_fastchem])
     ax_mix.set_xscale("log")
@@ -591,13 +332,7 @@ def _plot_profile_comparison(
         loc="upper left",
     )
 
-    max_abs_delta = float(
-        np.max(
-            np.abs(
-                np.log10(clipped_fastchem) - np.log10(clipped_truth)
-            )
-        )
-    )
+    max_abs_delta = float(np.max(np.abs(np.log10(clipped_fastchem) - np.log10(clipped_truth))))
     delta_limit = max(0.5, np.ceil(max_abs_delta))
     ax_delta.axvline(0.0, color="black", lw=1.0, alpha=0.6)
     ax_delta.set_xlim(-delta_limit, delta_limit)
@@ -612,39 +347,27 @@ def _plot_profile_comparison(
         ),
         fontsize=12,
     )
-
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
 
-def main() -> int:
-    """Load one processed test profile, rerun FastChem, and save a comparison figure.
+def main(argv: list[str] | None = None) -> int:
+    """Load one test profile, rerun FastChem, and save a comparison figure."""
+    args = _parse_args(argv)
+    project_root = resolve_project_root(Path(__file__).resolve())
+    config = load_and_validate_config(resolve_path(args.config, project_root))
+    if config["chemistry_type"] != "fastchem":
+        raise ValueError("compare_test_profile_fastchem.py requires a fastchem config.")
 
-    Returns
-    -------
-    int
-        Process-style exit code.
-    """
-    config_path = CONFIG_PATH.resolve()
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    run_root = resolve_path(dataset_run_root(config), project_root)
+    raw_root = run_root / "raw"
+    source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
 
-    config = _load_json(config_path)
-
-    processed_root = _resolve_path(
-        PROCESSED_ROOT_OVERRIDE or config["paths"]["processed_root"]
-    )
-    raw_root = _resolve_path(
-        RAW_ROOT_OVERRIDE or config["paths"]["raw_root"]
-    )
-    source_root = _resolve_path(config["paths"]["vulcan_source_root"])
-
-    test_run_ids = _load_test_run_ids(processed_root)
-    selected_run_id = _select_run_id(test_run_ids, run_id=RUN_ID)
+    test_run_ids = _load_test_run_ids(run_root)
+    selected_run_id = _select_run_id(test_run_ids, run_id=args.run_id)
     profile = _load_raw_equilibrium_profile(raw_root, selected_run_id)
-
     fastchem_ymix = _run_fastchem_online(
         source_root=source_root,
         pressure_bar=profile.pressure_bar,
@@ -659,16 +382,11 @@ def main() -> int:
         )
 
     output_path = (
-        OUTPUT_PATH.resolve()
-        if OUTPUT_PATH is not None
-        else (_ROOT / "extras" / "plots" / f"{profile.run_id}_fastchem_compare.png")
+        resolve_path(args.output, project_root)
+        if args.output is not None
+        else _ROOT / "extras" / "plots" / f"{profile.run_id}_fastchem_compare.png"
     )
-
-    _plot_profile_comparison(
-        profile=profile,
-        fastchem_ymix=fastchem_ymix,
-        output_path=output_path,
-    )
+    _plot_profile_comparison(profile=profile, fastchem_ymix=fastchem_ymix, output_path=output_path)
 
     print(f"Selected test run: {profile.run_id}")
     print(f"Saved comparison figure to: {output_path}")

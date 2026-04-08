@@ -7,7 +7,6 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
-
 import src.data_generation.generation as generation_module
 from src.data_generation.generation import (
     _copy_fastchem_runtime,
@@ -16,19 +15,15 @@ from src.data_generation.generation import (
     convert_vulcan_output_to_hdf5,
     generate_raw_dataset,
     generate_synthetic_raw_runs,
-    patch_python_assignments,
     run_vulcan_generation,
     write_equilibrium_hdf5,
 )
 from src.data_generation.sampling import sample_run_specifications
-from src.utils.config import load_and_validate_config
+from src.utils.config import dataset_info_root, load_and_validate_config
 
 
 def _open_first_run(artifact) -> h5py.Group:
     """Return the first stored run group from a raw-generation artifact."""
-    if artifact.consolidated_path is None:
-        handle = h5py.File(artifact.run_files[0], "r")
-        return handle
     root = h5py.File(artifact.consolidated_path, "r")
     return root[sorted(root.keys())[0]]
 
@@ -38,8 +33,8 @@ def _make_equilibrium_config(tmp_path: Path) -> dict:
     root = Path(__file__).resolve().parents[1]
     config = load_and_validate_config(root / "config" / "fastchem_mlp_config.json")
     config = copy.deepcopy(config)
-    config["paths"]["raw_root"] = str(tmp_path / "raw")
-    config["paths"]["processed_root"] = str(tmp_path / "processed")
+    config["paths"]["raw_root"] = str(tmp_path / "dataset" / "raw")
+    config["paths"]["processed_root"] = str(tmp_path / "dataset" / "processed")
     config["paths"]["checkpoints_root"] = str(tmp_path / "checkpoints")
     config["paths"]["vulcan_source_root"] = str(tmp_path / "VULCAN")
     config["generation"]["mode"] = "vulcan"
@@ -59,31 +54,10 @@ def _make_equilibrium_config(tmp_path: Path) -> dict:
     return config
 
 
-def test_patch_python_assignments():
-    text = "use_photo = False\nnetwork = 'old.txt'\n"
-    patched = patch_python_assignments(
-        text,
-        {"use_photo": True, "network": "new.txt", "extra_key": 3},
-    )
-    assert "use_photo = True" in patched
-    assert "network = 'new.txt'" in patched
-    assert "extra_key = 3" in patched
-
-
-def test_sample_run_specifications_no_longer_include_trajectory_fields(tiny_config):
-    spec = sample_run_specifications(
-        config=tiny_config,
-        project_root=tiny_config["_project_root"],
-        num_runs=1,
-        seed=5,
-    )[0]
-    assert not hasattr(spec, "initial_ymix")
-    assert not hasattr(spec, "time_s")
-
-
 def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
     artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
-    assert len(artifact.run_files) == tiny_config["generation"]["num_runs"]
+    assert len(artifact.run_ids) == tiny_config["generation"]["num_runs"]
+    assert not (artifact.raw_root / "runs").exists()
     assert artifact.manifest_path is not None and artifact.manifest_path.exists()
     assert artifact.coverage_path is not None and artifact.coverage_path.exists()
 
@@ -110,6 +84,16 @@ def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
         assert "target_mode" not in handle["inputs"]
     finally:
         handle.file.close()
+
+
+def test_generate_synthetic_raw_runs_reuse_keeps_raw_layout_flat(tiny_config):
+    artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
+    (artifact.raw_root / "runs").mkdir()
+
+    artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
+
+    assert artifact.consolidated_path.exists()
+    assert not (artifact.raw_root / "runs").exists()
 
 
 def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_config):
@@ -238,6 +222,47 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
         np.testing.assert_allclose(np.asarray(handle["inputs/gravity_cm_s2"]), runtime_gravity, atol=1.0e-12)
 
 
+def test_convert_fake_vulcan_output_requires_current_ymix_time_contract(tmp_path, tiny_config):
+    spec = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=1,
+        seed=5,
+    )[0]
+    species = list(tiny_config["data_spec"]["state_species"])
+    nz = spec.pressure_bar.size
+    state_dim = len(species)
+    reference = np.full((nz, state_dim), 1.0e-8, dtype=np.float64)
+    reference[:, species.index("H2")] = 0.84
+    reference[:, species.index("He")] = 0.15
+    reference[:, species.index("H2O")] = 1.0e-3
+    reference /= np.sum(reference, axis=1, keepdims=True)
+    fake = {
+        "variable": {
+            "species": species,
+            "y_time": np.stack([reference * 0.98, reference], axis=0),
+            "y_ini": reference * 1.0e12,
+        },
+        "atm": {
+            "pco": spec.pressure_bar * 1.0e6,
+            "Tco": spec.temperature_k,
+            "Kzz": spec.kzz_cm2_s[:-1],
+            "n_0": np.full(nz, 1.0e12, dtype=np.float64),
+        },
+    }
+    vul_path = tmp_path / "legacy_fake.vul"
+    with vul_path.open("wb") as handle:
+        pickle.dump(fake, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    with pytest.raises(ValueError, match="variable.ymix_time"):
+        convert_vulcan_output_to_hdf5(
+            vul_path,
+            output_h5_path=tmp_path / "converted.h5",
+            spec=spec,
+            config=tiny_config,
+        )
+
+
 def test_convert_fake_fastchem_output_to_hdf5_writes_equilibrium_contract(tmp_path, tiny_config):
     specs = sample_run_specifications(
         config=tiny_config,
@@ -273,8 +298,6 @@ def test_convert_fake_fastchem_output_to_hdf5_writes_equilibrium_contract(tmp_pa
         assert "trajectory" not in handle
         assert "target_mode" not in handle["inputs"]
         np.testing.assert_allclose(np.asarray(handle["equilibrium/ymix"]), equilibrium_ymix, atol=1.0e-12)
-
-
 def test_copy_fastchem_runtime_copies_minimal_runtime(tmp_path):
     source_root = tmp_path / "source"
     fastchem_root = source_root / "fastchem_vulcan"
@@ -336,7 +359,8 @@ def test_run_vulcan_generation_fastchem_skips_vulcan_runtime(tmp_path, monkeypat
 
     artifact = run_vulcan_generation(config, project_root=config["_project_root"])
 
-    assert len(artifact.run_files) == 1
+    assert len(artifact.run_ids) == 1
+    assert not (artifact.raw_root / "runs").exists()
     handle = _open_first_run(artifact)
     try:
         assert "equilibrium" in handle
@@ -439,5 +463,5 @@ def test_run_vulcan_generation_hard_fails_on_shortfall(tmp_path, tiny_config, mo
     with pytest.raises(RuntimeError, match="successful runs short"):
         run_vulcan_generation(config, project_root=config["_project_root"])
 
-    failed_log = Path(config["paths"]["raw_root"]) / "failed_runs.json"
+    failed_log = Path(dataset_info_root(config)) / "failed_runs.json"
     assert failed_log.exists()

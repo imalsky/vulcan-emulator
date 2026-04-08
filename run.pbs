@@ -7,6 +7,37 @@
 #PBS -j oe
 #PBS -m abe
 
+# =============================================================================
+# VULCAN Emulator Pipeline — PBS Submission Script
+#
+# Full pipeline: generation → normalization → training → export
+#
+# Usage:
+#   qsub run.pbs                          # full pipeline (GPU)
+#   qsub -v DATA_ONLY=1 run_cpu.pbs       # data processing only (CPU)
+#
+# To run ONLY data generation and normalization on a CPU node (no GPU hours
+# consumed), copy this script to run_cpu.pbs and change the PBS directives:
+#
+#   #PBS -q long
+#   #PBS -l select=1:ncpus=72:mem=400gb
+#
+# Then submit with:
+#   qsub -v DATA_ONLY=1 run_cpu.pbs
+#
+# This runs generation + normalization only, skipping training and export.
+# Once the data is ready, submit the GPU job with:
+#   qsub -v SKIP_GEN=1 run.pbs
+#
+# Environment Variables:
+#   CONFIG_PATH     — config file path (default: config/fastchem_transformer_config.json)
+#   DATA_ONLY       — set to 1 to run only generation + normalization (no GPU needed)
+#   SKIP_GEN        — set to 1 to skip generation (data already exists)
+#   SKIP_NORM       — set to 1 to skip normalization (processed data exists)
+#   CONDA_ENV       — conda environment name (default: pyt2_8_gh)
+#   REQUIRE_JAX_GPU — set to 0 to allow CPU-only JAX (default: 1, unless DATA_ONLY=1)
+# =============================================================================
+
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
@@ -15,6 +46,7 @@ cd -P "${PROJECT_ROOT}"
 LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
 mkdir -p "${LOG_ROOT}"
 
+# --- Conda Environment ---
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
 module load miniconda3/gh2
@@ -39,11 +71,21 @@ if [ "${rc}" -ne 0 ]; then
   exit 2
 fi
 
+# --- Configuration ---
 CONFIG_PATH="${CONFIG_PATH:-config/fastchem_transformer_config.json}"
-RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
-REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
+DATA_ONLY="${DATA_ONLY:-0}"
+SKIP_GEN="${SKIP_GEN:-0}"
+SKIP_NORM="${SKIP_NORM:-0}"
 DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
 
+# When running data-only, no GPU is needed.
+if [ "${DATA_ONLY}" = "1" ]; then
+  REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-0}"
+else
+  REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
+fi
+
+# --- Environment ---
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -61,27 +103,13 @@ XLA_FLAGS_VALUE="${XLA_FLAGS_VALUE} --xla_gpu_autotune_level=0"
 export XLA_FLAGS="${XLA_FLAGS_VALUE# }"
 unset XLA_FLAGS_VALUE
 
-if [ -n "${PBS_JOBID:-}" ]; then
-  export VULCAN_LIVE_LOG_PATH="${VULCAN_LIVE_LOG_PATH:-${LOG_ROOT}/pbs_${PBS_JOBID}.log}"
-  touch "${VULCAN_LIVE_LOG_PATH}"
-  echo "PBS_JOBID: ${PBS_JOBID}"
-  echo "Live log: ${VULCAN_LIVE_LOG_PATH}"
-  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
-    echo "ERROR: No visible NVIDIA GPU in this PBS job."
-    exit 1
-  fi
-fi
-
+# --- Preflight Checks ---
 if [ ! -f "${CONFIG_PATH}" ]; then
   echo "ERROR: config not found: ${CONFIG_PATH}"
   exit 1
 fi
 if [ ! -d "${PROJECT_ROOT}/src" ]; then
   echo "ERROR: source directory not found: ${PROJECT_ROOT}/src"
-  exit 1
-fi
-if [ ! -f "${PROJECT_ROOT}/src/models/jax_model.py" ]; then
-  echo "ERROR: required source file not found: ${PROJECT_ROOT}/src/models/jax_model.py"
   exit 1
 fi
 
@@ -91,9 +119,25 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: JAX_ENABLE_X64=${JAX_ENABLE_X64} XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE} DISABLE_TRITON_GEMM=${DISABLE_TRITON_GEMM}"
+echo "DATA_ONLY=${DATA_ONLY} SKIP_GEN=${SKIP_GEN} SKIP_NORM=${SKIP_NORM}"
+echo "JAX_ENABLE_X64=${JAX_ENABLE_X64} REQUIRE_JAX_GPU=${REQUIRE_JAX_GPU}"
 
-# Fail early if the environment cannot provide the requested JAX accelerator.
+if [ -n "${PBS_JOBID:-}" ]; then
+  export VULCAN_LIVE_LOG_PATH="${VULCAN_LIVE_LOG_PATH:-${LOG_ROOT}/pbs_${PBS_JOBID}.log}"
+  touch "${VULCAN_LIVE_LOG_PATH}"
+  echo "PBS_JOBID: ${PBS_JOBID}"
+  echo "Live log: ${VULCAN_LIVE_LOG_PATH}"
+fi
+
+# GPU check (only when training is expected).
+if [ "${DATA_ONLY}" != "1" ] && [ "${REQUIRE_JAX_GPU}" = "1" ]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: No visible NVIDIA GPU in this PBS job."
+    exit 1
+  fi
+fi
+
+# JAX backend check.
 if ! python - <<'PY'
 import os
 import sys
@@ -102,7 +146,6 @@ ok = True
 jax_backend = "unknown"
 try:
     import jax
-
     jax_backend = str(jax.default_backend()).lower()
 except Exception as exc:
     print(f"jax_error={exc!r}")
@@ -110,6 +153,8 @@ except Exception as exc:
 if os.environ.get("REQUIRE_JAX_GPU", "0") == "1" and jax_backend not in {"gpu", "cuda", "rocm", "metal"}:
     print(f"ERROR: REQUIRE_JAX_GPU=1 but jax backend is '{jax_backend}'", file=sys.stderr)
     ok = False
+else:
+    print(f"JAX backend: {jax_backend}")
 raise SystemExit(0 if ok else 1)
 PY
 then
@@ -117,8 +162,13 @@ then
   exit 1
 fi
 
-echo "Stage: dataset generation check (RUN_GEN_IF_MISSING=${RUN_GEN_IF_MISSING})"
-if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
+# =============================================================================
+# Stage 1: Data Generation
+# =============================================================================
+if [ "${SKIP_GEN}" != "1" ]; then
+  echo ""
+  echo "========== Stage: generation =========="
+  # Check if raw data already exists before regenerating.
   DATA_CFG_RAW="$(python - "${CONFIG_PATH}" <<'PY'
 from pathlib import Path
 import json
@@ -129,9 +179,10 @@ config_path = Path(sys.argv[1]).resolve()
 project_root = Path.cwd()
 with config_path.open("r", encoding="utf-8") as handle:
     cfg = json.load(handle)
-raw_root = Path(str(cfg["paths"]["raw_root"]))
-if not raw_root.is_absolute():
-    raw_root = (project_root / raw_root).resolve()
+run_root = Path(str(cfg["paths"]["run_root"]))
+if not run_root.is_absolute():
+    run_root = (project_root / run_root).resolve()
+raw_root = run_root / "raw"
 print(raw_root / "runs")
 print(int(cfg["generation"]["num_runs"]))
 consolidated_path = raw_root / "runs.h5"
@@ -160,21 +211,56 @@ PY
     RUN_COUNT="$(find "${RAW_RUN_DIR}" -maxdepth 1 -type f -name 'run_*.h5' | wc -l | tr -d ' ')"
   fi
   if [ "${CONSOLIDATED_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
-    echo "Stage: raw dataset already present in consolidated file (${CONSOLIDATED_COUNT} runs), skipping generation"
+    echo "Raw dataset already present in consolidated file (${CONSOLIDATED_COUNT} runs), skipping generation."
   elif [ "${RUN_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
-    echo "Stage: raw dataset already present (${RUN_COUNT} runs), skipping generation"
+    echo "Raw dataset already present (${RUN_COUNT} runs), skipping generation."
   elif [ "${RUN_COUNT}" -eq 0 ] && [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
-    echo "Stage: generating raw runs"
+    echo "Generating raw runs..."
     python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
   else
     echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} per-file runs in ${RAW_RUN_DIR} and ${CONSOLIDATED_COUNT} runs in ${CONSOLIDATED_PATH}, expected ${EXPECTED_RUNS}."
     echo "Set generation.overwrite=true and regenerate, or align generation.num_runs with the existing dataset."
     exit 1
   fi
+else
+  echo ""
+  echo "========== Stage: generation (SKIPPED via SKIP_GEN=1) =========="
 fi
 
-echo "Stage: preprocessing"
-python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization
+# =============================================================================
+# Stage 2: Normalization (Preprocessing)
+# =============================================================================
+if [ "${SKIP_NORM}" != "1" ]; then
+  echo ""
+  echo "========== Stage: normalization =========="
+  python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization
+else
+  echo ""
+  echo "========== Stage: normalization (SKIPPED via SKIP_NORM=1) =========="
+fi
 
-echo "Stage: training"
+# --- Stop here if DATA_ONLY mode ---
+if [ "${DATA_ONLY}" = "1" ]; then
+  echo ""
+  echo "========== DATA_ONLY=1: stopping after data processing =========="
+  echo "Data generation and normalization complete."
+  echo "Submit the GPU job with: qsub -v SKIP_GEN=1 run.pbs"
+  exit 0
+fi
+
+# =============================================================================
+# Stage 3: Training (requires GPU)
+# =============================================================================
+echo ""
+echo "========== Stage: training =========="
 python -u -m src.utils --config "${CONFIG_PATH}" --stage training
+
+# =============================================================================
+# Stage 4: Export (convert best checkpoint to portable NPZ bundle)
+# =============================================================================
+echo ""
+echo "========== Stage: export =========="
+python -u -m src.utils --config "${CONFIG_PATH}" --stage export
+
+echo ""
+echo "========== Pipeline complete =========="
