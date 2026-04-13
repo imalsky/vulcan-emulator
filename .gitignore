@@ -43,6 +43,12 @@ venv/
 # Immutable external assets are user-managed and not tracked.
 assets/**
 
+# Keep checked-in pipeline configs visible even if broader local/global
+# ignore rules exist on a given machine.
+!config/
+!config/*.json
+!config/*.md
+
 # Vulcan-emulator generated artifacts (data, models, logs)
 data/*
 data/**/raw/
