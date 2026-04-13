@@ -11,7 +11,10 @@ import os
 import sys
 from pathlib import Path
 
-PROJECT_MARKERS = ("pyproject.toml", "spec.md")
+PROJECT_MARKERS = (
+    ("pyproject.toml", "src"),
+    ("pyproject.toml", "spec.md"),
+)
 
 
 _LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -141,9 +144,11 @@ def ensure_dir(path: Path) -> Path:
 def resolve_project_root(start: Path | None = None) -> Path:
     """Walk upward from ``start`` until the repository root markers are found.
 
-    Looks for ``pyproject.toml`` and ``spec.md`` as co-located root
-    indicators.  Raises ``FileNotFoundError`` if neither the start
-    directory nor any of its parents contain both markers.
+    Looks for a supported set of co-located root indicators. The primary
+    marker set is ``pyproject.toml`` plus the top-level ``src`` directory;
+    ``spec.md`` is accepted as an additional legacy marker. Raises
+    ``FileNotFoundError`` if neither the start directory nor any of its
+    parents contain a supported marker set.
 
     Parameters
     ----------
@@ -160,8 +165,9 @@ def resolve_project_root(start: Path | None = None) -> Path:
     if cursor.is_file():
         cursor = cursor.parent
     for candidate in (cursor, *cursor.parents):
-        if all((candidate / marker).exists() for marker in PROJECT_MARKERS):
-            return candidate
+        for marker_group in PROJECT_MARKERS:
+            if all((candidate / marker).exists() for marker in marker_group):
+                return candidate
     raise FileNotFoundError("Could not resolve project root from the current path.")
 
 
