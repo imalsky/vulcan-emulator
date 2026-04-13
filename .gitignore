@@ -72,3 +72,7 @@ logs/
 plots/
 extras/plots/
 extras/standalone_plots/
+
+# Large demo artifacts
+*.zip
+*.npz
