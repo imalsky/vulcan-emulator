@@ -25,6 +25,7 @@ _NOISY_LOGGER_NAMES = (
     "jaxlib",
 )
 _LIVE_LOG_ENV = "VULCAN_LIVE_LOG_PATH"
+_PROJECT_ROOT_ENV = "VULCAN_PROJECT_ROOT"
 
 
 def _configure_standard_streams() -> None:
@@ -146,10 +147,12 @@ def resolve_project_root(start: Path | None = None) -> Path:
 
     Looks for a supported set of co-located root indicators. The primary
     marker set is ``pyproject.toml`` plus the top-level ``src`` directory;
-    ``spec.md`` is accepted as an additional legacy marker. When ``start``
-    points into a detached source tree, the current working directory is used
-    as a fallback search origin. Raises ``FileNotFoundError`` if neither
-    location contains a supported marker set.
+    ``spec.md`` is accepted as an additional legacy marker. When the runtime
+    exports ``VULCAN_PROJECT_ROOT``, that location is trusted first so batch
+    launchers can pin the working tree explicitly. When ``start`` points into
+    a detached source tree, the current working directory is used as a fallback
+    search origin. Raises ``FileNotFoundError`` if neither location contains a
+    supported marker set.
 
     Parameters
     ----------
@@ -162,6 +165,12 @@ def resolve_project_root(start: Path | None = None) -> Path:
     Path
         Resolved repository root containing the configured project markers.
     """
+    configured_root = os.environ.get(_PROJECT_ROOT_ENV, "").strip()
+    if configured_root:
+        candidate = Path(configured_root).expanduser().resolve()
+        if (candidate / "src").is_dir():
+            return candidate
+
     start_paths = [start] if start is not None else []
     start_paths.append(Path.cwd())
 

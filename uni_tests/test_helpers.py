@@ -20,3 +20,19 @@ def test_resolve_project_root_falls_back_to_current_working_directory(
     monkeypatch.chdir(project_root)
 
     assert resolve_project_root(detached_src_file) == project_root.resolve()
+
+
+def test_resolve_project_root_honors_explicit_environment_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "cluster_root"
+    (project_root / "src").mkdir(parents=True)
+
+    unrelated_file = tmp_path / "foreign" / "src" / "utils" / "cli.py"
+    unrelated_file.parent.mkdir(parents=True)
+    unrelated_file.write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("VULCAN_PROJECT_ROOT", str(project_root))
+
+    assert resolve_project_root(unrelated_file) == project_root.resolve()
