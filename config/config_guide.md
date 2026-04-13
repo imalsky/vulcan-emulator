@@ -307,12 +307,15 @@ When omitted, config validation synthesizes a single default preset from
 This section is required for all VULCAN configs. The current generation,
 preprocessing, and upstream VULCAN contracts still consume the stellar flux
 file and sampled irradiation geometry even when `use_photochemistry = false`.
+When every science preset disables photochemistry, `template_file` may be
+omitted and the pipeline will synthesize the default WASP-39 template
+internally.
 
 | Key | Description |
 |-----|-------------|
 | `template_name` | Name of default stellar spectrum |
-| `template_file` | Path to default spectrum .dat file |
-| `library_glob` | Optional glob for spectrum library; when omitted, VULCAN sampling falls back to `template_file` only |
+| `template_file` | Optional path to default spectrum .dat file; may be omitted when photochemistry is disabled for every preset |
+| `library_glob` | Optional glob for spectrum library; when omitted, VULCAN sampling falls back to `template_file` or the built-in analytic template |
 | `max_tokens` | Maximum number of packed spectrum tokens |
 | `latent_dim` | Spectrum encoder latent dimension |
 | `hidden_dim` | Spectrum encoder hidden width |

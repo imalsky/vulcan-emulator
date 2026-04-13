@@ -1680,7 +1680,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             spectrum,
             [
                 "template_name",
-                "template_file",
                 "max_tokens",
                 "wavelength_min_nm",
                 "wavelength_max_nm",
@@ -1698,10 +1697,14 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             spectrum["template_name"],
             "vulcan.stellar_spectrum.template_name",
         )
-        spectrum["template_file"] = _as_nonempty_str(
-            spectrum["template_file"],
-            "vulcan.stellar_spectrum.template_file",
-        )
+        template_file = spectrum.get("template_file")
+        if template_file is None:
+            spectrum["template_file"] = None
+        else:
+            spectrum["template_file"] = _as_nonempty_str(
+                template_file,
+                "vulcan.stellar_spectrum.template_file",
+            )
         library_glob = spectrum.get("library_glob")
         if library_glob is None:
             spectrum["library_glob"] = None
@@ -1834,6 +1837,19 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 raise ConfigValidationError(
                     "vulcan.stellar_spectrum.zenith_angle_deg must lie in [0, 90)."
                 )
+        any_photochemistry_enabled = any(
+            bool(preset["physics_toggles"]["use_photochemistry"])
+            for preset in science_presets
+        )
+        if (
+            spectrum["template_file"] is None
+            and spectrum["library_glob"] is None
+            and any_photochemistry_enabled
+        ):
+            raise ConfigValidationError(
+                "vulcan.stellar_spectrum.template_file is required when any science preset "
+                "enables photochemistry unless library_glob is configured."
+            )
 
         section["physics_toggles"] = physics
         section["science_presets"] = science_presets

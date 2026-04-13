@@ -309,8 +309,8 @@
     },
     "stellar_spectrum": {
       "template_name": "wasp39",
-      "template_file": "assets/stellar_spectra/wasp39_phoenix.dat",
-      "library_glob": "assets/stellar_spectra/*.dat",
+      "template_file": null,
+      "library_glob": null,
       "latent_dim": 32,
       "hidden_dim": 128,
       "wavelength_min_nm": 2.0,
@@ -323,7 +323,10 @@
       "num_latents": 16,
       "num_layers": 2,
       "num_heads": 4,
-      "fourier_features": 16
+      "fourier_features": 16,
+      "teff_k": 5485.0,
+      "radius_rsun": 0.939,
+      "semi_major_axis_au": 0.04858
     }
   }
 }

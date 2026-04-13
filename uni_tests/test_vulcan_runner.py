@@ -114,6 +114,18 @@ def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_
         generate_synthetic_raw_runs(config, project_root=config["_project_root"])
 
 
+def test_generate_synthetic_raw_runs_can_synthesize_template_without_asset(tiny_config):
+    config = copy.deepcopy(tiny_config)
+    config["stellar_spectrum"]["library_glob"] = None
+    config["vulcan"]["stellar_spectrum"]["library_glob"] = None
+    config["stellar_spectrum"]["template_file"] = None
+    config["vulcan"]["stellar_spectrum"]["template_file"] = None
+
+    artifact = generate_synthetic_raw_runs(config, project_root=config["_project_root"])
+
+    assert artifact.consolidated_path.exists()
+
+
 def test_vulcan_generation_requires_configured_checkout(tiny_config):
     config = copy.deepcopy(tiny_config)
     config["generation"]["mode"] = "vulcan"

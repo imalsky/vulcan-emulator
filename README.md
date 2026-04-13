@@ -41,8 +41,8 @@ Shipped defaults:
 - eddy diffusion is on
 - `vulcan.runtime.chemistry_file` is `thermo/SNCHO_photo_network_2025.txt`
 - `vulcan.runtime.regenerate_chem_funs` is enabled so worker-local runs rebuild `chem_funs.py` with photochemistry disabled
-- `vulcan.stellar_spectrum` is still required for VULCAN runs because the current pipeline and upstream VULCAN still consume the stellar flux file and irradiation geometry even when photochemistry is disabled
-- the shipped VULCAN example keeps `stellar_spectrum.library_glob` enabled to sample from the local spectrum library; removing it changes sampling to a single-template fallback
+- `vulcan.stellar_spectrum` is still part of the VULCAN run contract because the pipeline stores a spectrum and irradiation geometry for every run
+- when every science preset has `use_photochemistry = false`, `stellar_spectrum.template_file` may be omitted and the pipeline will synthesize the default WASP-39 template internally
 - Kzz is depth-constant from `sampling.kzz_cm2_s`
 - VULCAN surface gravity is sampled from `sampling.gravity_range_cm_s2`
 - VULCAN planet radius is sampled from `sampling.planet_radius_range_cm`

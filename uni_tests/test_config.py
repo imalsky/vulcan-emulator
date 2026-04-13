@@ -179,7 +179,11 @@ def test_shipped_vulcan_config_defaults_are_correct():
     assert config["science_presets"][0]["atm_base"] == "H2"
     assert config["science_presets"][0]["physics_toggles"]["use_photochemistry"] is False
     assert config["science_presets"][0]["physics_toggles"]["use_condensation"] is True
-    assert config["stellar_spectrum"]["library_glob"] == "assets/stellar_spectra/*.dat"
+    assert config["stellar_spectrum"]["template_file"] is None
+    assert config["stellar_spectrum"]["library_glob"] is None
+    assert config["stellar_spectrum"]["teff_k"] == pytest.approx(5485.0)
+    assert config["stellar_spectrum"]["radius_rsun"] == pytest.approx(0.939)
+    assert config["stellar_spectrum"]["semi_major_axis_au"] == pytest.approx(0.04858)
     assert config["stellar_spectrum"]["encoder_mode"] == "perceiver"
     assert config["stellar_spectrum"]["max_tokens"] == 2610
     assert config["stellar_spectrum"]["num_latents"] == 16
@@ -207,6 +211,44 @@ def test_resolve_conditioning_inputs_rejects_missing_vulcan_runtime_inputs():
             },
             required_global_inputs=list(config["data_spec"]["required_global_inputs"]),
         )
+
+
+def test_vulcan_config_allows_missing_template_file_when_photochemistry_disabled(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
+    payload["vulcan"]["stellar_spectrum"]["template_file"] = None
+    payload["vulcan"]["stellar_spectrum"]["library_glob"] = None
+
+    config = load_and_validate_config(_write_config(tmp_path, "vulcan_no_template.json", payload))
+
+    assert config["stellar_spectrum"]["template_file"] is None
+
+
+def test_vulcan_config_requires_template_or_library_when_photochemistry_enabled(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
+    payload["vulcan"]["physics_toggles"]["use_photochemistry"] = True
+    payload["vulcan"]["science_presets"] = [
+        {
+            "name": "photo_h2",
+            "atm_base": "H2",
+            "physics_toggles": {
+                "use_photochemistry": True,
+                "use_ion_chemistry": False,
+                "use_eddy_diffusion": True,
+                "use_molecular_diffusion": False,
+                "use_upwind_molecular_diffusion": False,
+                "use_boundary_conditions": False,
+                "use_condensation": True,
+                "use_settling": False,
+                "use_initial_cold_trap": False,
+                "use_sat_surface_h2o": False,
+            },
+        }
+    ]
+    payload["vulcan"]["stellar_spectrum"]["template_file"] = None
+    payload["vulcan"]["stellar_spectrum"]["library_glob"] = None
+
+    with pytest.raises(ConfigValidationError, match="template_file is required"):
+        load_and_validate_config(_write_config(tmp_path, "vulcan_missing_template.json", payload))
 
 
 def test_vulcan_block_is_required_only_for_vulcan(tmp_path):

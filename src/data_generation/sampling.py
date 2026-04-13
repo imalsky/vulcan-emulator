@@ -876,7 +876,7 @@ def _ensure_wasp39_template(
     project_root: Path,
     config: dict[str, Any],
 ) -> SpectrumRecord:
-    """Load the configured default stellar template from disk.
+    """Load or synthesize the configured default stellar template.
 
     Parameters
     ----------
@@ -889,10 +889,22 @@ def _ensure_wasp39_template(
     Returns
     -------
     SpectrumRecord
-        Parsed stellar template record.
+        Parsed or synthesized stellar template record.
     """
     spectrum_cfg = config["stellar_spectrum"]
-    template_path = (project_root / spectrum_cfg["template_file"]).resolve()
+    template_file = spectrum_cfg.get("template_file")
+    if template_file in {None, ""}:
+        from .spectrum import generate_wasp39b_template
+
+        return generate_wasp39b_template(
+            wavelength_min_nm=float(spectrum_cfg["wavelength_min_nm"]),
+            wavelength_max_nm=float(spectrum_cfg["wavelength_max_nm"]),
+            teff_k=float(spectrum_cfg.get("teff_k") or 5485.0),
+            radius_rsun=float(spectrum_cfg.get("radius_rsun") or 0.939),
+            semi_major_axis_au=float(spectrum_cfg.get("semi_major_axis_au") or 0.04858),
+            name=str(spectrum_cfg["template_name"]),
+        )
+    template_path = (project_root / str(template_file)).resolve()
     if not template_path.exists():
         raise FileNotFoundError(
             f"Configured stellar_spectrum.template_file does not exist: {template_path}"
