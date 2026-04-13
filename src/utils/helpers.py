@@ -146,9 +146,10 @@ def resolve_project_root(start: Path | None = None) -> Path:
 
     Looks for a supported set of co-located root indicators. The primary
     marker set is ``pyproject.toml`` plus the top-level ``src`` directory;
-    ``spec.md`` is accepted as an additional legacy marker. Raises
-    ``FileNotFoundError`` if neither the start directory nor any of its
-    parents contain a supported marker set.
+    ``spec.md`` is accepted as an additional legacy marker. When ``start``
+    points into a detached source tree, the current working directory is used
+    as a fallback search origin. Raises ``FileNotFoundError`` if neither
+    location contains a supported marker set.
 
     Parameters
     ----------
@@ -161,13 +162,21 @@ def resolve_project_root(start: Path | None = None) -> Path:
     Path
         Resolved repository root containing the configured project markers.
     """
-    cursor = (start or Path.cwd()).resolve()
-    if cursor.is_file():
-        cursor = cursor.parent
-    for candidate in (cursor, *cursor.parents):
-        for marker_group in PROJECT_MARKERS:
-            if all((candidate / marker).exists() for marker in marker_group):
-                return candidate
+    start_paths = [start] if start is not None else []
+    start_paths.append(Path.cwd())
+
+    seen: set[Path] = set()
+    for origin in start_paths:
+        cursor = origin.resolve()
+        if cursor.is_file():
+            cursor = cursor.parent
+        if cursor in seen:
+            continue
+        seen.add(cursor)
+        for candidate in (cursor, *cursor.parents):
+            for marker_group in PROJECT_MARKERS:
+                if all((candidate / marker).exists() for marker in marker_group):
+                    return candidate
     raise FileNotFoundError("Could not resolve project root from the current path.")
 
 
