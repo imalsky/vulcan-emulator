@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -27,29 +28,27 @@ def _write_config(tmp_path: Path, name: str, payload: dict) -> Path:
     return config_path
 
 
+def _with_mlp_model(payload: dict) -> dict:
+    updated = copy.deepcopy(payload)
+    updated["model_type"] = "mlp"
+    updated["model"] = {
+        "d_hidden": 256,
+        "num_hidden_layers": 4,
+        "conditioning_hidden_dim": 256,
+        "film_clamp": 5.0,
+    }
+    return updated
+
+
 @pytest.mark.parametrize(
     ("filename", "chemistry_type", "model_type", "sequence_order", "global_order"),
     [
-        (
-            "fastchem_mlp_config.json",
-            "fastchem",
-            "mlp",
-            ["pressure_bar", "temperature_k"],
-            FASTCHEM_GLOBAL_ORDER,
-        ),
         (
             "fastchem_transformer_config.json",
             "fastchem",
             "transformer",
             ["pressure_bar", "temperature_k"],
             FASTCHEM_GLOBAL_ORDER,
-        ),
-        (
-            "vulcan_mlp_config.json",
-            "vulcan",
-            "mlp",
-            ["pressure_bar", "temperature_k", "kzz_cm2_s"],
-            VULCAN_GLOBAL_ORDER,
         ),
         (
             "vulcan_transformer_config.json",
@@ -96,9 +95,7 @@ def test_shipped_configs_load_with_expected_contract(
 @pytest.mark.parametrize(
     "filename",
     [
-        "fastchem_mlp_config.json",
         "fastchem_transformer_config.json",
-        "vulcan_mlp_config.json",
         "vulcan_transformer_config.json",
     ],
 )
@@ -111,7 +108,7 @@ def test_shipped_configs_use_single_dataset_root_layout(filename: str):
 
 
 def test_shipped_fastchem_config_defaults_are_correct():
-    config = load_and_validate_config(ROOT / "config" / "fastchem_mlp_config.json")
+    config = load_and_validate_config(ROOT / "config" / "fastchem_transformer_config.json")
     assert config["normalization"]["global_methods"] == {
         "He_H": "standard",
         "C_H": "log-standard",
@@ -131,13 +128,13 @@ def test_shipped_fastchem_config_defaults_are_correct():
     }
     assert config["roth_sampler"]["enabled"] is True
     assert config["roth_sampler"]["data_glob"] == "assets/PTprofiles/*.dat"
-    assert config["training"]["model"]["activation"] == "leaky_relu"
+    assert config["training"]["model"]["activation"] == "gelu"
     assert config["training"]["model"]["dropout_rate"] == pytest.approx(0.05)
     assert config["training"]["early_stopping_patience"] == 30
 
 
 def test_config_rejects_legacy_data_root_keys(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["paths"]["raw_root"] = "data/raw/fastchem"
     payload["paths"]["processed_root"] = "data/processed/fastchem_mlp"
     with pytest.raises(ConfigValidationError, match="no longer supported|run_root only"):
@@ -145,7 +142,7 @@ def test_config_rejects_legacy_data_root_keys(tmp_path):
 
 
 def test_config_requires_run_root(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["paths"].pop("run_root")
     with pytest.raises(ConfigValidationError, match="Missing required keys in paths"):
         load_and_validate_config(_write_config(tmp_path, "missing_run_root.json", payload))
@@ -155,7 +152,11 @@ def test_shipped_vulcan_config_defaults_are_correct():
     raw_config = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
     assert "python_executable" not in raw_config["vulcan"]["runtime"]
     assert "cfg_file" not in raw_config["vulcan"]["runtime"]
+    assert raw_config["vulcan"]["runtime"]["chemistry_file"] == "thermo/SNCHO_photo_network_2025.txt"
+    assert raw_config["vulcan"]["runtime"]["regenerate_chem_funs"] is True
     assert raw_config["vulcan"]["runtime"]["rocky"] is False
+    assert raw_config["vulcan"]["runtime"]["cfg_assignments"]["condense_sp"] == ["H2O", "S8"]
+    assert raw_config["vulcan"]["runtime"]["cfg_assignments"]["non_gas_sp"] == ["H2O_l_s", "S8_l_s"]
     assert "enabled" not in raw_config["vulcan"]["stellar_spectrum"]
 
     config = load_and_validate_config(ROOT / "config" / "vulcan_transformer_config.json")
@@ -164,15 +165,20 @@ def test_shipped_vulcan_config_defaults_are_correct():
     assert config["vulcan_runtime"]["python_executable"] == "python"
     assert config["vulcan_runtime"]["cfg_file"] == "vulcan_cfg.py"
     assert config["vulcan_runtime"]["worker_root"] == "data/vulcan_workers"
+    assert config["vulcan_runtime"]["chemistry_file"] == "thermo/SNCHO_photo_network_2025.txt"
+    assert config["vulcan_runtime"]["regenerate_chem_funs"] is True
     assert config["vulcan_runtime"]["use_lowT_limit_rates"] is True
     assert config["vulcan_runtime"]["use_adaptive_rtol"] is True
     assert config["vulcan_runtime"]["rocky"] is False
     assert config["vulcan_runtime"]["top_bc_flux_file"] is None
     assert config["vulcan_runtime"]["bot_bc_flux_file"] is None
+    assert config["vulcan_runtime"]["cfg_assignments"]["condense_sp"] == ["H2O", "S8"]
+    assert config["vulcan_runtime"]["cfg_assignments"]["non_gas_sp"] == ["H2O_l_s", "S8_l_s"]
     assert len(config["science_presets"]) == 1
     assert config["science_presets"][0]["name"] == "basic_h2"
     assert config["science_presets"][0]["atm_base"] == "H2"
-    assert config["science_presets"][0]["physics_toggles"]["use_photochemistry"] is True
+    assert config["science_presets"][0]["physics_toggles"]["use_photochemistry"] is False
+    assert config["science_presets"][0]["physics_toggles"]["use_condensation"] is True
     assert config["stellar_spectrum"]["library_glob"] == "assets/stellar_spectra/*.dat"
     assert config["stellar_spectrum"]["encoder_mode"] == "perceiver"
     assert config["stellar_spectrum"]["max_tokens"] == 2610
@@ -204,12 +210,12 @@ def test_resolve_conditioning_inputs_rejects_missing_vulcan_runtime_inputs():
 
 
 def test_vulcan_block_is_required_only_for_vulcan(tmp_path):
-    fastchem = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    fastchem = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     fastchem["vulcan"] = {"unexpected": True}
     with pytest.raises(ConfigValidationError, match="chemistry_type='fastchem'"):
         load_and_validate_config(_write_config(tmp_path, "fastchem_invalid.json", fastchem))
 
-    vulcan = _load_raw_json(ROOT / "config" / "vulcan_mlp_config.json")
+    vulcan = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
     vulcan.pop("vulcan")
     with pytest.raises(ConfigValidationError, match="Missing required keys in root"):
         load_and_validate_config(_write_config(tmp_path, "vulcan_missing.json", vulcan))
@@ -224,30 +230,43 @@ def test_vulcan_block_is_required_only_for_vulcan(tmp_path):
     ],
 )
 def test_legacy_sections_are_rejected(tmp_path, legacy_key: str, legacy_value: object, message: str):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload[legacy_key] = legacy_value
     with pytest.raises(ConfigValidationError, match=message):
         load_and_validate_config(_write_config(tmp_path, "legacy_section.json", payload))
 
 
 def test_legacy_model_type_values_are_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["model_type"] = "equilibrium"
     with pytest.raises(ConfigValidationError, match="Legacy model_type values"):
         load_and_validate_config(_write_config(tmp_path, "legacy_model_type.json", payload))
 
 
 @pytest.mark.parametrize(
-    ("filename", "model_type"),
+    ("payload", "filename", "model_type"),
     [
-        ("fastchem_mlp_config.json", "mlp"),
-        ("fastchem_transformer_config.json", "transformer"),
+        (
+            _with_mlp_model(_load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")),
+            "fastchem_mlp_config.json",
+            "mlp",
+        ),
+        (
+            _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json"),
+            "fastchem_transformer_config.json",
+            "transformer",
+        ),
     ],
 )
-def test_model_defaults_are_applied_for_each_model_family(tmp_path, filename: str, model_type: str):
-    payload = _load_raw_json(ROOT / "config" / filename)
-    payload["model"].pop("activation")
-    payload["model"].pop("dropout_rate")
+def test_model_defaults_are_applied_for_each_model_family(
+    tmp_path,
+    payload: dict,
+    filename: str,
+    model_type: str,
+):
+    payload = copy.deepcopy(payload)
+    payload["model"].pop("activation", None)
+    payload["model"].pop("dropout_rate", None)
     payload["training"].pop("early_stopping_patience")
     config = load_and_validate_config(_write_config(tmp_path, filename, payload))
     assert config["model_type"] == model_type
@@ -260,76 +279,89 @@ def test_model_defaults_are_applied_for_each_model_family(tmp_path, filename: st
     "activation",
     ["relu", "gelu", "silu", "tanh", "elu", "selu", "softplus", "leaky_relu"],
 )
-@pytest.mark.parametrize("filename", ["fastchem_mlp_config.json", "fastchem_transformer_config.json"])
+@pytest.mark.parametrize(
+    ("payload", "filename"),
+    [
+        (
+            _with_mlp_model(_load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")),
+            "fastchem_mlp_config.json",
+        ),
+        (
+            _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json"),
+            "fastchem_transformer_config.json",
+        ),
+    ],
+)
 def test_supported_activations_validate_for_both_model_families(
     tmp_path,
     activation: str,
+    payload: dict,
     filename: str,
 ):
-    payload = _load_raw_json(ROOT / "config" / filename)
+    payload = copy.deepcopy(payload)
     payload["model"]["activation"] = activation
     config = load_and_validate_config(_write_config(tmp_path, filename, payload))
     assert config["training"]["model"]["activation"] == activation
 
 
 def test_invalid_mlp_activation_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _with_mlp_model(_load_raw_json(ROOT / "config" / "fastchem_transformer_config.json"))
     payload["model"]["activation"] = "bad_activation"
     with pytest.raises(ConfigValidationError, match="model.activation"):
         load_and_validate_config(_write_config(tmp_path, "invalid_activation.json", payload))
 
 
 def test_invalid_dropout_rate_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["model"]["dropout_rate"] = 1.0
     with pytest.raises(ConfigValidationError, match="dropout_rate"):
         load_and_validate_config(_write_config(tmp_path, "invalid_dropout.json", payload))
 
 
 def test_invalid_early_stopping_patience_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["training"]["early_stopping_patience"] = 0
     with pytest.raises(ConfigValidationError, match="early_stopping_patience"):
         load_and_validate_config(_write_config(tmp_path, "invalid_patience.json", payload))
 
 
 def test_vulcan_requires_lambda_z_and_lambda_phys_only(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
     payload["training"]["loss"].pop("lambda_phys")
     with pytest.raises(ConfigValidationError, match="lambda_phys"):
         load_and_validate_config(_write_config(tmp_path, "vulcan_missing_lambda_phys.json", payload))
 
 
 def test_vulcan_requires_planet_radius_sampling_range(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "vulcan_transformer_config.json")
     payload["sampling"].pop("planet_radius_range_cm")
     with pytest.raises(ConfigValidationError, match="planet_radius_range_cm"):
         load_and_validate_config(_write_config(tmp_path, "missing_planet_radius.json", payload))
 
 
 def test_fastchem_rejects_vulcan_only_sampling_keys(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["sampling"]["planet_radius_range_cm"] = [7.0e9, 1.0e10]
     with pytest.raises(ConfigValidationError, match="chemistry_type='fastchem'"):
         load_and_validate_config(_write_config(tmp_path, "fastchem_planet_radius.json", payload))
 
 
 def test_invalid_mixed_temperature_profile_probability_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["temperature_profiles"]["analytic_probability"] = 1.0
     with pytest.raises(ConfigValidationError, match="analytic_probability"):
         load_and_validate_config(_write_config(tmp_path, "invalid_temp_prob.json", payload))
 
 
 def test_missing_analytic_sampler_for_mixed_temperature_profiles_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["temperature_profiles"].pop("analytic_sampler")
     with pytest.raises(ConfigValidationError, match="analytic_sampler"):
         load_and_validate_config(_write_config(tmp_path, "missing_analytic_sampler.json", payload))
 
 
 def test_valid_temperature_profile_filters_are_normalized(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["temperature_profiles"]["filters"] = {
         "Teq": [1400.0, 1600.0],
         "LogDrag": 0.0,
@@ -344,28 +376,28 @@ def test_valid_temperature_profile_filters_are_normalized(tmp_path):
 
 
 def test_invalid_temperature_profile_filter_key_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["temperature_profiles"]["filters"] = {"phase": ["global_mean", "disk_mean"]}
     with pytest.raises(ConfigValidationError, match="temperature_profiles.filters"):
         load_and_validate_config(_write_config(tmp_path, "invalid_filter_key.json", payload))
 
 
 def test_invalid_analytic_temperature_sampler_exponent_range_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["temperature_profiles"]["analytic_sampler"]["power_law_n_range"] = [0.0, 0.5]
     with pytest.raises(ConfigValidationError, match="power_law_n_range"):
         load_and_validate_config(_write_config(tmp_path, "invalid_power_law.json", payload))
 
 
 def test_invalid_temperature_profile_filter_range_is_rejected(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["temperature_profiles"]["filters"] = {"Teq": [1800.0, 1200.0]}
     with pytest.raises(ConfigValidationError, match="Teq"):
         load_and_validate_config(_write_config(tmp_path, "invalid_filter_range.json", payload))
 
 
 def test_explicit_cosine_scheduler_is_preserved(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "fastchem_mlp_config.json")
+    payload = _load_raw_json(ROOT / "config" / "fastchem_transformer_config.json")
     payload["training"]["scheduler"] = {"name": "cosine"}
     validated = load_and_validate_config(_write_config(tmp_path, "cosine_scheduler.json", payload))
     assert validated["training"]["scheduler"] == {"name": "cosine"}

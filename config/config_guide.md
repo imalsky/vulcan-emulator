@@ -16,17 +16,15 @@ The four supported combinations are:
 - `vulcan + transformer`
 
 Shipped example configs:
-- `config/fastchem_mlp_config.json`
 - `config/fastchem_transformer_config.json`
-- `config/vulcan_mlp_config.json`
 - `config/vulcan_transformer_config.json`
 
 CLI:
 
 ```bash
-python -m src.utils --config config/fastchem_mlp_config.json --stage generation
-python -m src.utils --config config/fastchem_mlp_config.json --stage normalization
-python -m src.utils --config config/fastchem_mlp_config.json --stage training
+python -m src.utils --config config/fastchem_transformer_config.json --stage generation
+python -m src.utils --config config/fastchem_transformer_config.json --stage normalization
+python -m src.utils --config config/fastchem_transformer_config.json --stage training
 ```
 
 ---
@@ -301,14 +299,20 @@ Optional list of per-run science variations. Each preset supports:
 - `atm_base` (optional, falls back to `vulcan.runtime.atm_base`)
 - `physics_toggles` (optional, omitted values fall back to `vulcan.physics_toggles`)
 
+When omitted, config validation synthesizes a single default preset from
+`vulcan.physics_toggles` and `vulcan.runtime.atm_base`.
+
 #### `vulcan.stellar_spectrum`
+
+This section is required for all VULCAN configs. The current generation,
+preprocessing, and upstream VULCAN contracts still consume the stellar flux
+file and sampled irradiation geometry even when `use_photochemistry = false`.
 
 | Key | Description |
 |-----|-------------|
-| `enabled` | Boolean gate for stellar-spectrum conditioning in VULCAN configs |
 | `template_name` | Name of default stellar spectrum |
 | `template_file` | Path to default spectrum .dat file |
-| `library_glob` | Optional glob for spectrum library |
+| `library_glob` | Optional glob for spectrum library; when omitted, VULCAN sampling falls back to `template_file` only |
 | `max_tokens` | Maximum number of packed spectrum tokens |
 | `latent_dim` | Spectrum encoder latent dimension |
 | `hidden_dim` | Spectrum encoder hidden width |
@@ -319,6 +323,9 @@ Optional list of per-run science variations. Each preset supports:
 | `encoder_mode` | `"perceiver"` |
 | `wavelength_min_nm` | Minimum wavelength (nm) |
 | `wavelength_max_nm` | Maximum wavelength (nm) |
+| `dbin1_nm` | Optional fine native-grid bin width below the transition wavelength; defaults to `0.1` |
+| `dbin2_nm` | Optional coarse native-grid bin width above the transition wavelength; defaults to `2.0` |
+| `dbin_12trans_nm` | Optional transition wavelength between `dbin1_nm` and `dbin2_nm`; defaults to `240.0` |
 | `teff_k` | Optional provenance/template-generation metadata only |
 | `radius_rsun` | Optional legacy fixed stellar radius; backfilled to `sampling.stellar_radius_range_rsun = [x, x]` |
 | `semi_major_axis_au` | Optional legacy fixed orbital distance; backfilled to `sampling.semi_major_axis_range_au = [x, x]` |

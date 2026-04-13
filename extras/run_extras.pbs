@@ -14,9 +14,9 @@
 # benchmark/demo can use the accelerator-backed runtime.
 #
 # Usage:
-#   qsub run_extras.pbs
-#   qsub -v CONFIG_PATH=config/fastchem_mlp_config.json run_extras.pbs
-#   qsub -v BUNDLE_PATH=models/fastchem_transformer/best_exported.npz run_extras.pbs
+#   qsub extras/run_extras.pbs
+#   qsub -v CONFIG_PATH=config/fastchem_transformer_config.json extras/run_extras.pbs
+#   qsub -v BUNDLE_PATH=models/fastchem_transformer/best_exported.npz extras/run_extras.pbs
 #
 # Environment Variables:
 #   CONFIG_PATH  — FastChem config file path
@@ -27,7 +27,9 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DEFAULT_PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
 cd -P "${PROJECT_ROOT}"
 
 LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
@@ -197,20 +199,14 @@ fi
 echo "Resolved bundle: ${BUNDLE_PATH}"
 BUNDLE_ARGS=(--bundle "${BUNDLE_PATH}")
 
-run_extra "plot_profiles" \
-  python -u extras/plot_profiles.py --config "${CONFIG_PATH}"
+run_extra "plot_saved_test_profiles" \
+  python -u extras/plot_saved_test_profiles.py --config "${CONFIG_PATH}"
 
-run_extra "compare_test_profile_fastchem" \
-  python -u extras/compare_test_profile_fastchem.py --config "${CONFIG_PATH}"
+run_extra "compare_saved_test_profile_fastchem" \
+  python -u extras/compare_saved_test_profile_fastchem.py --config "${CONFIG_PATH}"
 
-run_extra "standalone_basic" \
-  python -u extras/standalone_basic.py --config "${CONFIG_PATH}" "${BUNDLE_ARGS[@]}"
-
-run_extra "standalone_test" \
-  python -u extras/standalone_test.py --config "${CONFIG_PATH}" "${BUNDLE_ARGS[@]}"
-
-run_extra "test_blackbody_vs_example_spectra" \
-  python -u extras/test_blackbody_vs_example_spectra.py
+run_extra "fastchem_saved_test_profile_demo" \
+  python -u extras/fastchem_saved_test_profile_demo.py --config "${CONFIG_PATH}" "${BUNDLE_ARGS[@]}"
 
 echo ""
 echo "========== Extras complete =========="

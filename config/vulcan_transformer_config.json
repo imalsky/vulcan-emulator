@@ -242,15 +242,15 @@
   },
   "vulcan": {
     "physics_toggles": {
-      "use_photochemistry": true,
-      "use_condensation": false,
+      "use_photochemistry": false,
+      "use_condensation": true,
       "use_ion_chemistry": false,
       "use_eddy_diffusion": true,
       "use_molecular_diffusion": false,
       "use_upwind_molecular_diffusion": false,
       "use_boundary_conditions": false,
       "use_settling": false,
-      "use_initial_cold_trap": false,
+      "use_initial_cold_trap": true,
       "use_sat_surface_h2o": false
     },
     "science_presets": [
@@ -258,15 +258,50 @@
         "name": "basic_h2",
         "atm_base": "H2",
         "physics_toggles": {
-          "use_photochemistry": true,
-          "use_eddy_diffusion": true
+          "use_photochemistry": false,
+          "use_condensation": true,
+          "use_eddy_diffusion": true,
+          "use_initial_cold_trap": true
         }
       }
     ],
     "runtime": {
-      "chemistry_file": "thermo/SNCHO_photo_network_2024.txt",
+      "chemistry_file": "thermo/SNCHO_photo_network_2025.txt",
+      "regenerate_chem_funs": true,
       "rocky": false,
       "atm_base": "H2",
+      "cfg_assignments": {
+        "condense_sp": [
+          "H2O",
+          "S8"
+        ],
+        "non_gas_sp": [
+          "H2O_l_s",
+          "S8_l_s"
+        ],
+        "use_relax": [
+          "H2O"
+        ],
+        "humidity": 1.0,
+        "r_p": {
+          "H2O_l_s": 5e-05,
+          "S8_l_s": 0.0001
+        },
+        "rho_p": {
+          "H2O_l_s": 0.9,
+          "S8_l_s": 2.07
+        },
+        "fix_species": [
+          "H2O",
+          "H2O_l_s",
+          "S8",
+          "S8_l_s"
+        ],
+        "start_conden_time": 0,
+        "stop_conden_time": 100000000.0,
+        "fix_species_time": 100000000.0,
+        "fix_species_from_coldtrap_lev": true
+      },
       "t_cross_sp": [
         "H2",
         "He"

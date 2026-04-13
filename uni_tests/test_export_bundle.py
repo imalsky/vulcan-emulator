@@ -448,6 +448,48 @@ def test_exported_fastchem_transformer_bundle_predicts_from_physical_inputs(tmp_
     np.testing.assert_allclose(np.asarray(predicted_log10), expected_log10, rtol=1.0e-5, atol=1.0e-6)
 
 
+def test_exported_fastchem_compiled_predictor_matches_eager_and_is_cached(tmp_path):
+    payload, _, _ = _make_fastchem_payload("transformer")
+    bundle = load_exported_model(export_checkpoint_payload(payload, tmp_path / "fastchem_transformer_export.npz"))
+
+    pressure_bar = jnp.asarray([100.0, 10.0, 1.0, 0.1], dtype=jnp.float32)
+    temperature_k = jnp.asarray([1450.0, 1300.0, 1050.0, 900.0], dtype=jnp.float32)
+    global_inputs = _element_globals()
+
+    compiled_linear = bundle.make_compiled_fastchem_profile_predictor()
+    compiled_log10 = bundle.make_compiled_fastchem_profile_predictor(return_log10=True)
+
+    assert compiled_linear is bundle.make_compiled_fastchem_profile_predictor()
+    assert compiled_log10 is bundle.make_compiled_fastchem_profile_predictor(return_log10=True)
+
+    eager_linear = bundle.predict_fastchem_profile(
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        global_inputs=global_inputs,
+    )
+    eager_log10 = bundle.predict_fastchem_profile(
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        global_inputs=global_inputs,
+        return_log10=True,
+    )
+    compiled_linear_output = compiled_linear(pressure_bar, temperature_k, global_inputs)
+    compiled_log10_output = compiled_log10(pressure_bar, temperature_k, global_inputs)
+
+    np.testing.assert_allclose(
+        np.asarray(compiled_linear_output),
+        np.asarray(eager_linear),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(compiled_log10_output),
+        np.asarray(eager_log10),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+
+
 def test_exported_vulcan_mlp_bundle_predicts_from_unseen_physical_spectrum(tmp_path):
     payload, normalization, dims = _make_vulcan_payload("mlp")
     bundle = load_exported_model(export_checkpoint_payload(payload, tmp_path / "vulcan_mlp_export.npz"))

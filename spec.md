@@ -12,6 +12,10 @@ Supported combinations:
 - `vulcan + mlp`
 - `vulcan + transformer`
 
+Shipped example configs:
+- `config/fastchem_transformer_config.json`
+- `config/vulcan_transformer_config.json`
+
 `chemistry_type` selects the target contract and learned inputs.
 `model_type` selects the prediction architecture only.
 
@@ -205,6 +209,11 @@ Internal runtime defaults that are not learned public inputs:
 - `rocky`
 - optional `top_bc_flux_file`
 - optional `bot_bc_flux_file`
+
+The shipped `vulcan_transformer` example is a condensation-enabled,
+photochemistry-disabled H2 setup using `thermo/SNCHO_photo_network_2025.txt`
+and `vulcan.runtime.cfg_assignments` to pass the `H2O`/`S8` condensation
+recipe through to worker-local `vulcan_cfg.py`.
 
 Worker runtime scratch directories are temporary and live outside `data/`.
 

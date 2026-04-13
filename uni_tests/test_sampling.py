@@ -111,7 +111,7 @@ def test_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config
 
 def test_shipped_equilibrium_config_uses_fixture_temperature_profiles():
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "fastchem_mlp_config.json")
+    config = load_and_validate_config(root / "config" / "fastchem_transformer_config.json")
     config["_project_root"] = root
     config["temperature_profiles"]["data_glob"] = str(FIXTURE_PT_PATH)
     config["temperature_profiles"]["filters"] = {"Teq": (1200.0, 1200.0), "LogMet": 0.0, "TiOVO": False}

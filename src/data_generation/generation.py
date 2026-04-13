@@ -1697,9 +1697,19 @@ def convert_vulcan_output_to_hdf5(
         gravity_profile_runtime = None
 
     # Extract the final converged mixing ratios from VULCAN output.
-    if "ymix_time" not in _fetch(data, "variable"):
-        raise ValueError("VULCAN output is missing variable.ymix_time required by the current raw-data contract.")
-    ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
+    variable = _fetch(data, "variable")
+    if "ymix_time" in variable:
+        ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
+    elif "y_time" in variable:
+        y_time = np.asarray(_fetch(data, "variable", "y_time"), dtype=np.float64)
+        if y_time.ndim != 3 or y_time.shape[1] != n0.size:
+            raise ValueError("VULCAN output contains inconsistent variable.y_time and atm.n_0 shapes.")
+        ymix_time = y_time / n0[None, :, None]
+    else:
+        raise ValueError(
+            "VULCAN output is missing variable.ymix_time and legacy variable.y_time "
+            "required to derive the final raw-data contract."
+        )
     output_species = list(config["data_spec"]["output_species"])
     output_indices = [species.index(name) for name in output_species]
     # Take the last timestep as the final converged state.

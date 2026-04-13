@@ -27,12 +27,12 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Tuple, Union
 
 import numpy as np
 
-RothFilterValue = float | tuple[float, float] | bool
-RothFilterConfig = dict[str, RothFilterValue]
+RothFilterValue = Union[float, Tuple[float, float], bool]
+RothFilterConfig = Dict[str, RothFilterValue]
 
 ROTH_NUMERIC_FILTER_KEYS = ("Teq", "LogMet", "LogDrag", "Mstar", "Rp", "logG")
 ROTH_BOOLEAN_FILTER_KEYS = ("TiOVO",)

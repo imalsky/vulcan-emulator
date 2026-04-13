@@ -9,13 +9,13 @@ from src.utils.cli import main
 
 def test_cli_rejects_legacy_subcommands():
     with pytest.raises(SystemExit):
-        main(["--config", "config/fastchem_mlp_config.json", "generation"])
+        main(["--config", "config/fastchem_transformer_config.json", "generation"])
     with pytest.raises(SystemExit):
-        main(["--config", "config/fastchem_mlp_config.json", "--stage", "migrate"])
+        main(["--config", "config/fastchem_transformer_config.json", "--stage", "migrate"])
 
 
 def test_cli_normalization_stage_dispatches_preprocess(monkeypatch, capsys, tmp_path):
-    expected_config = {"chemistry_type": "fastchem", "model_type": "mlp"}
+    expected_config = {"chemistry_type": "fastchem", "model_type": "transformer"}
     called: dict[str, object] = {}
 
     monkeypatch.setattr("src.utils.cli.resolve_project_root", lambda _start: tmp_path)
@@ -28,7 +28,7 @@ def test_cli_normalization_stage_dispatches_preprocess(monkeypatch, capsys, tmp_
 
     monkeypatch.setattr("src.utils.cli.preprocess_raw_dataset", _fake_preprocess)
 
-    exit_code = main(["--config", "config/fastchem_mlp_config.json", "--stage", "normalization"])
+    exit_code = main(["--config", "config/fastchem_transformer_config.json", "--stage", "normalization"])
     stdout = capsys.readouterr().out
 
     assert exit_code == 0
@@ -38,7 +38,7 @@ def test_cli_normalization_stage_dispatches_preprocess(monkeypatch, capsys, tmp_
 
 
 def test_cli_generation_stage_reports_only_run_root_layout(monkeypatch, capsys, tmp_path):
-    expected_config = {"chemistry_type": "fastchem", "model_type": "mlp"}
+    expected_config = {"chemistry_type": "fastchem", "model_type": "transformer"}
     called: dict[str, object] = {}
 
     monkeypatch.setattr("src.utils.cli.resolve_project_root", lambda _start: tmp_path)
@@ -59,7 +59,7 @@ def test_cli_generation_stage_reports_only_run_root_layout(monkeypatch, capsys, 
 
     monkeypatch.setattr("src.utils.cli.generate_raw_dataset", _fake_generate)
 
-    exit_code = main(["--config", "config/fastchem_mlp_config.json", "--stage", "generation"])
+    exit_code = main(["--config", "config/fastchem_transformer_config.json", "--stage", "generation"])
     stdout = capsys.readouterr().out
 
     assert exit_code == 0

@@ -1,6 +1,0 @@
-cd /Users/imalsky/Desktop/VULCAN_Project/vulcan-emulator
-# PBS defaults already point at the FastChem transformer, so this is the first launch.
-qsub -v CONFIG_PATH=config/fastchem_transformer_config.json run.pbs
-qsub -v CONFIG_PATH=config/fastchem_mlp_config.json run.pbs
-qsub -v CONFIG_PATH=config/vulcan_transformer_config.json run.pbs
-qsub -v CONFIG_PATH=config/vulcan_mlp_config.json run.pbs

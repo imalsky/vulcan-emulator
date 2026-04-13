@@ -11,17 +11,15 @@ Supported model families:
 - `transformer`
 
 Shipped example configs:
-- `config/fastchem_mlp_config.json`
 - `config/fastchem_transformer_config.json`
-- `config/vulcan_mlp_config.json`
 - `config/vulcan_transformer_config.json`
 
 CLI:
 
 ```bash
-python -m src.utils --config config/fastchem_mlp_config.json --stage generation
-python -m src.utils --config config/fastchem_mlp_config.json --stage normalization
-python -m src.utils --config config/fastchem_mlp_config.json --stage training
+python -m src.utils --config config/fastchem_transformer_config.json --stage generation
+python -m src.utils --config config/fastchem_transformer_config.json --stage normalization
+python -m src.utils --config config/fastchem_transformer_config.json --stage training
 ```
 
 `--stage normalization` performs the full raw-to-processed step: split creation, train-only normalization fitting, and processed tensor writing.
@@ -37,9 +35,14 @@ Chemistry contract:
 - these are hydrogen-normalized absolute abundances `n_X / n_H`
 
 Shipped defaults:
-- the VULCAN example configs use one basic thermochemical `basic_h2` preset
+- the VULCAN example config uses one `basic_h2` preset
 - photochemistry is off
+- condensation is on for `H2O` and `S8`
 - eddy diffusion is on
+- `vulcan.runtime.chemistry_file` is `thermo/SNCHO_photo_network_2025.txt`
+- `vulcan.runtime.regenerate_chem_funs` is enabled so worker-local runs rebuild `chem_funs.py` with photochemistry disabled
+- `vulcan.stellar_spectrum` is still required for VULCAN runs because the current pipeline and upstream VULCAN still consume the stellar flux file and irradiation geometry even when photochemistry is disabled
+- the shipped VULCAN example keeps `stellar_spectrum.library_glob` enabled to sample from the local spectrum library; removing it changes sampling to a single-template fallback
 - Kzz is depth-constant from `sampling.kzz_cm2_s`
 - VULCAN surface gravity is sampled from `sampling.gravity_range_cm_s2`
 - VULCAN planet radius is sampled from `sampling.planet_radius_range_cm`

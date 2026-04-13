@@ -23,8 +23,9 @@ from __future__ import annotations
 import json
 import pickle
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -130,7 +131,9 @@ def _restore_block_transform_space_jax(
     x : jax.Array
         Normalized values in model space.
     block : dict[str, Any]
-        Normalization block containing ``method``, ``mean``, and ``std``.
+        Normalization block containing ``method`` plus fitted statistics.
+        Standard and log-standard blocks use ``mean`` and ``std``; log-minmax
+        blocks use ``log10_min`` and ``span``.
 
     Returns
     -------
@@ -244,6 +247,9 @@ def apply_mixed_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> j
             outputs.append((jnp.log10(jnp.maximum(column, floor)) - mean) / std)
             continue
         if method == "log-minmax":
+            # In the mixed-block format, _fit_mixed_block stores log10_min
+            # as "mean" and span as "std", so the formula is identical to
+            # log-standard despite the different semantic meaning.
             floor = jnp.asarray(float(block["floor"][idx]), dtype=arr.dtype)
             outputs.append((jnp.log10(jnp.maximum(column, floor)) - mean) / std)
             continue
@@ -336,6 +342,28 @@ def _pack_native_spectrum_tokens_jax(
     increasing native spectrum whose wavelength coverage already lies within
     ``[wavelength_min_nm, wavelength_max_nm]`` and whose length is at most
     ``max_tokens``.
+
+    Parameters
+    ----------
+    wavelength_nm : jax.Array
+        1-D wavelength grid in nanometers, strictly increasing.
+    flux_erg_cm2_s_nm : jax.Array
+        1-D flux array in erg cm-2 s-1 nm-1, same length as ``wavelength_nm``.
+    wavelength_min_nm : float
+        Minimum allowed wavelength (consumed by the caller for validation;
+        unused here).
+    wavelength_max_nm : float
+        Maximum allowed wavelength (consumed by the caller for validation;
+        unused here).
+    max_tokens : int
+        Fixed token-sequence length for the model; shorter inputs are
+        zero-padded on the right.
+
+    Returns
+    -------
+    tuple[jax.Array, jax.Array, jax.Array]
+        ``(padded_wavelength, padded_flux, mask)`` each with shape
+        ``(max_tokens,)``.  The boolean mask is ``True`` for real tokens.
     """
     del wavelength_min_nm, wavelength_max_nm
     wavelength = jnp.asarray(wavelength_nm, dtype=jnp.float32)
@@ -357,6 +385,95 @@ def _pack_native_spectrum_tokens_jax(
     mask = jnp.arange(int(max_tokens)) < num_tokens
     return padded_wavelength, padded_flux, mask
 
+
+def _predict_fastchem_profile_impl(
+    *,
+    params: Any,
+    dims: TransformerDimensions | MLPDimensions,
+    normalization: dict[str, Any],
+    data_contract: dict[str, Any],
+    model_type: str,
+    pressure_bar: jax.Array | np.ndarray,
+    temperature_k: jax.Array | np.ndarray,
+    global_inputs: dict[str, float] | jax.Array | np.ndarray,
+    return_log10: bool,
+) -> jax.Array:
+    """Run FastChem inference from physical inputs using shared bundle logic.
+
+    Normalizes the physical inputs, runs the forward pass through the
+    selected model architecture, and inverse-normalizes the predictions
+    back to physical space.
+
+    Parameters
+    ----------
+    params : Any
+        Nested JAX parameter tree for the model.
+    dims : TransformerDimensions or MLPDimensions
+        Architecture dimensionality constants.
+    normalization : dict[str, Any]
+        Full normalization payload (sequence_static, global_static, target).
+    data_contract : dict[str, Any]
+        Data contract specifying feature orders and target shape.
+    model_type : str
+        Either ``"mlp"`` or ``"transformer"``.
+    pressure_bar : jax.Array or np.ndarray
+        Pressure grid in bar, shape ``(nz,)``.
+    temperature_k : jax.Array or np.ndarray
+        Temperature profile in Kelvin, shape ``(nz,)``.
+    global_inputs : dict[str, float] or array-like
+        Global conditioning scalars (elemental abundances).
+    return_log10 : bool
+        If True, return log10 mixing ratios instead of linear.
+
+    Returns
+    -------
+    jax.Array
+        Predicted mixing ratios, shape ``(nz, target_dim)``.
+    """
+    pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
+    temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
+    if pressure.ndim != 1 or temperature.ndim != 1 or pressure.shape != temperature.shape:
+        raise ValueError("pressure_bar and temperature_k must be 1-D arrays with identical shapes.")
+
+    static_inputs = jnp.stack([pressure, temperature], axis=-1)  # shape: (nz, 2)
+    sequence = _apply_sequence_static_block_jax(
+        static_inputs,
+        normalization["sequence_static"],
+    )[None, :, :]  # shape: (1, nz, 2)
+    global_vector = _ordered_feature_vector(
+        global_inputs,
+        list(data_contract["global_static_feature_order"]),
+        field_name="global_inputs",
+    )
+    globals_norm = apply_mixed_block_jax(
+        global_vector[None, :],
+        normalization["global_static"],
+    )  # shape: (1, global_dim)
+
+    if model_type == "mlp":
+        pred_norm, _ = apply_mlp(
+            params,
+            sequence,
+            globals_norm,
+            dims,
+            None,
+            None,
+            None,
+        )
+    else:
+        pred_norm, _ = apply_transformer_model(
+            params,
+            sequence,
+            globals_norm,
+            None,
+            None,
+            None,
+            dims,
+        )
+    pred_norm = pred_norm[0]
+    if return_log10:
+        return _restore_block_transform_space_jax(pred_norm, normalization["target"])
+    return inverse_block_jax(pred_norm, normalization["target"])
 
 
 def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) -> Path:
@@ -388,10 +505,12 @@ def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) 
         "data_contract": json.dumps(payload["data_contract"]),
         "config": json.dumps(payload["config"]),
     }
+    standalone_src = (Path(__file__).parent / "standalone_inference.py").read_text(encoding="utf-8")
     np.savez(
         destination,
         **{f"params/{key}": value for key, value in flat_params.items()},
         **{f"meta/{key}": np.array(value) for key, value in metadata.items()},
+        **{"meta/vulcan_emulator_src": np.frombuffer(standalone_src.encode("utf-8"), dtype=np.uint8)},
     )
     return destination
 
@@ -545,6 +664,69 @@ class ExportedJAXModel:
         """
         return self.model_type == "transformer"
 
+    @cached_property
+    def _compiled_fastchem_profile_predictor(self) -> Callable[[Any, Any, Any], jax.Array]:
+        """Cache a compiled FastChem predictor for repeated linear-space calls."""
+        return jax.jit(
+            lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
+                params=self.params,
+                dims=self.dims,
+                normalization=self.normalization,
+                data_contract=self.data_contract,
+                model_type=self.model_type,
+                pressure_bar=pressure_bar,
+                temperature_k=temperature_k,
+                global_inputs=global_inputs,
+                return_log10=False,
+            )
+        )
+
+    @cached_property
+    def _compiled_fastchem_profile_predictor_log10(self) -> Callable[[Any, Any, Any], jax.Array]:
+        """Cache a compiled FastChem predictor for repeated log10-space calls."""
+        return jax.jit(
+            lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
+                params=self.params,
+                dims=self.dims,
+                normalization=self.normalization,
+                data_contract=self.data_contract,
+                model_type=self.model_type,
+                pressure_bar=pressure_bar,
+                temperature_k=temperature_k,
+                global_inputs=global_inputs,
+                return_log10=True,
+            )
+        )
+
+    def make_compiled_fastchem_profile_predictor(
+        self,
+        *,
+        return_log10: bool = False,
+    ) -> Callable[[Any, Any, Any], jax.Array]:
+        """Return a cached JIT-compiled FastChem predictor for repeated calls.
+
+        This keeps ``predict_fastchem_profile()`` eager, which avoids compile
+        latency for one-off scripts, while exposing an explicitly compiled path
+        for repeated inference workloads.
+
+        Parameters
+        ----------
+        return_log10 : bool
+            If True, the returned callable produces log10 mixing ratios;
+            otherwise linear mixing ratios.
+
+        Returns
+        -------
+        Callable[[array-like, array-like, array-like], jax.Array]
+            JIT-compiled function with signature
+            ``(pressure_bar, temperature_k, global_inputs) -> predictions``.
+        """
+        if not self.uses_fastchem:
+            raise ValueError("make_compiled_fastchem_profile_predictor requires a fastchem export bundle.")
+        if return_log10:
+            return self._compiled_fastchem_profile_predictor_log10
+        return self._compiled_fastchem_profile_predictor
+
     def predict_fastchem_profile(
         self,
         *,
@@ -582,51 +764,17 @@ class ExportedJAXModel:
         """
         if not self.uses_fastchem:
             raise ValueError("predict_fastchem_profile requires a fastchem export bundle.")
-
-        pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
-        temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
-        if pressure.ndim != 1 or temperature.ndim != 1 or pressure.shape != temperature.shape:
-            raise ValueError("pressure_bar and temperature_k must be 1-D arrays with identical shapes.")
-
-        static_inputs = jnp.stack([pressure, temperature], axis=-1)  # shape: (nz, 2)
-        sequence = _apply_sequence_static_block_jax(
-            static_inputs,
-            self.normalization["sequence_static"],
-        )[None, :, :]  # shape: (1, nz, 2)
-        global_vector = _ordered_feature_vector(
-            global_inputs,
-            list(self.data_contract["global_static_feature_order"]),
-            field_name="global_inputs",
+        return _predict_fastchem_profile_impl(
+            params=self.params,
+            dims=self.dims,
+            normalization=self.normalization,
+            data_contract=self.data_contract,
+            model_type=self.model_type,
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            global_inputs=global_inputs,
+            return_log10=return_log10,
         )
-        globals_norm = apply_mixed_block_jax(
-            global_vector[None, :],
-            self.normalization["global_static"],
-        )  # shape: (1, global_dim)
-
-        if self.uses_mlp:
-            pred_norm, _ = apply_mlp(
-                self.params,
-                sequence,
-                globals_norm,
-                self.dims,
-                None,
-                None,
-                None,
-            )
-        else:
-            pred_norm, _ = apply_transformer_model(
-                self.params,
-                sequence,
-                globals_norm,
-                None,
-                None,
-                None,
-                self.dims,
-            )
-        pred_norm = pred_norm[0]
-        if return_log10:
-            return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
-        return inverse_block_jax(pred_norm, self.normalization["target"])
 
 
     def predict_vulcan_profile(
@@ -647,6 +795,31 @@ class ExportedJAXModel:
         inputs must already be valid native-grid spectra with static
         ``len(spectrum) <= spectrum_max_tokens``; in that case the method pads
         them inside JAX without sorting, clipping, or rebinning.
+
+        Parameters
+        ----------
+        pressure_bar : array-like
+            Pressure grid in bar, shape ``(nz,)``.
+        temperature_k : array-like
+            Temperature profile in Kelvin, shape ``(nz,)``.
+        kzz_cm2_s : array-like
+            Vertical eddy diffusion coefficient in cm2 s-1, shape ``(nz,)``.
+        global_inputs : dict or array-like
+            Global conditioning scalars.  If a dict, keys must match
+            ``data_contract["global_static_feature_order"]``.
+            If an array, must have shape ``(global_dim,)`` in the correct order.
+        spectrum_wavelength_nm : array-like
+            Stellar spectrum wavelength grid in nanometers.
+        spectrum_flux_erg_cm2_s_nm : array-like
+            Stellar spectrum flux in erg cm-2 s-1 nm-1, same length as
+            ``spectrum_wavelength_nm``.
+        return_log10 : bool
+            If True, return log10 mixing ratios instead of linear.
+
+        Returns
+        -------
+        jax.Array
+            Predicted mixing ratios, shape ``(nz, target_dim)``.
         """
         if not self.uses_vulcan_chemistry:
             raise ValueError("predict_vulcan_profile requires a vulcan export bundle.")
@@ -731,6 +904,7 @@ class ExportedJAXModel:
         if return_log10:
             return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
         return inverse_block_jax(pred_norm, self.normalization["target"])
+
 
 def load_exported_model(
     bundle_path: str | Path,

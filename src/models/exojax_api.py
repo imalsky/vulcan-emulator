@@ -160,6 +160,7 @@ def make_fastchem_vmr_fn(
 
     _validate_fastchem_bundle_global_order(bundle)
     species_labels = list(bundle.data_contract["output_species_order"])
+    compiled_predict = bundle.make_compiled_fastchem_profile_predictor()
 
     def vmr_fn(
         temperatures_k: jax.Array,  # shape: (nz,), top -> bottom
@@ -201,11 +202,7 @@ def make_fastchem_vmr_fn(
 
         internal_temperatures = temperatures[::-1]
         internal_pressures = pressures[::-1]
-        vmr_internal = bundle.predict_fastchem_profile(
-            pressure_bar=internal_pressures,
-            temperature_k=internal_temperatures,
-            global_inputs=global_inputs,
-        )
+        vmr_internal = compiled_predict(internal_pressures, internal_temperatures, global_inputs)
         return vmr_internal[::-1, :]
 
     return vmr_fn, species_labels

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import pickle
+import sys
 from pathlib import Path
 
 import h5py
@@ -19,6 +21,7 @@ from src.data_generation.generation import (
     write_equilibrium_hdf5,
 )
 from src.data_generation.sampling import sample_run_specifications
+from src.data_generation.spectrum import generate_wasp39b_template, write_vulcan_spectrum_txt
 from src.utils.config import dataset_info_root, load_and_validate_config
 
 
@@ -31,7 +34,7 @@ def _open_first_run(artifact) -> h5py.Group:
 def _make_equilibrium_config(tmp_path: Path) -> dict:
     """Build one small FastChem config suitable for unit tests."""
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "fastchem_mlp_config.json")
+    config = load_and_validate_config(root / "config" / "fastchem_transformer_config.json")
     config = copy.deepcopy(config)
     config["paths"]["raw_root"] = str(tmp_path / "dataset" / "raw")
     config["paths"]["processed_root"] = str(tmp_path / "dataset" / "processed")
@@ -116,9 +119,40 @@ def test_vulcan_generation_requires_configured_checkout(tiny_config):
 
 
 def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_config):
+    config = copy.deepcopy(tiny_config)
+    config["vulcan"]["physics_toggles"]["use_photochemistry"] = False
+    config["vulcan"]["physics_toggles"]["use_condensation"] = True
+    config["vulcan"]["physics_toggles"]["use_initial_cold_trap"] = True
+    config["physics_toggles"] = dict(config["vulcan"]["physics_toggles"])
+    config["vulcan"]["science_presets"] = [
+        {
+            "name": "basic_h2",
+            "atm_base": "H2",
+            "physics_toggles": dict(config["vulcan"]["physics_toggles"]),
+        }
+    ]
+    config["science_presets"] = copy.deepcopy(config["vulcan"]["science_presets"])
+    config["default_science_preset"] = copy.deepcopy(config["science_presets"][0])
+    config["vulcan"]["runtime"]["chemistry_file"] = "thermo/SNCHO_photo_network_2025.txt"
+    config["vulcan"]["runtime"]["regenerate_chem_funs"] = True
+    config["vulcan"]["runtime"]["cfg_assignments"] = {
+        "condense_sp": ["H2O", "S8"],
+        "non_gas_sp": ["H2O_l_s", "S8_l_s"],
+        "use_relax": ["H2O"],
+        "humidity": 1.0,
+        "r_p": {"H2O_l_s": 5e-5, "S8_l_s": 1e-4},
+        "rho_p": {"H2O_l_s": 0.9, "S8_l_s": 2.07},
+        "fix_species": ["H2O", "H2O_l_s", "S8", "S8_l_s"],
+        "start_conden_time": 0,
+        "stop_conden_time": 1.0e8,
+        "fix_species_time": 1.0e8,
+        "fix_species_from_coldtrap_lev": True,
+    }
+    config["vulcan_runtime"] = copy.deepcopy(config["vulcan"]["runtime"])
+
     spec = sample_run_specifications(
-        config=tiny_config,
-        project_root=tiny_config["_project_root"],
+        config=config,
+        project_root=config["_project_root"],
         num_runs=1,
         seed=5,
     )[0]
@@ -137,7 +171,7 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
     _patch_vulcan_cfg(
         cfg_file,
         spec=spec,
-        config=tiny_config,
+        config=config,
         tp_file=tp_file,
         spectrum_file=spectrum_file,
     )
@@ -149,6 +183,21 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
     )
     assert "atm_type = 'file'" in patched
     assert "Kzz_prof = 'file'" in patched
+    assert "use_photo = False" in patched
+    assert "use_condense = True" in patched
+    assert "use_ini_cold_trap = True" in patched
+    assert "network = 'thermo/SNCHO_photo_network_2025.txt'" in patched
+    assert "condense_sp = ['H2O', 'S8']" in patched
+    assert "non_gas_sp = ['H2O_l_s', 'S8_l_s']" in patched
+    assert "use_relax = ['H2O']" in patched
+    assert "humidity = 1.0" in patched
+    assert "'H2O_l_s': 5e-05" in patched
+    assert "'S8_l_s': 0.0001" in patched
+    assert "'S8_l_s': 2.07" in patched
+    assert "fix_species = ['H2O', 'H2O_l_s', 'S8', 'S8_l_s']" in patched
+    assert "stop_conden_time = 100000000.0" in patched
+    assert "fix_species_time = 100000000.0" in patched
+    assert "fix_species_from_coldtrap_lev = True" in patched
     assert "T_cross_sp = ['H2O', 'H2S', 'SH', 'SO2', 'S2']" in patched
     assert f"atm_base = '{expected_atm_base}'" in patched
     assert f"gs = {float(spec.globals['gravity_cm_s2'])}" in patched
@@ -156,6 +205,68 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
     assert "rocky = False" in patched
     assert "use_lowT_limit_rates = True" in patched
     assert "use_adapt_rtol = True" in patched
+
+
+def test_shipped_vulcan_transformer_smoke_runs_local_checkout(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    source_root = (root / "../VULCAN-master").resolve()
+    if not source_root.exists():
+        pytest.skip("Local VULCAN checkout is required for the smoke test.")
+
+    raw_config = json.loads(
+        (root / "config" / "vulcan_transformer_config.json").read_text(encoding="utf-8")
+    )
+    spectrum_dir = tmp_path / "spectra"
+    spectrum_dir.mkdir(parents=True, exist_ok=True)
+    spectrum_path = spectrum_dir / "smoke_surface_flux.txt"
+    write_vulcan_spectrum_txt(
+        generate_wasp39b_template(
+            num_points=64,
+            wavelength_min_nm=float(raw_config["vulcan"]["stellar_spectrum"]["wavelength_min_nm"]),
+            wavelength_max_nm=float(raw_config["vulcan"]["stellar_spectrum"]["wavelength_max_nm"]),
+            name="smoke_surface_flux",
+        ),
+        spectrum_path,
+    )
+
+    raw_config["paths"]["run_root"] = str(tmp_path / "vulcan_transformer")
+    raw_config["paths"]["checkpoints_root"] = str(tmp_path / "checkpoints")
+    raw_config["paths"]["vulcan_source_root"] = str(source_root)
+    raw_config["sampling"]["num_levels"] = 12
+    raw_config["sampling"]["gravity_range_cm_s2"] = [900.0, 950.0]
+    raw_config["sampling"]["planet_radius_range_cm"] = [8.0e9, 8.2e9]
+    raw_config["sampling"]["stellar_radius_range_rsun"] = [0.95, 0.95]
+    raw_config["sampling"]["semi_major_axis_range_au"] = [0.048, 0.048]
+    raw_config["sampling"]["zenith_angle_range_deg"] = [48.0, 48.0]
+    raw_config["sampling"]["diurnal_factor_range"] = [1.0, 1.0]
+    raw_config["sampling"]["metallicity_log10_range"] = [0.0, 0.05]
+    raw_config["sampling"]["c_to_o_range"] = [0.55, 0.6]
+    raw_config["sampling"]["s_to_o_range"] = [0.02, 0.025]
+    raw_config["temperature_profiles"]["source_mode"] = "analytic"
+    raw_config["temperature_profiles"].pop("analytic_probability", None)
+    raw_config["temperature_profiles"].pop("data_glob", None)
+    raw_config["temperature_profiles"].pop("filters", None)
+    raw_config["generation"]["num_runs"] = 1
+    raw_config["generation"]["parallel_workers"] = 1
+    raw_config["generation"]["reuse_raw_if_present"] = False
+    raw_config["vulcan"]["runtime"]["python_executable"] = sys.executable
+    raw_config["vulcan"]["runtime"]["worker_root"] = str(tmp_path / "workers")
+    raw_config["vulcan"]["stellar_spectrum"]["template_name"] = "smoke_surface_flux"
+    raw_config["vulcan"]["stellar_spectrum"]["template_file"] = str(spectrum_path)
+    raw_config["vulcan"]["stellar_spectrum"]["library_glob"] = str(spectrum_dir / "*.txt")
+
+    config_path = tmp_path / "vulcan_transformer_smoke.json"
+    config_path.write_text(json.dumps(raw_config, indent=2) + "\n", encoding="utf-8")
+    config = load_and_validate_config(config_path)
+    artifact = generation_module.generate_raw_dataset(config, project_root=root)
+
+    assert len(artifact.run_ids) == 1
+    assert artifact.consolidated_path.exists()
+    with h5py.File(artifact.consolidated_path, "r") as handle:
+        run = handle[artifact.run_ids[0]]
+        assert "final_state" in run
+        assert float(run["globals/use_photochemistry"][()]) == 0.0
+        assert float(run["globals/use_condensation"][()]) == 1.0
 
 
 def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, tiny_config):
@@ -222,7 +333,7 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
         np.testing.assert_allclose(np.asarray(handle["inputs/gravity_cm_s2"]), runtime_gravity, atol=1.0e-12)
 
 
-def test_convert_fake_vulcan_output_requires_current_ymix_time_contract(tmp_path, tiny_config):
+def test_convert_fake_vulcan_output_accepts_legacy_y_time_contract(tmp_path, tiny_config):
     spec = sample_run_specifications(
         config=tiny_config,
         project_root=tiny_config["_project_root"],
@@ -254,13 +365,17 @@ def test_convert_fake_vulcan_output_requires_current_ymix_time_contract(tmp_path
     with vul_path.open("wb") as handle:
         pickle.dump(fake, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-    with pytest.raises(ValueError, match="variable.ymix_time"):
-        convert_vulcan_output_to_hdf5(
-            vul_path,
-            output_h5_path=tmp_path / "converted.h5",
-            spec=spec,
-            config=tiny_config,
-        )
+    out_h5 = tmp_path / "converted.h5"
+    convert_vulcan_output_to_hdf5(
+        vul_path,
+        output_h5_path=out_h5,
+        spec=spec,
+        config=tiny_config,
+    )
+    with h5py.File(out_h5, "r") as handle:
+        final_state = np.asarray(handle["final_state/ymix_output"])
+        expected = fake["variable"]["y_time"][-1] / np.asarray(fake["atm"]["n_0"])[:, None]
+        np.testing.assert_allclose(final_state, expected, atol=1.0e-12)
 
 
 def test_convert_fake_fastchem_output_to_hdf5_writes_equilibrium_contract(tmp_path, tiny_config):

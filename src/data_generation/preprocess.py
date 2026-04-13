@@ -494,7 +494,11 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
             transformed_columns.append(column)
         elif method == "standard":
             mean = float(np.mean(column))
-            std = float(max(np.std(column), 1.0e-8))
+            raw_std = float(np.std(column))
+            # Clamp to 1.0 (not 1e-8) for near-constant features, matching
+            # _fit_standard.  Using 1e-8 would amplify float-precision noise
+            # into enormous normalized values at inference time.
+            std = raw_std if raw_std >= 1.0e-8 else 1.0
             means.append(mean)
             stds.append(std)
             floors.append(None)
@@ -503,7 +507,8 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
             floor = 1.0e-30
             log_column = np.log10(np.clip(column, floor, None))
             mean = float(np.mean(log_column))
-            std = float(max(np.std(log_column), 1.0e-8))
+            raw_std = float(np.std(log_column))
+            std = raw_std if raw_std >= 1.0e-8 else 1.0
             means.append(mean)
             stds.append(std)
             floors.append(floor)
@@ -513,7 +518,8 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
             log_column = np.log10(np.clip(column, floor, None))
             log_min = float(np.min(log_column))
             log_max = float(np.max(log_column))
-            span = max(log_max - log_min, 1.0e-8)
+            raw_span = log_max - log_min
+            span = raw_span if raw_span >= 1.0e-8 else 1.0
             means.append(log_min)
             stds.append(span)
             floors.append(floor)
