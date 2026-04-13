@@ -20,7 +20,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 SUPPORTED_ATM_BASES = ("H2", "N2", "O2", "CO2", "H2O")
 PUBLIC_PHYSICS_TOGGLES = (
     "use_photochemistry",

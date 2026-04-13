@@ -61,7 +61,7 @@ predictions_log10 = np.asarray(
 
 idx = int(np.argmin(np.abs(pressure_bar - 0.1)))
 print(f"Output shape: {predictions_log10.shape}  |  species: {', '.join(model.species)}")
-print(f"\nMixing ratios at P ≈ 0.1 bar (log10):")
+print("\nMixing ratios at P ≈ 0.1 bar (log10):")
 for name in ["H2", "H2O", "CO", "CO2", "CH4", "NH3", "H2S"]:
     if name in model.species:
         col = model.species.index(name)

@@ -430,3 +430,10 @@ def test_removed_legacy_keys_raise_targeted_errors(tmp_path, path: tuple[str, ..
         cursor[path[-1]] = 1
     with pytest.raises(ConfigValidationError, match=message):
         load_and_validate_config(_write_config(tmp_path, "legacy_key.json", payload))
+
+
+def test_run_pbs_defaults_to_condensation_enabled_vulcan_transformer_config() -> None:
+    script_text = (ROOT / "run.pbs").read_text(encoding="utf-8")
+    assert 'CONFIG_PATH="${CONFIG_PATH:-config/vulcan_transformer_config.json}"' in script_text
+    assert "#PBS -N vulcan_transformer_condensation" in script_text
+    assert "requires a condensation-enabled config" in script_text

@@ -7,9 +7,9 @@ for the demo scripts so they do not repeat dynamic module-loading boilerplate.
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 

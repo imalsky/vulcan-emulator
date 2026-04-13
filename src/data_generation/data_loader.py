@@ -18,7 +18,6 @@ from typing import Any
 
 import numpy as np
 
-
 PROCESSED_INFO_DIRNAME = "info"
 
 
@@ -52,12 +51,12 @@ class ProcessedSplit:
     metadata: dict[str, Any]
 
     @property
-    def num_runs(self) -> int:
+    def num_runs(self: "ProcessedSplit") -> int:
         """Return the number of runs stored in this split."""
         return int(self.sequence_inputs.shape[0])
 
     @property
-    def has_spectrum_inputs(self) -> bool:
+    def has_spectrum_inputs(self: "ProcessedSplit") -> bool:
         """Return whether this split includes stellar-spectrum conditioning."""
         return (
             self.spectrum_wavelengths_nm is not None

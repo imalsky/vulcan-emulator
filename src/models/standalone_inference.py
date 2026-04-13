@@ -24,12 +24,14 @@ Loading from a bundle
 """
 
 from __future__ import annotations
+
 import json
 import math
 from dataclasses import asdict, dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Callable
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -70,11 +72,16 @@ class TransformerDimensions:
     activation: str = "gelu"
     dropout_rate: float = 0.0
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self: "TransformerDimensions") -> dict[str, Any]:
+        """Serialize the dataclass fields into a plain Python mapping."""
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TransformerDimensions":
+    def from_dict(
+        cls: type["TransformerDimensions"],
+        payload: dict[str, Any],
+    ) -> "TransformerDimensions":
+        """Rebuild one dimensions dataclass from serialized metadata."""
         return cls(**payload)
 
 
@@ -101,11 +108,16 @@ class MLPDimensions:
     activation: str
     dropout_rate: float = 0.0
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self: "MLPDimensions") -> dict[str, Any]:
+        """Serialize the dataclass fields into a plain Python mapping."""
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "MLPDimensions":
+    def from_dict(
+        cls: type["MLPDimensions"],
+        payload: dict[str, Any],
+    ) -> "MLPDimensions":
+        """Rebuild one dimensions dataclass from serialized metadata."""
         return cls(**payload)
 
 
@@ -117,6 +129,7 @@ _SINUSOIDAL_BASE_WAVELENGTH = 10_000.0
 
 
 def _linear(params: dict[str, jax.Array], x: jax.Array) -> jax.Array:
+    """Apply a dense affine transform while preserving leading batch axes."""
     leading_shape = x.shape[:-1]
     x_2d = x.reshape((-1, x.shape[-1]))
     y_2d = x_2d @ params["weight"] + params["bias"]
@@ -130,6 +143,7 @@ def _apply_dropout(
     key: jax.Array | None,
     training: bool,
 ) -> jax.Array:
+    """Apply inverted-dropout masking during training and pass through otherwise."""
     if not training or rate <= 0.0 or key is None:
         return x
     keep_prob = 1.0 - float(rate)
@@ -138,6 +152,7 @@ def _apply_dropout(
 
 
 def _layer_norm(params: dict[str, jax.Array], x: jax.Array, eps: float = 1.0e-5) -> jax.Array:
+    """Apply learned affine layer normalization across the last dimension."""
     mean = jnp.mean(x, axis=-1, keepdims=True)
     var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
     normalized = (x - mean) / jnp.sqrt(var + eps)
@@ -163,6 +178,7 @@ def _masked_mean(
     axis: int,
     keepdims: bool = False,
 ) -> jax.Array:
+    """Compute a mean over valid tokens while guarding against empty masks."""
     weights = mask.astype(x.dtype)
     while weights.ndim < x.ndim:
         weights = weights[..., None]
@@ -172,6 +188,7 @@ def _masked_mean(
 
 
 def _fourier_encode(values: jax.Array, *, num_features: int) -> jax.Array:
+    """Expand scalar inputs into powers-of-two sinusoidal Fourier features."""
     if int(num_features) <= 0:
         return values[..., None]
     frequencies = jnp.power(
@@ -182,7 +199,8 @@ def _fourier_encode(values: jax.Array, *, num_features: int) -> jax.Array:
     return jnp.concatenate([jnp.sin(phase), jnp.cos(phase)], axis=-1)
 
 
-def _resolve_activation(name: str):
+def _resolve_activation(name: str) -> Callable[[jax.Array], jax.Array]:
+    """Resolve an activation name to the corresponding JAX callable."""
     activations = {
         "elu": jax.nn.elu,
         "gelu": jax.nn.gelu,
@@ -205,6 +223,7 @@ def _prepare_spectrum_tokens(
     mask: jax.Array,
     dims: TransformerDimensions | MLPDimensions,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Sanitize packed spectrum tokens and derive per-token encoder features."""
     valid_mask = mask.astype(bool)
     dtype = fluxes_erg_cm2_s_nm.dtype
     safe_wavelengths = jnp.where(
@@ -1104,27 +1123,34 @@ class ExportedModel:
     model_type: str
 
     @property
-    def uses_fastchem(self) -> bool:
+    def uses_fastchem(self: "ExportedModel") -> bool:
+        """Report whether the exported bundle predicts FastChem chemistry outputs."""
         return self.chemistry_type == "fastchem"
 
     @property
-    def uses_vulcan_chemistry(self) -> bool:
+    def uses_vulcan_chemistry(self: "ExportedModel") -> bool:
+        """Report whether the exported bundle predicts VULCAN chemistry outputs."""
         return self.chemistry_type == "vulcan"
 
     @property
-    def uses_mlp(self) -> bool:
+    def uses_mlp(self: "ExportedModel") -> bool:
+        """Report whether the exported bundle wraps the FiLM-conditioned MLP."""
         return self.model_type == "mlp"
 
     @property
-    def uses_transformer(self) -> bool:
+    def uses_transformer(self: "ExportedModel") -> bool:
+        """Report whether the exported bundle wraps the FiLM-conditioned Transformer."""
         return self.model_type == "transformer"
 
     @property
-    def species(self) -> list[str]:
+    def species(self: "ExportedModel") -> list[str]:
+        """Return the ordered species labels predicted by the bundled model."""
         return list(self.data_contract["output_species_order"])
 
     @cached_property
-    def _compiled_fastchem_predictor(self) -> Callable[[Any, Any, Any], jax.Array]:
+    def _compiled_fastchem_predictor(
+        self: "ExportedModel",
+    ) -> Callable[[Any, Any, Any], jax.Array]:
         """Cache a compiled FastChem predictor for repeated linear-space calls."""
         return jax.jit(
             lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_impl(
@@ -1141,7 +1167,9 @@ class ExportedModel:
         )
 
     @cached_property
-    def _compiled_fastchem_predictor_log10(self) -> Callable[[Any, Any, Any], jax.Array]:
+    def _compiled_fastchem_predictor_log10(
+        self: "ExportedModel",
+    ) -> Callable[[Any, Any, Any], jax.Array]:
         """Cache a compiled FastChem predictor for repeated log10-space calls."""
         return jax.jit(
             lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_impl(
@@ -1158,7 +1186,7 @@ class ExportedModel:
         )
 
     def make_compiled_fastchem_predictor(
-        self,
+        self: "ExportedModel",
         *,
         return_log10: bool = False,
     ) -> Callable[[Any, Any, Any], jax.Array]:
@@ -1170,7 +1198,7 @@ class ExportedModel:
         return self._compiled_fastchem_predictor
 
     def predict_fastchem(
-        self,
+        self: "ExportedModel",
         pressure_bar: jax.Array | np.ndarray,
         temperature_k: jax.Array | np.ndarray,
         global_inputs: dict[str, float] | jax.Array | np.ndarray,
@@ -1210,7 +1238,7 @@ class ExportedModel:
         )
 
     def predict_vulcan(
-        self,
+        self: "ExportedModel",
         pressure_bar: jax.Array | np.ndarray,
         temperature_k: jax.Array | np.ndarray,
         kzz_cm2_s: jax.Array | np.ndarray,
@@ -1333,8 +1361,12 @@ class ExportedModel:
 # Section 12: load_model function
 # ---------------------------------------------------------------------------
 
-def load_model(bundle_path: str | Path, *, device=None) -> ExportedModel:
-    """Load an exported NPZ bundle."""
+def load_model(
+    bundle_path: str | Path,
+    *,
+    device: str | jax.Device | None = None,
+) -> ExportedModel:
+    """Load an exported NPZ bundle and place parameters onto the requested device."""
     bundle = Path(bundle_path)
     with np.load(bundle, allow_pickle=False) as arrays:
         (export_format, export_version, chemistry_type, model_type,
@@ -1403,6 +1435,7 @@ def make_fastchem_vmr_fn(model: ExportedModel) -> tuple[Any, list[str]]:
         global_inputs: dict[str, Any] | jax.Array,
         gravity_cm_s2: jax.Array | None = None,
     ) -> jax.Array:
+        """Predict FastChem VMRs on an ExoJAX top-to-bottom pressure grid."""
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
         if temperatures.ndim != 1 or pressures.ndim != 1:
@@ -1449,6 +1482,7 @@ def make_vulcan_vmr_fn(model: ExportedModel) -> tuple[Any, list[str]]:
         spectrum_wavelength_nm: jax.Array,
         spectrum_flux_erg_cm2_s_nm: jax.Array,
     ) -> jax.Array:
+        """Predict VULCAN VMRs on an ExoJAX top-to-bottom pressure grid."""
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
         kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)

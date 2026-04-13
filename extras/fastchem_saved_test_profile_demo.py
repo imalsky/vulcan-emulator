@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 from _common import (
     EPSILON,
     FastChemTestCase,
@@ -29,12 +30,9 @@ from _common import (
     resolve_vulcan_source_root,
     select_fastchem_test_run_id,
 )
-
-import numpy as np
 from compare_saved_test_profile_fastchem import _run_fastchem_online
 from src.models.export_bundle import load_exported_model
 from src.utils.helpers import resolve_path, resolve_project_root
-
 
 # ======================================================================
 # CLI

@@ -47,7 +47,7 @@ class SpectrumRecord:
     flux_erg_cm2_s_nm: np.ndarray
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def validate(self) -> None:
+    def validate(self: "SpectrumRecord") -> None:
         """Validate the in-memory spectrum contract before use downstream."""
         if self.wavelength_nm.ndim != 1 or self.flux_erg_cm2_s_nm.ndim != 1:
             raise ValueError("Spectrum arrays must be one-dimensional.")

@@ -17,6 +17,8 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
+import numpy as np
 from _common import (
     FastChemTestContext,
     apply_style,
@@ -27,12 +29,8 @@ from _common import (
     plots_dir_for_bundle,
     resolve_bundle_path,
 )
-
-import matplotlib.pyplot as plt
-import numpy as np
 from src.models.export_bundle import load_exported_model
 from src.utils.helpers import resolve_path, resolve_project_root
-
 
 _BUCKET_FEATURE_KEYS: dict[str, list[str]] = {
     "pt_library": [
@@ -146,7 +144,7 @@ def _bucket_test_run_ids(
     return buckets
 
 
-def _color_palette(cmap, n: int) -> list[Any]:
+def _color_palette(cmap: Any, n: int) -> list[Any]:
     """Sample *n* evenly spaced colors from the interior of a colormap."""
     return [cmap(0.35 + 0.55 * i / max(n - 1, 1)) for i in range(n)]
 

@@ -45,11 +45,11 @@ from ..utils.config import (
     uses_fastchem,
 )
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
-
-LOGGER = get_logger(__name__)
 from ..utils.provenance import fingerprint_payload, manifest_for_files
 from .data_loader import processed_info_dir
 from .spectrum import pack_spectrum_tokens, sanitize_spectrum_arrays
+
+LOGGER = get_logger(__name__)
 # Bump this integer whenever the processed tensor layout changes in a way
 # that would silently break a model trained on a prior version.
 PROCESSED_DATA_VERSION = 17
@@ -618,6 +618,7 @@ def load_raw_run(
     requested_output_species = list(config["data_spec"]["output_species"])
 
     def _extract(handle: h5py.Group) -> dict[str, Any]:
+        """Read the raw HDF5 datasets needed to build one aligned run record."""
         return {
             "pressure_bar": np.asarray(handle["inputs/pressure_bar"], dtype=np.float64),
             "temperature_k": np.asarray(handle["inputs/temperature_k"], dtype=np.float64),

@@ -21,7 +21,6 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from vulcan_emulator import (
     BUNDLE_PATH,
     FASTCHEM_GLOBAL_ORDER,
@@ -94,7 +93,7 @@ np.testing.assert_allclose(
 # Gradients -- jax.grad and jax.vjp
 # ===================================================================
 
-def total_vmr_sum(temps):
+def total_vmr_sum(temps: jax.Array) -> jax.Array:
     """Scalar loss: sum of all predicted mixing ratios."""
     return jnp.sum(vmr_fn(temps, pressures_bar, global_array))
 
@@ -114,7 +113,7 @@ print(f"jax.vjp:  dT finite={bool(jnp.all(jnp.isfinite(g_T)))}, dP finite={bool(
 h2o_idx = species_labels.index(H2O_SPECIES)
 level_idx = int(jnp.argmin(jnp.abs(pressures_bar - PHOTOSPHERE_PRESSURE_BAR)))
 
-def h2o_at_photosphere(abundances):
+def h2o_at_photosphere(abundances: jax.Array) -> jax.Array:
     """Predict H2O mixing ratio near the photosphere."""
     vmr = vmr_fn(temperatures_k, pressures_bar, abundances)
     return vmr[level_idx, h2o_idx]

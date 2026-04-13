@@ -12,7 +12,6 @@ Usage
 from __future__ import annotations
 
 import numpy as np
-
 from vulcan_emulator import BUNDLE_PATH, SOLAR_ABUNDANCES, load_model
 
 NUM_LEVELS = 50

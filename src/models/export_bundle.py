@@ -31,14 +31,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..data_generation.spectrum import pack_spectrum_tokens
 from .jax_model import (
     MLPDimensions,
     TransformerDimensions,
     apply_mlp,
     apply_transformer_model,
 )
-from ..data_generation.spectrum import pack_spectrum_tokens
-
 
 EXPORT_FORMAT = "jax_physical_bundle"
 EXPORT_VERSION = 4
@@ -621,7 +620,7 @@ class ExportedJAXModel:
     model_type: str
 
     @property
-    def uses_fastchem(self) -> bool:
+    def uses_fastchem(self: "ExportedJAXModel") -> bool:
         """Report whether the exported bundle predicts FastChem chemistry outputs.
 
         Returns
@@ -632,7 +631,7 @@ class ExportedJAXModel:
         return self.chemistry_type == "fastchem"
 
     @property
-    def uses_vulcan_chemistry(self) -> bool:
+    def uses_vulcan_chemistry(self: "ExportedJAXModel") -> bool:
         """Report whether the exported bundle predicts VULCAN chemistry outputs.
 
         Returns
@@ -643,7 +642,7 @@ class ExportedJAXModel:
         return self.chemistry_type == "vulcan"
 
     @property
-    def uses_mlp(self) -> bool:
+    def uses_mlp(self: "ExportedJAXModel") -> bool:
         """Report whether the exported bundle wraps the FiLM-conditioned MLP.
 
         Returns
@@ -654,7 +653,7 @@ class ExportedJAXModel:
         return self.model_type == "mlp"
 
     @property
-    def uses_transformer(self) -> bool:
+    def uses_transformer(self: "ExportedJAXModel") -> bool:
         """Report whether the exported bundle wraps the FiLM Transformer model.
 
         Returns
@@ -665,7 +664,9 @@ class ExportedJAXModel:
         return self.model_type == "transformer"
 
     @cached_property
-    def _compiled_fastchem_profile_predictor(self) -> Callable[[Any, Any, Any], jax.Array]:
+    def _compiled_fastchem_profile_predictor(
+        self: "ExportedJAXModel",
+    ) -> Callable[[Any, Any, Any], jax.Array]:
         """Cache a compiled FastChem predictor for repeated linear-space calls."""
         return jax.jit(
             lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
@@ -682,7 +683,9 @@ class ExportedJAXModel:
         )
 
     @cached_property
-    def _compiled_fastchem_profile_predictor_log10(self) -> Callable[[Any, Any, Any], jax.Array]:
+    def _compiled_fastchem_profile_predictor_log10(
+        self: "ExportedJAXModel",
+    ) -> Callable[[Any, Any, Any], jax.Array]:
         """Cache a compiled FastChem predictor for repeated log10-space calls."""
         return jax.jit(
             lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
@@ -699,7 +702,7 @@ class ExportedJAXModel:
         )
 
     def make_compiled_fastchem_profile_predictor(
-        self,
+        self: "ExportedJAXModel",
         *,
         return_log10: bool = False,
     ) -> Callable[[Any, Any, Any], jax.Array]:
@@ -728,7 +731,7 @@ class ExportedJAXModel:
         return self._compiled_fastchem_profile_predictor
 
     def predict_fastchem_profile(
-        self,
+        self: "ExportedJAXModel",
         *,
         pressure_bar: jax.Array | np.ndarray,
         temperature_k: jax.Array | np.ndarray,
@@ -776,9 +779,8 @@ class ExportedJAXModel:
             return_log10=return_log10,
         )
 
-
     def predict_vulcan_profile(
-        self,
+        self: "ExportedJAXModel",
         *,
         pressure_bar: jax.Array | np.ndarray,
         temperature_k: jax.Array | np.ndarray,

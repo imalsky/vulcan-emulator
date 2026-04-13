@@ -13,7 +13,10 @@ from src.data_generation.generation import (
     consolidate_runs_to_single_hdf5,
     write_equilibrium_hdf5,
 )
-from src.data_generation.preprocess import load_raw_equilibrium_run, preprocess_equilibrium_dataset
+from src.data_generation.preprocess import (
+    load_raw_equilibrium_run,
+    preprocess_equilibrium_dataset,
+)
 from src.models.export_bundle import export_checkpoint_payload
 from src.models.jax_model import TransformerDimensions, init_transformer_params
 from src.utils.config import ELEMENT_INPUT_ORDER, load_and_validate_config

@@ -28,7 +28,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -42,6 +42,8 @@ from ..data_generation.data_loader import (
 from ..data_generation.generation import generate_raw_dataset
 from ..data_generation.preprocess import PROCESSED_DATA_VERSION, preprocess_raw_dataset
 from ..models.jax_model import (
+    MLPDimensions,
+    TransformerDimensions,
     apply_mlp,
     apply_transformer_model,
     count_parameters,
@@ -455,12 +457,15 @@ def _state_stats(normalization: dict[str, Any]) -> tuple[jax.Array, jax.Array]:
 
 def make_transformer_train_eval_functions(
     *,
-    dims,
+    dims: TransformerDimensions,
     normalization: dict[str, Any],
     loss_cfg: dict[str, float],
     gradient_clip: float,
     weight_decay: float,
-):
+) -> tuple[
+    Callable[[Any, dict[str, Any], dict[str, jax.Array], jax.Array, jax.Array], tuple[Any, dict[str, Any], dict[str, jax.Array]]],
+    Callable[[Any, dict[str, jax.Array]], dict[str, jax.Array]],
+]:
     """Build JIT-compiled train/eval functions for the Transformer model.
 
     Parameters
@@ -486,7 +491,13 @@ def make_transformer_train_eval_functions(
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
-    def train_step(params, opt_state, batch, learning_rate, dropout_key):
+    def train_step(
+        params: Any,
+        opt_state: dict[str, Any],
+        batch: dict[str, jax.Array],
+        learning_rate: jax.Array,
+        dropout_key: jax.Array,
+    ) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
         """Run one Transformer optimizer step on a normalized batch.
 
         Parameters
@@ -509,7 +520,7 @@ def make_transformer_train_eval_functions(
             Updated parameter tree, updated optimizer state, and scalar
             training metrics.
         """
-        def loss_fn(model_params):
+        def loss_fn(model_params: Any) -> tuple[jax.Array, dict[str, jax.Array]]:
             """Compute weighted Transformer losses and scalar metrics.
 
             Parameters
@@ -523,7 +534,7 @@ def make_transformer_train_eval_functions(
                 Combined loss plus a metrics mapping containing normalized,
                 log10-physical, and optional spectrum-reconstruction terms.
             """
-            pred, aux = apply_transformer_model(
+            pred, _aux = apply_transformer_model(
                 model_params,
                 batch["sequence"],
                 batch["global_inputs"],
@@ -563,7 +574,7 @@ def make_transformer_train_eval_functions(
         return new_params, new_opt_state, metrics
 
     @jax.jit
-    def eval_step(params, batch):
+    def eval_step(params: Any, batch: dict[str, jax.Array]) -> dict[str, jax.Array]:
         """Evaluate the Transformer model on one normalized batch.
 
         Parameters
@@ -578,7 +589,7 @@ def make_transformer_train_eval_functions(
         dict[str, jax.Array]
             Scalar evaluation metrics for the batch.
         """
-        pred, aux = apply_transformer_model(
+        pred, _aux = apply_transformer_model(
             params,
             batch["sequence"],
             batch["global_inputs"],
@@ -874,12 +885,15 @@ def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
 
 def make_mlp_train_eval_functions(
     *,
-    dims,
+    dims: MLPDimensions,
     normalization: dict[str, Any],
     loss_cfg: dict[str, float],
     gradient_clip: float,
     weight_decay: float,
-):
+) -> tuple[
+    Callable[[Any, dict[str, Any], dict[str, jax.Array], jax.Array, jax.Array], tuple[Any, dict[str, Any], dict[str, jax.Array]]],
+    Callable[[Any, dict[str, jax.Array]], dict[str, jax.Array]],
+]:
     """Build JIT-compiled train/eval functions for the FiLM-MLP.
 
     Parameters
@@ -905,7 +919,13 @@ def make_mlp_train_eval_functions(
     target_mean, target_std = _state_stats(normalization)
 
     @jax.jit
-    def train_step(params, opt_state, batch, learning_rate, dropout_key):
+    def train_step(
+        params: Any,
+        opt_state: dict[str, Any],
+        batch: dict[str, jax.Array],
+        learning_rate: jax.Array,
+        dropout_key: jax.Array,
+    ) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
         """Run one FiLM-MLP optimizer step on a normalized batch.
 
         Parameters
@@ -928,7 +948,7 @@ def make_mlp_train_eval_functions(
             Updated parameter tree, updated optimizer state, and scalar
             training metrics.
         """
-        def loss_fn(model_params):
+        def loss_fn(model_params: Any) -> tuple[jax.Array, dict[str, jax.Array]]:
             """Compute weighted FiLM-MLP losses and scalar metrics.
 
             Parameters
@@ -942,7 +962,7 @@ def make_mlp_train_eval_functions(
                 Combined loss plus a metrics mapping containing normalized,
                 log10-physical, and optional spectrum-reconstruction terms.
             """
-            pred, aux = apply_mlp(
+            pred, _aux = apply_mlp(
                 model_params,
                 batch["sequence"],
                 batch["global_inputs"],
@@ -977,7 +997,7 @@ def make_mlp_train_eval_functions(
         return new_params, new_opt_state, metrics
 
     @jax.jit
-    def eval_step(params, batch):
+    def eval_step(params: Any, batch: dict[str, jax.Array]) -> dict[str, jax.Array]:
         """Evaluate the FiLM-MLP on one normalized batch.
 
         Parameters
@@ -992,7 +1012,7 @@ def make_mlp_train_eval_functions(
         dict[str, jax.Array]
             Scalar evaluation metrics for the batch.
         """
-        pred, aux = apply_mlp(
+        pred, _aux = apply_mlp(
             params,
             batch["sequence"],
             batch["global_inputs"],

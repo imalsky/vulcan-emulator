@@ -15,18 +15,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from matplotlib.lines import Line2D
 import numpy as np
+from matplotlib.lines import Line2D
+from vulcan_emulator import BUNDLE_PATH, load_model
 
 DEMO_DIR = Path(__file__).resolve().parent
 PLOTS_DIR = DEMO_DIR / "plots"
 STYLE_PATH = DEMO_DIR / "science.mplstyle"
 TEST_DATA_PATH = DEMO_DIR / "bundle" / "test_profiles.npz"
-
-from vulcan_emulator import BUNDLE_PATH, load_model
 
 VMR_FLOOR = 1.0e-30
 TEMPERATURE_PLOT_MIN_K = 0.0

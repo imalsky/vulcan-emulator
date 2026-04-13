@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N vulcan_emulator
+#PBS -N vulcan_transformer_condensation
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
@@ -8,9 +8,10 @@
 #PBS -m abe
 
 # =============================================================================
-# VULCAN Emulator Pipeline — PBS Submission Script
+# VULCAN Transformer Condensation Pipeline — PBS Submission Script
 #
-# Full pipeline: generation → normalization → training → export
+# Full condensation-enabled VULCAN pipeline:
+# generation → normalization → training → export
 #
 # Usage:
 #   qsub run.pbs                          # full pipeline (GPU)
@@ -30,7 +31,8 @@
 #   qsub -v SKIP_GEN=1 run.pbs
 #
 # Environment Variables:
-#   CONFIG_PATH     — config file path (default: config/fastchem_transformer_config.json)
+#   CONFIG_PATH     — config file path
+#                     (default: config/vulcan_transformer_config.json)
 #   DATA_ONLY       — set to 1 to run only generation + normalization (no GPU needed)
 #   SKIP_GEN        — set to 1 to skip generation (data already exists)
 #   SKIP_NORM       — set to 1 to skip normalization (processed data exists)
@@ -72,7 +74,7 @@ if [ "${rc}" -ne 0 ]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/fastchem_transformer_config.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/vulcan_transformer_config.json}"
 DATA_ONLY="${DATA_ONLY:-0}"
 SKIP_GEN="${SKIP_GEN:-0}"
 SKIP_NORM="${SKIP_NORM:-0}"
@@ -113,12 +115,50 @@ if [ ! -d "${PROJECT_ROOT}/src" ]; then
   exit 1
 fi
 
+CONFIG_SUMMARY_RAW="$(python - "${CONFIG_PATH}" <<'PY'
+from pathlib import Path
+import sys
+
+from src.utils.config import load_and_validate_config
+
+config = load_and_validate_config(Path(sys.argv[1]).resolve())
+use_condensation = bool(config["vulcan"]["physics_toggles"]["use_condensation"]) if config["chemistry_type"] == "vulcan" else False
+print(config["chemistry_type"])
+print(config["model_type"])
+print(int(use_condensation))
+PY
+)" || {
+  echo "ERROR: failed to validate config: ${CONFIG_PATH}"
+  exit 1
+}
+mapfile -t CONFIG_SUMMARY <<<"${CONFIG_SUMMARY_RAW}"
+if [ "${#CONFIG_SUMMARY[@]}" -lt 3 ]; then
+  echo "ERROR: config validation did not return chemistry, model, and condensation flags."
+  exit 1
+fi
+CONFIG_CHEMISTRY_TYPE="${CONFIG_SUMMARY[0]}"
+CONFIG_MODEL_TYPE="${CONFIG_SUMMARY[1]}"
+CONFIG_USE_CONDENSATION="${CONFIG_SUMMARY[2]}"
+if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ]; then
+  echo "ERROR: run.pbs is for the VULCAN transformer condensation pipeline, but chemistry_type=${CONFIG_CHEMISTRY_TYPE}."
+  exit 1
+fi
+if [ "${CONFIG_MODEL_TYPE}" != "transformer" ]; then
+  echo "ERROR: run.pbs is for the VULCAN transformer condensation pipeline, but model_type=${CONFIG_MODEL_TYPE}."
+  exit 1
+fi
+if [ "${CONFIG_USE_CONDENSATION}" != "1" ]; then
+  echo "ERROR: run.pbs requires a condensation-enabled config."
+  exit 1
+fi
+
 echo "Config path: $(python - <<'PY' "${CONFIG_PATH}"
 from pathlib import Path
 import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
+echo "chemistry_type=${CONFIG_CHEMISTRY_TYPE} model_type=${CONFIG_MODEL_TYPE} use_condensation=${CONFIG_USE_CONDENSATION}"
 echo "DATA_ONLY=${DATA_ONLY} SKIP_GEN=${SKIP_GEN} SKIP_NORM=${SKIP_NORM}"
 echo "JAX_ENABLE_X64=${JAX_ENABLE_X64} REQUIRE_JAX_GPU=${REQUIRE_JAX_GPU}"
 

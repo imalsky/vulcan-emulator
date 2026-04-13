@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 from src.data_generation.spectrum import (
+    _flux_conserving_rebin,
+    _vulcan_bin_edges,
     generate_wasp39b_template,
     load_spectrum_manifest,
     pack_spectrum_tokens,
@@ -10,8 +12,6 @@ from src.data_generation.spectrum import (
     save_spectrum_manifest,
     vulcan_wavelength_bins,
     write_vulcan_spectrum_txt,
-    _flux_conserving_rebin,
-    _vulcan_bin_edges,
 )
 
 
@@ -76,8 +76,8 @@ def test_flux_conserving_rebin_preserves_integral():
     rebinned = _flux_conserving_rebin(wavelength_nm, flux, edges)
 
     centers = 0.5 * (edges[:-1] + edges[1:])
-    original_integral = np.trapz(flux, wavelength_nm)
-    rebinned_integral = np.trapz(rebinned, centers)
+    original_integral = np.trapezoid(flux, wavelength_nm)
+    rebinned_integral = np.trapezoid(rebinned, centers)
     np.testing.assert_allclose(rebinned_integral, original_integral, rtol=0.02)
 
 
@@ -127,7 +127,7 @@ def test_pack_spectrum_tokens_flux_conservation():
     centers = vulcan_wavelength_bins()
     edges = _vulcan_bin_edges(centers, 0.1, 2.0, 240.0)
     widths = np.diff(edges)
-    original_integral = np.trapz(flux, wavelength_nm)
+    original_integral = np.trapezoid(flux, wavelength_nm)
     rebinned_integral = np.sum(valid_f * widths)
     assert rebinned_integral > 0.0
     assert abs(rebinned_integral - original_integral) / original_integral < 0.02

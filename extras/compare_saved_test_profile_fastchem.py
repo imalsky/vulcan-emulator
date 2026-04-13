@@ -20,6 +20,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
 from _common import (
     EPSILON,
     FASTCHEM_METALLICITY_SCALED_ELEMENTS,
@@ -31,17 +34,12 @@ from _common import (
     resolve_vulcan_source_root,
     select_fastchem_test_run_id,
 )
-
-import h5py
-import matplotlib.pyplot as plt
-import numpy as np
 from matplotlib.lines import Line2D
 from src.data_generation.generation import (
     _copy_fastchem_runtime,
 )
 from src.models.export_bundle import load_exported_model
 from src.utils.helpers import resolve_path, resolve_project_root
-
 
 # ======================================================================
 # Data structures

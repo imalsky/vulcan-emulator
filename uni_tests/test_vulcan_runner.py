@@ -21,11 +21,14 @@ from src.data_generation.generation import (
     write_equilibrium_hdf5,
 )
 from src.data_generation.sampling import sample_run_specifications
-from src.data_generation.spectrum import generate_wasp39b_template, write_vulcan_spectrum_txt
+from src.data_generation.spectrum import (
+    generate_wasp39b_template,
+    write_vulcan_spectrum_txt,
+)
 from src.utils.config import dataset_info_root, load_and_validate_config
 
 
-def _open_first_run(artifact) -> h5py.Group:
+def _open_first_run(artifact: generation_module.GeneratedRawDataset) -> h5py.Group:
     """Return the first stored run group from a raw-generation artifact."""
     root = h5py.File(artifact.consolidated_path, "r")
     return root[sorted(root.keys())[0]]

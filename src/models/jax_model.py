@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -70,11 +70,16 @@ class TransformerDimensions:
     activation: str = "gelu"
     dropout_rate: float = 0.0
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self: "TransformerDimensions") -> dict[str, Any]:
+        """Serialize the dataclass fields into a plain Python mapping."""
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TransformerDimensions":
+    def from_dict(
+        cls: type["TransformerDimensions"],
+        payload: dict[str, Any],
+    ) -> "TransformerDimensions":
+        """Rebuild one dimensions dataclass from serialized metadata."""
         return cls(**payload)
 
 
@@ -643,11 +648,16 @@ class MLPDimensions:
     activation: str
     dropout_rate: float = 0.0
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self: "MLPDimensions") -> dict[str, Any]:
+        """Serialize the dataclass fields into a plain Python mapping."""
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "MLPDimensions":
+    def from_dict(
+        cls: type["MLPDimensions"],
+        payload: dict[str, Any],
+    ) -> "MLPDimensions":
+        """Rebuild one dimensions dataclass from serialized metadata."""
         return cls(**payload)
 
 
@@ -703,7 +713,7 @@ def init_mlp_params(
     return params
 
 
-def _resolve_activation(name: str):
+def _resolve_activation(name: str) -> Callable[[jax.Array], jax.Array]:
     """Resolve an activation name to the corresponding JAX callable.
 
     Parameters

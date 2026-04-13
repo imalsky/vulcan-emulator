@@ -261,6 +261,7 @@ def _prepare_generation_directory(
     existing_files = sorted(legacy_runs_dir.glob("run_*.h5")) if legacy_runs_dir.exists() else []
 
     def _make_staging_dir() -> Path:
+        """Create one temporary staging directory for raw-run generation."""
         return Path(tempfile.mkdtemp(prefix=f"{run_root.name}_", dir=str(staging_root)))
 
     # Also count runs inside a consolidated file, if present.

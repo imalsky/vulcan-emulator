@@ -7,8 +7,8 @@ stay focused on their own purpose.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +21,16 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.data_generation.data_loader import ProcessedSplit, load_processed_dataset  # noqa: E402
+from src.data_generation.data_loader import (  # noqa: E402
+    ProcessedSplit,
+    load_processed_dataset,
+)
 from src.data_generation.generation import list_run_ids_from_consolidated  # noqa: E402
-from src.data_generation.preprocess import inverse_block, inverse_mixed_block  # noqa: E402
-from src.utils.helpers import resolve_path, resolve_project_root  # noqa: E402
+from src.data_generation.preprocess import (  # noqa: E402
+    inverse_block,
+    inverse_mixed_block,
+)
+from src.utils.helpers import resolve_path  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths
