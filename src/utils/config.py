@@ -1100,8 +1100,8 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "generation",
     )
     generation["mode"] = _as_nonempty_str(generation["mode"], "generation.mode").lower()
-    if generation["mode"] not in {"synthetic", "vulcan"}:
-        raise ConfigValidationError("generation.mode must be 'synthetic' or 'vulcan'.")
+    if generation["mode"] not in {"vulcan"}:
+        raise ConfigValidationError("generation.mode must be 'vulcan'.")
     generation["num_runs"] = _as_int(generation["num_runs"], "generation.num_runs")
     generation["seed"] = _as_int(generation["seed"], "generation.seed")
     generation["overwrite"] = _as_bool(generation["overwrite"], "generation.overwrite")
@@ -1115,8 +1115,8 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     )
     if generation["num_runs"] < 1:
         raise ConfigValidationError("generation.num_runs must be >= 1.")
-    if generation["parallel_workers"] < 1:
-        raise ConfigValidationError("generation.parallel_workers must be >= 1.")
+    if generation["parallel_workers"] < 0:
+        raise ConfigValidationError("generation.parallel_workers must be >= 0 (0 = auto-detect).")
     backfill = generation.get("backfill", {"enabled": True, "max_retries": 3})
     if not isinstance(backfill, dict):
         raise ConfigValidationError("generation.backfill must be a mapping.")

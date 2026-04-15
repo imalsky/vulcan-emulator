@@ -5,8 +5,8 @@ runtime matches the working notebook environment.
 
 Usage
 -----
-    conda run -n vulcan python extras/debug_notebook_chemistry_mismatch.py
-    conda run -n vulcan python extras/debug_notebook_chemistry_mismatch.py --run-id run_00042
+    conda run -n vulcan python extras/debug_chemistry.py
+    conda run -n vulcan python extras/debug_chemistry.py --run-id run_00042
 """
 
 from __future__ import annotations
@@ -35,9 +35,9 @@ try:  # noqa: E402
         load_fastchem_test_context,
         resolve_bundle_path,
         resolve_vulcan_source_root,
+        run_fastchem_online,
         select_fastchem_test_run_id,
     )
-    from extras.compare_saved_test_profile_fastchem import _run_fastchem_online
 except ImportError:  # noqa: E402
     from _common import (
         EPSILON,
@@ -47,9 +47,9 @@ except ImportError:  # noqa: E402
         load_fastchem_test_context,
         resolve_bundle_path,
         resolve_vulcan_source_root,
+        run_fastchem_online,
         select_fastchem_test_run_id,
     )
-    from compare_saved_test_profile_fastchem import _run_fastchem_online
 from exogibbs.api import (  # noqa: E402
     get_default_equilibrium_grid_path,
     load_equilibrium_grid_netcdf,
@@ -408,7 +408,7 @@ def _report_saved_test_case(
     if public_error is not None:
         raise RuntimeError(f"Saved test case unexpectedly failed the public transformer path: {public_error}")
 
-    live_fastchem = _run_fastchem_online(
+    live_fastchem = run_fastchem_online(
         source_root=vulcan_source_root,
         pressure_bar=test_case.pressure_bar,
         temperature_k=test_case.temperature_k,
@@ -490,7 +490,7 @@ def _report_notebook_profile(
             diagnostic_vmr = public_vmr
             print("  public transformer path: success")
 
-        live_fastchem = _run_fastchem_online(
+        live_fastchem = run_fastchem_online(
             source_root=vulcan_source_root,
             pressure_bar=pressure_bar,
             temperature_k=temperature_k,
@@ -518,7 +518,7 @@ def _report_notebook_profile(
             species=list(EXOGIBBS_SPECIES_MAP),
         )
 
-    live_fastchem_aag21 = _run_fastchem_online(
+    live_fastchem_aag21 = run_fastchem_online(
         source_root=vulcan_source_root,
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,

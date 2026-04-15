@@ -36,7 +36,7 @@
   },
   "temperature_profiles": {
     "source_mode": "mixed",
-    "analytic_probability": 0.5,
+    "analytic_probability": 0.0,
     "data_glob": "assets/PTprofiles/*.dat",
     "filters": {
       "Teq": [1400.0, 2200.0],
@@ -61,11 +61,11 @@
   },
   "generation": {
     "mode": "vulcan",
-    "num_runs": 2000,
+    "num_runs": 1000,
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
-    "parallel_workers": 8,
+    "parallel_workers": 0,
     "backfill": {
       "enabled": true,
       "max_retries": 3

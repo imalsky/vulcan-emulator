@@ -25,7 +25,10 @@ from src.data_generation.data_loader import (  # noqa: E402
     ProcessedSplit,
     load_processed_dataset,
 )
-from src.data_generation.generation import list_run_ids_from_consolidated  # noqa: E402
+from src.data_generation.generation import (  # noqa: E402
+    _copy_fastchem_runtime,
+    list_run_ids_from_consolidated,
+)
 from src.data_generation.preprocess import (  # noqa: E402
     inverse_block,
     inverse_mixed_block,
@@ -482,3 +485,257 @@ def apply_style() -> None:
         import matplotlib.pyplot as plt
 
         plt.style.use(str(STYLE_PATH))
+
+
+# ---------------------------------------------------------------------------
+# Raw equilibrium profile loading
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class RawEquilibriumProfile:
+    """One raw equilibrium run stored in physical units."""
+
+    run_id: str
+    pressure_bar: np.ndarray
+    temperature_k: np.ndarray
+    equilibrium_ymix: np.ndarray
+    output_species: list[str]
+    globals: dict[str, float]
+
+
+def _extract_raw_profile(handle: Any, run_id: str) -> RawEquilibriumProfile:
+    """Extract one raw equilibrium profile from an open HDF5 group."""
+    pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
+    temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
+    output_species = _decode_hdf5_labels(np.asarray(handle["inputs/output_species"]))
+    equilibrium_ymix = np.asarray(handle["equilibrium/ymix"], dtype=np.float64)
+
+    globals_map = {
+        key: float(np.asarray(handle[f"globals/{key}"]))
+        for key in handle["globals"].keys()
+    }
+    if "inputs/element_input_order" in handle and "inputs/elemental_abundances_frac" in handle:
+        element_labels = _decode_hdf5_labels(np.asarray(handle["inputs/element_input_order"]))
+        element_profile = np.asarray(
+            handle["inputs/elemental_abundances_frac"], dtype=np.float64,
+        )
+        for index, label in enumerate(element_labels):
+            globals_map[label] = float(element_profile[0, index])
+
+    return RawEquilibriumProfile(
+        run_id=run_id,
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        equilibrium_ymix=equilibrium_ymix,
+        output_species=output_species,
+        globals=globals_map,
+    )
+
+
+def load_raw_equilibrium_profile(raw_root: Path, run_id: str) -> RawEquilibriumProfile:
+    """Load one raw equilibrium profile from the consolidated HDF5 dataset."""
+    consolidated_path = raw_root / "runs.h5"
+    if not consolidated_path.exists():
+        raise FileNotFoundError(f"Consolidated raw dataset not found: {consolidated_path}")
+    with h5py.File(consolidated_path, "r") as handle:
+        if run_id not in handle:
+            raise KeyError(f"Run ID {run_id!r} not found in {consolidated_path}")
+        return _extract_raw_profile(handle[run_id], run_id)
+
+
+# ---------------------------------------------------------------------------
+# FastChem execution utilities
+# ---------------------------------------------------------------------------
+def _element_abundances_from_globals(globals_map: dict[str, float]) -> dict[str, float]:
+    """Map profile globals to elemental abundances expected by FastChem.
+
+    When the stored globals include ``metallicity_log10`` (the original
+    sampled value), metallicity is recovered directly so that the
+    ``fastchem_met_scale`` is bit-identical to the value used during data
+    generation.  Falling back to ``O_H / solar_O_H`` would introduce a
+    float-precision round-trip error that can shift background-element
+    abundances by ~0.0001 dex.
+    """
+    required = ("He_H", "C_H", "O_H", "N_H", "S_H")
+    missing = [k for k in required if k not in globals_map]
+    if missing:
+        raise ValueError(
+            f"FastChem comparison requires elemental abundances {required}, missing {missing}."
+        )
+    if "metallicity_log10" in globals_map:
+        met_scale = 10.0 ** float(globals_map["metallicity_log10"])
+    else:
+        met_scale = float(globals_map["O_H"]) / SOLAR_ELEMENT_ABUNDANCES["O_H"]
+    return {
+        "He_H": float(globals_map["He_H"]),
+        "C_H": float(globals_map["C_H"]),
+        "O_H": float(globals_map["O_H"]),
+        "N_H": float(globals_map["N_H"]),
+        "S_H": float(globals_map["S_H"]),
+        "fastchem_met_scale": met_scale,
+    }
+
+
+def _write_fastchem_tp_profile(
+    fastchem_root: Path,
+    *,
+    pressure_bar: np.ndarray,
+    temperature_k: np.ndarray,
+) -> Path:
+    """Write a FastChem-format T-P profile for the selected run."""
+    tp_dir = fastchem_root / "input" / "vulcan_TP"
+    tp_dir.mkdir(parents=True, exist_ok=True)
+    tp_path = tp_dir / "vulcan_TP.dat"
+    with tp_path.open("w", encoding="utf-8") as fh:
+        fh.write("#p (bar)    T (K)\n")
+        for p, t in zip(pressure_bar, temperature_k):
+            fh.write(f"{p:.3e}\t{t:.1f}\n")
+    return tp_path
+
+
+def _sulfur_enabled(config: dict) -> bool:
+    """Return whether the configured species lists require sulfur chemistry."""
+    data_spec = config.get("data_spec", {})
+    species = list(data_spec.get("state_species", [])) + list(data_spec.get("output_species", []))
+    return any("S" in name for name in species)
+
+
+def _explicit_element_set(config: dict) -> set[str]:
+    """Build the set of non-H atoms written with explicit number fractions.
+
+    Must match ``_vulcan_atom_list`` in the generation module.
+    """
+    atoms = {"O", "C", "N", "He"}
+    if _sulfur_enabled(config):
+        atoms.add("S")
+    return atoms
+
+
+def _write_fastchem_element_abundances(
+    fastchem_root: Path,
+    *,
+    globals_map: dict[str, float],
+    config: dict,
+) -> Path:
+    """Write FastChem elemental abundances derived from the number-fraction globals."""
+    import subprocess as _subprocess  # noqa: F811 — deferred to avoid top-level cost
+
+    input_dir = fastchem_root / "input"
+    physics = config.get("physics_toggles", {})
+    use_ion = bool(physics.get("use_ion_chemistry", False))
+    parameters_name = "parameters_ion.dat" if use_ion else "parameters_wo_ion.dat"
+    parameters_src = input_dir / parameters_name
+    if not parameters_src.exists():
+        raise FileNotFoundError(f"FastChem parameters file not found: {parameters_src}")
+    (input_dir / "parameters.dat").write_text(
+        parameters_src.read_text(encoding="utf-8"), encoding="utf-8",
+    )
+
+    element_abundances = _element_abundances_from_globals(globals_map)
+    metallicity_offset = float(np.log10(element_abundances["fastchem_met_scale"]))
+    explicit_atoms = _explicit_element_set(config)
+
+    solar_file = input_dir / "solar_element_abundances.dat"
+    if not solar_file.exists():
+        raise FileNotFoundError(f"FastChem solar abundance table not found: {solar_file}")
+
+    output_lines: list[str] = []
+    for raw_line in solar_file.read_text(encoding="utf-8").splitlines(keepends=True):
+        if not raw_line.strip() or raw_line.startswith("#"):
+            output_lines.append(raw_line)
+            continue
+        parts = raw_line.split()
+        species_name = parts[0]
+        if species_name in explicit_atoms:
+            key = "He_H" if species_name == "He" else f"{species_name}_H"
+            number_frac = element_abundances.get(key)
+            if number_frac is None:
+                raise ValueError(f"Missing elemental abundance for {species_name}.")
+            new_value = np.log10(float(number_frac)) + 12.0
+            output_lines.append(f"{species_name}\t{new_value:.4f}\n")
+        elif species_name in FASTCHEM_METALLICITY_SCALED_ELEMENTS:
+            new_value = float(parts[1]) + metallicity_offset
+            output_lines.append(f"{species_name}\t{new_value:.4f}\n")
+        else:
+            output_lines.append(raw_line)
+
+    output_path = input_dir / "element_abundances_vulcan.dat"
+    output_path.write_text("".join(output_lines), encoding="utf-8")
+    return output_path
+
+
+def _load_fastchem_output(output_path: Path, output_species: list[str]) -> np.ndarray:
+    """Load the FastChem equilibrium table, ordered by repository species list."""
+    if not output_path.exists():
+        raise FileNotFoundError(f"FastChem output file not found: {output_path}")
+    payload = np.genfromtxt(output_path, names=True, dtype=None, encoding=None)
+    if payload.dtype.names is None:
+        raise ValueError(f"FastChem output at {output_path} has no named header.")
+    rows = np.atleast_1d(payload)
+    missing = [name for name in output_species if name not in rows.dtype.names]
+    if missing:
+        raise ValueError(f"FastChem output is missing species columns: {missing}")
+    return np.column_stack(
+        [np.asarray(rows[name], dtype=np.float64) for name in output_species]
+    )
+
+
+def run_fastchem_online(
+    *,
+    source_root: Path,
+    pressure_bar: np.ndarray,
+    temperature_k: np.ndarray,
+    globals_map: dict[str, float],
+    output_species: list[str],
+    config: dict,
+) -> np.ndarray:
+    """Rerun the bundled FastChem executable for one raw test profile.
+
+    Parameters
+    ----------
+    source_root : Path
+        VULCAN-master source tree containing the FastChem binary.
+    pressure_bar, temperature_k : np.ndarray
+        1-D physical arrays defining the atmospheric column.
+    globals_map : dict
+        Elemental abundance globals (number-fraction keys), plus ``metallicity_log10``
+        when available for exact metallicity recovery.
+    output_species : list[str]
+        Species names whose mixing ratios are returned.
+    config : dict
+        Full pipeline config from the exported bundle, used to select
+        ion chemistry and determine the explicit-element set.
+
+    Returns
+    -------
+    np.ndarray
+        2-D array of shape ``(n_levels, n_species)`` with linear mixing ratios.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="fastchem_compare_") as tmpdir:
+        worker_root = Path(tmpdir)
+        fastchem_root = _copy_fastchem_runtime(source_root, worker_root)
+        _write_fastchem_element_abundances(
+            fastchem_root, globals_map=globals_map, config=config,
+        )
+        _write_fastchem_tp_profile(
+            fastchem_root,
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+        )
+        result = subprocess.run(
+            ["./fastchem", "input/config.input"],
+            cwd=fastchem_root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"FastChem execution failed.\nCommand output:\n{result.stdout}"
+            )
+        return _load_fastchem_output(
+            fastchem_root / "output" / "vulcan_EQ.dat", output_species,
+        )

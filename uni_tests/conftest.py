@@ -283,7 +283,7 @@ def tiny_config(tmp_path):
     config["stellar_spectrum"]["library_glob"] = str(spectrum_dir / "*.txt")
 
     config["_project_root"] = ROOT
-    config["generation"]["mode"] = "synthetic"
+    config["generation"]["mode"] = "vulcan"
     config["generation"]["num_runs"] = 4
     config["generation"]["seed"] = 11
     config["generation"]["parallel_workers"] = 1

@@ -65,7 +65,7 @@
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
-    "parallel_workers": 8,
+    "parallel_workers": 0,
     "backfill": {
       "enabled": true,
       "max_retries": 3

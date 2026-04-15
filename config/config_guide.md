@@ -168,12 +168,12 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 
 | Key | Description |
 |-----|-------------|
-| `mode` | `"vulcan"` or `"synthetic"` |
+| `mode` | `"vulcan"` |
 | `num_runs` | Target number of successful runs |
 | `seed` | Sampling seed |
 | `overwrite` | Whether to overwrite existing raw data |
 | `reuse_raw_if_present` | Skip generation if raw data exists |
-| `parallel_workers` | Number of parallel generation workers |
+| `parallel_workers` | Number of parallel generation workers (`0` = auto-detect from PBS/SLURM/OS) |
 | `backfill` | `{enabled, max_retries}` for VULCAN failure recovery |
 
 ### `normalization`

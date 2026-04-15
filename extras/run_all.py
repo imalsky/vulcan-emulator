@@ -22,10 +22,10 @@ from pathlib import Path
 # Scripts to run, in order.  Each entry is (display name, module path).
 _EXTRAS_DIR = Path(__file__).resolve().parent
 _SCRIPTS: list[tuple[str, Path]] = [
-    ("stand_alone_example", _EXTRAS_DIR / "stand_alone_example.py"),
-    ("fastchem_saved_test_profile_demo", _EXTRAS_DIR / "fastchem_saved_test_profile_demo.py"),
-    ("plot_saved_test_profiles", _EXTRAS_DIR / "plot_saved_test_profiles.py"),
-    ("compare_saved_test_profile_fastchem", _EXTRAS_DIR / "compare_saved_test_profile_fastchem.py"),
+    ("standalone_inference", _EXTRAS_DIR / "standalone_inference.py"),
+    ("emulator_demo", _EXTRAS_DIR / "emulator_demo.py"),
+    ("plot_test_profiles", _EXTRAS_DIR / "plot_test_profiles.py"),
+    ("fastchem_comparison", _EXTRAS_DIR / "fastchem_comparison.py"),
 ]
 
 

@@ -255,12 +255,17 @@ PY
   if [ "${CONSOLIDATED_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
     echo "Raw dataset already present in consolidated file (${CONSOLIDATED_COUNT} runs), skipping generation."
   elif [ "${RUN_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
-    echo "Raw dataset already present (${RUN_COUNT} runs), skipping generation."
-  elif [ "${RUN_COUNT}" -eq 0 ] && [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
-    echo "Generating raw runs..."
+    echo "Raw dataset already present (${RUN_COUNT} per-run files), consolidation needed."
+    python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
+  elif [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
+    if [ "${RUN_COUNT}" -gt 0 ]; then
+      echo "Resuming generation: ${RUN_COUNT}/${EXPECTED_RUNS} per-run files found, continuing..."
+    else
+      echo "Generating raw runs..."
+    fi
     python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
   else
-    echo "ERROR: raw-run count mismatch: found ${RUN_COUNT} per-file runs in ${RAW_RUN_DIR} and ${CONSOLIDATED_COUNT} runs in ${CONSOLIDATED_PATH}, expected ${EXPECTED_RUNS}."
+    echo "ERROR: consolidated file has ${CONSOLIDATED_COUNT} runs but expected ${EXPECTED_RUNS}."
     echo "Set generation.overwrite=true and regenerate, or align generation.num_runs with the existing dataset."
     exit 1
   fi

@@ -7,8 +7,8 @@ Overlays saved test-set profiles on a single panel with distinct line styles:
 
 Usage
 -----
-    python extras/plot_saved_test_profiles.py
-    python extras/plot_saved_test_profiles.py --bundle models/fastchem_transformer/best_exported.npz --seed 42 -n 20
+    python extras/plot_test_profiles.py
+    python extras/plot_test_profiles.py --bundle models/fastchem_transformer/best_exported.npz --seed 42 -n 20
 """
 
 from __future__ import annotations

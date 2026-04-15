@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from src.data_generation.data_loader import build_batch, load_processed_dataset
-from src.data_generation.generation import generate_synthetic_raw_runs
+from synthetic_fixture import generate_synthetic_raw_runs
 from src.data_generation.preprocess import preprocess_raw_dataset
 from src.models.jax_model import (
     TransformerDimensions,
@@ -70,6 +70,7 @@ def test_transformer_forward_grad_and_jvp(tiny_config):
 
 
 def test_training_checkpoint_smoke(tiny_config):
+    generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
     artifacts = train_model(tiny_config, project_root=tiny_config["_project_root"])
     assert artifacts.checkpoint_path.exists()
     assert artifacts.history_path.exists()
@@ -86,6 +87,7 @@ def test_training_checkpoint_smoke(tiny_config):
 
 def test_training_checkpoint_smoke_with_cosine_scheduler(tiny_config):
     tiny_config["training"]["scheduler"] = {"name": "cosine"}
+    generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
     artifacts = train_model(tiny_config, project_root=tiny_config["_project_root"])
     assert artifacts.checkpoint_path.exists()
 

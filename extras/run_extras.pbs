@@ -199,14 +199,14 @@ fi
 echo "Resolved bundle: ${BUNDLE_PATH}"
 BUNDLE_ARGS=(--bundle "${BUNDLE_PATH}")
 
-run_extra "plot_saved_test_profiles" \
-  python -u extras/plot_saved_test_profiles.py --config "${CONFIG_PATH}"
+run_extra "plot_test_profiles" \
+  python -u extras/plot_test_profiles.py --config "${CONFIG_PATH}"
 
-run_extra "compare_saved_test_profile_fastchem" \
-  python -u extras/compare_saved_test_profile_fastchem.py --config "${CONFIG_PATH}"
+run_extra "fastchem_comparison" \
+  python -u extras/fastchem_comparison.py --config "${CONFIG_PATH}"
 
-run_extra "fastchem_saved_test_profile_demo" \
-  python -u extras/fastchem_saved_test_profile_demo.py --config "${CONFIG_PATH}" "${BUNDLE_ARGS[@]}"
+run_extra "emulator_demo" \
+  python -u extras/emulator_demo.py --config "${CONFIG_PATH}" "${BUNDLE_ARGS[@]}"
 
 echo ""
 echo "========== Extras complete =========="

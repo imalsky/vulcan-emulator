@@ -8,9 +8,9 @@ Runs four sections:
 
 Usage
 -----
-    python extras/fastchem_saved_test_profile_demo.py
-    python extras/fastchem_saved_test_profile_demo.py --bundle models/fastchem_transformer/best_exported.npz
-    python extras/fastchem_saved_test_profile_demo.py --run-id run_00042
+    python extras/emulator_demo.py
+    python extras/emulator_demo.py --bundle models/fastchem_transformer/best_exported.npz
+    python extras/emulator_demo.py --run-id run_00042
 """
 
 from __future__ import annotations
@@ -28,9 +28,9 @@ from _common import (
     plots_dir_for_bundle,
     resolve_bundle_path,
     resolve_vulcan_source_root,
+    run_fastchem_online,
     select_fastchem_test_run_id,
 )
-from compare_saved_test_profile_fastchem import _run_fastchem_online
 from src.models.export_bundle import load_exported_model
 from src.utils.helpers import resolve_path, resolve_project_root
 
@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Skipped -- VULCAN source not found at: {vulcan_source_root}")
         else:
             print(f"  Running FastChem from: {vulcan_source_root}")
-            fastchem_ymix = _run_fastchem_online(
+            fastchem_ymix = run_fastchem_online(
                 source_root=vulcan_source_root,
                 pressure_bar=test_case.pressure_bar,
                 temperature_k=test_case.temperature_k,

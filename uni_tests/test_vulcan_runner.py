@@ -16,10 +16,10 @@ from src.data_generation.generation import (
     convert_fastchem_output_to_hdf5,
     convert_vulcan_output_to_hdf5,
     generate_raw_dataset,
-    generate_synthetic_raw_runs,
     run_vulcan_generation,
     write_equilibrium_hdf5,
 )
+from synthetic_fixture import generate_synthetic_raw_runs
 from src.data_generation.sampling import sample_run_specifications
 from src.data_generation.spectrum import (
     generate_wasp39b_template,

@@ -6,7 +6,7 @@ directly from the bundle.
 
 Usage
 -----
-    python extras/stand_alone_example.py
+    python extras/standalone_inference.py
 """
 
 from __future__ import annotations
