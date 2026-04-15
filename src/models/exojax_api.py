@@ -16,20 +16,21 @@ one-hot flags.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..utils.config import (
-    DEFAULT_REQUIRED_GLOBAL_INPUTS,
-    FASTCHEM_CONDITIONING_INPUT_ORDER,
+from ..constants import FASTCHEM_GLOBAL_LABELS, VULCAN_GLOBAL_LABELS
+from .abundance_utils import (  # noqa: F401 — re-exported for user convenience
+    SOLAR_ABUNDANCES,
+    SPECIES_MOLAR_MASS,
+    global_inputs_from_metallicity,
+    mean_molecular_weight,
+    solar_abundances,
 )
 from .export_bundle import ExportedJAXModel
-
-FASTCHEM_GLOBAL_LABELS = list(FASTCHEM_CONDITIONING_INPUT_ORDER)
-VULCAN_GLOBAL_LABELS = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
 
 def _validate_fastchem_bundle_global_order(bundle: ExportedJAXModel) -> None:
     """Reject FastChem bundles that use an outdated global-input ordering.
@@ -139,6 +140,8 @@ def _require_matching_level_shapes(
 
 def make_fastchem_vmr_fn(
     bundle: ExportedJAXModel,
+    *,
+    pressure_order: Literal["top_to_bottom", "bottom_to_top"] = "top_to_bottom",
 ) -> tuple[Any, list[str]]:
     """Create an ExoJAX-compatible FastChem profile inference callable.
 
@@ -147,49 +150,56 @@ def make_fastchem_vmr_fn(
     bundle : ExportedJAXModel
         Exported FastChem emulator bundle with physical-unit preprocessing
         embedded in the wrapper.
+    pressure_order : ``"top_to_bottom"`` or ``"bottom_to_top"``
+        Level ordering convention for inputs and outputs.
+        ``"top_to_bottom"`` (default) means index 0 is the top of the
+        atmosphere (lowest pressure).  ``"bottom_to_top"`` means index 0
+        is the bottom (highest pressure), matching the internal training
+        convention.
 
     Returns
     -------
     tuple[Any, list[str]]
         Callable ``vmr_fn`` plus the ordered output-species labels. The
         callable returns linear VMR predictions with shape ``(nz, n_species)``
-        in top-to-bottom level order.
+        in the requested level order.
     """
+    if pressure_order not in ("top_to_bottom", "bottom_to_top"):
+        raise ValueError(
+            f"pressure_order must be 'top_to_bottom' or 'bottom_to_top', got {pressure_order!r}"
+        )
     if not bundle.uses_fastchem:
         raise ValueError("make_fastchem_vmr_fn requires a fastchem bundle.")
 
     _validate_fastchem_bundle_global_order(bundle)
     species_labels = list(bundle.data_contract["output_species_order"])
     compiled_predict = bundle.make_compiled_fastchem_profile_predictor()
+    _flip = pressure_order == "top_to_bottom"
 
     def vmr_fn(
-        temperatures_k: jax.Array,  # shape: (nz,), top -> bottom
-        pressures_bar: jax.Array,  # shape: (nz,), top -> bottom
-        global_inputs: dict[str, Any] | jax.Array,  # X/H globals
-        gravity_cm_s2: jax.Array | None = None,  # optional shape: (nz,), top -> bottom
+        temperatures_k: jax.Array,
+        pressures_bar: jax.Array,
+        global_inputs: dict[str, Any] | jax.Array,
+        gravity_cm_s2: jax.Array | None = None,
     ) -> jax.Array:
-        """Predict one FastChem composition profile in ExoJAX ordering.
+        """Predict one FastChem composition profile.
 
         Parameters
         ----------
         temperatures_k : jax.Array
-            Temperature profile in Kelvin with shape ``(nz,)`` ordered from
-            top to bottom.
+            Temperature profile in Kelvin, shape ``(nz,)``.
         pressures_bar : jax.Array
-            Pressure profile in bar with shape ``(nz,)`` ordered from top to
-            bottom.
+            Pressure profile in bar, shape ``(nz,)``.
         global_inputs : dict[str, Any] or jax.Array
             Elemental conditioning inputs matching
             ``FASTCHEM_GLOBAL_LABELS``.
         gravity_cm_s2 : jax.Array or None, optional
-            Optional gravity profile. It is validated for shape compatibility
-            but not consumed by the current FastChem bundle contract.
+            Optional gravity profile (validated but not consumed).
 
         Returns
         -------
         jax.Array
-            Linear VMR array with shape ``(nz, n_species)`` in top-to-bottom
-            order.
+            Linear VMR array with shape ``(nz, n_species)``.
         """
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
@@ -200,16 +210,18 @@ def make_fastchem_vmr_fn(
                 raise ValueError("gravity_cm_s2 must be a 1-D array sharing the PT grid shape.")
             del gravity
 
-        internal_temperatures = temperatures[::-1]
-        internal_pressures = pressures[::-1]
+        internal_temperatures = temperatures[::-1] if _flip else temperatures
+        internal_pressures = pressures[::-1] if _flip else pressures
         vmr_internal = compiled_predict(internal_pressures, internal_temperatures, global_inputs)
-        return vmr_internal[::-1, :]
+        return vmr_internal[::-1, :] if _flip else vmr_internal
 
     return vmr_fn, species_labels
 
 
 def make_vulcan_vmr_fn(
     bundle: ExportedJAXModel,
+    *,
+    pressure_order: Literal["top_to_bottom", "bottom_to_top"] = "top_to_bottom",
 ) -> tuple[Any, list[str]]:
     """Create an ExoJAX-compatible VULCAN profile inference callable.
 
@@ -218,54 +230,54 @@ def make_vulcan_vmr_fn(
     bundle : ExportedJAXModel
         Exported VULCAN emulator bundle with embedded physical-unit
         preprocessing.
+    pressure_order : ``"top_to_bottom"`` or ``"bottom_to_top"``
+        Level ordering convention for inputs and outputs.
+        ``"top_to_bottom"`` (default) means index 0 is the top of the
+        atmosphere (lowest pressure).  ``"bottom_to_top"`` means index 0
+        is the bottom (highest pressure), matching the internal training
+        convention.
 
     Returns
     -------
     tuple[Any, list[str]]
         Callable ``vmr_fn`` plus the ordered output-species labels. The
         callable returns linear VMR predictions with shape ``(nz, n_species)``
-        in top-to-bottom level order.
+        in the requested level order.
     """
+    if pressure_order not in ("top_to_bottom", "bottom_to_top"):
+        raise ValueError(
+            f"pressure_order must be 'top_to_bottom' or 'bottom_to_top', got {pressure_order!r}"
+        )
     if not bundle.uses_vulcan_chemistry:
         raise ValueError("make_vulcan_vmr_fn requires a vulcan bundle.")
 
     _validate_vulcan_bundle_global_order(bundle)
     species_labels = list(bundle.data_contract["output_species_order"])
+    _flip = pressure_order == "top_to_bottom"
 
     def vmr_fn(
-        temperatures_k: jax.Array,  # shape: (nz,), top -> bottom
-        pressures_bar: jax.Array,  # shape: (nz,), top -> bottom
-        kzz_cm2_s: jax.Array,  # shape: (nz,), top -> bottom
+        temperatures_k: jax.Array,
+        pressures_bar: jax.Array,
+        kzz_cm2_s: jax.Array,
         global_inputs: dict[str, Any] | jax.Array,
-        spectrum_wavelength_nm: jax.Array,  # shape: (n_spectrum,)
-        spectrum_flux_erg_cm2_s_nm: jax.Array,  # shape: (n_spectrum,)
     ) -> jax.Array:
-        """Predict one VULCAN composition profile in ExoJAX ordering.
+        """Predict one VULCAN composition profile.
 
         Parameters
         ----------
         temperatures_k : jax.Array
-            Temperature profile in Kelvin with shape ``(nz,)`` ordered from
-            top to bottom.
+            Temperature profile in Kelvin, shape ``(nz,)``.
         pressures_bar : jax.Array
-            Pressure profile in bar with shape ``(nz,)`` ordered from top to
-            bottom.
+            Pressure profile in bar, shape ``(nz,)``.
         kzz_cm2_s : jax.Array
-            Eddy-diffusion profile in ``cm^2 s^-1`` with shape ``(nz,)``.
+            Eddy-diffusion profile in ``cm^2 s^-1``, shape ``(nz,)``.
         global_inputs : dict[str, Any] or jax.Array
             Global conditioning inputs matching ``VULCAN_GLOBAL_LABELS``.
-        spectrum_wavelength_nm : jax.Array
-            Stellar-spectrum wavelength samples in nanometres with shape
-            ``(n_spectrum,)``.
-        spectrum_flux_erg_cm2_s_nm : jax.Array
-            Stellar-spectrum flux density values aligned to
-            ``spectrum_wavelength_nm`` with shape ``(n_spectrum,)``.
 
         Returns
         -------
         jax.Array
-            Linear VMR array with shape ``(nz, n_species)`` in top-to-bottom
-            order.
+            Linear VMR array with shape ``(nz, n_species)``.
         """
         temperatures = jnp.asarray(temperatures_k, dtype=jnp.float32)
         pressures = jnp.asarray(pressures_bar, dtype=jnp.float32)
@@ -278,17 +290,15 @@ def make_vulcan_vmr_fn(
         if isinstance(global_inputs, dict) and "planet_radius_cm" in global_inputs:
             _maybe_require_column_constant(global_inputs["planet_radius_cm"], name="planet_radius_cm")
 
-        internal_temperatures = temperatures[::-1]
-        internal_pressures = pressures[::-1]
-        internal_kzz = kzz[::-1]
+        internal_temperatures = temperatures[::-1] if _flip else temperatures
+        internal_pressures = pressures[::-1] if _flip else pressures
+        internal_kzz = kzz[::-1] if _flip else kzz
         vmr_internal = bundle.predict_vulcan_profile(
             pressure_bar=internal_pressures,
             temperature_k=internal_temperatures,
             kzz_cm2_s=internal_kzz,
             global_inputs=global_inputs,
-            spectrum_wavelength_nm=spectrum_wavelength_nm,
-            spectrum_flux_erg_cm2_s_nm=spectrum_flux_erg_cm2_s_nm,
         )
-        return vmr_internal[::-1, :]
+        return vmr_internal[::-1, :] if _flip else vmr_internal
 
     return vmr_fn, species_labels

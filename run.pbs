@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N vulcan_transformer_condensation
+#PBS -N vulcan_emulator
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
@@ -8,14 +8,15 @@
 #PBS -m abe
 
 # =============================================================================
-# VULCAN Transformer Condensation Pipeline — PBS Submission Script
+# VULCAN Emulator Pipeline — PBS Submission Script
 #
-# Full condensation-enabled VULCAN pipeline:
+# Full VULCAN kinetic-chemistry pipeline:
 # generation → normalization → training → export
 #
 # Usage:
-#   qsub run.pbs                          # full pipeline (GPU)
-#   qsub -v DATA_ONLY=1 run_cpu.pbs       # data processing only (CPU)
+#   qsub run.pbs                                                    # no condensation (default)
+#   qsub -v CONFIG_PATH=config/vulcan_condensation.json run.pbs     # with condensation
+#   qsub -v DATA_ONLY=1 run_cpu.pbs                                # data only (CPU)
 #
 # To run ONLY data generation and normalization on a CPU node (no GPU hours
 # consumed), copy this script to run_cpu.pbs and change the PBS directives:
@@ -32,7 +33,7 @@
 #
 # Environment Variables:
 #   CONFIG_PATH     — config file path
-#                     (default: config/vulcan_transformer_config.json)
+#                     (default: config/vulcan_no_condensation.json)
 #   DATA_ONLY       — set to 1 to run only generation + normalization (no GPU needed)
 #   SKIP_GEN        — set to 1 to skip generation (data already exists)
 #   SKIP_NORM       — set to 1 to skip normalization (processed data exists)
@@ -76,7 +77,7 @@ if [ "${rc}" -ne 0 ]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/vulcan_transformer_config.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/vulcan_no_condensation.json}"
 if [[ "${CONFIG_PATH}" != /* ]]; then
   CONFIG_PATH="${PROJECT_ROOT}/${CONFIG_PATH}"
 fi
@@ -145,15 +146,11 @@ CONFIG_CHEMISTRY_TYPE="${CONFIG_SUMMARY[0]}"
 CONFIG_MODEL_TYPE="${CONFIG_SUMMARY[1]}"
 CONFIG_USE_CONDENSATION="${CONFIG_SUMMARY[2]}"
 if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ]; then
-  echo "ERROR: run.pbs is for the VULCAN transformer condensation pipeline, but chemistry_type=${CONFIG_CHEMISTRY_TYPE}."
+  echo "ERROR: run.pbs is for the VULCAN pipeline, but chemistry_type=${CONFIG_CHEMISTRY_TYPE}."
   exit 1
 fi
 if [ "${CONFIG_MODEL_TYPE}" != "transformer" ]; then
-  echo "ERROR: run.pbs is for the VULCAN transformer condensation pipeline, but model_type=${CONFIG_MODEL_TYPE}."
-  exit 1
-fi
-if [ "${CONFIG_USE_CONDENSATION}" != "1" ]; then
-  echo "ERROR: run.pbs requires a condensation-enabled config."
+  echo "ERROR: run.pbs is for the VULCAN transformer pipeline, but model_type=${CONFIG_MODEL_TYPE}."
   exit 1
 fi
 

@@ -31,16 +31,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..data_generation.spectrum import pack_spectrum_tokens
+from ..constants import EXPORT_FORMAT, EXPORT_VERSION
 from .jax_model import (
-    MLPDimensions,
     TransformerDimensions,
-    apply_mlp,
     apply_transformer_model,
 )
-
-EXPORT_FORMAT = "jax_physical_bundle"
-EXPORT_VERSION = 4
 
 
 def _flatten_params(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
@@ -321,77 +316,63 @@ def _ordered_feature_vector(
     return arr
 
 
+def _validate_near_constant_standard_globals(
+    values: dict[str, float] | jax.Array | np.ndarray,
+    feature_order: list[str],
+    normalization_block: dict[str, Any],
+    *,
+    field_name: str,
+    std_threshold: float = 1.0e-6,
+    atol: float = 1.0e-6,
+) -> None:
+    """Reject eager inputs that change fixed training-time global features."""
+    methods = list(normalization_block.get("methods", []))
+    means = list(normalization_block.get("mean", []))
+    stds = list(normalization_block.get("std", []))
+    if not methods or len(methods) != len(feature_order):
+        return
+
+    if isinstance(values, dict):
+        missing = [name for name in feature_order if name not in values]
+        if missing:
+            return
+        if any(_is_traced_array(values[name]) for name in feature_order):
+            return
+        vector = np.asarray([values[name] for name in feature_order], dtype=np.float64)
+    else:
+        if _is_traced_array(values):
+            return
+        vector = np.asarray(values, dtype=np.float64)
+        if vector.ndim != 1 or vector.shape[0] != len(feature_order):
+            return
+
+    for idx, name in enumerate(feature_order):
+        if str(methods[idx]).lower() != "standard":
+            continue
+        std = float(stds[idx])
+        if std > std_threshold:
+            continue
+        mean = float(means[idx])
+        value = float(vector[idx])
+        if np.isclose(value, mean, atol=atol, rtol=0.0):
+            continue
+        raise ValueError(
+            f"{field_name}[{name}] must equal {mean:.8g} within {atol:.1e} "
+            f"because this exported model was trained with {name} fixed; got {value:.8g}."
+        )
+
+
 def _is_traced_array(value: Any) -> bool:
     """Return whether an input is a JAX tracer inside a transformed context."""
     return isinstance(value, jax.core.Tracer)
 
 
-def _pack_native_spectrum_tokens_jax(
-    wavelength_nm: jax.Array,
-    flux_erg_cm2_s_nm: jax.Array,
-    *,
-    wavelength_min_nm: float,
-    wavelength_max_nm: float,
-    max_tokens: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Pad an already-valid native-grid spectrum without leaving JAX.
-
-    This helper is intentionally narrow: it does not sanitize, clip, sort, or
-    rebin traced inputs. The caller must provide a one-dimensional, strictly
-    increasing native spectrum whose wavelength coverage already lies within
-    ``[wavelength_min_nm, wavelength_max_nm]`` and whose length is at most
-    ``max_tokens``.
-
-    Parameters
-    ----------
-    wavelength_nm : jax.Array
-        1-D wavelength grid in nanometers, strictly increasing.
-    flux_erg_cm2_s_nm : jax.Array
-        1-D flux array in erg cm-2 s-1 nm-1, same length as ``wavelength_nm``.
-    wavelength_min_nm : float
-        Minimum allowed wavelength (consumed by the caller for validation;
-        unused here).
-    wavelength_max_nm : float
-        Maximum allowed wavelength (consumed by the caller for validation;
-        unused here).
-    max_tokens : int
-        Fixed token-sequence length for the model; shorter inputs are
-        zero-padded on the right.
-
-    Returns
-    -------
-    tuple[jax.Array, jax.Array, jax.Array]
-        ``(padded_wavelength, padded_flux, mask)`` each with shape
-        ``(max_tokens,)``.  The boolean mask is ``True`` for real tokens.
-    """
-    del wavelength_min_nm, wavelength_max_nm
-    wavelength = jnp.asarray(wavelength_nm, dtype=jnp.float32)
-    flux = jnp.asarray(flux_erg_cm2_s_nm, dtype=jnp.float32)
-    if wavelength.ndim != 1 or flux.ndim != 1:
-        raise ValueError("JAX-native VULCAN spectra must be 1-D arrays.")
-    if wavelength.shape != flux.shape:
-        raise ValueError("JAX-native VULCAN wavelength and flux arrays must share the same shape.")
-    num_tokens = int(wavelength.shape[0])
-    if num_tokens < 2:
-        raise ValueError("JAX-native VULCAN spectra must contain at least two samples.")
-    if num_tokens > int(max_tokens):
-        raise ValueError(
-            "JAX-native VULCAN spectra must satisfy len(spectrum) <= spectrum_max_tokens."
-        )
-    pad_width = int(max_tokens) - num_tokens
-    padded_wavelength = jnp.pad(wavelength, (0, pad_width))
-    padded_flux = jnp.pad(flux, (0, pad_width))
-    mask = jnp.arange(int(max_tokens)) < num_tokens
-    return padded_wavelength, padded_flux, mask
-
-
 def _predict_fastchem_profile_impl(
     *,
     params: Any,
-    dims: TransformerDimensions | MLPDimensions,
+    dims: TransformerDimensions,
     normalization: dict[str, Any],
     data_contract: dict[str, Any],
-    model_type: str,
     pressure_bar: jax.Array | np.ndarray,
     temperature_k: jax.Array | np.ndarray,
     global_inputs: dict[str, float] | jax.Array | np.ndarray,
@@ -399,22 +380,16 @@ def _predict_fastchem_profile_impl(
 ) -> jax.Array:
     """Run FastChem inference from physical inputs using shared bundle logic.
 
-    Normalizes the physical inputs, runs the forward pass through the
-    selected model architecture, and inverse-normalizes the predictions
-    back to physical space.
-
     Parameters
     ----------
     params : Any
         Nested JAX parameter tree for the model.
-    dims : TransformerDimensions or MLPDimensions
+    dims : TransformerDimensions
         Architecture dimensionality constants.
     normalization : dict[str, Any]
         Full normalization payload (sequence_static, global_static, target).
     data_contract : dict[str, Any]
         Data contract specifying feature orders and target shape.
-    model_type : str
-        Either ``"mlp"`` or ``"transformer"``.
     pressure_bar : jax.Array or np.ndarray
         Pressure grid in bar, shape ``(nz,)``.
     temperature_k : jax.Array or np.ndarray
@@ -449,26 +424,12 @@ def _predict_fastchem_profile_impl(
         normalization["global_static"],
     )  # shape: (1, global_dim)
 
-    if model_type == "mlp":
-        pred_norm, _ = apply_mlp(
-            params,
-            sequence,
-            globals_norm,
-            dims,
-            None,
-            None,
-            None,
-        )
-    else:
-        pred_norm, _ = apply_transformer_model(
-            params,
-            sequence,
-            globals_norm,
-            None,
-            None,
-            None,
-            dims,
-        )
+    pred_norm, _ = apply_transformer_model(
+        params,
+        sequence,
+        globals_norm,
+        dims,
+    )
     pred_norm = pred_norm[0]
     if return_log10:
         return _restore_block_transform_space_jax(pred_norm, normalization["target"])
@@ -585,10 +546,10 @@ def _parse_export_metadata(
         Export format name, export version, chemistry type, model type, model
         dimensions, normalization payload, data contract, and config.
     """
-    export_format = str(arrays["meta/export_format"].item()) if "meta/export_format" in arrays else "legacy_npz"
-    export_version = int(str(arrays["meta/export_version"].item())) if "meta/export_version" in arrays else 0
-    chemistry_type = str(arrays["meta/chemistry_type"].item()) if "meta/chemistry_type" in arrays else ""
-    model_type = str(arrays["meta/model_type"].item()) if "meta/model_type" in arrays else ""
+    export_format = str(arrays["meta/export_format"].item())
+    export_version = int(str(arrays["meta/export_version"].item()))
+    chemistry_type = str(arrays["meta/chemistry_type"].item())
+    model_type = str(arrays["meta/model_type"].item())
     model_dimensions = json.loads(str(arrays["meta/model_dimensions"].item()))
     normalization = json.loads(str(arrays["meta/normalization"].item()))
     data_contract = json.loads(str(arrays["meta/data_contract"].item()))
@@ -610,7 +571,7 @@ class ExportedJAXModel:
     """Portable JAX model bundle with physical-units inference helpers."""
 
     params: Any
-    dims: TransformerDimensions | MLPDimensions
+    dims: TransformerDimensions
     normalization: dict[str, Any]
     data_contract: dict[str, Any]
     config: dict[str, Any]
@@ -642,17 +603,6 @@ class ExportedJAXModel:
         return self.chemistry_type == "vulcan"
 
     @property
-    def uses_mlp(self: "ExportedJAXModel") -> bool:
-        """Report whether the exported bundle wraps the FiLM-conditioned MLP.
-
-        Returns
-        -------
-        bool
-            ``True`` when ``model_type`` equals ``"mlp"``.
-        """
-        return self.model_type == "mlp"
-
-    @property
     def uses_transformer(self: "ExportedJAXModel") -> bool:
         """Report whether the exported bundle wraps the FiLM Transformer model.
 
@@ -663,18 +613,54 @@ class ExportedJAXModel:
         """
         return self.model_type == "transformer"
 
+    @property
+    def species(self: "ExportedJAXModel") -> list[str]:
+        """Return the ordered species labels predicted by the bundled model."""
+        return list(self.data_contract["output_species_order"])
+
+    @property
+    def fixed_globals(self: "ExportedJAXModel") -> dict[str, float]:
+        """Return global inputs held constant during training.
+
+        Returns a dict mapping feature names to their required constant
+        values.  Features whose training-set standard deviation fell below
+        ``1e-6`` are considered fixed; passing a different value will raise
+        ``ValueError`` at prediction time.
+        """
+        feature_order = list(self.data_contract.get("global_static_feature_order", []))
+        norm = self.normalization.get("global_static", {})
+        methods = list(norm.get("methods", []))
+        means = list(norm.get("mean", []))
+        stds = list(norm.get("std", []))
+        result: dict[str, float] = {}
+        for idx, name in enumerate(feature_order):
+            if idx >= len(methods):
+                break
+            if str(methods[idx]).lower() == "standard" and float(stds[idx]) < 1.0e-6:
+                result[name] = float(means[idx])
+        return result
+
+    def species_index(self: "ExportedJAXModel", name: str) -> int:
+        """Return the column index for a named output species."""
+        labels = list(self.data_contract["output_species_order"])
+        try:
+            return labels.index(name)
+        except ValueError:
+            raise ValueError(
+                f"Species '{name}' not found. Available: {labels}"
+            ) from None
+
     @cached_property
     def _compiled_fastchem_profile_predictor(
         self: "ExportedJAXModel",
     ) -> Callable[[Any, Any, Any], jax.Array]:
         """Cache a compiled FastChem predictor for repeated linear-space calls."""
-        return jax.jit(
+        compiled = jax.jit(
             lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
                 params=self.params,
                 dims=self.dims,
                 normalization=self.normalization,
                 data_contract=self.data_contract,
-                model_type=self.model_type,
                 pressure_bar=pressure_bar,
                 temperature_k=temperature_k,
                 global_inputs=global_inputs,
@@ -682,24 +668,47 @@ class ExportedJAXModel:
             )
         )
 
+        def predictor(pressure_bar: Any, temperature_k: Any, global_inputs: Any) -> jax.Array:
+            """Validate global inputs and run the compiled FastChem predictor."""
+            _validate_near_constant_standard_globals(
+                global_inputs,
+                list(self.data_contract["global_static_feature_order"]),
+                self.normalization["global_static"],
+                field_name="global_inputs",
+            )
+            return compiled(pressure_bar, temperature_k, global_inputs)
+
+        return predictor
+
     @cached_property
     def _compiled_fastchem_profile_predictor_log10(
         self: "ExportedJAXModel",
     ) -> Callable[[Any, Any, Any], jax.Array]:
         """Cache a compiled FastChem predictor for repeated log10-space calls."""
-        return jax.jit(
+        compiled = jax.jit(
             lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
                 params=self.params,
                 dims=self.dims,
                 normalization=self.normalization,
                 data_contract=self.data_contract,
-                model_type=self.model_type,
                 pressure_bar=pressure_bar,
                 temperature_k=temperature_k,
                 global_inputs=global_inputs,
                 return_log10=True,
             )
         )
+
+        def predictor(pressure_bar: Any, temperature_k: Any, global_inputs: Any) -> jax.Array:
+            """Validate global inputs and run the compiled FastChem log10 predictor."""
+            _validate_near_constant_standard_globals(
+                global_inputs,
+                list(self.data_contract["global_static_feature_order"]),
+                self.normalization["global_static"],
+                field_name="global_inputs",
+            )
+            return compiled(pressure_bar, temperature_k, global_inputs)
+
+        return predictor
 
     def make_compiled_fastchem_profile_predictor(
         self: "ExportedJAXModel",
@@ -755,7 +764,7 @@ class ExportedJAXModel:
         global_inputs : dict or array-like
             Global conditioning scalars.  If a dict, keys must match
             ``data_contract["global_static_feature_order"]`` (e.g.,
-            ``{"He_H": 8.38e-2, "C_H": 3.6e-4, "O_H": 5.37e-4, "N_H": 8.5e-5, "S_H": 1.8e-5}``).
+            ``{"He_H": 7.84e-2, "C_H": 3.3e-4, "O_H": 4.9e-4, "N_H": 7.8e-5, "S_H": 1.6e-5}``).
             If an array, must have shape ``(global_dim,)`` in the correct order.
         return_log10 : bool
             If True, return log10 mixing ratios instead of linear.
@@ -767,12 +776,17 @@ class ExportedJAXModel:
         """
         if not self.uses_fastchem:
             raise ValueError("predict_fastchem_profile requires a fastchem export bundle.")
+        _validate_near_constant_standard_globals(
+            global_inputs,
+            list(self.data_contract["global_static_feature_order"]),
+            self.normalization["global_static"],
+            field_name="global_inputs",
+        )
         return _predict_fastchem_profile_impl(
             params=self.params,
             dims=self.dims,
             normalization=self.normalization,
             data_contract=self.data_contract,
-            model_type=self.model_type,
             pressure_bar=pressure_bar,
             temperature_k=temperature_k,
             global_inputs=global_inputs,
@@ -786,17 +800,9 @@ class ExportedJAXModel:
         temperature_k: jax.Array | np.ndarray,
         kzz_cm2_s: jax.Array | np.ndarray,
         global_inputs: dict[str, float] | jax.Array | np.ndarray,
-        spectrum_wavelength_nm: jax.Array | np.ndarray,
-        spectrum_flux_erg_cm2_s_nm: jax.Array | np.ndarray,
         return_log10: bool = False,
     ) -> jax.Array:
         """Run VULCAN inference directly from physical-unit inputs.
-
-        Eager inputs may use arbitrary valid wavelength grids and are sanitized
-        and packed through the NumPy preprocessing path. JAX-traced spectrum
-        inputs must already be valid native-grid spectra with static
-        ``len(spectrum) <= spectrum_max_tokens``; in that case the method pads
-        them inside JAX without sorting, clipping, or rebinning.
 
         Parameters
         ----------
@@ -810,11 +816,6 @@ class ExportedJAXModel:
             Global conditioning scalars.  If a dict, keys must match
             ``data_contract["global_static_feature_order"]``.
             If an array, must have shape ``(global_dim,)`` in the correct order.
-        spectrum_wavelength_nm : array-like
-            Stellar spectrum wavelength grid in nanometers.
-        spectrum_flux_erg_cm2_s_nm : array-like
-            Stellar spectrum flux in erg cm-2 s-1 nm-1, same length as
-            ``spectrum_wavelength_nm``.
         return_log10 : bool
             If True, return log10 mixing ratios instead of linear.
 
@@ -850,58 +851,12 @@ class ExportedJAXModel:
             self.normalization["global_static"],
         )
 
-        if _is_traced_array(spectrum_wavelength_nm) or _is_traced_array(spectrum_flux_erg_cm2_s_nm):
-            packed_wavelengths_nm, packed_fluxes, packed_mask = _pack_native_spectrum_tokens_jax(
-                spectrum_wavelength_nm,
-                spectrum_flux_erg_cm2_s_nm,
-                wavelength_min_nm=float(self.data_contract["spectrum_wavelength_min_nm"]),
-                wavelength_max_nm=float(self.data_contract["spectrum_wavelength_max_nm"]),
-                max_tokens=int(self.data_contract["spectrum_max_tokens"]),
-            )
-            spectrum_wavelengths = packed_wavelengths_nm[None, :]
-            spectrum_fluxes = packed_fluxes[None, :]
-            spectrum_mask = packed_mask[None, :]
-        else:
-            wavelength_np = np.asarray(spectrum_wavelength_nm, dtype=np.float64).reshape(-1)
-            flux_np = np.asarray(spectrum_flux_erg_cm2_s_nm, dtype=np.float64).reshape(-1)
-            if wavelength_np.size != flux_np.size:
-                raise ValueError(
-                    "spectrum_wavelength_nm and spectrum_flux_erg_cm2_s_nm must have the same length."
-                )
-            packed_wavelengths_nm, packed_fluxes, packed_mask = pack_spectrum_tokens(
-                wavelength_np,
-                flux_np,
-                wavelength_min_nm=float(self.data_contract["spectrum_wavelength_min_nm"]),
-                wavelength_max_nm=float(self.data_contract["spectrum_wavelength_max_nm"]),
-                max_tokens=int(self.data_contract["spectrum_max_tokens"]),
-                dbin1_nm=float(self.data_contract.get("spectrum_dbin1_nm", 0.1)),
-                dbin2_nm=float(self.data_contract.get("spectrum_dbin2_nm", 2.0)),
-                dbin_12trans_nm=float(self.data_contract.get("spectrum_dbin_12trans_nm", 240.0)),
-            )
-            spectrum_wavelengths = jnp.asarray(packed_wavelengths_nm[None, :], dtype=jnp.float32)
-            spectrum_fluxes = jnp.asarray(packed_fluxes[None, :], dtype=jnp.float32)
-            spectrum_mask = jnp.asarray(packed_mask[None, :], dtype=bool)
-
-        if self.uses_mlp:
-            pred_norm, _ = apply_mlp(
-                self.params,
-                sequence,
-                globals_norm,
-                self.dims,
-                spectrum_wavelengths,
-                spectrum_fluxes,
-                spectrum_mask,
-            )
-        else:
-            pred_norm, _ = apply_transformer_model(
-                self.params,
-                sequence,
-                globals_norm,
-                spectrum_wavelengths,
-                spectrum_fluxes,
-                spectrum_mask,
-                self.dims,
-            )
+        pred_norm, _ = apply_transformer_model(
+            self.params,
+            sequence,
+            globals_norm,
+            self.dims,
+        )
         pred_norm = pred_norm[0]
         if return_log10:
             return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
@@ -958,18 +913,11 @@ def load_exported_model(
     )
     chemistry_type = chemistry_type or str(data_contract.get("chemistry_type", "")).lower()
     model_type = model_type or str(data_contract.get("model_type", "")).lower()
-    if chemistry_type not in {"fastchem", "vulcan"} or model_type not in {"mlp", "transformer"}:
+    if chemistry_type not in {"fastchem", "vulcan"} or model_type != "transformer":
         raise ValueError(
-            "This export bundle uses the legacy task-based contract. Re-export a model trained "
-            "with the chemistry_type × model_type config surface."
+            f"Unsupported chemistry_type={chemistry_type!r} or model_type={model_type!r}."
         )
-    dims: TransformerDimensions | MLPDimensions
-    if model_type == "mlp":
-        dims = MLPDimensions.from_dict(model_dimensions)
-    elif model_type == "transformer":
-        dims = TransformerDimensions.from_dict(model_dimensions)
-    else:
-        raise ValueError(f"Unsupported exported model_type: {model_type!r}.")
+    dims = TransformerDimensions.from_dict(model_dimensions)
     return ExportedJAXModel(
         params=params,
         dims=dims,

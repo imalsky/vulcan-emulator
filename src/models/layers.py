@@ -1,0 +1,263 @@
+"""Shared neural-network primitives for the FastChem and VULCAN emulators.
+
+Contains low-level building blocks (linear layers, LayerNorm, dropout,
+positional encoding, activation resolution, and multi-head attention).
+
+All operations are pure JAX and compatible with ``jax.grad`` / ``jax.jvp``.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Callable
+
+import jax
+import jax.numpy as jnp
+
+from ..constants import _SINUSOIDAL_BASE_WAVELENGTH
+
+
+# ---------------------------------------------------------------------------
+# Low-level primitives
+# ---------------------------------------------------------------------------
+
+
+def _init_linear(key: jax.Array, in_dim: int, out_dim: int) -> dict[str, jax.Array]:
+    """Initialize a single dense (affine) layer with Xavier-uniform weights.
+
+    The weight matrix is sampled uniformly from [-limit, +limit] where
+    ``limit = sqrt(6 / (in_dim + out_dim))``.  Biases are initialized to zero.
+
+    Parameters
+    ----------
+    key : jax.Array
+        PRNG key for random initialization.
+    in_dim : int
+        Number of input features.
+    out_dim : int
+        Number of output features.
+
+    Returns
+    -------
+    dict[str, jax.Array]
+        ``{"weight": (in_dim, out_dim), "bias": (out_dim,)}`` in float32.
+    """
+    limit = math.sqrt(6.0 / float(in_dim + out_dim))
+    weight = jax.random.uniform(key, shape=(in_dim, out_dim), minval=-limit, maxval=limit)
+    bias = jnp.zeros((out_dim,), dtype=jnp.float32)
+    return {"weight": weight.astype(jnp.float32), "bias": bias}
+
+
+def _linear(params: dict[str, jax.Array], x: jax.Array) -> jax.Array:
+    """Apply a dense affine transform: ``output = x @ W + b``.
+
+    Flattens any leading batch dimensions so XLA can lower the operation to a
+    single 2-D GEMM on accelerators, then restores the original shape.
+
+    Parameters
+    ----------
+    params : dict[str, jax.Array]
+        ``{"weight": (in_dim, out_dim), "bias": (out_dim,)}``.
+    x : jax.Array
+        Input tensor with last dimension equal to ``in_dim``.
+
+    Returns
+    -------
+    jax.Array
+        Output tensor with last dimension replaced by ``out_dim``.
+    """
+    leading_shape = x.shape[:-1]
+    x_2d = x.reshape((-1, x.shape[-1]))
+    y_2d = x_2d @ params["weight"] + params["bias"]
+    return y_2d.reshape(leading_shape + (params["bias"].shape[0],))
+
+
+def _apply_dropout(
+    x: jax.Array,
+    *,
+    rate: float,
+    key: jax.Array | None,
+    training: bool,
+) -> jax.Array:
+    """Apply inverted dropout to a hidden activation tensor.
+
+    Parameters
+    ----------
+    x : jax.Array
+        Input activation tensor of any shape.
+    rate : float
+        Dropout probability in ``[0, 1)``.
+    key : jax.Array or None
+        PRNG key used to sample the dropout mask.
+    training : bool
+        Whether dropout should be enabled for this forward pass.
+
+    Returns
+    -------
+    jax.Array
+        Activation tensor with the same shape as ``x``. When dropout is
+        active, surviving activations are scaled by ``1 / (1 - rate)``.
+    """
+    if not training or rate <= 0.0 or key is None:
+        return x
+    keep_prob = 1.0 - float(rate)
+    mask = jax.random.bernoulli(key, p=keep_prob, shape=x.shape)
+    return jnp.where(mask, x / keep_prob, jnp.zeros_like(x))
+
+
+def _init_layer_norm(dim: int) -> dict[str, jax.Array]:
+    """Initialize LayerNorm learnable parameters: scale=1, bias=0.
+
+    Parameters
+    ----------
+    dim : int
+        Feature dimension (last axis of the normalized tensor).
+
+    Returns
+    -------
+    dict[str, jax.Array]
+        ``{"scale": (dim,), "bias": (dim,)}`` in float32.
+    """
+    return {
+        "scale": jnp.ones((dim,), dtype=jnp.float32),
+        "bias": jnp.zeros((dim,), dtype=jnp.float32),
+    }
+
+
+def _layer_norm(params: dict[str, jax.Array], x: jax.Array, eps: float = 1.0e-5) -> jax.Array:
+    """Apply layer normalization (Ba et al., 2016) over the last axis.
+
+    Computes ``y = (x - mean) / sqrt(var + eps) * scale + bias`` where mean
+    and variance are computed per-token over the feature dimension.
+
+    Parameters
+    ----------
+    params : dict[str, jax.Array]
+        ``{"scale": (dim,), "bias": (dim,)}``.
+    x : jax.Array
+        Input tensor of any shape; normalization is over the last axis.
+    eps : float
+        Small constant for numerical stability.
+
+    Returns
+    -------
+    jax.Array
+        Normalized tensor, same shape as *x*.
+    """
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+    normalized = (x - mean) / jnp.sqrt(var + eps)
+    return normalized * params["scale"] + params["bias"]
+
+
+def sinusoidal_position_encoding(length: int, dim: int, dtype: jnp.dtype = jnp.float32) -> jax.Array:
+    """Compute fixed sinusoidal positional encoding (Vaswani et al., 2017).
+
+    Even indices use sin, odd indices use cos:
+        PE(pos, 2i)   = sin(pos / 10000^(2i/dim))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i/dim))
+
+    Parameters
+    ----------
+    length : int
+        Number of positions (atmospheric levels).
+    dim : int
+        Encoding dimension (should equal ``d_model``).
+    dtype : jnp.dtype
+        Output dtype.
+
+    Returns
+    -------
+    jax.Array
+        Positional encoding matrix of shape ``(length, dim)``.
+    """
+    position = jnp.arange(length, dtype=dtype)[:, None]
+    index = jnp.arange(dim, dtype=dtype)[None, :]
+    angle_rate = 1.0 / jnp.power(
+        _SINUSOIDAL_BASE_WAVELENGTH,
+        (2.0 * jnp.floor(index / 2.0)) / float(dim),
+    )
+    angle = position * angle_rate
+    return jnp.where((jnp.arange(dim) % 2)[None, :] == 0, jnp.sin(angle), jnp.cos(angle))
+
+
+def _resolve_activation(name: str) -> Callable[[jax.Array], jax.Array]:
+    """Resolve an activation name to the corresponding JAX callable.
+
+    Parameters
+    ----------
+    name : str
+        Activation identifier stored in the validated config.
+
+    Returns
+    -------
+    callable
+        JAX-compatible activation function.
+    """
+    activations = {
+        "elu": jax.nn.elu,
+        "gelu": jax.nn.gelu,
+        "leaky_relu": jax.nn.leaky_relu,
+        "relu": jax.nn.relu,
+        "selu": jax.nn.selu,
+        "silu": jax.nn.silu,
+        "softplus": jax.nn.softplus,
+        "tanh": jnp.tanh,
+    }
+    try:
+        return activations[name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported activation: {name}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Multi-head attention
+# ---------------------------------------------------------------------------
+
+
+def _multihead_attention_qkv(
+    q_params: dict[str, jax.Array],
+    k_params: dict[str, jax.Array],
+    v_params: dict[str, jax.Array],
+    o_params: dict[str, jax.Array],
+    query: jax.Array,
+    source: jax.Array,
+    *,
+    nhead: int,
+    source_mask: jax.Array | None = None,
+) -> jax.Array:
+    """Scaled dot-product attention from ``query`` tokens over ``source`` tokens."""
+    batch_size, query_len, d_model = query.shape
+    source_len = source.shape[1]
+    head_dim = d_model // nhead
+
+    q = _linear(q_params, query).reshape(batch_size, query_len, nhead, head_dim).transpose(0, 2, 1, 3)
+    k = _linear(k_params, source).reshape(batch_size, source_len, nhead, head_dim).transpose(0, 2, 1, 3)
+    v = _linear(v_params, source).reshape(batch_size, source_len, nhead, head_dim).transpose(0, 2, 1, 3)
+
+    scale = 1.0 / math.sqrt(float(head_dim))
+    logits = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
+    if source_mask is not None:
+        expanded_mask = source_mask[:, None, None, :]
+        logits = jnp.where(expanded_mask, logits, jnp.full_like(logits, -1.0e30))
+    weights = jax.nn.softmax(logits, axis=-1)
+    if source_mask is not None:
+        expanded_mask = source_mask[:, None, None, :].astype(weights.dtype)
+        weights = weights * expanded_mask
+        weights = weights / jnp.maximum(jnp.sum(weights, axis=-1, keepdims=True), 1.0e-8)
+    attended = jnp.einsum("bhij,bhjd->bhid", weights, v)
+    attended = attended.transpose(0, 2, 1, 3).reshape(batch_size, query_len, d_model)
+    return _linear(o_params, attended)
+
+
+def _multihead_attention(params: dict[str, jax.Array], x: jax.Array, *, nhead: int) -> jax.Array:
+    """Convenience wrapper for bidirectional self-attention."""
+    return _multihead_attention_qkv(
+        params["q"],
+        params["k"],
+        params["v"],
+        params["o"],
+        x,
+        x,
+        nhead=nhead,
+    )

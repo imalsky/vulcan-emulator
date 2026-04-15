@@ -37,7 +37,7 @@ def _open_first_run(artifact: generation_module.GeneratedRawDataset) -> h5py.Gro
 def _make_equilibrium_config(tmp_path: Path) -> dict:
     """Build one small FastChem config suitable for unit tests."""
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "fastchem_transformer_config.json")
+    config = load_and_validate_config(root / "uni_tests" / "fixtures" / "fastchem_transformer_config.json")
     config = copy.deepcopy(config)
     config["paths"]["raw_root"] = str(tmp_path / "dataset" / "raw")
     config["paths"]["processed_root"] = str(tmp_path / "dataset" / "processed")
@@ -78,7 +78,7 @@ def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
         assert np.all(np.isfinite(final_state))
         assert species == list(tiny_config["data_spec"]["state_species"])
         assert element_labels == ["He_H", "C_H", "O_H", "N_H", "S_H"]
-        assert np.asarray(handle["inputs/elemental_abundances_x_h"]).shape == (
+        assert np.asarray(handle["inputs/elemental_abundances_frac"]).shape == (
             int(tiny_config["sampling"]["num_levels"]),
             len(element_labels),
         )
@@ -92,14 +92,12 @@ def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
         handle.file.close()
 
 
-def test_generate_synthetic_raw_runs_reuse_keeps_raw_layout_flat(tiny_config):
+def test_generate_synthetic_raw_runs_reuse_keeps_consolidated_format(tiny_config):
     artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
-    (artifact.raw_root / "runs").mkdir()
 
     artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
 
     assert artifact.consolidated_path.exists()
-    assert not (artifact.raw_root / "runs").exists()
 
 
 def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_config):
@@ -227,9 +225,13 @@ def test_shipped_vulcan_transformer_smoke_runs_local_checkout(tmp_path):
     source_root = (root / "../VULCAN-master").resolve()
     if not source_root.exists():
         pytest.skip("Local VULCAN checkout is required for the smoke test.")
+    # Requires a VULCAN version that outputs variable.ymix_time (not legacy y_time).
+    vulcan_py = source_root / "vulcan.py"
+    if vulcan_py.exists() and "ymix_time" not in vulcan_py.read_text(encoding="utf-8", errors="ignore"):
+        pytest.skip("Local VULCAN checkout does not produce ymix_time (legacy output format).")
 
     raw_config = json.loads(
-        (root / "config" / "vulcan_transformer_config.json").read_text(encoding="utf-8")
+        (root / "config" / "vulcan_condensation.json").read_text(encoding="utf-8")
     )
     spectrum_dir = tmp_path / "spectra"
     spectrum_dir.mkdir(parents=True, exist_ok=True)
@@ -254,9 +256,11 @@ def test_shipped_vulcan_transformer_smoke_runs_local_checkout(tmp_path):
     raw_config["sampling"]["semi_major_axis_range_au"] = [0.048, 0.048]
     raw_config["sampling"]["zenith_angle_range_deg"] = [48.0, 48.0]
     raw_config["sampling"]["diurnal_factor_range"] = [1.0, 1.0]
-    raw_config["sampling"]["metallicity_log10_range"] = [0.0, 0.05]
-    raw_config["sampling"]["c_to_o_range"] = [0.55, 0.6]
-    raw_config["sampling"]["s_to_o_range"] = [0.02, 0.025]
+    raw_config["sampling"]["he_frac_range"] = [0.06, 0.12]
+    raw_config["sampling"]["c_frac_range"] = [1e-5, 5e-3]
+    raw_config["sampling"]["o_frac_range"] = [1e-5, 5e-3]
+    raw_config["sampling"]["n_frac_range"] = [1e-6, 1e-3]
+    raw_config["sampling"]["s_frac_range"] = [1e-7, 5e-4]
     raw_config["temperature_profiles"]["source_mode"] = "analytic"
     raw_config["temperature_profiles"].pop("analytic_probability", None)
     raw_config["temperature_profiles"].pop("data_glob", None)
@@ -329,7 +333,7 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
         globals=spec.globals,
         spectrum=spec.spectrum,
         metadata={**spec.metadata, "state_species": species, "output_species": species},
-        elemental_abundances_x_h=spec.elemental_abundances_x_h,
+        elemental_abundances_frac=spec.elemental_abundances_frac,
         gravity_cm_s2=spec.gravity_cm_s2,
     )
     convert_vulcan_output_to_hdf5(
@@ -347,50 +351,6 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
         assert np.asarray(handle["inputs/kzz_cm2_s"]).shape == (nz,)
         np.testing.assert_allclose(np.asarray(handle["inputs/gravity_cm_s2"]), runtime_gravity, atol=1.0e-12)
 
-
-def test_convert_fake_vulcan_output_accepts_legacy_y_time_contract(tmp_path, tiny_config):
-    spec = sample_run_specifications(
-        config=tiny_config,
-        project_root=tiny_config["_project_root"],
-        num_runs=1,
-        seed=5,
-    )[0]
-    species = list(tiny_config["data_spec"]["state_species"])
-    nz = spec.pressure_bar.size
-    state_dim = len(species)
-    reference = np.full((nz, state_dim), 1.0e-8, dtype=np.float64)
-    reference[:, species.index("H2")] = 0.84
-    reference[:, species.index("He")] = 0.15
-    reference[:, species.index("H2O")] = 1.0e-3
-    reference /= np.sum(reference, axis=1, keepdims=True)
-    fake = {
-        "variable": {
-            "species": species,
-            "y_time": np.stack([reference * 0.98, reference], axis=0),
-            "y_ini": reference * 1.0e12,
-        },
-        "atm": {
-            "pco": spec.pressure_bar * 1.0e6,
-            "Tco": spec.temperature_k,
-            "Kzz": spec.kzz_cm2_s[:-1],
-            "n_0": np.full(nz, 1.0e12, dtype=np.float64),
-        },
-    }
-    vul_path = tmp_path / "legacy_fake.vul"
-    with vul_path.open("wb") as handle:
-        pickle.dump(fake, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-    out_h5 = tmp_path / "converted.h5"
-    convert_vulcan_output_to_hdf5(
-        vul_path,
-        output_h5_path=out_h5,
-        spec=spec,
-        config=tiny_config,
-    )
-    with h5py.File(out_h5, "r") as handle:
-        final_state = np.asarray(handle["final_state/ymix_output"])
-        expected = fake["variable"]["y_time"][-1] / np.asarray(fake["atm"]["n_0"])[:, None]
-        np.testing.assert_allclose(final_state, expected, atol=1.0e-12)
 
 
 def test_convert_fake_fastchem_output_to_hdf5_writes_equilibrium_contract(tmp_path, tiny_config):
@@ -514,21 +474,18 @@ def test_run_vulcan_generation_backfill_assigns_unique_run_ids(tmp_path, monkeyp
         total = int(num_runs or 0)
         pressure_bar = np.array([1.0, 0.1], dtype=np.float64)
         temperature_k = np.array([1200.0, 1000.0], dtype=np.float64)
-        elemental_abundances_x_h = np.repeat(
-            np.array([[8.38e-2, 2.95e-4, 5.37e-4, 7.08e-5, 1.41e-5]], dtype=np.float64),
+        elemental_abundances_frac = np.repeat(
+            np.array([[7.84e-2, 2.69e-4, 4.90e-4, 6.76e-5, 1.32e-5]], dtype=np.float64),
             pressure_bar.size,
             axis=0,
         )
         gravity_cm_s2 = np.full(pressure_bar.shape, 2.5e3, dtype=np.float64)
         globals_map = {
-            "metallicity_log10": 0.0,
-            "c_to_o": 0.55,
-            "s_to_o": 0.02,
-            "He_H": 8.38e-2,
-            "C_H": 2.95e-4,
-            "O_H": 5.37e-4,
-            "N_H": 7.08e-5,
-            "S_H": 1.41e-5,
+            "He_H": 7.84e-2,
+            "C_H": 2.69e-4,
+            "O_H": 4.90e-4,
+            "N_H": 6.76e-5,
+            "S_H": 1.32e-5,
         }
         return [
             generation_module.RunSpecification(
@@ -537,7 +494,7 @@ def test_run_vulcan_generation_backfill_assigns_unique_run_ids(tmp_path, monkeyp
                 temperature_k=temperature_k,
                 globals=dict(globals_map),
                 metadata={},
-                elemental_abundances_x_h=elemental_abundances_x_h,
+                elemental_abundances_frac=elemental_abundances_frac,
                 gravity_cm_s2=gravity_cm_s2,
             )
             for idx in range(total)

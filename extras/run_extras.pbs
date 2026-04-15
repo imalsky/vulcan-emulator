@@ -15,12 +15,12 @@
 #
 # Usage:
 #   qsub extras/run_extras.pbs
-#   qsub -v CONFIG_PATH=config/fastchem_transformer_config.json extras/run_extras.pbs
+#   qsub -v CONFIG_PATH=uni_tests/fixtures/fastchem_transformer_config.json extras/run_extras.pbs
 #   qsub -v BUNDLE_PATH=models/fastchem_transformer/best_exported.npz extras/run_extras.pbs
 #
 # Environment Variables:
 #   CONFIG_PATH  — FastChem config file path
-#                  (default: config/fastchem_transformer_config.json)
+#                  (default: uni_tests/fixtures/fastchem_transformer_config.json)
 #   BUNDLE_PATH  — optional explicit exported bundle path for standalone extras
 #   CONDA_ENV    — conda environment name (default: pyt2_8_gh)
 # =============================================================================
@@ -61,7 +61,7 @@ if [ "${rc}" -ne 0 ]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/fastchem_transformer_config.json}"
+CONFIG_PATH="${CONFIG_PATH:-uni_tests/fixtures/fastchem_transformer_config.json}"
 BUNDLE_PATH="${BUNDLE_PATH:-}"
 DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"

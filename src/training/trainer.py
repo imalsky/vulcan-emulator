@@ -1,22 +1,15 @@
-"""Training loops for all chemistry/model combinations.
+"""Training loop for the FiLM-conditioned Transformer emulator.
 
-This module provides the complete training pipeline for the emulator matrix:
+Supports FastChem and VULCAN (condensation) chemistry types with the
+Transformer architecture.
 
-- **FastChem / MLP**
-- **FastChem / Transformer**
-- **VULCAN / MLP**
-- **VULCAN / Transformer**
+Uses AdamW with decoupled weight decay, global L2 gradient clipping, and
+checkpointing (save best by validation combined loss). Learning-rate
+scheduling keeps linear warmup for all runs, defaults to reduce-on-plateau
+after warmup, and retains the pre-existing cosine-annealing path when
+explicitly requested in the config.
 
-Both paths share the same optimizer (AdamW with decoupled weight decay),
-gradient clipping (global L2 norm), and checkpointing logic (save best by
-validation combined loss). Learning-rate scheduling keeps linear warmup for
-all runs, defaults to reduce-on-plateau after warmup, and retains the
-pre-existing cosine-annealing path when explicitly requested in the config.
-
-The combined loss is ``lambda_z * MSE_norm + lambda_phys * MSE_log10``. The
-normalized-space MSE is the primary gradient signal; the log10-space MSE is a
-physical-scale auxiliary term that keeps the optimization focused on mixing
-ratio accuracy without adding any spectrum-reconstruction objective.
+The combined loss is ``lambda_z * MSE_norm + lambda_phys * MSE_log10``.
 """
 
 from __future__ import annotations
@@ -42,14 +35,12 @@ from ..data_generation.data_loader import (
 from ..data_generation.generation import generate_raw_dataset
 from ..data_generation.preprocess import PROCESSED_DATA_VERSION, preprocess_raw_dataset
 from ..models.jax_model import (
-    MLPDimensions,
     TransformerDimensions,
-    apply_mlp,
     apply_transformer_model,
     count_parameters,
     initialize_model,
 )
-from ..utils.config import get_chemistry_type, get_model_type, uses_mlp
+from ..utils.config import get_chemistry_type, get_model_type
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
@@ -475,8 +466,7 @@ def make_transformer_train_eval_functions(
     normalization : dict[str, Any]
         Normalization payload used to recover target-space log10 statistics.
     loss_cfg : dict[str, float]
-        Loss weights for normalized-space, physical-space, and optional
-        spectrum-reconstruction losses.
+        Loss weights for normalized-space and physical-space losses.
     gradient_clip : float
         Global L2 gradient-clip threshold.
     weight_decay : float
@@ -507,8 +497,7 @@ def make_transformer_train_eval_functions(
         opt_state : dict[str, Any]
             AdamW optimizer state.
         batch : dict[str, jax.Array]
-            Normalized batch containing ``sequence``, ``global_inputs``,
-            ``target``, plus optional ``spectrum_wavelengths_nm``, ``spectrum_fluxes_erg_cm2_s_nm``, and ``spectrum_mask``.
+            Normalized batch containing ``sequence``, ``global_inputs``, and ``target``.
         learning_rate : jax.Array
             Scalar learning rate for this step.
         dropout_key : jax.Array
@@ -531,16 +520,13 @@ def make_transformer_train_eval_functions(
             Returns
             -------
             tuple[jax.Array, dict[str, jax.Array]]
-                Combined loss plus a metrics mapping containing normalized,
-                log10-physical, and optional spectrum-reconstruction terms.
+                Combined loss plus a metrics mapping containing normalized
+                and log10-physical terms.
             """
             pred, _aux = apply_transformer_model(
                 model_params,
                 batch["sequence"],
                 batch["global_inputs"],
-                batch.get("spectrum_wavelengths_nm"),
-                batch.get("spectrum_fluxes_erg_cm2_s_nm"),
-                batch.get("spectrum_mask"),
                 dims,
                 dropout_key=dropout_key,
                 training=True,
@@ -593,9 +579,6 @@ def make_transformer_train_eval_functions(
             params,
             batch["sequence"],
             batch["global_inputs"],
-            batch.get("spectrum_wavelengths_nm"),
-            batch.get("spectrum_fluxes_erg_cm2_s_nm"),
-            batch.get("spectrum_mask"),
             dims,
         )
         mse_norm = jnp.mean((pred - batch["target"]) ** 2)
@@ -883,161 +866,6 @@ def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def make_mlp_train_eval_functions(
-    *,
-    dims: MLPDimensions,
-    normalization: dict[str, Any],
-    loss_cfg: dict[str, float],
-    gradient_clip: float,
-    weight_decay: float,
-) -> tuple[
-    Callable[[Any, dict[str, Any], dict[str, jax.Array], jax.Array, jax.Array], tuple[Any, dict[str, Any], dict[str, jax.Array]]],
-    Callable[[Any, dict[str, jax.Array]], dict[str, jax.Array]],
-]:
-    """Build JIT-compiled train/eval functions for the FiLM-MLP.
-
-    Parameters
-    ----------
-    dims : MLPDimensions
-        MLP architecture dimensions.
-    normalization : dict[str, Any]
-        Normalization payload used to recover target-space log10 statistics.
-    loss_cfg : dict[str, float]
-        Loss weights for normalized-space, physical-space, and optional
-        spectrum-reconstruction losses.
-    gradient_clip : float
-        Global L2 gradient-clip threshold.
-    weight_decay : float
-        AdamW decoupled weight-decay coefficient.
-
-    Returns
-    -------
-    tuple[callable, callable]
-        ``(train_step, eval_step)`` closures that consume normalized batch
-        dictionaries.
-    """
-    target_mean, target_std = _state_stats(normalization)
-
-    @jax.jit
-    def train_step(
-        params: Any,
-        opt_state: dict[str, Any],
-        batch: dict[str, jax.Array],
-        learning_rate: jax.Array,
-        dropout_key: jax.Array,
-    ) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
-        """Run one FiLM-MLP optimizer step on a normalized batch.
-
-        Parameters
-        ----------
-        params : Any
-            Current MLP parameter tree.
-        opt_state : dict[str, Any]
-            AdamW optimizer state.
-        batch : dict[str, jax.Array]
-            Normalized batch containing ``sequence``, ``global_inputs``,
-            ``target``, plus optional ``spectrum_wavelengths_nm``, ``spectrum_fluxes_erg_cm2_s_nm``, and ``spectrum_mask``.
-        learning_rate : jax.Array
-            Scalar learning rate for this step.
-        dropout_key : jax.Array
-            PRNG key used for hidden-layer dropout.
-
-        Returns
-        -------
-        tuple[Any, dict[str, Any], dict[str, jax.Array]]
-            Updated parameter tree, updated optimizer state, and scalar
-            training metrics.
-        """
-        def loss_fn(model_params: Any) -> tuple[jax.Array, dict[str, jax.Array]]:
-            """Compute weighted FiLM-MLP losses and scalar metrics.
-
-            Parameters
-            ----------
-            model_params : Any
-                MLP parameter tree.
-
-            Returns
-            -------
-            tuple[jax.Array, dict[str, jax.Array]]
-                Combined loss plus a metrics mapping containing normalized,
-                log10-physical, and optional spectrum-reconstruction terms.
-            """
-            pred, _aux = apply_mlp(
-                model_params,
-                batch["sequence"],
-                batch["global_inputs"],
-                dims,
-                batch.get("spectrum_wavelengths_nm"),
-                batch.get("spectrum_fluxes_erg_cm2_s_nm"),
-                batch.get("spectrum_mask"),
-                dropout_key=dropout_key,
-                training=True,
-            )
-            mse_norm = jnp.mean((pred - batch["target"]) ** 2)
-            pred_log10 = pred * target_std + target_mean
-            target_log10 = batch["target"] * target_std + target_mean
-            mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
-            total = (
-                float(loss_cfg["lambda_z"]) * mse_norm
-                + float(loss_cfg["lambda_phys"]) * mse_log10
-            )
-            metrics = {
-                "combined_loss": total,
-                "mse_norm": mse_norm,
-                "mse_log10": mse_log10,
-            }
-            return total, metrics
-
-        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        grads = _clip_tree(grads, gradient_clip)
-        new_params, new_opt_state = _adamw_update(
-            params, grads, opt_state,
-            learning_rate=learning_rate, weight_decay=weight_decay,
-        )
-        return new_params, new_opt_state, metrics
-
-    @jax.jit
-    def eval_step(params: Any, batch: dict[str, jax.Array]) -> dict[str, jax.Array]:
-        """Evaluate the FiLM-MLP on one normalized batch.
-
-        Parameters
-        ----------
-        params : Any
-            MLP parameter tree.
-        batch : dict[str, jax.Array]
-            Normalized validation or test batch.
-
-        Returns
-        -------
-        dict[str, jax.Array]
-            Scalar evaluation metrics for the batch.
-        """
-        pred, _aux = apply_mlp(
-            params,
-            batch["sequence"],
-            batch["global_inputs"],
-            dims,
-            batch.get("spectrum_wavelengths_nm"),
-            batch.get("spectrum_fluxes_erg_cm2_s_nm"),
-            batch.get("spectrum_mask"),
-        )
-        mse_norm = jnp.mean((pred - batch["target"]) ** 2)
-        pred_log10 = pred * target_std + target_mean
-        target_log10 = batch["target"] * target_std + target_mean
-        mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
-        total = (
-            float(loss_cfg["lambda_z"]) * mse_norm
-            + float(loss_cfg["lambda_phys"]) * mse_log10
-        )
-        return {
-            "combined_loss": total,
-            "mse_norm": mse_norm,
-            "mse_log10": mse_log10,
-        }
-
-    return train_step, eval_step
-
-
 def train_model(
     config: dict[str, Any],
     *,
@@ -1073,22 +901,13 @@ def train_model(
         count_parameters(params),
     )
     opt_state = _init_adamw_state(params)
-    if uses_mlp(config):
-        train_step, eval_step = make_mlp_train_eval_functions(
-            dims=dims,
-            normalization=normalization,
-            loss_cfg=config["training"]["loss"],
-            gradient_clip=float(config["training"]["gradient_clip"]),
-            weight_decay=float(config["training"]["weight_decay"]),
-        )
-    else:
-        train_step, eval_step = make_transformer_train_eval_functions(
-            dims=dims,
-            normalization=normalization,
-            loss_cfg=config["training"]["loss"],
-            gradient_clip=float(config["training"]["gradient_clip"]),
-            weight_decay=float(config["training"]["weight_decay"]),
-        )
+    train_step, eval_step = make_transformer_train_eval_functions(
+        dims=dims,
+        normalization=normalization,
+        loss_cfg=config["training"]["loss"],
+        gradient_clip=float(config["training"]["gradient_clip"]),
+        weight_decay=float(config["training"]["weight_decay"]),
+    )
 
     checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
     ensure_dir(checkpoints_root)

@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Photochemical VULCAN surrogate pipeline.")
     parser.add_argument(
         "--config",
-        default="config/fastchem_transformer_config.json",
+        default="config/vulcan_no_condensation.json",
         help="Path to a configuration JSON file relative to the project root.",
     )
     parser.add_argument(

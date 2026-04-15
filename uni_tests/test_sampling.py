@@ -96,7 +96,7 @@ def test_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config
     assert preset_names == {preset["name"] for preset in tiny_config["science_presets"]}
     assert len({spec.metadata["spectrum_name"] for spec in specs}) >= 2
     for spec in specs:
-        assert spec.elemental_abundances_x_h.shape[-1] == len(tiny_config["data_spec"]["element_input_order"])
+        assert spec.elemental_abundances_frac.shape[-1] == len(tiny_config["data_spec"]["element_input_order"])
         for name in ("He_H", "C_H", "O_H", "N_H", "S_H"):
             assert name in spec.globals
         assert "gravity_cm_s2" in spec.globals
@@ -109,9 +109,9 @@ def test_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config
         ) == 1
 
 
-def test_shipped_equilibrium_config_uses_fixture_temperature_profiles():
+def test_shipped_config_uses_fixture_temperature_profiles():
     root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "fastchem_transformer_config.json")
+    config = load_and_validate_config(root / "config" / "vulcan_no_condensation.json")
     config["_project_root"] = root
     config["temperature_profiles"]["data_glob"] = str(FIXTURE_PT_PATH)
     config["temperature_profiles"]["filters"] = {"Teq": (1200.0, 1200.0), "LogMet": 0.0, "TiOVO": False}
@@ -119,10 +119,7 @@ def test_shipped_equilibrium_config_uses_fixture_temperature_profiles():
     config["roth_sampler"]["filters"] = dict(config["temperature_profiles"]["filters"])
     assert config["roth_sampler"]["source_mode"] == "mixed"
     assert config["roth_sampler"]["analytic_probability"] == pytest.approx(0.5)
-    assert config["temperature_profiles"]["analytic_sampler"]["log10_kappa_ir_m2_kg_normal"] == {
-        "mean": -2.5,
-        "std": 2.5,
-    }
+    assert config["temperature_profiles"]["analytic_sampler"]["log10_delta_range"] == [-6.0, 6.0]
     pressure_bar = sample_pressure_grid(
         num_levels=int(config["sampling"]["num_levels"]),
         pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
@@ -139,7 +136,7 @@ def test_shipped_equilibrium_config_uses_fixture_temperature_profiles():
     assert float(np.max(profile)) <= float(config["temperature_profiles"]["validation"]["max_temperature_k"])
 
 
-def test_analytic_temperature_sampling_uses_line_sampler_metadata_and_bounds(tiny_config):
+def test_analytic_temperature_sampling_uses_piette_sampler_metadata_and_bounds(tiny_config):
     config = copy.deepcopy(tiny_config)
     config["roth_sampler"] = {"enabled": False}
     config["temperature_profiles"]["source_mode"] = "analytic"
@@ -162,11 +159,14 @@ def test_analytic_temperature_sampling_uses_line_sampler_metadata_and_bounds(tin
     assert float(np.min(profile)) >= float(hard_bounds["min_temperature_k"])
     assert float(np.max(profile)) <= float(hard_bounds["max_temperature_k"])
     assert metadata["temperature_profile_source"] == "analytic"
-    assert metadata["temperature_profile_analytic_profile_type"] == "line_2013"
+    assert metadata["temperature_profile_analytic_profile_type"] == "piette_2019"
     assert metadata["temperature_profile_analytic_convective_adjustment_applied"] is True
     assert "temperature_profile_analytic_t_int_k" in metadata
-    assert "temperature_profile_analytic_gamma_1" in metadata
+    assert "temperature_profile_analytic_t_eq_k" in metadata
+    assert "temperature_profile_analytic_gamma" in metadata
     assert "temperature_profile_analytic_alpha" in metadata
+    assert "temperature_profile_analytic_log10_delta" in metadata
+    assert "temperature_profile_analytic_log10_p_trans_bar" in metadata
 
 
 def test_pt_library_sampling_rejects_profiles_outside_shared_temperature_bounds(tiny_config, tmp_path):

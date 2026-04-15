@@ -23,17 +23,30 @@ from pathlib import Path
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-from _common import (
-    EPSILON,
-    FASTCHEM_METALLICITY_SCALED_ELEMENTS,
-    SOLAR_ELEMENT_ABUNDANCES,
-    apply_style,
-    load_fastchem_test_context,
-    plots_dir_for_bundle,
-    resolve_bundle_path,
-    resolve_vulcan_source_root,
-    select_fastchem_test_run_id,
-)
+try:
+    from extras._common import (
+        EPSILON,
+        FASTCHEM_METALLICITY_SCALED_ELEMENTS,
+        SOLAR_ELEMENT_ABUNDANCES,
+        apply_style,
+        load_fastchem_test_context,
+        plots_dir_for_bundle,
+        resolve_bundle_path,
+        resolve_vulcan_source_root,
+        select_fastchem_test_run_id,
+    )
+except ImportError:
+    from _common import (
+        EPSILON,
+        FASTCHEM_METALLICITY_SCALED_ELEMENTS,
+        SOLAR_ELEMENT_ABUNDANCES,
+        apply_style,
+        load_fastchem_test_context,
+        plots_dir_for_bundle,
+        resolve_bundle_path,
+        resolve_vulcan_source_root,
+        select_fastchem_test_run_id,
+    )
 from matplotlib.lines import Line2D
 from src.data_generation.generation import (
     _copy_fastchem_runtime,
@@ -110,10 +123,10 @@ def _extract_raw_profile(handle: h5py.Group, run_id: str) -> RawEquilibriumProfi
     }
 
     # Override with per-element abundances when stored explicitly.
-    if "inputs/element_input_order" in handle and "inputs/elemental_abundances_x_h" in handle:
+    if "inputs/element_input_order" in handle and "inputs/elemental_abundances_frac" in handle:
         element_labels = _decode_labels(np.asarray(handle["inputs/element_input_order"]))
         element_profile = np.asarray(
-            handle["inputs/elemental_abundances_x_h"], dtype=np.float64,
+            handle["inputs/elemental_abundances_frac"], dtype=np.float64,
         )
         for index, label in enumerate(element_labels):
             globals_map[label] = float(element_profile[0, index])
@@ -195,8 +208,8 @@ def _sulfur_enabled(config: dict) -> bool:
     """Return whether the configured species lists require sulfur chemistry.
 
     Mirrors the identical check in ``src.data_generation.generation`` so that
-    the comparison rerun partitions elements (explicit X/H vs metallicity-
-    scaled) exactly as the original data-generation run did.
+    the comparison rerun partitions elements (explicit number fractions vs
+    metallicity-scaled) exactly as the original data-generation run did.
     """
     data_spec = config.get("data_spec", {})
     species = list(data_spec.get("state_species", [])) + list(data_spec.get("output_species", []))
@@ -204,7 +217,7 @@ def _sulfur_enabled(config: dict) -> bool:
 
 
 def _explicit_element_set(config: dict) -> set[str]:
-    """Build the set of non-H atoms written with explicit X/H abundances.
+    """Build the set of non-H atoms written with explicit number fractions.
 
     This must match ``_vulcan_atom_list`` in the generation module; elements
     NOT in this set are instead written via the metallicity-offset path.
@@ -223,7 +236,7 @@ def _write_fastchem_element_abundances(
     globals_map: dict[str, float],
     config: dict,
 ) -> Path:
-    """Write FastChem elemental abundances derived from the X/H globals.
+    """Write FastChem elemental abundances derived from the number-fraction globals.
 
     Parameters
     ----------
@@ -234,7 +247,7 @@ def _write_fastchem_element_abundances(
         available, ``metallicity_log10``.
     config : dict
         Full pipeline config (from the exported bundle) used to decide
-        which elements get explicit X/H values vs metallicity scaling.
+        which elements get explicit number fractions vs metallicity scaling.
     """
     input_dir = fastchem_root / "input"
 
@@ -252,7 +265,7 @@ def _write_fastchem_element_abundances(
     element_abundances = _element_abundances_from_globals(globals_map)
     metallicity_offset = float(np.log10(element_abundances["fastchem_met_scale"]))
 
-    # Determine which elements get explicit X/H values (the rest are
+    # Determine which elements get explicit number fractions (the rest are
     # metallicity-scaled) — must mirror the generation's _vulcan_atom_list.
     explicit_atoms = _explicit_element_set(config)
 
@@ -269,12 +282,12 @@ def _write_fastchem_element_abundances(
         parts = raw_line.split()
         species_name = parts[0]
         if species_name in explicit_atoms:
-            # Write with the exact stored X/H value, matching generation.
+            # Write with the exact stored number fraction, matching generation.
             key = "He_H" if species_name == "He" else f"{species_name}_H"
-            abundance_h = element_abundances.get(key)
-            if abundance_h is None:
+            number_frac = element_abundances.get(key)
+            if number_frac is None:
                 raise ValueError(f"Missing elemental abundance for {species_name}.")
-            new_value = np.log10(float(abundance_h)) + 12.0
+            new_value = np.log10(float(number_frac)) + 12.0
             output_lines.append(f"{species_name}\t{new_value:.4f}\n")
         elif species_name in FASTCHEM_METALLICITY_SCALED_ELEMENTS:
             # Scale from solar using the metallicity offset.
@@ -322,7 +335,7 @@ def _run_fastchem_online(
     pressure_bar, temperature_k : np.ndarray
         1-D physical arrays defining the atmospheric column.
     globals_map : dict
-        Elemental abundance globals (X/H keys), plus ``metallicity_log10``
+        Elemental abundance globals (number-fraction keys), plus ``metallicity_log10``
         when available for exact metallicity recovery.
     output_species : list[str]
         Species names whose mixing ratios are returned.

@@ -42,11 +42,11 @@ DEFAULT_BUNDLE = ROOT / "models" / "fastchem_transformer" / "best_exported.npz"
 # Physical constants
 # ---------------------------------------------------------------------------
 SOLAR_ELEMENT_ABUNDANCES: dict[str, float] = {
-    "He_H": 8.38e-2,
-    "C_H": 2.95e-4,
-    "O_H": 5.37e-4,
-    "N_H": 7.08e-5,
-    "S_H": 1.41e-5,
+    "He_H": 7.84e-2,
+    "C_H": 2.69e-4,
+    "O_H": 4.90e-4,
+    "N_H": 6.76e-5,
+    "S_H": 1.32e-5,
 }
 
 # Elements whose FastChem abundances are scaled by metallicity.
@@ -303,9 +303,9 @@ def _load_raw_sidecars(
             key: float(np.asarray(group[f"globals/{key}"]))
             for key in group["globals"].keys()
         }
-        if "inputs/element_input_order" in group and "inputs/elemental_abundances_x_h" in group:
+        if "inputs/element_input_order" in group and "inputs/elemental_abundances_frac" in group:
             element_labels = _decode_hdf5_labels(np.asarray(group["inputs/element_input_order"]))
-            element_profile = np.asarray(group["inputs/elemental_abundances_x_h"], dtype=np.float64)
+            element_profile = np.asarray(group["inputs/elemental_abundances_frac"], dtype=np.float64)
             for index, label in enumerate(element_labels):
                 globals_map[label] = float(element_profile[0, index])
         metadata: dict[str, Any] = {}

@@ -34,9 +34,6 @@ import h5py
 import numpy as np
 
 from ..utils.config import (
-    ELEMENT_INPUT_ORDER,
-    PUBLIC_PHYSICS_TOGGLES,
-    SUPPORTED_ATM_BASES,
     dataset_info_root,
     dataset_raw_root,
     dataset_run_root,
@@ -44,23 +41,13 @@ from ..utils.config import (
     get_model_type,
     uses_fastchem,
 )
+from ..constants import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SOLAR_ABUNDANCES, SUPPORTED_ATM_BASES
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 from ..utils.provenance import manifest_for_files
 from .sampling import RunSpecification, sample_run_specifications
 from .spectrum import write_vulcan_spectrum_txt
 
 LOGGER = get_logger(__name__)
-
-# Solar photospheric abundances (Asplund et al. 2009) expressed as
-# number ratios relative to hydrogen.  These are scaled by 10^[M/H]
-# to produce the per-run elemental abundances fed to FastChem.
-_SOLAR_ELEMENT_ABUNDANCES = {
-    "O_H": 5.37e-4,
-    "C_H": 2.95e-4,
-    "N_H": 7.08e-5,
-    "S_H": 1.41e-5,
-    "He_H": 8.38e-2,
-}
 _FASTCHEM_METALLICITY_SCALED_ELEMENTS = {
     "C",
     "N",
@@ -252,25 +239,19 @@ def _prepare_generation_directory(
     ensure_dir(run_root)
     ensure_dir(raw_root)
     ensure_dir(info_root)
-    staging_root = ensure_dir(project_root / "runtime" / "raw_staging")
-    legacy_runs_dir = raw_root / "runs"
-    if legacy_runs_dir.exists() and not any(legacy_runs_dir.iterdir()):
-        legacy_runs_dir.rmdir()
+    staging_root = Path(tempfile.mkdtemp(prefix="vulcan_staging_"))
     requested_runs = _requested_run_count(config, num_runs)
     consolidated_path = raw_root / "runs.h5"
-    existing_files = sorted(legacy_runs_dir.glob("run_*.h5")) if legacy_runs_dir.exists() else []
 
     def _make_staging_dir() -> Path:
         """Create one temporary staging directory for raw-run generation."""
         return Path(tempfile.mkdtemp(prefix=f"{run_root.name}_", dir=str(staging_root)))
 
-    # Also count runs inside a consolidated file, if present.
+    # Count runs inside a consolidated file, if present.
     consolidated_count = 0
     if consolidated_path.exists():
         consolidated_count = len(list_run_ids_from_consolidated(consolidated_path))
     if bool(config["generation"]["overwrite"]):
-        if legacy_runs_dir.exists():
-            shutil.rmtree(legacy_runs_dir)
         if consolidated_path.exists():
             consolidated_path.unlink()
         for metadata_path in (
@@ -282,13 +263,7 @@ def _prepare_generation_directory(
                 metadata_path.unlink()
         return run_root, raw_root, info_root, _make_staging_dir(), None
     # Reuse only the canonical consolidated raw-data layout.
-    total_existing = consolidated_count + len(existing_files)
-    if total_existing > 0:
-        if existing_files:
-            raise RuntimeError(
-                "Found legacy per-file raw runs under raw/runs/. "
-                "Set generation.overwrite=true to regenerate the dataset in the current format."
-            )
+    if consolidated_count > 0:
         if bool(config["generation"]["reuse_raw_if_present"]) and consolidated_count == requested_runs:
             manifest_path = info_root / "generation_manifest.json"
             if not manifest_path.exists():
@@ -308,7 +283,7 @@ def _prepare_generation_directory(
                 )
             return run_root, raw_root, info_root, None, consolidated_path
         raise RuntimeError(
-            f"Found {total_existing} existing raw runs (consolidated: {consolidated_count}). "
+            f"Found {consolidated_count} existing raw runs. "
             "Set generation.overwrite=true or align generation.num_runs with the existing dataset."
         )
     return run_root, raw_root, info_root, _make_staging_dir(), None
@@ -367,9 +342,11 @@ def _sampling_coverage_payload(
         parameters.
     """
     fastchem = uses_fastchem(config)
-    metallicity = np.asarray([spec.globals["metallicity_log10"] for spec in specs], dtype=np.float64)
-    c_to_o = np.asarray([spec.globals["c_to_o"] for spec in specs], dtype=np.float64)
-    s_to_o = np.asarray([spec.globals.get("s_to_o", 0.026) for spec in specs], dtype=np.float64)
+    frac_keys = ("He_H", "C_H", "O_H", "N_H", "S_H")
+    frac_arrays = {
+        key: np.asarray([spec.globals[key] for spec in specs], dtype=np.float64)
+        for key in frac_keys
+    }
     temperature_rows: list[np.ndarray] = []
     pressure_rows: list[np.ndarray] = []
     for path in run_files:
@@ -380,15 +357,21 @@ def _sampling_coverage_payload(
                 pressure_rows.append(np.asarray(source["inputs/pressure_bar"], dtype=np.float64))
     temperature = np.concatenate(temperature_rows, axis=0)
     pressure = np.concatenate(pressure_rows, axis=0)
-    metallicity_range = [float(x) for x in config["sampling"]["metallicity_log10_range"]]
-    c_to_o_range = [float(x) for x in config["sampling"]["c_to_o_range"]]
-    s_to_o_range = [float(x) for x in config["sampling"]["s_to_o_range"]]
+    _element_to_config_key = {
+        "He_H": "he_frac_range",
+        "C_H": "c_frac_range",
+        "O_H": "o_frac_range",
+        "N_H": "n_frac_range",
+        "S_H": "s_frac_range",
+    }
+    frac_ranges = {
+        key: [float(x) for x in config["sampling"][_element_to_config_key[key]]]
+        for key in frac_keys
+    }
     temperature_range = [float(x) for x in config["sampling"]["temperature_range_k"]]
 
     configured_ranges: dict[str, Any] = {
-        "metallicity_log10": metallicity_range,
-        "c_to_o": c_to_o_range,
-        "s_to_o": s_to_o_range,
+        **{key: frac_ranges[key] for key in frac_keys},
         "temperature_k": temperature_range,
         "pressure_bar": [
             float(config["sampling"]["pressure_top_bar"]),
@@ -396,23 +379,18 @@ def _sampling_coverage_payload(
         ],
     }
     realized: dict[str, Any] = {
-        "metallicity_log10": {
-            "min": float(np.min(metallicity)),
-            "max": float(np.max(metallicity)),
+        key: {
+            "min": float(np.min(frac_arrays[key])),
+            "max": float(np.max(frac_arrays[key])),
             "coverage_fraction": _coverage_fraction(
-                *metallicity_range, float(np.min(metallicity)), float(np.max(metallicity)),
+                *frac_ranges[key],
+                float(np.min(frac_arrays[key])),
+                float(np.max(frac_arrays[key])),
             ),
-        },
-        "c_to_o": {
-            "min": float(np.min(c_to_o)),
-            "max": float(np.max(c_to_o)),
-            "coverage_fraction": _coverage_fraction(*c_to_o_range, float(np.min(c_to_o)), float(np.max(c_to_o))),
-        },
-        "s_to_o": {
-            "min": float(np.min(s_to_o)),
-            "max": float(np.max(s_to_o)),
-            "coverage_fraction": _coverage_fraction(*s_to_o_range, float(np.min(s_to_o)), float(np.max(s_to_o))),
-        },
+        }
+        for key in frac_keys
+    }
+    realized.update({
         "temperature_k": {
             "min": float(np.min(temperature)),
             "max": float(np.max(temperature)),
@@ -424,7 +402,7 @@ def _sampling_coverage_payload(
             "min": float(np.min(pressure)),
             "max": float(np.max(pressure)),
         },
-    }
+    })
 
     if not fastchem:
         gravity = np.asarray([spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64)
@@ -569,80 +547,79 @@ def _vulcan_atom_list(config: dict[str, Any]) -> list[str]:
 
 
 def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
-    """Map one sampled run specification to elemental abundance scalars.
+    """Extract elemental number fractions from a run specification.
+
+    The run specification carries elemental *number fractions* (summing with
+    hydrogen to 1).  This function validates the fractions and computes the
+    auxiliary ``fastchem_met_scale`` scalar.
 
     Parameters
     ----------
     spec : RunSpecification
         Sampled run specification containing either an explicit per-level
-        elemental abundance profile or scalar metallicity and ratio globals.
+        elemental fraction profile or scalar fraction globals.
 
     Returns
     -------
     dict[str, float]
-        Mapping containing hydrogen-normalized elemental abundances for
-        ``He_H``, ``C_H``, ``O_H``, ``N_H``, and ``S_H``, plus the auxiliary
+        Mapping containing number fractions ``He_H``, ``C_H``,
+        ``O_H``, ``N_H``, ``S_H``, plus the auxiliary
         ``fastchem_met_scale`` scalar used by the FastChem runtime.
     """
-    if spec.elemental_abundances_x_h is not None:
-        element_profile = np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
-        if element_profile.ndim != 2 or element_profile.shape[1] != len(ELEMENT_INPUT_ORDER):
+    if spec.elemental_abundances_frac is not None:
+        frac_profile = np.asarray(spec.elemental_abundances_frac, dtype=np.float64)
+        if frac_profile.ndim != 2 or frac_profile.shape[1] != len(ELEMENT_INPUT_ORDER):
             raise ValueError(
-                "RunSpecification.elemental_abundances_x_h must have shape "
+                "RunSpecification.elemental_abundances_frac must have shape "
                 f"(nz, {len(ELEMENT_INPUT_ORDER)})."
             )
-        element_vector = element_profile[0]
-        element_scalars = {
-            name: float(element_vector[idx])
+        frac_vector = frac_profile[0]
+        fractions = {
+            name: float(frac_vector[idx])
             for idx, name in enumerate(ELEMENT_INPUT_ORDER)
         }
-        oxygen_h = float(element_scalars["O_H"])
-        return {
-            **element_scalars,
-            "fastchem_met_scale": float(oxygen_h / _SOLAR_ELEMENT_ABUNDANCES["O_H"]),
-        }
-    metal_scale = 10.0 ** float(spec.globals["metallicity_log10"])
-    oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
-    s_to_o = spec.globals.get("s_to_o")
-    if s_to_o is not None:
-        sulfur_h = float(oxygen_h * s_to_o)
     else:
-        sulfur_h = float(_SOLAR_ELEMENT_ABUNDANCES["S_H"] * metal_scale)
+        fractions = {name: float(spec.globals[name]) for name in ELEMENT_INPUT_ORDER}
+
+    h_frac = 1.0 - sum(fractions.values())
+    if h_frac <= 0.0:
+        raise ValueError(
+            f"Elemental fractions sum to >= 1.0 (H_frac={h_frac:.6f}); "
+            "hydrogen remainder is non-positive."
+        )
     return {
-        "O_H": float(oxygen_h),
-        "C_H": float(oxygen_h * spec.globals["c_to_o"]),
-        "N_H": float(_SOLAR_ELEMENT_ABUNDANCES["N_H"] * metal_scale),
-        "S_H": sulfur_h,
-        "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
-        "fastchem_met_scale": float(metal_scale),
+        **fractions,
+        "fastchem_met_scale": float(
+            fractions["O_H"] / SOLAR_ABUNDANCES["O_H"]
+        ),
     }
 
 
 def _element_profile_from_spec(spec: RunSpecification) -> np.ndarray:
-    """Return the per-level elemental-abundance profile for one run.
+    """Return the per-level elemental number-fraction profile for one run.
 
     Parameters
     ----------
     spec : RunSpecification
         Sampled run specification containing either a precomputed elemental
-        profile or scalar conditioning globals.
+        fraction profile or scalar fraction globals.
 
     Returns
     -------
     np.ndarray
-        Elemental abundance profile with shape
+        Elemental fraction profile with shape
         ``(nz, len(ELEMENT_INPUT_ORDER))`` ordered by ``ELEMENT_INPUT_ORDER``.
     """
-    if spec.elemental_abundances_x_h is not None:
-        profile = np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
+    if spec.elemental_abundances_frac is not None:
+        profile = np.asarray(spec.elemental_abundances_frac, dtype=np.float64)
         if profile.ndim != 2 or profile.shape[1] != len(ELEMENT_INPUT_ORDER):
             raise ValueError(
-                "RunSpecification.elemental_abundances_x_h must have shape "
+                "RunSpecification.elemental_abundances_frac must have shape "
                 f"(nz, {len(ELEMENT_INPUT_ORDER)})."
             )
         return profile
-    scalars = _element_abundances_from_spec(spec)
-    vector = np.array([float(scalars[name]) for name in ELEMENT_INPUT_ORDER], dtype=np.float64)
+    fractions = {name: float(spec.globals[name]) for name in ELEMENT_INPUT_ORDER}
+    vector = np.array([fractions[name] for name in ELEMENT_INPUT_ORDER], dtype=np.float64)
     return np.repeat(vector[None, :], int(spec.pressure_bar.size), axis=0)
 
 
@@ -760,7 +737,7 @@ def write_equilibrium_hdf5(
         inputs/pressure_bar      (nz,)
         inputs/temperature_k     (nz,)
         inputs/element_input_order (n_elements,) string
-        inputs/elemental_abundances_x_h (nz, n_elements)
+        inputs/elemental_abundances_frac (nz, n_elements)
         inputs/gravity_cm_s2     (nz,)
         inputs/output_species    (n_species,) string
         globals/{key}            scalar per global
@@ -774,7 +751,7 @@ def write_equilibrium_hdf5(
         inputs.create_dataset("pressure_bar", data=np.asarray(spec.pressure_bar, dtype=np.float64))
         inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
         inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
-        inputs.create_dataset("elemental_abundances_x_h", data=element_profile)
+        inputs.create_dataset("elemental_abundances_frac", data=element_profile)
         inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
         inputs.create_dataset("state_species", data=np.asarray(state_species, dtype="S"))
         inputs.create_dataset("output_species", data=np.asarray(output_species, dtype="S"))
@@ -820,7 +797,7 @@ def write_raw_run_hdf5(
         inputs/temperature_k         (nz,)
         inputs/kzz_cm2_s             (nz,)
         inputs/element_input_order   (n_elements,) string
-        inputs/elemental_abundances_x_h (nz, n_elements)
+        inputs/elemental_abundances_frac (nz, n_elements)
         inputs/gravity_cm_s2         (nz,)
         inputs/state_species         (n_state,) string
         inputs/output_species        (n_output,) string
@@ -841,7 +818,7 @@ def write_raw_run_hdf5(
         if spec.kzz_cm2_s is not None:
             inputs.create_dataset("kzz_cm2_s", data=np.asarray(spec.kzz_cm2_s, dtype=np.float64))
         inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
-        inputs.create_dataset("elemental_abundances_x_h", data=element_profile)
+        inputs.create_dataset("elemental_abundances_frac", data=element_profile)
         inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
         inputs.create_dataset(
             "state_species",
@@ -892,32 +869,6 @@ def _synthetic_vertical_coordinate(pressure_bar: np.ndarray) -> np.ndarray:
     """
     logp = np.log10(np.clip(np.asarray(pressure_bar, dtype=np.float64), 1.0e-30, None))
     return np.clip((logp - np.min(logp)) / max(np.max(logp) - np.min(logp), 1.0e-8), 0.0, 1.0)
-
-
-def _synthetic_uv_strength(spec: RunSpecification) -> float:
-    """Estimate one scalar UV forcing strength from a sampled stellar spectrum.
-
-    Parameters
-    ----------
-    spec : RunSpecification
-        Run specification containing an optional ``SpectrumRecord``.
-
-    Returns
-    -------
-    float
-        Fraction of the total stellar flux that falls at wavelengths
-        ``<= 300 nm``, clipped to ``[0, 1]``.
-    """
-    if spec.spectrum is None:
-        return 0.0
-    wavelength_nm = np.asarray(spec.spectrum.wavelength_nm, dtype=np.float64)
-    flux = np.asarray(spec.spectrum.flux_erg_cm2_s_nm, dtype=np.float64)
-    uv_mask = wavelength_nm <= 300.0
-    if not np.any(uv_mask):
-        return 0.0
-    total_flux = float(np.trapz(flux, wavelength_nm))
-    uv_flux = float(np.trapz(flux[uv_mask], wavelength_nm[uv_mask]))
-    return float(np.clip(uv_flux / max(total_flux, 1.0e-30), 0.0, 1.0))
 
 
 def _assign_species(state: np.ndarray, species_index: dict[str, int], name: str, values: np.ndarray) -> None:
@@ -971,11 +922,11 @@ def _synthetic_final_state(
     state = np.full((int(spec.pressure_bar.size), len(state_species)), 1.0e-30, dtype=np.float64)
 
     elements = _element_abundances_from_spec(spec)
-    he_h = float(elements["He_H"])
-    c_h = float(elements["C_H"])
-    o_h = float(elements["O_H"])
-    n_h = float(elements["N_H"])
-    s_h = float(elements["S_H"])
+    he_frac = float(elements["He_H"])
+    c_frac = float(elements["C_H"])
+    o_frac = float(elements["O_H"])
+    n_frac = float(elements["N_H"])
+    s_frac = float(elements["S_H"])
 
     pressure_bar = np.asarray(spec.pressure_bar, dtype=np.float64)
     temperature_k = np.asarray(spec.temperature_k, dtype=np.float64)
@@ -983,8 +934,8 @@ def _synthetic_final_state(
     top = 1.0 - depth
     hot = np.clip((temperature_k - 1000.0) / 1200.0, 0.0, 1.0)
     cool = np.clip((1200.0 - temperature_k) / 900.0, 0.0, 1.0)
-    photo_strength = _synthetic_uv_strength(spec) * float(spec.globals.get("use_photochemistry", 0.0))
-    photo_profile = photo_strength * np.exp(-3.0 * depth)
+    # Photochemistry is disabled — UV forcing is always zero.
+    photo_profile = np.zeros_like(depth)
     kzz_profile = np.asarray(spec.kzz_cm2_s if spec.kzz_cm2_s is not None else np.full_like(pressure_bar, 1.0e6), dtype=np.float64)
     mix_strength = (
         np.clip((np.log10(np.clip(kzz_profile, 1.0, None)) - 6.0) / 4.0, 0.0, 1.0)
@@ -1007,73 +958,73 @@ def _synthetic_final_state(
         state,
         species_index,
         "H2O",
-        o_h * (0.45 + 0.20 * top + 0.20 * cool + 0.10 * sat_surface_h2o * depth) * (1.0 - 0.35 * photo_profile) * (1.0 - water_depletion),
+        o_frac * (0.45 + 0.20 * top + 0.20 * cool + 0.10 * sat_surface_h2o * depth) * (1.0 - 0.35 * photo_profile) * (1.0 - water_depletion),
     )
     _assign_species(
         state,
         species_index,
         "CO",
-        c_h * (0.35 + 0.35 * hot + 0.20 * depth + 0.10 * mix_strength),
+        c_frac * (0.35 + 0.35 * hot + 0.20 * depth + 0.10 * mix_strength),
     )
     _assign_species(
         state,
         species_index,
         "CO2",
-        np.minimum(c_h, o_h) * (0.05 + 0.15 * photo_profile + 0.10 * top + 0.10 * molecular_diffusion * top),
+        np.minimum(c_frac, o_frac) * (0.05 + 0.15 * photo_profile + 0.10 * top + 0.10 * molecular_diffusion * top),
     )
     _assign_species(
         state,
         species_index,
         "CH4",
-        c_h * (0.18 + 0.42 * depth + 0.08 * mix_strength) * (1.0 - 0.55 * hot),
+        c_frac * (0.18 + 0.42 * depth + 0.08 * mix_strength) * (1.0 - 0.55 * hot),
     )
     _assign_species(
         state,
         species_index,
         "N2",
-        n_h * (0.45 + 0.25 * hot + 0.15 * depth + 0.10 * mix_strength),
+        n_frac * (0.45 + 0.25 * hot + 0.15 * depth + 0.10 * mix_strength),
     )
     _assign_species(
         state,
         species_index,
         "NH3",
-        n_h * (0.16 + 0.30 * depth + 0.10 * cool) * (1.0 - 0.40 * photo_profile),
+        n_frac * (0.16 + 0.30 * depth + 0.10 * cool) * (1.0 - 0.40 * photo_profile),
     )
     _assign_species(
         state,
         species_index,
         "H2S",
-        s_h * (0.50 + 0.22 * depth + 0.10 * cool) * (1.0 - 0.45 * photo_profile) * (1.0 - sulfur_depletion),
+        s_frac * (0.50 + 0.22 * depth + 0.10 * cool) * (1.0 - 0.45 * photo_profile) * (1.0 - sulfur_depletion),
     )
     _assign_species(
         state,
         species_index,
         "SH",
-        s_h * (0.004 + 0.03 * photo_profile + 0.01 * upwind_diffusion * top),
+        s_frac * (0.004 + 0.03 * photo_profile + 0.01 * upwind_diffusion * top),
     )
     _assign_species(
         state,
         species_index,
         "S",
-        s_h * (0.002 + 0.02 * photo_profile + 0.006 * ion_chemistry * top),
+        s_frac * (0.002 + 0.02 * photo_profile + 0.006 * ion_chemistry * top),
     )
     _assign_species(
         state,
         species_index,
         "SO",
-        s_h * (0.001 + 0.03 * photo_profile + 0.01 * hot) * (1.0 - 0.20 * sulfur_depletion),
+        s_frac * (0.001 + 0.03 * photo_profile + 0.01 * hot) * (1.0 - 0.20 * sulfur_depletion),
     )
     _assign_species(
         state,
         species_index,
         "SO2",
-        s_h * (0.001 + 0.04 * photo_profile + 0.01 * mix_strength) * (1.0 - 0.15 * sulfur_depletion),
+        s_frac * (0.001 + 0.04 * photo_profile + 0.01 * mix_strength) * (1.0 - 0.15 * sulfur_depletion),
     )
     _assign_species(
         state,
         species_index,
         "S2",
-        s_h * (0.0005 + 0.01 * depth + 0.005 * upwind_diffusion * top),
+        s_frac * (0.0005 + 0.01 * depth + 0.005 * upwind_diffusion * top),
     )
     _assign_species(
         state,
@@ -1085,13 +1036,13 @@ def _synthetic_final_state(
         state,
         species_index,
         "O",
-        o_h * 1.0e-3 * (1.0 + 15.0 * photo_profile + 3.0 * ion_chemistry),
+        o_frac * 1.0e-3 * (1.0 + 15.0 * photo_profile + 3.0 * ion_chemistry),
     )
     _assign_species(
         state,
         species_index,
         "OH",
-        o_h * 2.0e-3 * (1.0 + 8.0 * photo_profile + 2.0 * boundary_conditions * top),
+        o_frac * 2.0e-3 * (1.0 + 8.0 * photo_profile + 2.0 * boundary_conditions * top),
     )
 
     base_name = next(
@@ -1127,7 +1078,7 @@ def _synthetic_final_state(
         _assign_species(state, species_index, "H2", 0.05 * reservoir)
         _assign_species(state, species_index, "He", 0.15 * reservoir)
     else:
-        he_reservoir_fraction = np.clip(he_h / max(1.0 + he_h, 1.0e-6), 0.08, 0.18)
+        he_reservoir_fraction = np.clip(he_frac / max(1.0 + he_frac, 1.0e-6), 0.08, 0.18)
         _assign_species(state, species_index, "H2", (1.0 - he_reservoir_fraction) * reservoir)
         _assign_species(state, species_index, "He", he_reservoir_fraction * reservoir)
 
@@ -1246,7 +1197,7 @@ def generate_synthetic_raw_runs(
                     "state_species": state_species,
                     "output_species": output_species,
                 },
-                elemental_abundances_x_h=spec.elemental_abundances_x_h,
+                elemental_abundances_frac=spec.elemental_abundances_frac,
                 gravity_cm_s2=spec.gravity_cm_s2,
             )
         )
@@ -1461,10 +1412,11 @@ def _write_fastchem_element_abundances(
             parts = raw_line.split()
             species_name = parts[0].strip()
             if species_name in non_h_atoms:
-                abundance_h = element_abundances.get(f"{species_name}_H")
-                if abundance_h is None:
+                key = "He_H" if species_name == "He" else f"{species_name}_H"
+                number_frac = element_abundances.get(key)
+                if number_frac is None:
                     raise ValueError(f"Missing elemental abundance for {species_name} in FastChem setup.")
-                output_lines.append(f"{species_name}\t{12.0 + np.log10(float(abundance_h)):.4f}\n")
+                output_lines.append(f"{species_name}\t{12.0 + np.log10(float(number_frac)):.4f}\n")
             elif species_name in _FASTCHEM_METALLICITY_SCALED_ELEMENTS:
                 output_lines.append(f"{species_name}\t{float(parts[1]) + metallicity_offset:.4f}\n")
             else:
@@ -1699,18 +1651,12 @@ def convert_vulcan_output_to_hdf5(
 
     # Extract the final converged mixing ratios from VULCAN output.
     variable = _fetch(data, "variable")
-    if "ymix_time" in variable:
-        ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
-    elif "y_time" in variable:
-        y_time = np.asarray(_fetch(data, "variable", "y_time"), dtype=np.float64)
-        if y_time.ndim != 3 or y_time.shape[1] != n0.size:
-            raise ValueError("VULCAN output contains inconsistent variable.y_time and atm.n_0 shapes.")
-        ymix_time = y_time / n0[None, :, None]
-    else:
+    if "ymix_time" not in variable:
         raise ValueError(
-            "VULCAN output is missing variable.ymix_time and legacy variable.y_time "
+            "VULCAN output is missing variable.ymix_time "
             "required to derive the final raw-data contract."
         )
+    ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
     output_species = list(config["data_spec"]["output_species"])
     output_indices = [species.index(name) for name in output_species]
     # Take the last timestep as the final converged state.
@@ -1727,9 +1673,9 @@ def convert_vulcan_output_to_hdf5(
             "state_species": list(config["data_spec"]["state_species"]),
             "output_species": output_species,
         },
-        elemental_abundances_x_h=(
-            np.asarray(spec.elemental_abundances_x_h, dtype=np.float64)
-            if spec.elemental_abundances_x_h is not None
+        elemental_abundances_frac=(
+            np.asarray(spec.elemental_abundances_frac, dtype=np.float64)
+            if spec.elemental_abundances_frac is not None
             else None
         ),
         gravity_cm_s2=(
@@ -2022,7 +1968,7 @@ def run_vulcan_generation(
     worker_base = resolve_path(
         config["vulcan_runtime"]["worker_root"]
         if worker_root_key
-        else "runtime/vulcan_workers",
+        else "data/vulcan_workers",
         project_root,
     )
     run_single = _run_single_fastchem_spec if fastchem else _run_single_vulcan_spec
@@ -2068,7 +2014,7 @@ def run_vulcan_generation(
                     },
                     kzz_cm2_s=spec.kzz_cm2_s,
                     spectrum=spec.spectrum,
-                    elemental_abundances_x_h=spec.elemental_abundances_x_h,
+                    elemental_abundances_frac=spec.elemental_abundances_frac,
                     gravity_cm_s2=spec.gravity_cm_s2,
                 )
             )

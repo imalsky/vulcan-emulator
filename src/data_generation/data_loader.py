@@ -5,7 +5,7 @@ This module sits between the on-disk processed tensors (produced by
 
 * a single ``ProcessedSplit`` dataclass for any chemistry/model combination
 * split loading helpers for the processed train/val/test partitions
-* index-based batch assembly with optional variable-length spectrum inputs
+* index-based batch assembly
 * epoch batch iteration for the trainer
 """
 
@@ -18,35 +18,29 @@ from typing import Any
 
 import numpy as np
 
-PROCESSED_INFO_DIRNAME = "info"
+from ..constants import PROCESSED_INFO_DIRNAME
 
 
 def processed_info_dir(processed_root: str | Path) -> Path:
-    """Return the shared metadata directory for a processed dataset."""
-    return Path(processed_root) / PROCESSED_INFO_DIRNAME
+    """Return the shared metadata directory adjacent to raw and processed."""
+    return Path(processed_root).parent / PROCESSED_INFO_DIRNAME
 
 
 @dataclass(frozen=True)
 class ProcessedSplit:
-    """Processed split with normalized tensors and optional spectrum tokens.
+    """Processed split with normalized tensors.
 
     Array shapes:
 
     * ``sequence_inputs``                 — ``(num_runs, nz, sequence_dim)``
     * ``target_outputs``                  — ``(num_runs, nz, target_dim)``
     * ``global_inputs``                   — ``(num_runs, global_dim)``
-    * ``spectrum_wavelengths_nm``         — ``(num_runs, spectrum_max_tokens)``
-    * ``spectrum_fluxes_erg_cm2_s_nm``    — ``(num_runs, spectrum_max_tokens)``
-    * ``spectrum_mask``                   — ``(num_runs, spectrum_max_tokens)``
     """
 
     name: str
     sequence_inputs: np.ndarray
     target_outputs: np.ndarray
     global_inputs: np.ndarray
-    spectrum_wavelengths_nm: np.ndarray | None
-    spectrum_fluxes_erg_cm2_s_nm: np.ndarray | None
-    spectrum_mask: np.ndarray | None
     run_ids: list[str]
     metadata: dict[str, Any]
 
@@ -55,15 +49,6 @@ class ProcessedSplit:
         """Return the number of runs stored in this split."""
         return int(self.sequence_inputs.shape[0])
 
-    @property
-    def has_spectrum_inputs(self: "ProcessedSplit") -> bool:
-        """Return whether this split includes stellar-spectrum conditioning."""
-        return (
-            self.spectrum_wavelengths_nm is not None
-            and self.spectrum_fluxes_erg_cm2_s_nm is not None
-            and self.spectrum_mask is not None
-        )
-
 
 def load_processed_split(split_dir: str | Path) -> ProcessedSplit:
     """Load one processed dataset split from its on-disk tensors."""
@@ -71,19 +56,11 @@ def load_processed_split(split_dir: str | Path) -> ProcessedSplit:
     metadata = json.loads((split_path / "metadata.json").read_text(encoding="utf-8"))
     run_ids = json.loads((split_path / "run_ids.json").read_text(encoding="utf-8"))
 
-    wavelength_path = split_path / "spectrum_wavelengths_nm.npy"
-    flux_path = split_path / "spectrum_fluxes_erg_cm2_s_nm.npy"
-    mask_path = split_path / "spectrum_mask.npy"
-
-    has_spectrum = wavelength_path.exists() and flux_path.exists() and mask_path.exists()
     return ProcessedSplit(
         name=split_path.name,
         sequence_inputs=np.load(split_path / "sequence_inputs.npy"),
         target_outputs=np.load(split_path / "target_outputs.npy"),
         global_inputs=np.load(split_path / "global_inputs.npy"),
-        spectrum_wavelengths_nm=np.load(wavelength_path) if has_spectrum else None,
-        spectrum_fluxes_erg_cm2_s_nm=np.load(flux_path) if has_spectrum else None,
-        spectrum_mask=np.load(mask_path) if has_spectrum else None,
         run_ids=list(run_ids),
         metadata=metadata,
     )
@@ -116,12 +93,6 @@ def build_batch(
         "global_inputs": split.global_inputs[idx].astype(np.float32),
         "target": split.target_outputs[idx].astype(np.float32),
     }
-    if split.has_spectrum_inputs:
-        batch["spectrum_wavelengths_nm"] = split.spectrum_wavelengths_nm[idx].astype(np.float32)
-        batch["spectrum_fluxes_erg_cm2_s_nm"] = split.spectrum_fluxes_erg_cm2_s_nm[idx].astype(
-            np.float32
-        )
-        batch["spectrum_mask"] = split.spectrum_mask[idx].astype(bool)
     return batch
 
 

@@ -77,10 +77,16 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "temperature_range_k": [1.0, 4000.0],
                     "gravity_range_cm_s2": [300.0, 900.0],
                     "planet_radius_range_cm": [7.0e9, 1.1e10],
-                    "metallicity_log10_range": [0.0, 2.0],
-                    "c_to_o_range": [0.25, 1.1],
-                    "s_to_o_range": [0.005, 0.1],
+                    "he_frac_range": [0.06, 0.12],
+                    "c_frac_range": [1e-5, 5e-3],
+                    "o_frac_range": [1e-5, 5e-3],
+                    "n_frac_range": [1e-6, 1e-3],
+                    "s_frac_range": [1e-7, 5e-4],
                     "kzz_cm2_s": 1.0e8,
+                    "stellar_radius_range_rsun": [0.8, 1.2],
+                    "semi_major_axis_range_au": [0.03, 0.06],
+                    "zenith_angle_range_deg": [0.0, 89.0],
+                    "diurnal_factor_range": [0.5, 1.0],
                 },
                 "temperature_profiles": {
                     "source_mode": "mixed",
@@ -93,14 +99,12 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     },
                     "analytic_sampler": {
                         "reference_gravity_m_s2": 24.79,
-                        "t_int_k_normal": {"mean": 500.0, "std": 150.0},
-                        "t_irr_k_normal": {"mean": 1800.0, "std": 500.0},
-                        "log10_kappa_ir_m2_kg_normal": {"mean": -2.5, "std": 2.5},
-                        "power_law_n_range": [0.5, 2.0],
-                        "log10_gamma_1_range": [-2.0, 2.0],
-                        "log10_gamma_2_range": [-2.0, 2.0],
-                        "alpha_range": [0.0, 1.0],
-                        "temperature_shift_k_range": [-600.0, 600.0],
+                        "t_int_k_range": [100.0, 800.0],
+                        "t_eq_k_range": [300.0, 4000.0],
+                        "log10_delta_range": [-6.0, 6.0],
+                        "log10_gamma_range": [-2.0, 2.0],
+                        "alpha_range": [0.0, 0.99],
+                        "log10_p_trans_bar_range": [-5.0, 1.0],
                         "convection_probability": 1.0 / 3.0,
                         "adiabatic_gradient_range": [0.25, 0.35],
                     },
@@ -121,7 +125,6 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                         "seed": 123,
                     },
                     "state_floor": 1e-30,
-                    "spectrum_floor": 1e-30,
                     "target_method": "log-standard",
                     "sequence_methods": {
                         "pressure_bar": "log-standard",
@@ -182,7 +185,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                 },
                 "vulcan": {
                     "physics_toggles": {
-                        "use_photochemistry": True,
+                        "use_photochemistry": False,
                         "use_ion_chemistry": False,
                         "use_eddy_diffusion": True,
                         "use_molecular_diffusion": False,
@@ -195,16 +198,16 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     },
                     "science_presets": [
                         {
-                            "name": "photo_h2",
+                            "name": "thermochem_h2",
                             "atm_base": "H2",
                             "physics_toggles": {
-                                "use_photochemistry": True,
+                                "use_photochemistry": False,
                                 "use_eddy_diffusion": True,
                             },
                         },
                         {
-                            "name": "thermochem_h2",
-                            "atm_base": "H2",
+                            "name": "thermochem_n2",
+                            "atm_base": "N2",
                             "physics_toggles": {
                                 "use_photochemistry": False,
                                 "use_eddy_diffusion": True,
@@ -224,18 +227,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                         "max_tokens": 32,
                         "wavelength_min_nm": 400.0,
                         "wavelength_max_nm": 450.0,
-                        "encoder_mode": "perceiver",
-                        "latent_dim": 16,
-                        "hidden_dim": 64,
-                        "num_latents": 8,
-                        "num_layers": 2,
-                        "num_heads": 4,
-                        "fourier_features": 16,
                         "teff_k": 5485.0,
-                        "radius_rsun": 0.939,
-                        "semi_major_axis_au": 0.04858,
-                        "zenith_angle_deg": 48.0,
-                        "diurnal_factor": 1.0,
                     },
                 },
             },
@@ -262,9 +254,7 @@ def tiny_config(tmp_path):
             num_points=64,
             wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
             wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
-            teff_k=float(config["stellar_spectrum"]["teff_k"]),
-            radius_rsun=float(config["stellar_spectrum"]["radius_rsun"]),
-            semi_major_axis_au=float(config["stellar_spectrum"]["semi_major_axis_au"]),
+            teff_k=float(config["stellar_spectrum"].get("teff_k", 5485.0)),
             name="test_surface_flux",
         ),
         spectrum_file,
@@ -274,9 +264,7 @@ def tiny_config(tmp_path):
             num_points=64,
             wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
             wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
-            teff_k=float(config["stellar_spectrum"]["teff_k"]) + 250.0,
-            radius_rsun=float(config["stellar_spectrum"]["radius_rsun"]),
-            semi_major_axis_au=float(config["stellar_spectrum"]["semi_major_axis_au"]),
+            teff_k=float(config["stellar_spectrum"].get("teff_k", 5485.0)) + 250.0,
             name="test_surface_flux_alt",
         ),
         spectrum_file_alt,
@@ -302,19 +290,7 @@ def tiny_config(tmp_path):
     config["sampling"]["num_levels"] = 12
 
     config["vulcan"]["stellar_spectrum"]["max_tokens"] = 32
-    config["vulcan"]["stellar_spectrum"]["hidden_dim"] = 16
-    config["vulcan"]["stellar_spectrum"]["latent_dim"] = 4
-    config["vulcan"]["stellar_spectrum"]["num_latents"] = 4
-    config["vulcan"]["stellar_spectrum"]["num_layers"] = 1
-    config["vulcan"]["stellar_spectrum"]["num_heads"] = 4
-    config["vulcan"]["stellar_spectrum"]["fourier_features"] = 8
     config["stellar_spectrum"]["max_tokens"] = 32
-    config["stellar_spectrum"]["hidden_dim"] = 16
-    config["stellar_spectrum"]["latent_dim"] = 4
-    config["stellar_spectrum"]["num_latents"] = 4
-    config["stellar_spectrum"]["num_layers"] = 1
-    config["stellar_spectrum"]["num_heads"] = 4
-    config["stellar_spectrum"]["fourier_features"] = 8
 
     config["training"]["batch_size"] = 4
     config["training"]["epochs"] = 1

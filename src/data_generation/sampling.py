@@ -4,10 +4,11 @@ This module is the primary entry point for constructing the atmospheric
 configurations used to generate raw training runs.  It supports three
 temperature-profile sources, selected by ``temperature_profiles.source_mode``:
 
-- **analytic**: Profiles are generated from the Line et al. (2013) radiative-
-  equilibrium parameterization with Robinson & Catling (2012) thermal opacity
-  modifications and an optional convective adjustment.  Ten random parameters
-  are drawn per profile (see ``_sample_analytic_temperature_profile_record``).
+- **analytic**: Profiles are generated from the Piette & Madhusudhan (2019)
+  modified Guillot (2010) radiative-equilibrium parameterization with an
+  optional convective adjustment.  Eight random parameters are drawn per
+  profile (six physics plus two convection; see
+  ``_sample_analytic_temperature_profile_record``).
 
 - **pt_library**: Profiles are loaded from externally computed GCM output files
   (Roth .dat format).  Each ``(lon, lat)`` column in a file is expanded into a
@@ -34,14 +35,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.special import expn
 
-from ..utils.config import (
-    ELEMENT_INPUT_ORDER,
-    PUBLIC_PHYSICS_TOGGLES,
-    SUPPORTED_ATM_BASES,
-    uses_fastchem,
-)
+from ..constants import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SUPPORTED_ATM_BASES
+from ..utils.config import uses_fastchem
 from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
 from .spectrum import (
     SpectrumRecord,
@@ -55,17 +51,6 @@ logger = logging.getLogger(__name__)
 # Maximum number of rejection-resampling attempts for analytic profiles.
 _MAX_PROFILE_ATTEMPTS = 100
 
-# Bar-to-Pascal conversion factor.
-_BAR_TO_PA = 1.0e5
-
-_SOLAR_ELEMENT_ABUNDANCES = {
-    "O_H": 5.37e-4,
-    "C_H": 2.95e-4,
-    "N_H": 7.08e-5,
-    "S_H": 1.41e-5,
-    "He_H": 8.38e-2,
-}
-
 
 @dataclass(frozen=True)
 class RunSpecification:
@@ -77,62 +62,63 @@ class RunSpecification:
     metadata: dict[str, Any]
     kzz_cm2_s: np.ndarray | None = None
     spectrum: SpectrumRecord | None = None
-    elemental_abundances_x_h: np.ndarray | None = None
+    elemental_abundances_frac: np.ndarray | None = None
     gravity_cm_s2: np.ndarray | None = None
 
 
-def _element_scalars_from_sampled_globals(globals_map: dict[str, float]) -> dict[str, float]:
-    """Convert sampled global ratios into FastChem elemental abundances.
+def _element_fractions_from_sampled_globals(globals_map: dict[str, float]) -> dict[str, float]:
+    """Extract elemental number fractions from sampled globals.
 
     Parameters
     ----------
     globals_map : dict[str, float]
-        Sampled global scalars containing at least ``metallicity_log10``,
-        ``c_to_o``, and ``s_to_o``.
+        Sampled global scalars containing ``He_H``, ``C_H``,
+        ``O_H``, ``N_H``, and ``S_H``.
 
     Returns
     -------
     dict[str, float]
-        Hydrogen-normalized elemental abundances keyed by
-        ``ELEMENT_INPUT_ORDER`` names.
+        Elemental number fractions keyed by ``ELEMENT_INPUT_ORDER`` names.
+        The implicit hydrogen fraction is ``1 - sum(fractions)``.
     """
-    metal_scale = 10.0 ** float(globals_map["metallicity_log10"])
-    oxygen_h = _SOLAR_ELEMENT_ABUNDANCES["O_H"] * metal_scale
-    sulfur_h = oxygen_h * float(globals_map["s_to_o"])
-    return {
-        "He_H": float(_SOLAR_ELEMENT_ABUNDANCES["He_H"]),
-        "C_H": float(oxygen_h * float(globals_map["c_to_o"])),
-        "O_H": float(oxygen_h),
-        "N_H": float(_SOLAR_ELEMENT_ABUNDANCES["N_H"] * metal_scale),
-        "S_H": float(sulfur_h),
-    }
+    from ..utils.config import ELEMENT_INPUT_ORDER
+
+    fractions = {name: float(globals_map[name]) for name in ELEMENT_INPUT_ORDER}
+    total = sum(fractions.values())
+    if total >= 1.0:
+        raise ValueError(
+            f"Elemental number fractions sum to {total:.6f} >= 1.0; "
+            "hydrogen remainder would be non-positive."
+        )
+    return fractions
 
 
-def _element_profile_from_scalars(
-    element_scalars: dict[str, float],
+def _element_profile_from_fractions(
+    element_fractions: dict[str, float],
     *,
     num_levels: int,
 ) -> np.ndarray:
-    """Broadcast elemental scalars to a per-level profile tensor.
+    """Broadcast elemental fractions to a per-level profile tensor.
 
     Parameters
     ----------
-    element_scalars : dict[str, float]
-        Elemental abundances keyed by ``ELEMENT_INPUT_ORDER``.
+    element_fractions : dict[str, float]
+        Elemental number fractions keyed by ``ELEMENT_INPUT_ORDER``.
     num_levels : int
         Number of vertical levels in the atmospheric column.
 
     Returns
     -------
     np.ndarray
-        Array with shape ``(num_levels, len(ELEMENT_INPUT_ORDER))`` whose rows
-        all contain the same elemental abundance vector.
+        Profile tensor of shape ``(num_levels, len(ELEMENT_INPUT_ORDER))``.
     """
-    element_vector = np.array(
-        [float(element_scalars[name]) for name in ELEMENT_INPUT_ORDER],
+    from ..utils.config import ELEMENT_INPUT_ORDER
+
+    vector = np.array(
+        [float(element_fractions[name]) for name in ELEMENT_INPUT_ORDER],
         dtype=np.float64,
     )
-    return np.repeat(element_vector[None, :], int(num_levels), axis=0)
+    return np.repeat(vector[None, :], int(num_levels), axis=0)
 
 
 def _equilibrium_gravity_profile(
@@ -212,90 +198,112 @@ def _sample_range_value(values: list[float] | tuple[float, float], *, rng: np.ra
     return float(rng.uniform(lower, upper))
 
 
-def _sample_normal_value(spec: dict[str, float], *, rng: np.random.Generator) -> float:
-    """Sample one scalar from a config-provided normal distribution.
-
-    Parameters
-    ----------
-    spec : dict[str, float]
-        Distribution spec containing ``"mean"`` and ``"std"`` entries.
-    rng : np.random.Generator
-        Random number generator driving reproducible sampling.
-
-    Returns
-    -------
-    float
-        One sample drawn from ``Normal(mean, std)``.
-    """
-    return float(rng.normal(float(spec["mean"]), float(spec["std"])))
-
-
-def _compute_xi(gamma: float, tau: np.ndarray) -> np.ndarray:
-    """Compute the xi penetration function for a visible-channel opacity ratio.
-
-    Implements the two-stream approximation term from Line et al. (2013):
-
-        xi(gamma, tau) = 2/3
-            + (2 / (3*gamma)) * (1 + (gamma*tau/2 - 1) * exp(-gamma*tau))
-            + (2*gamma / 3) * (1 - tau^2/2) * E_2(gamma*tau)
-
-    Parameters
-    ----------
-    gamma : float
-        Ratio of the visible-channel Planck mean opacity to the thermal opacity.
-        Must be > 0.
-    tau : np.ndarray
-        Infrared optical depth at each pressure level.
-
-    Returns
-    -------
-    np.ndarray
-        The xi contribution at each pressure level, same shape as *tau*.
-    """
-    if gamma <= 0:
-        raise ValueError(f"gamma must be > 0, got {gamma}")
-    tau = np.asarray(tau, dtype=np.float64)
-    gt = gamma * tau
-    term1 = 2.0 / 3.0
-    term2 = (2.0 / (3.0 * gamma)) * (1.0 + (gt / 2.0 - 1.0) * np.exp(-gt))
-    term3 = (2.0 * gamma / 3.0) * (1.0 - 0.5 * tau ** 2) * expn(2, gt)
-    return term1 + term2 + term3
-
-
-def _compute_optical_depth(
+def _guillot_temperature(
     pressure_bar: np.ndarray,
     *,
-    kappa_ir_m2_kg: float,
-    gravity_m_s2: float,
-    power_law_n: float,
+    delta: float,
+    gamma: float,
+    t_int_k: float,
+    t_eq_k: float,
 ) -> np.ndarray:
-    """Compute gray infrared optical depth following the reference formulation.
+    """Compute the Guillot (2010) radiative-equilibrium temperature profile.
 
-    tau(P) = (kappa_ref * P_ref_Pa) / (g * n) * (P / P_ref)^n
+    Implements Eq. 16 from Piette & Madhusudhan (2019):
 
-    where P_ref = 1 bar.  This is the integrated form assuming
-    kappa(P) = kappa_ref * (P/P_ref)^(n-1).
+        T^4(P) = (3/4)*T_int^4*(2/3 + delta*P)
+               + (3/4)*T_eq^4*[2/3 + 1/(gamma*sqrt(3))
+               + (gamma/sqrt(3) - 1/(gamma*sqrt(3)))
+                 * exp(-gamma*delta*sqrt(3)*P)]
 
     Parameters
     ----------
     pressure_bar : np.ndarray
-        Pressure grid in bar.
-    kappa_ir_m2_kg : float
-        Reference infrared opacity in m^2/kg.
-    gravity_m_s2 : float
-        Surface gravity in m/s^2.
-    power_law_n : float
-        Pressure power-law exponent.  Must be > 0.
+        Pressure grid in bar, shape ``(nz,)``.
+    delta : float
+        Ratio of infrared opacity to gravity (kappa_IR / g).  Must be > 0.
+    gamma : float
+        Ratio of visible to infrared mean opacity.  Must be > 0.
+    t_int_k : float
+        Internal (intrinsic) temperature in Kelvin.
+    t_eq_k : float
+        Equilibrium temperature in Kelvin.
 
     Returns
     -------
     np.ndarray
-        Gray infrared optical depth at each pressure level.
+        Temperature profile in Kelvin, same shape as *pressure_bar*.
     """
-    if power_law_n <= 0:
-        raise ValueError(f"power_law_n must be > 0, got {power_law_n}")
-    tau_scale = (kappa_ir_m2_kg * _BAR_TO_PA) / gravity_m_s2
-    return (tau_scale / power_law_n) * pressure_bar ** power_law_n
+    pressure_bar = np.asarray(pressure_bar, dtype=np.float64)
+    sqrt3 = math.sqrt(3.0)
+    tau = delta * pressure_bar
+
+    t4_internal = 0.75 * t_int_k ** 4 * (2.0 / 3.0 + tau)
+    inv_gamma_sqrt3 = 1.0 / (gamma * sqrt3)
+    gamma_sqrt3 = gamma * sqrt3
+    t4_stellar = 0.75 * t_eq_k ** 4 * (
+        2.0 / 3.0
+        + inv_gamma_sqrt3
+        + (gamma / sqrt3 - inv_gamma_sqrt3) * np.exp(-gamma_sqrt3 * tau)
+    )
+    t4_total = t4_internal + t4_stellar
+    return np.clip(t4_total, 0.0, None) ** 0.25
+
+
+def _apply_upper_atmosphere_modification(
+    pressure_bar: np.ndarray,
+    temperature_k: np.ndarray,
+    *,
+    alpha: float,
+    p_trans_bar: float,
+    smoothing_width_dex: float = 1.25,
+) -> np.ndarray:
+    """Apply the Piette & Madhusudhan (2019) upper-atmosphere modification.
+
+    Implements Eq. 15:
+
+        T(P) = <T_Guillot(P) * (1 - alpha / (1 + P / P_trans))>_P
+
+    where ``<...>_P`` denotes boxcar smoothing over *smoothing_width_dex*
+    decades in log10(P).
+
+    Parameters
+    ----------
+    pressure_bar : np.ndarray
+        Pressure grid in bar, shape ``(nz,)``.  Must be uniformly spaced
+        in log10(P).
+    temperature_k : np.ndarray
+        Guillot base temperature profile in Kelvin, shape ``(nz,)``.
+    alpha : float
+        Strength of the upper-atmosphere modification.  Must lie in [0, 1).
+    p_trans_bar : float
+        Transition pressure in bar.
+    smoothing_width_dex : float, optional
+        Width of the boxcar smoothing window in decades of log10(P).
+        Default is 1.25 per the original paper.
+
+    Returns
+    -------
+    np.ndarray
+        Modified and smoothed temperature profile, shape ``(nz,)``.
+    """
+    modified = temperature_k * (1.0 - alpha / (1.0 + pressure_bar / p_trans_bar))
+
+    nz = len(pressure_bar)
+    if nz < 2:
+        return modified
+
+    dp = abs(np.log10(pressure_bar[1]) - np.log10(pressure_bar[0]))
+    if dp <= 0.0:
+        return modified
+
+    window = max(1, int(round(smoothing_width_dex / dp)))
+    if window <= 1:
+        return modified
+
+    pad = window // 2
+    padded = np.pad(modified, pad, mode="edge")
+    kernel = np.ones(window) / window
+    return np.convolve(padded, kernel, mode="valid")[:nz]
 
 
 def _apply_convective_adjustment(
@@ -382,15 +390,20 @@ def _sample_analytic_temperature_profile_record(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Sample a valid analytic PT profile via rejection sampling.
 
-    Draws parameters from the configured distributions, computes the
-    three-channel Line et al. (2013) radiative equilibrium profile,
-    optionally applies convective adjustment and a temperature shift,
-    then validates.  If the profile fails validation it is discarded
-    and a fresh draw is attempted (up to ``_MAX_PROFILE_ATTEMPTS``).
+    Draws parameters from uniform distributions, computes the Piette &
+    Madhusudhan (2019) modified Guillot (2010) radiative-equilibrium
+    profile, optionally applies convective adjustment, then validates.
+    If the profile fails validation it is discarded and a fresh draw is
+    attempted (up to ``_MAX_PROFILE_ATTEMPTS``).
 
-    The profile equation is:
-        T^4(tau) = (3*T_int^4/4) * (2/3 + tau)
-                 + (3*T_irr^4/4) * ((1-alpha)*xi_1 + alpha*xi_2)
+    The profile equations are (Piette & Madhusudhan 2019, Eqs. 15-16):
+
+        T_G^4(P) = (3/4)*T_int^4*(2/3 + delta*P)
+                 + (3/4)*T_eq^4*[2/3 + 1/(gamma*sqrt(3))
+                 + (gamma/sqrt(3) - 1/(gamma*sqrt(3)))
+                   * exp(-gamma*delta*sqrt(3)*P)]
+
+        T(P) = <T_G(P) * (1 - alpha/(1 + P/P_trans))>_P
 
     Parameters
     ----------
@@ -409,46 +422,38 @@ def _sample_analytic_temperature_profile_record(
     """
     sampler = config["temperature_profiles"]["analytic_sampler"]
     validation = config["temperature_profiles"]["validation"]
-    gravity_m_s2 = float(sampler["reference_gravity_m_s2"])
 
     for attempt in range(_MAX_PROFILE_ATTEMPTS):
         # --- Draw parameters ---
-        t_int_k = abs(_sample_normal_value(sampler["t_int_k_normal"], rng=rng))
-        t_irr_k = abs(_sample_normal_value(sampler["t_irr_k_normal"], rng=rng))
-        log10_kappa_ir = _sample_normal_value(sampler["log10_kappa_ir_m2_kg_normal"], rng=rng)
-        power_law_n = _sample_range_value(sampler["power_law_n_range"], rng=rng)
-        log10_gamma_1 = _sample_range_value(sampler["log10_gamma_1_range"], rng=rng)
-        log10_gamma_2 = _sample_range_value(sampler["log10_gamma_2_range"], rng=rng)
+        t_int_k = _sample_range_value(sampler["t_int_k_range"], rng=rng)
+        t_eq_k = _sample_range_value(sampler["t_eq_k_range"], rng=rng)
+        log10_delta = _sample_range_value(sampler["log10_delta_range"], rng=rng)
+        log10_gamma = _sample_range_value(sampler["log10_gamma_range"], rng=rng)
         alpha = _sample_range_value(sampler["alpha_range"], rng=rng)
-        temperature_shift_k = _sample_range_value(sampler["temperature_shift_k_range"], rng=rng)
+        log10_p_trans = _sample_range_value(sampler["log10_p_trans_bar_range"], rng=rng)
 
-        kappa_ir = 10.0 ** log10_kappa_ir
-        gamma_1 = 10.0 ** log10_gamma_1
-        gamma_2 = 10.0 ** log10_gamma_2
+        delta = 10.0 ** log10_delta
+        gamma = 10.0 ** log10_gamma
+        p_trans_bar = 10.0 ** log10_p_trans
 
-        # --- Compute optical depth and profile ---
-        try:
-            optical_depth = _compute_optical_depth(
-                pressure_bar,
-                kappa_ir_m2_kg=kappa_ir,
-                gravity_m_s2=gravity_m_s2,
-                power_law_n=power_law_n,
-            )
-        except ValueError:
+        # --- Compute Guillot base profile ---
+        profile_k = _guillot_temperature(
+            pressure_bar,
+            delta=delta,
+            gamma=gamma,
+            t_int_k=t_int_k,
+            t_eq_k=t_eq_k,
+        )
+
+        if not np.all(np.isfinite(profile_k)):
             continue
 
-        xi_1 = _compute_xi(gamma_1, optical_depth)
-        xi_2 = _compute_xi(gamma_2, optical_depth)
-
-        t4_deep = (3.0 * t_int_k ** 4 / 4.0) * (2.0 / 3.0 + optical_depth)
-        t4_channel1 = (3.0 * t_irr_k ** 4 / 4.0) * (1.0 - alpha) * xi_1
-        t4_channel2 = (3.0 * t_irr_k ** 4 / 4.0) * alpha * xi_2
-        t4_total = t4_deep + t4_channel1 + t4_channel2
-
-        if np.any(t4_total < 0):
-            continue
-
-        profile_k = t4_total ** 0.25
+        # --- Upper atmosphere modification + smoothing ---
+        profile_k = _apply_upper_atmosphere_modification(
+            pressure_bar, profile_k,
+            alpha=alpha,
+            p_trans_bar=p_trans_bar,
+        )
 
         # --- Convective adjustment (probability-gated) ---
         convective_adjustment_applied = bool(
@@ -464,9 +469,6 @@ def _sample_analytic_temperature_profile_record(
                 adiabatic_gradient=adiabatic_gradient,
             )
 
-        # --- Temperature shift ---
-        profile_k = profile_k + temperature_shift_k
-
         # --- Validate (reject if out of bounds) ---
         is_valid, reason = _validate_temperature_profile(
             profile_k, validation=validation,
@@ -477,19 +479,16 @@ def _sample_analytic_temperature_profile_record(
 
         metadata: dict[str, Any] = {
             "source": "analytic",
-            "analytic_profile_type": "line_2013",
-            "analytic_reference_gravity_m_s2": gravity_m_s2,
+            "analytic_profile_type": "piette_2019",
             "analytic_t_int_k": t_int_k,
-            "analytic_t_irr_k": t_irr_k,
-            "analytic_log10_kappa_ir_m2_kg": log10_kappa_ir,
-            "analytic_kappa_ir_m2_kg": kappa_ir,
-            "analytic_power_law_n": power_law_n,
-            "analytic_log10_gamma_1": log10_gamma_1,
-            "analytic_log10_gamma_2": log10_gamma_2,
-            "analytic_gamma_1": gamma_1,
-            "analytic_gamma_2": gamma_2,
+            "analytic_t_eq_k": t_eq_k,
+            "analytic_log10_delta": log10_delta,
+            "analytic_delta": delta,
+            "analytic_log10_gamma": log10_gamma,
+            "analytic_gamma": gamma,
             "analytic_alpha": alpha,
-            "analytic_temperature_shift_k": temperature_shift_k,
+            "analytic_log10_p_trans_bar": log10_p_trans,
+            "analytic_p_trans_bar": p_trans_bar,
             "analytic_convective_adjustment_applied": convective_adjustment_applied,
         }
         if adiabatic_gradient is not None:
@@ -1085,15 +1084,15 @@ def sample_run_specifications(
     fastchem = uses_fastchem(config)
 
     if fastchem:
-        # LHC over (metallicity, C/O, S/O) — 3 dimensions, no gravity.
+        # LHC over (He_H, C_H, O_H, N_H, S_H) — 5 dimensions.
         design = _latin_hypercube_unit_samples(
-            num_samples=total_runs, num_dimensions=3, rng=rng,
+            num_samples=total_runs, num_dimensions=5, rng=rng,
         )
     else:
         # LHC over (surface gravity, planet radius, stellar radius, orbit,
-        # zenith angle, diurnal factor, metallicity, C/O, S/O).
+        # zenith angle, diurnal factor, He_H, C_H, O_H, N_H, S_H).
         design = _latin_hypercube_unit_samples(
-            num_samples=total_runs, num_dimensions=9, rng=rng,
+            num_samples=total_runs, num_dimensions=11, rng=rng,
         )
 
     # Spectrum loading only needed for VULCAN chemistry.
@@ -1115,17 +1114,25 @@ def sample_run_specifications(
     result: list[RunSpecification] = []
     for run_idx in range(total_runs):
         if fastchem:
-            metallicity = _scale_unit_interval(
+            he_frac = _scale_unit_interval(
                 design[run_idx, 0],
-                *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
+                *[float(x) for x in config["sampling"]["he_frac_range"]],
             )
-            c_to_o = _scale_unit_interval(
+            c_frac = _scale_unit_interval(
                 design[run_idx, 1],
-                *[float(x) for x in config["sampling"]["c_to_o_range"]],
+                *[float(x) for x in config["sampling"]["c_frac_range"]],
             )
-            s_to_o = _scale_unit_interval(
+            o_frac = _scale_unit_interval(
                 design[run_idx, 2],
-                *[float(x) for x in config["sampling"]["s_to_o_range"]],
+                *[float(x) for x in config["sampling"]["o_frac_range"]],
+            )
+            n_frac = _scale_unit_interval(
+                design[run_idx, 3],
+                *[float(x) for x in config["sampling"]["n_frac_range"]],
+            )
+            s_frac = _scale_unit_interval(
+                design[run_idx, 4],
+                *[float(x) for x in config["sampling"]["s_frac_range"]],
             )
         else:
             gravity = _scale_unit_interval(
@@ -1152,17 +1159,25 @@ def sample_run_specifications(
                 design[run_idx, 5],
                 *[float(x) for x in config["sampling"]["diurnal_factor_range"]],
             )
-            metallicity = _scale_unit_interval(
+            he_frac = _scale_unit_interval(
                 design[run_idx, 6],
-                *[float(x) for x in config["sampling"]["metallicity_log10_range"]],
+                *[float(x) for x in config["sampling"]["he_frac_range"]],
             )
-            c_to_o = _scale_unit_interval(
+            c_frac = _scale_unit_interval(
                 design[run_idx, 7],
-                *[float(x) for x in config["sampling"]["c_to_o_range"]],
+                *[float(x) for x in config["sampling"]["c_frac_range"]],
             )
-            s_to_o = _scale_unit_interval(
+            o_frac = _scale_unit_interval(
                 design[run_idx, 8],
-                *[float(x) for x in config["sampling"]["s_to_o_range"]],
+                *[float(x) for x in config["sampling"]["o_frac_range"]],
+            )
+            n_frac = _scale_unit_interval(
+                design[run_idx, 9],
+                *[float(x) for x in config["sampling"]["n_frac_range"]],
+            )
+            s_frac = _scale_unit_interval(
+                design[run_idx, 10],
+                *[float(x) for x in config["sampling"]["s_frac_range"]],
             )
 
         temperature_k, temperature_metadata = _sample_temperature_profile_record(
@@ -1172,11 +1187,13 @@ def sample_run_specifications(
         )
         if fastchem:
             base_globals: dict[str, float] = {
-                "metallicity_log10": float(metallicity),
-                "c_to_o": float(c_to_o),
-                "s_to_o": float(s_to_o),
+                "He_H": float(he_frac),
+                "C_H": float(c_frac),
+                "O_H": float(o_frac),
+                "N_H": float(n_frac),
+                "S_H": float(s_frac),
             }
-            element_scalars = _element_scalars_from_sampled_globals(base_globals)
+            element_fractions = _element_fractions_from_sampled_globals(base_globals)
             gravity_profile = _equilibrium_gravity_profile(
                 pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
                 config=config,
@@ -1189,23 +1206,25 @@ def sample_run_specifications(
                 "semi_major_axis_au": float(semi_major_axis_au),
                 "zenith_angle_deg": float(zenith_angle_deg),
                 "diurnal_factor": float(diurnal_factor),
-                "metallicity_log10": float(metallicity),
-                "c_to_o": float(c_to_o),
-                "s_to_o": float(s_to_o),
+                "He_H": float(he_frac),
+                "C_H": float(c_frac),
+                "O_H": float(o_frac),
+                "N_H": float(n_frac),
+                "S_H": float(s_frac),
             }
-            element_scalars = _element_scalars_from_sampled_globals(base_globals)
+            element_fractions = _element_fractions_from_sampled_globals(base_globals)
             gravity_profile = np.full(
                 np.asarray(pressure_bar).shape,
                 float(gravity),
                 dtype=np.float64,
             )
-        elemental_profile = _element_profile_from_scalars(
-            element_scalars,
+        elemental_profile = _element_profile_from_fractions(
+            element_fractions,
             num_levels=np.asarray(pressure_bar).size,
         )
 
         if fastchem:
-            globals_map = {**base_globals, **element_scalars}
+            globals_map = {**base_globals, **element_fractions}
             result.append(
                 RunSpecification(
                     run_id=f"run_{run_idx:05d}",
@@ -1213,7 +1232,7 @@ def sample_run_specifications(
                     temperature_k=np.asarray(temperature_k, dtype=np.float64),
                     globals=globals_map,
                     metadata=dict(temperature_metadata),
-                    elemental_abundances_x_h=elemental_profile,
+                    elemental_abundances_frac=elemental_profile,
                     gravity_cm_s2=gravity_profile,
                 )
             )
@@ -1231,7 +1250,7 @@ def sample_run_specifications(
             )
             globals_map = {
                 **base_globals,
-                **element_scalars,
+                **element_fractions,
                 **_science_preset_conditioning_inputs(preset),
             }
             result.append(
@@ -1247,7 +1266,7 @@ def sample_run_specifications(
                     },
                     kzz_cm2_s=np.asarray(kzz, dtype=np.float64),
                     spectrum=spectrum,
-                    elemental_abundances_x_h=elemental_profile,
+                    elemental_abundances_frac=elemental_profile,
                     gravity_cm_s2=gravity_profile,
                 )
             )

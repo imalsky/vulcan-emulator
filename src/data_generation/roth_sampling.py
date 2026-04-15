@@ -31,12 +31,10 @@ from typing import Any, Dict, Tuple, Union
 
 import numpy as np
 
+from ..constants import ROTH_BOOLEAN_FILTER_KEYS, ROTH_FILTER_KEYS, ROTH_NUMERIC_FILTER_KEYS
+
 RothFilterValue = Union[float, Tuple[float, float], bool]
 RothFilterConfig = Dict[str, RothFilterValue]
-
-ROTH_NUMERIC_FILTER_KEYS = ("Teq", "LogMet", "LogDrag", "Mstar", "Rp", "logG")
-ROTH_BOOLEAN_FILTER_KEYS = ("TiOVO",)
-ROTH_FILTER_KEYS = (*ROTH_NUMERIC_FILTER_KEYS, *ROTH_BOOLEAN_FILTER_KEYS)
 _PT_PROFILE_FILENAME_PATTERN = re.compile(
     r"Teq_(?P<Teq>[\d.]+)-"
     r"LogMet_(?P<LogMet>[-]?[\d.]+)-"

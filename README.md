@@ -10,16 +10,16 @@ Supported model families:
 - `mlp`
 - `transformer`
 
-Shipped example configs:
-- `config/fastchem_transformer_config.json`
-- `config/vulcan_transformer_config.json`
+Shipped configs:
+- `config/vulcan_no_condensation.json` — gas-phase only VULCAN
+- `config/vulcan_condensation.json` — condensation-enabled VULCAN
 
 CLI:
 
 ```bash
-python -m src.utils --config config/fastchem_transformer_config.json --stage generation
-python -m src.utils --config config/fastchem_transformer_config.json --stage normalization
-python -m src.utils --config config/fastchem_transformer_config.json --stage training
+python -m src.utils --config config/vulcan_no_condensation.json --stage generation
+python -m src.utils --config config/vulcan_no_condensation.json --stage normalization
+python -m src.utils --config config/vulcan_no_condensation.json --stage training
 ```
 
 `--stage normalization` performs the full raw-to-processed step: split creation, train-only normalization fitting, and processed tensor writing.
@@ -65,8 +65,9 @@ Layout:
 - `config/`: canonical JSON configs and helper notes
 - `data/`: dataset runs with `raw/`, `info/`, `train/`, `val/`, `test/`, and derived spectrum libraries
 - `models/`: checkpoints and exported bundles
+- `src/constants.py`: single source of truth for all shared constants
 - `src/models/`: architecture, inference, and export logic
 - `src/training/`: training loops and evaluation utilities
 - `src/data_generation/`: sampling, raw generation, preprocessing, and dataset I/O
 - `src/utils/`: config validation, CLI, logging, paths, and provenance helpers
-- `uni_tests/fixtures/`: tiny tracked fixtures used by tests
+- `uni_tests/`: minimal test suite (5 files — config, model, export, sampling, runner)

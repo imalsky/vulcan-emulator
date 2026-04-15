@@ -13,8 +13,8 @@ trainer.  The pipeline has four stages:
    data remain unseen during fitting.
 4. **Apply & persist** — transform every split through the fitted
    normalization blocks and write the resulting ``.npy`` tensors,
-   shared JSON metadata under ``processed_root / "info"``, and provenance
-   manifests to ``processed_root``.
+   shared JSON metadata under the dataset-level ``info`` directory, and
+   provenance manifests to disk.
 
 Two top-level entry points handle the two chemistry types:
 
@@ -37,8 +37,8 @@ from typing import Any
 import h5py
 import numpy as np
 
+from ..constants import ELEMENT_INPUT_ORDER, PROCESSED_DATA_VERSION
 from ..utils.config import (
-    ELEMENT_INPUT_ORDER,
     get_chemistry_type,
     get_model_type,
     resolve_conditioning_inputs,
@@ -47,19 +47,8 @@ from ..utils.config import (
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 from ..utils.provenance import fingerprint_payload, manifest_for_files
 from .data_loader import processed_info_dir
-from .spectrum import pack_spectrum_tokens, sanitize_spectrum_arrays
 
 LOGGER = get_logger(__name__)
-# Bump this integer whenever the processed tensor layout changes in a way
-# that would silently break a model trained on a prior version.
-PROCESSED_DATA_VERSION = 17
-_EQUILIBRIUM_GLOBAL_ORDER = ELEMENT_INPUT_ORDER
-_LEGACY_PROCESSED_INFO_FILES = (
-    "normalization.json",
-    "data_contract.json",
-    "processed_manifest.json",
-    "splits.json",
-)
 
 
 @dataclass(frozen=True)
@@ -76,10 +65,7 @@ class RawRun:
     kzz_cm2_s: np.ndarray
     final_ymix_output: np.ndarray
     globals: dict[str, float]
-    spectrum_name: str
-    spectrum_wavelength_nm: np.ndarray
-    spectrum_flux_erg_cm2_s_nm: np.ndarray
-    elemental_abundances_x_h: np.ndarray
+    elemental_abundances_frac: np.ndarray
     gravity_cm_s2: np.ndarray
 
 
@@ -91,28 +77,9 @@ class RawEquilibriumRun:
     temperature_k: np.ndarray
     equilibrium_ymix: np.ndarray
     globals: dict[str, float]
-    elemental_abundances_x_h: np.ndarray
+    elemental_abundances_frac: np.ndarray
     gravity_cm_s2: np.ndarray
 
-
-def _remove_legacy_processed_info_files(processed_root: Path) -> None:
-    """Remove legacy top-level processed metadata files after migrating to ``info``.
-
-    Parameters
-    ----------
-    processed_root : Path
-        Processed dataset root that may still contain legacy top-level JSON
-        metadata files.
-
-    Returns
-    -------
-    None
-        Any legacy top-level shared metadata files are deleted in place.
-    """
-    for filename in _LEGACY_PROCESSED_INFO_FILES:
-        legacy_path = processed_root / filename
-        if legacy_path.exists():
-            legacy_path.unlink()
 
 
 def _decode_species(values: np.ndarray) -> list[str]:
@@ -198,9 +165,9 @@ def _elemental_conditioning_globals(
     profile = np.asarray(elemental_profile, dtype=np.float64)
     if profile.ndim != 2 or profile.shape[1] != len(ELEMENT_INPUT_ORDER):
         raise ValueError(
-            f"{run_label}: elemental_abundances_x_h must have shape (nz, {len(ELEMENT_INPUT_ORDER)})."
+            f"{run_label}: elemental_abundances_frac must have shape (nz, {len(ELEMENT_INPUT_ORDER)})."
         )
-    _require_column_constant(profile, name="elemental_abundances_x_h", run_label=run_label)
+    _require_column_constant(profile, name="elemental_abundances_frac", run_label=run_label)
     resolved = {
         name: float(profile[0, idx])
         for idx, name in enumerate(ELEMENT_INPUT_ORDER)
@@ -228,9 +195,9 @@ def _require_elemental_conditioning_globals(
     -------
     dict[str, float]
         Subset of ``globals_map`` containing the required elemental inputs in
-        ``_EQUILIBRIUM_GLOBAL_ORDER``.
+        ``ELEMENT_INPUT_ORDER``.
     """
-    missing = [name for name in _EQUILIBRIUM_GLOBAL_ORDER if name not in globals_map]
+    missing = [name for name in ELEMENT_INPUT_ORDER if name not in globals_map]
     if missing:
         raise ValueError(
             f"{run_label}: raw globals are missing required elemental-conditioning inputs "
@@ -238,7 +205,7 @@ def _require_elemental_conditioning_globals(
         )
     resolved = {
         name: float(globals_map[name])
-        for name in _EQUILIBRIUM_GLOBAL_ORDER
+        for name in ELEMENT_INPUT_ORDER
     }
     if not np.all(np.isfinite(list(resolved.values()))):
         raise ValueError(f"{run_label}: non-finite elemental-conditioning globals detected.")
@@ -608,13 +575,7 @@ def load_raw_run(
     config: dict[str, Any],
     run_id: str | None = None,
 ) -> RawRun:
-    """Load one raw HDF5 full-VULCAN run and align it to the configured species contract.
-
-    The stellar spectrum is preserved on its native wavelength grid. Only
-    basic sanitation is applied here: non-finite rows are dropped, negative
-    fluxes are clipped to zero, duplicate wavelengths are averaged, and the
-    arrays are clipped to the configured wavelength interval.
-    """
+    """Load one raw HDF5 full-VULCAN run and align it to the configured species contract."""
     requested_output_species = list(config["data_spec"]["output_species"])
 
     def _extract(handle: h5py.Group) -> dict[str, Any]:
@@ -624,7 +585,7 @@ def load_raw_run(
             "temperature_k": np.asarray(handle["inputs/temperature_k"], dtype=np.float64),
             "kzz_cm2_s": np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64),
             "element_input_order": _decode_species(np.asarray(handle["inputs/element_input_order"])),
-            "elemental_abundances_x_h": np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64),
+            "elemental_abundances_frac": np.asarray(handle["inputs/elemental_abundances_frac"], dtype=np.float64),
             "gravity_cm_s2": np.asarray(handle["inputs/gravity_cm_s2"], dtype=np.float64),
             "stored_output_species": _decode_species(np.asarray(handle["inputs/output_species"])),
             "final_ymix_output": np.asarray(handle["final_state/ymix_output"], dtype=np.float64),
@@ -632,9 +593,6 @@ def load_raw_run(
                 key: float(np.asarray(handle[f"globals/{key}"]))
                 for key in handle["globals"].keys()
             },
-            "spectrum_name": str(np.asarray(handle["spectrum/name"]).astype(str)),
-            "spectrum_wavelength_nm": np.asarray(handle["spectrum/wavelength_nm"], dtype=np.float64),
-            "spectrum_flux": np.asarray(handle["spectrum/flux_erg_cm2_s_nm"], dtype=np.float64),
         }
 
     if isinstance(source, h5py.Group):
@@ -658,13 +616,13 @@ def load_raw_run(
         raise ValueError(f"{label}: non-finite temperature values detected.")
     if not np.all(np.isfinite(kzz_cm2_s)):
         raise ValueError(f"{label}: non-finite Kzz values detected.")
-    if not np.all(np.isfinite(d["elemental_abundances_x_h"])):
+    if not np.all(np.isfinite(d["elemental_abundances_frac"])):
         raise ValueError(f"{label}: non-finite elemental abundance values detected.")
     if not np.all(np.isfinite(d["gravity_cm_s2"])):
         raise ValueError(f"{label}: non-finite gravity values detected.")
     if final_ymix_output.shape[0] != pressure_bar.size:
         raise ValueError(f"{label}: final_ymix_output vertical dimension does not match pressure grid.")
-    if d["elemental_abundances_x_h"].shape[0] != pressure_bar.size:
+    if d["elemental_abundances_frac"].shape[0] != pressure_bar.size:
         raise ValueError(f"{label}: elemental abundance profile does not match pressure grid.")
     if d["gravity_cm_s2"].shape != pressure_bar.shape:
         raise ValueError(f"{label}: gravity profile does not match pressure grid.")
@@ -672,7 +630,7 @@ def load_raw_run(
     output_indices = [d["stored_output_species"].index(name) for name in requested_output_species]
     element_order = list(config["data_spec"]["element_input_order"])
     element_indices = [d["element_input_order"].index(name) for name in element_order]
-    elemental_profile = d["elemental_abundances_x_h"][:, element_indices]
+    elemental_profile = d["elemental_abundances_frac"][:, element_indices]
     gravity_profile = np.asarray(d["gravity_cm_s2"], dtype=np.float64)
     element_globals = _elemental_conditioning_globals(
         elemental_profile=elemental_profile,
@@ -684,14 +642,6 @@ def load_raw_run(
         reduced_globals["gravity_cm_s2"] = float(gravity_profile[0])
     final_ymix_output = final_ymix_output[:, output_indices]
 
-    clean_wavelength_nm, clean_flux = sanitize_spectrum_arrays(
-        d["spectrum_wavelength_nm"],
-        d["spectrum_flux"],
-        wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
-        wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
-        min_points=2,
-    )
-
     return RawRun(
         run_id=run_id or label,
         pressure_bar=pressure_bar,
@@ -699,10 +649,7 @@ def load_raw_run(
         kzz_cm2_s=kzz_cm2_s,
         final_ymix_output=final_ymix_output,
         globals=reduced_globals,
-        spectrum_name=d["spectrum_name"],
-        spectrum_wavelength_nm=clean_wavelength_nm.astype(np.float64),
-        spectrum_flux_erg_cm2_s_nm=clean_flux.astype(np.float64),
-        elemental_abundances_x_h=elemental_profile,
+        elemental_abundances_frac=elemental_profile,
         gravity_cm_s2=gravity_profile,
     )
 
@@ -752,14 +699,8 @@ def _normalization_payload(
     config: dict[str, Any],
     global_static_order: list[str],
 ) -> dict[str, Any]:
-    """Fit all normalization blocks for the full-VULCAN pipeline.
-
-    Stellar spectra are *not* dataset-normalized here. They are stored in
-    physical units and normalized on-the-fly inside the spectrum encoder so
-    that inference remains valid for variable native wavelength grids.
-    """
+    """Fit all normalization blocks for the full-VULCAN pipeline."""
     state_floor = float(config["normalization"]["state_floor"])
-    spectrum_floor = float(config["normalization"]["spectrum_floor"])
     sequence_static = np.concatenate(
         [
             np.stack(
@@ -820,12 +761,6 @@ def _normalization_payload(
             floor=state_floor,
         ),
         "global_static": _fit_mixed_block(global_static, global_methods),
-        "spectrum_processing": {
-            "floor": spectrum_floor,
-            "wavelength_min_nm": float(config["stellar_spectrum"]["wavelength_min_nm"]),
-            "wavelength_max_nm": float(config["stellar_spectrum"]["wavelength_max_nm"]),
-            "max_tokens": int(config["stellar_spectrum"]["max_tokens"]),
-        },
     }
 
 
@@ -896,7 +831,7 @@ def load_raw_equilibrium_run(
         pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
         temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
         element_input_order = _decode_species(np.asarray(handle["inputs/element_input_order"]))
-        elemental_abundances_x_h = np.asarray(handle["inputs/elemental_abundances_x_h"], dtype=np.float64)
+        elemental_abundances_frac = np.asarray(handle["inputs/elemental_abundances_frac"], dtype=np.float64)
         gravity_cm_s2 = np.asarray(handle["inputs/gravity_cm_s2"], dtype=np.float64)
         stored_output_species = _decode_species(np.asarray(handle["inputs/output_species"]))
         equilibrium_ymix = np.asarray(handle["equilibrium/ymix"], dtype=np.float64)
@@ -906,7 +841,7 @@ def load_raw_equilibrium_run(
         }
         element_order = list(config["data_spec"]["element_input_order"])
         element_indices = [element_input_order.index(name) for name in element_order]
-        elemental_profile = elemental_abundances_x_h[:, element_indices]
+        elemental_profile = elemental_abundances_frac[:, element_indices]
         return pressure_bar, temperature_k, elemental_profile, gravity_cm_s2, stored_output_species, equilibrium_ymix, globals_map
 
     if isinstance(source, h5py.Group):
@@ -951,7 +886,7 @@ def load_raw_equilibrium_run(
         temperature_k=temperature_k,
         equilibrium_ymix=equilibrium_ymix,
         globals=globals_map,
-        elemental_abundances_x_h=elemental_profile,
+        elemental_abundances_frac=elemental_profile,
         gravity_cm_s2=gravity_profile,
     )
 
@@ -1081,7 +1016,6 @@ def preprocess_equilibrium_dataset(
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     ensure_dir(processed_root)
     info_dir = ensure_dir(processed_info_dir(processed_root))
-    _remove_legacy_processed_info_files(processed_root)
 
     consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
     if consolidated_path is not None:
@@ -1251,15 +1185,7 @@ def preprocess_raw_dataset(
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     ensure_dir(processed_root)
     info_dir = ensure_dir(processed_info_dir(processed_root))
-    _remove_legacy_processed_info_files(processed_root)
 
-
-    spectrum_max_tokens = int(config["stellar_spectrum"]["max_tokens"])
-    spectrum_wavelength_min_nm = float(config["stellar_spectrum"]["wavelength_min_nm"])
-    spectrum_wavelength_max_nm = float(config["stellar_spectrum"]["wavelength_max_nm"])
-    spectrum_dbin1_nm = float(config["stellar_spectrum"].get("dbin1_nm", 0.1))
-    spectrum_dbin2_nm = float(config["stellar_spectrum"].get("dbin2_nm", 2.0))
-    spectrum_dbin_12trans_nm = float(config["stellar_spectrum"].get("dbin_12trans_nm", 240.0))
 
     consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
     if consolidated_path is not None:
@@ -1297,9 +1223,6 @@ def preprocess_raw_dataset(
         sequence_inputs = np.zeros((len(runs), nz, 3), dtype=np.float32)
         target_outputs = np.zeros((len(runs), nz, target_dim), dtype=np.float32)
         global_inputs = np.zeros((len(runs), len(global_static_order)), dtype=np.float32)
-        spectrum_wavelengths_nm = np.zeros((len(runs), spectrum_max_tokens), dtype=np.float32)
-        spectrum_fluxes_erg_cm2_s_nm = np.zeros((len(runs), spectrum_max_tokens), dtype=np.float32)
-        spectrum_mask = np.zeros((len(runs), spectrum_max_tokens), dtype=bool)
         run_ids: list[str] = []
 
         for idx, run in enumerate(runs):
@@ -1320,20 +1243,6 @@ def preprocess_raw_dataset(
                 global_vector[None, :],
                 normalization["global_static"],
             )[0].astype(np.float32)
-
-            packed_wavelengths_nm, packed_fluxes, packed_mask = pack_spectrum_tokens(
-                run.spectrum_wavelength_nm,
-                run.spectrum_flux_erg_cm2_s_nm,
-                wavelength_min_nm=spectrum_wavelength_min_nm,
-                wavelength_max_nm=spectrum_wavelength_max_nm,
-                max_tokens=spectrum_max_tokens,
-                dbin1_nm=spectrum_dbin1_nm,
-                dbin2_nm=spectrum_dbin2_nm,
-                dbin_12trans_nm=spectrum_dbin_12trans_nm,
-            )
-            spectrum_wavelengths_nm[idx] = packed_wavelengths_nm
-            spectrum_fluxes_erg_cm2_s_nm[idx] = packed_fluxes
-            spectrum_mask[idx] = packed_mask
             run_ids.append(run.run_id)
 
         metadata = {
@@ -1348,19 +1257,10 @@ def preprocess_raw_dataset(
             "element_input_order": list(config["data_spec"]["element_input_order"]),
             "global_feature_order": list(config["data_spec"]["global_feature_order"]),
             "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
-            "spectrum_max_tokens": spectrum_max_tokens,
-            "spectrum_wavelength_min_nm": spectrum_wavelength_min_nm,
-            "spectrum_wavelength_max_nm": spectrum_wavelength_max_nm,
-            "spectrum_dbin1_nm": spectrum_dbin1_nm,
-            "spectrum_dbin2_nm": spectrum_dbin2_nm,
-            "spectrum_dbin_12trans_nm": spectrum_dbin_12trans_nm,
         }
         np.save(split_dir / "sequence_inputs.npy", sequence_inputs)
         np.save(split_dir / "target_outputs.npy", target_outputs)
         np.save(split_dir / "global_inputs.npy", global_inputs)
-        np.save(split_dir / "spectrum_wavelengths_nm.npy", spectrum_wavelengths_nm)
-        np.save(split_dir / "spectrum_fluxes_erg_cm2_s_nm.npy", spectrum_fluxes_erg_cm2_s_nm)
-        np.save(split_dir / "spectrum_mask.npy", spectrum_mask)
         (split_dir / "run_ids.json").write_text(json.dumps(run_ids, indent=2) + "\n", encoding="utf-8")
         (split_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -1375,13 +1275,6 @@ def preprocess_raw_dataset(
         "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
         "sequence_dim": 3,
         "target_dim": len(config["data_spec"]["output_species"]),
-        "spectrum_max_tokens": spectrum_max_tokens,
-        "spectrum_wavelength_min_nm": spectrum_wavelength_min_nm,
-        "spectrum_wavelength_max_nm": spectrum_wavelength_max_nm,
-        "spectrum_dbin1_nm": spectrum_dbin1_nm,
-        "spectrum_dbin2_nm": spectrum_dbin2_nm,
-        "spectrum_dbin_12trans_nm": spectrum_dbin_12trans_nm,
-        "spectrum_variable_length": True,
     }
     (info_dir / "normalization.json").write_text(
         json.dumps(normalization, indent=2) + "\n",
