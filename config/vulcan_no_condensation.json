@@ -180,7 +180,7 @@
       "t_cross_sp": ["H2", "He"]
     },
     "stellar_spectrum": {
-      "template_name": "wasp39",
+      "template_name": "blackbody",
       "template_file": null,
       "library_glob": null,
       "wavelength_min_nm": 2.0,

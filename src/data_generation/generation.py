@@ -1136,8 +1136,7 @@ def _patch_vulcan_cfg(
             "orbit_radius": float(spec.globals["semi_major_axis_au"]),
             "sl_angle": float(np.deg2rad(spec.globals["zenith_angle_deg"])),
             "f_diurnal": float(spec.globals["diurnal_factor"]),
-            "save_evolution": True,
-            "save_evo_frq": 1,
+            "save_evolution": False,
             "use_live_plot": False,
             "use_live_flux": False,
             "use_plot_end": False,
@@ -1253,14 +1252,6 @@ def convert_vulcan_output_to_hdf5(
     pressure_bar = np.asarray(_fetch(data, "atm", "pco"), dtype=np.float64) / 1.0e6
     temperature_k = np.asarray(_fetch(data, "atm", "Tco"), dtype=np.float64)
 
-    # Reference (initial) state: convert number densities to mixing ratios.
-    if "y_ini" not in _fetch(data, "variable") or "n_0" not in _fetch(data, "atm"):
-        raise ValueError("VULCAN output is missing variable.y_ini or atm.n_0 required for exact FastChem extraction.")
-    y_ini = np.asarray(_fetch(data, "variable", "y_ini"), dtype=np.float64)
-    n0 = np.asarray(_fetch(data, "atm", "n_0"), dtype=np.float64)
-    if y_ini.shape[0] != n0.size:
-        raise ValueError("VULCAN output contains inconsistent y_ini and atm.n_0 shapes.")
-
     # Kzz may be on cell edges (nz-1); interpolate to cell centres if needed.
     kzz_raw = np.asarray(_fetch(data, "atm", "Kzz"), dtype=np.float64)
     if kzz_raw.ndim == 1 and kzz_raw.size == pressure_bar.size - 1:
@@ -1275,16 +1266,15 @@ def convert_vulcan_output_to_hdf5(
 
     # Extract the final converged mixing ratios from VULCAN output.
     variable = _fetch(data, "variable")
-    if "ymix_time" not in variable:
+    if "ymix" not in variable:
         raise ValueError(
-            "VULCAN output is missing variable.ymix_time "
+            "VULCAN output is missing variable.ymix "
             "required to derive the final raw-data contract."
         )
-    ymix_time = np.asarray(_fetch(data, "variable", "ymix_time"), dtype=np.float64)
+    ymix = np.asarray(_fetch(data, "variable", "ymix"), dtype=np.float64)
     output_species = list(config["data_spec"]["output_species"])
     output_indices = [species.index(name) for name in output_species]
-    # Take the last timestep as the final converged state.
-    final_ymix_output = ymix_time[-1, :, :][:, output_indices]
+    final_ymix_output = ymix[:, output_indices]
     converted_spec = RunSpecification(
         run_id=spec.run_id,
         pressure_bar=pressure_bar,

@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data_generation.spectrum import (  # noqa: E402
-    generate_wasp39b_template,
+    generate_blackbody_template,
     write_vulcan_spectrum_txt,
 )
 from src.utils.config import load_and_validate_config  # noqa: E402
@@ -221,8 +221,8 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                         "t_cross_sp": ["H2O", "H2S", "SH", "SO2", "S2"],
                     },
                     "stellar_spectrum": {
-                        "template_name": "wasp39b_frances_surface_flux",
-                        "template_file": "assets/spectra/wasp39b/test_surface_flux.txt",
+                        "template_name": "test_blackbody",
+                        "template_file": "assets/spectra/test_surface_flux.txt",
                         "library_glob": "assets/spectra/library/*.txt",
                         "max_tokens": 32,
                         "wavelength_min_nm": 400.0,
@@ -250,7 +250,7 @@ def tiny_config(tmp_path):
     spectrum_file = spectrum_dir / "test_surface_flux.txt"
     spectrum_file_alt = spectrum_dir / "test_surface_flux_alt.txt"
     write_vulcan_spectrum_txt(
-        generate_wasp39b_template(
+        generate_blackbody_template(
             num_points=64,
             wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
             wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
@@ -260,7 +260,7 @@ def tiny_config(tmp_path):
         spectrum_file,
     )
     write_vulcan_spectrum_txt(
-        generate_wasp39b_template(
+        generate_blackbody_template(
             num_points=64,
             wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
             wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),

@@ -22,7 +22,7 @@ from src.data_generation.generation import (
 from synthetic_fixture import generate_synthetic_raw_runs
 from src.data_generation.sampling import sample_run_specifications
 from src.data_generation.spectrum import (
-    generate_wasp39b_template,
+    generate_blackbody_template,
     write_vulcan_spectrum_txt,
 )
 from src.utils.config import dataset_info_root, load_and_validate_config
@@ -155,11 +155,8 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
         "humidity": 1.0,
         "r_p": {"H2O_l_s": 5e-5, "S8_l_s": 1e-4},
         "rho_p": {"H2O_l_s": 0.9, "S8_l_s": 2.07},
-        "fix_species": ["H2O", "H2O_l_s", "S8", "S8_l_s"],
         "start_conden_time": 0,
-        "stop_conden_time": 1.0e8,
-        "fix_species_time": 1.0e8,
-        "fix_species_from_coldtrap_lev": True,
+        "runtime": 1.0e12,
     }
     config["vulcan_runtime"] = copy.deepcopy(config["vulcan"]["runtime"])
 
@@ -207,10 +204,7 @@ def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_con
     assert "'H2O_l_s': 5e-05" in patched
     assert "'S8_l_s': 0.0001" in patched
     assert "'S8_l_s': 2.07" in patched
-    assert "fix_species = ['H2O', 'H2O_l_s', 'S8', 'S8_l_s']" in patched
-    assert "stop_conden_time = 100000000.0" in patched
-    assert "fix_species_time = 100000000.0" in patched
-    assert "fix_species_from_coldtrap_lev = True" in patched
+    assert "runtime = 1000000000000.0" in patched
     assert "T_cross_sp = ['H2O', 'H2S', 'SH', 'SO2', 'S2']" in patched
     assert f"atm_base = '{expected_atm_base}'" in patched
     assert f"gs = {float(spec.globals['gravity_cm_s2'])}" in patched
@@ -225,10 +219,9 @@ def test_shipped_vulcan_transformer_smoke_runs_local_checkout(tmp_path):
     source_root = (root / "../VULCAN-master").resolve()
     if not source_root.exists():
         pytest.skip("Local VULCAN checkout is required for the smoke test.")
-    # Requires a VULCAN version that outputs variable.ymix_time (not legacy y_time).
     vulcan_py = source_root / "vulcan.py"
-    if vulcan_py.exists() and "ymix_time" not in vulcan_py.read_text(encoding="utf-8", errors="ignore"):
-        pytest.skip("Local VULCAN checkout does not produce ymix_time (legacy output format).")
+    if not vulcan_py.exists():
+        pytest.skip("Local VULCAN checkout is missing vulcan.py.")
 
     raw_config = json.loads(
         (root / "config" / "vulcan_condensation.json").read_text(encoding="utf-8")
@@ -237,7 +230,7 @@ def test_shipped_vulcan_transformer_smoke_runs_local_checkout(tmp_path):
     spectrum_dir.mkdir(parents=True, exist_ok=True)
     spectrum_path = spectrum_dir / "smoke_surface_flux.txt"
     write_vulcan_spectrum_txt(
-        generate_wasp39b_template(
+        generate_blackbody_template(
             num_points=64,
             wavelength_min_nm=float(raw_config["vulcan"]["stellar_spectrum"]["wavelength_min_nm"]),
             wavelength_max_nm=float(raw_config["vulcan"]["stellar_spectrum"]["wavelength_max_nm"]),
@@ -304,21 +297,17 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
     reference[:, species.index("He")] = 0.15
     reference[:, species.index("H2O")] = 1.0e-3
     reference /= np.sum(reference, axis=1, keepdims=True)
-    ymix_time = np.stack([reference * 0.98, reference], axis=0)
-    n0 = np.full(nz, 1.0e12, dtype=np.float64)
     runtime_gravity = np.linspace(2.0e3, 1.7e3, nz, dtype=np.float64)
     fake = {
         "variable": {
             "species": species,
-            "ymix_time": ymix_time,
-            "y_ini": reference * n0[:, None],
+            "ymix": reference,
         },
         "atm": {
             "pco": spec.pressure_bar * 1.0e6,
             "Tco": spec.temperature_k,
             "Kzz": spec.kzz_cm2_s[:-1],
             "g": runtime_gravity,
-            "n_0": n0,
         },
     }
     vul_path = tmp_path / "fake.vul"
@@ -347,7 +336,7 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
         assert "target_mode" not in handle["inputs"]
         final_state = np.asarray(handle["final_state/ymix_output"])
         assert final_state.shape == (nz, state_dim)
-        np.testing.assert_allclose(final_state, ymix_time[-1], atol=1.0e-12)
+        np.testing.assert_allclose(final_state, reference, atol=1.0e-12)
         assert np.asarray(handle["inputs/kzz_cm2_s"]).shape == (nz,)
         np.testing.assert_allclose(np.asarray(handle["inputs/gravity_cm_s2"]), runtime_gravity, atol=1.0e-12)
 

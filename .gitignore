@@ -73,15 +73,19 @@ logs/
 *.h5
 *.npy
 *.npz
+*.vul
 
-# Log files
-*.log
-
-# Generated plot outputs
+# Images / plot outputs
+*.png
+*.jpg
+*.jpeg
+*.gif
 plots/
 extras/plots/
 extras/standalone_plots/
 
+# Log files
+*.log
+
 # Large demo artifacts
 *.zip
-*.npz

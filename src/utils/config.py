@@ -835,9 +835,9 @@ def _validate_temperature_profiles(profile_config: Any) -> dict[str, Any]:
             normalized.get("analytic_probability", 0.5),
             "temperature_profiles.analytic_probability",
         )
-        if not 0.0 < normalized["analytic_probability"] < 1.0:
+        if not 0.0 <= normalized["analytic_probability"] <= 1.0:
             raise ConfigValidationError(
-                "temperature_profiles.analytic_probability must lie strictly between 0 and 1 "
+                "temperature_profiles.analytic_probability must be between 0 and 1 "
                 "when temperature_profiles.source_mode='mixed'."
             )
     else:

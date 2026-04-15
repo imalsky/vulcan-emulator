@@ -870,7 +870,7 @@ def _scale_unit_interval(value: float, lower: float, upper: float) -> float:
     return float(lower + value * (upper - lower))
 
 
-def _ensure_wasp39_template(
+def _ensure_stellar_template(
     *,
     project_root: Path,
     config: dict[str, Any],
@@ -893,9 +893,9 @@ def _ensure_wasp39_template(
     spectrum_cfg = config["stellar_spectrum"]
     template_file = spectrum_cfg.get("template_file")
     if template_file in {None, ""}:
-        from .spectrum import generate_wasp39b_template
+        from .spectrum import generate_blackbody_template
 
-        return generate_wasp39b_template(
+        return generate_blackbody_template(
             wavelength_min_nm=float(spectrum_cfg["wavelength_min_nm"]),
             wavelength_max_nm=float(spectrum_cfg["wavelength_max_nm"]),
             teff_k=float(spectrum_cfg.get("teff_k") or 5485.0),
@@ -964,7 +964,7 @@ def _load_configured_spectrum_records(
     library_glob = _resolve_spectrum_library_glob(project_root=project_root, config=config)
     if library_glob:
         return load_spectrum_records_from_glob(library_glob)
-    template = _ensure_wasp39_template(project_root=project_root, config=config)
+    template = _ensure_stellar_template(project_root=project_root, config=config)
     return {template.name: template}
 
 

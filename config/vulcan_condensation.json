@@ -183,16 +183,13 @@
         "humidity": 1.0,
         "r_p": {"H2O_l_s": 5e-05, "S8_l_s": 0.0001},
         "rho_p": {"H2O_l_s": 0.9, "S8_l_s": 2.07},
-        "fix_species": ["H2O", "H2O_l_s", "S8", "S8_l_s"],
         "start_conden_time": 0,
-        "stop_conden_time": 1000000000000.0,
-        "fix_species_time": 100000000.0,
-        "fix_species_from_coldtrap_lev": true
+        "runtime": 1e12
       },
       "t_cross_sp": ["H2", "He"]
     },
     "stellar_spectrum": {
-      "template_name": "wasp39",
+      "template_name": "blackbody",
       "template_file": null,
       "library_glob": null,
       "wavelength_min_nm": 2.0,

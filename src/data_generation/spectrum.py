@@ -33,7 +33,7 @@ class SpectrumRecord:
     Attributes
     ----------
     name : str
-        Human-readable identifier (e.g., ``"wasp39b_template"``).
+        Human-readable identifier (e.g., ``"blackbody_template"``).
     wavelength_nm : 1-D array
         Strictly increasing wavelength grid in nanometres.
     flux_erg_cm2_s_nm : 1-D array
@@ -88,7 +88,7 @@ def blackbody_surface_flux(
     return surface_exitance * 1.0e-7
 
 
-def generate_wasp39b_template(
+def generate_blackbody_template(
     *,
     num_points: int = 2401,
     wavelength_min_nm: float = 100.0,
@@ -96,9 +96,9 @@ def generate_wasp39b_template(
     teff_k: float = 5485.0,
     radius_rsun: float = 0.939,
     semi_major_axis_au: float = 0.04858,
-    name: str = "wasp39b_template",
+    name: str = "blackbody_template",
 ) -> SpectrumRecord:
-    """Generate the default blackbody-based WASP-39b stellar template."""
+    """Generate a blackbody stellar surface-flux template."""
     wavelength_nm = np.linspace(
         wavelength_min_nm,
         wavelength_max_nm,
