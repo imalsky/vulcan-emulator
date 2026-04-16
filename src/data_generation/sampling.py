@@ -28,7 +28,6 @@ chemistry runs.
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,15 +37,14 @@ import numpy as np
 
 from ..constants import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SUPPORTED_ATM_BASES
 from ..utils.config import uses_fastchem
+from ..utils.helpers import get_logger
 from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
 from .spectrum import (
     SpectrumRecord,
-    load_spectrum_manifest,
     load_spectrum_records_from_glob,
-    save_spectrum_manifest,
 )
 
-logger = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 # Maximum number of rejection-resampling attempts for analytic profiles.
 _MAX_PROFILE_ATTEMPTS = 100
@@ -81,7 +79,6 @@ def _element_fractions_from_sampled_globals(globals_map: dict[str, float]) -> di
         Elemental number fractions keyed by ``ELEMENT_INPUT_ORDER`` names.
         The implicit hydrogen fraction is ``1 - sum(fractions)``.
     """
-    from ..utils.config import ELEMENT_INPUT_ORDER
 
     fractions = {name: float(globals_map[name]) for name in ELEMENT_INPUT_ORDER}
     total = sum(fractions.values())
@@ -112,7 +109,6 @@ def _element_profile_from_fractions(
     np.ndarray
         Profile tensor of shape ``(num_levels, len(ELEMENT_INPUT_ORDER))``.
     """
-    from ..utils.config import ELEMENT_INPUT_ORDER
 
     vector = np.array(
         [float(element_fractions[name]) for name in ELEMENT_INPUT_ORDER],
@@ -474,7 +470,7 @@ def _sample_analytic_temperature_profile_record(
             profile_k, validation=validation,
         )
         if not is_valid:
-            logger.debug("Analytic profile attempt %d rejected: %s", attempt + 1, reason)
+            LOGGER.debug("Analytic profile attempt %d rejected: %s", attempt + 1, reason)
             continue
 
         metadata: dict[str, Any] = {
@@ -582,13 +578,13 @@ def _load_configured_roth_profiles(
                 profiles.append(profile)
                 continue
             rejected_profiles += 1
-            logger.debug(
+            LOGGER.debug(
                 "Rejected PT-library profile %s: %s",
                 profile.metadata.get("source_file", "<unknown>"),
                 reason,
             )
         if rejected_profiles:
-            logger.debug(
+            LOGGER.debug(
                 "Rejected %d PT-library profiles outside shared temperature bounds.",
                 rejected_profiles,
             )
@@ -994,45 +990,17 @@ def _science_preset_conditioning_inputs(preset: dict[str, Any]) -> dict[str, flo
     return {**physics, **one_hot}
 
 
-def ensure_default_spectrum_library(
-    *,
-    project_root: Path,
-    config: dict[str, Any],
-) -> Path:
-    """Materialize the configured spectrum library under ``data/spectra_library``.
-
-    Parameters
-    ----------
-    project_root : Path
-        Repository root where the managed spectrum library is stored.
-    config : dict[str, Any]
-        Validated config describing the template or library glob to load.
-
-    Returns
-    -------
-    Path
-        Path to the written manifest describing the serialized spectrum
-        library.
-    """
-    output_dir = project_root / "data" / "spectra_library"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    records = _load_configured_spectrum_records(project_root=project_root, config=config)
-    manifest_path = output_dir / "manifest.json"
-    save_spectrum_manifest(records.values(), output_dir)
-    return manifest_path
-
-
 def load_default_spectra(
     *,
     project_root: Path,
     config: dict[str, Any],
 ) -> dict[str, SpectrumRecord]:
-    """Load the managed default spectrum library into memory.
+    """Load the configured stellar spectrum library into memory.
 
     Parameters
     ----------
     project_root : Path
-        Repository root where the managed spectrum library is stored.
+        Repository root used to resolve template and glob paths.
     config : dict[str, Any]
         Validated config describing the library source.
 
@@ -1041,8 +1009,7 @@ def load_default_spectra(
     dict[str, SpectrumRecord]
         Spectrum records keyed by spectrum name.
     """
-    manifest = ensure_default_spectrum_library(project_root=project_root, config=config)
-    return load_spectrum_manifest(manifest)
+    return _load_configured_spectrum_records(project_root=project_root, config=config)
 
 
 def sample_run_specifications(

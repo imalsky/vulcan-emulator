@@ -126,6 +126,16 @@ def _requested_run_count(config: dict[str, Any], num_runs: int | None) -> int:
     return int(config["generation"]["num_runs"] if num_runs is None else num_runs)
 
 
+def _read_run_hdf5_to_bytes(run_file: Path) -> tuple[str, bytes]:
+    """Read a per-run HDF5 file into memory as raw bytes.
+
+    Returns the run ID (file stem) and the full file contents.  Reading
+    into memory avoids holding the file handle open during the slow
+    sequential write phase of consolidation.
+    """
+    return run_file.stem, run_file.read_bytes()
+
+
 def consolidate_runs_to_single_hdf5(
     run_files: list[Path],
     output_path: Path,
@@ -133,6 +143,10 @@ def consolidate_runs_to_single_hdf5(
     delete_originals: bool = True,
 ) -> Path:
     """Merge per-run HDF5 files into a single file with one group per run.
+
+    On network filesystems the bottleneck is per-file metadata round-trips.
+    This reads all per-run files in parallel (thread pool), then writes the
+    consolidated output in a single sequential pass.
 
     Parameters
     ----------
@@ -150,14 +164,25 @@ def consolidate_runs_to_single_hdf5(
         Path to the consolidated HDF5 file where each original run is stored
         as a top-level group named after the source file stem.
     """
+    import io
+
     ensure_dir(output_path.parent)
+
+    # Parallel read: each thread opens one file on the network FS and reads
+    # it into memory.  This overlaps the per-file metadata latency.
+    max_workers = min(32, len(run_files))
+    LOGGER.info("Reading %d per-run files with %d threads", len(run_files), max_workers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        buffers = dict(executor.map(_read_run_hdf5_to_bytes, sorted(run_files)))
+
+    # Sequential write: replay each in-memory buffer into the output file.
     with h5py.File(output_path, "w") as dest:
-        for run_file in sorted(run_files):
-            run_id = run_file.stem
-            with h5py.File(run_file, "r") as src:
+        for run_id in sorted(buffers):
+            with h5py.File(io.BytesIO(buffers[run_id]), "r") as src:
                 dest_group = dest.create_group(run_id)
                 for key in src:
                     src.copy(src[key], dest_group, name=key)
+    del buffers
     LOGGER.info("Consolidated %d runs into %s", len(run_files), output_path)
     if delete_originals:
         for run_file in run_files:

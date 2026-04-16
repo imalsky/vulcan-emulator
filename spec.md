@@ -33,13 +33,14 @@ Module-private constants (used by only one file) stay in their owning module.
 ## Public Pipeline
 
 ```bash
-python -m src.utils --config <path> --stage generation|normalization|training
+python -m src.utils --config <path> --stage generation|normalization|training|export
 ```
 
 Stages:
 1. `generation`
 2. `normalization`
 3. `training`
+4. `export`
 
 `generation` must reach the requested number of successful runs. Failed VULCAN runs are never included in the final dataset.
 
@@ -150,14 +151,21 @@ Within a preset:
 - omitted toggle values fall back to `vulcan.physics_toggles`
 - omitted `atm_base` falls back to `vulcan.runtime.atm_base`
 
-`vulcan.stellar_spectrum` (when present) supports:
+`vulcan.stellar_spectrum` is required because VULCAN reads `sflux_file`
+unconditionally at startup, even when `use_photochemistry` is `False`.
+When present, it supports:
 - `template_name`
 - `template_file`
 - optional `library_glob` — glob pattern for multi-spectrum libraries
 - `max_tokens`
 - `wavelength_min_nm`
 - `wavelength_max_nm`
-- optional `teff_k` — provenance/template-generation metadata only
+- optional `dbin1_nm` — short-wavelength bin width in nm (default 0.1)
+- optional `dbin2_nm` — long-wavelength bin width in nm (default 2.0)
+- optional `dbin_12trans_nm` — transition wavelength between bin regimes in nm (default 240.0)
+- optional `teff_k` — effective temperature for blackbody template generation (defaults to 5485 K)
+- optional `radius_rsun` — provenance metadata only (per-run values come from `sampling`)
+- optional `semi_major_axis_au` — provenance metadata only (per-run values come from `sampling`)
 
 Per-run stellar irradiation geometry now lives under `sampling`:
 - `stellar_radius_range_rsun`

@@ -23,6 +23,7 @@ CLI:
 python -m src.utils --config config/vulcan_no_condensation.json --stage generation
 python -m src.utils --config config/vulcan_no_condensation.json --stage normalization
 python -m src.utils --config config/vulcan_no_condensation.json --stage training
+python -m src.utils --config config/vulcan_no_condensation.json --stage export
 ```
 
 ---
@@ -140,9 +141,11 @@ data/<run_name>/
 | `pressure_top_bar` | both | Top-of-atmosphere pressure (bar) |
 | `pressure_bottom_bar` | both | Bottom pressure (bar) |
 | `temperature_range_k` | both | [min, max] temperature bounds (K) |
-| `metallicity_log10_range` | both | [min, max] log10([M/H]) |
-| `c_to_o_range` | both | [min, max] C/O ratio |
-| `s_to_o_range` | both | [min, max] S/O ratio |
+| `he_frac_range` | both | [min, max] He number fraction (n_He / n_H) |
+| `c_frac_range` | both | [min, max] C number fraction (n_C / n_H) |
+| `o_frac_range` | both | [min, max] O number fraction (n_O / n_H) |
+| `n_frac_range` | both | [min, max] N number fraction (n_N / n_H) |
+| `s_frac_range` | both | [min, max] S number fraction (n_S / n_H) |
 | `gravity_range_cm_s2` | vulcan only | [min, max] surface gravity (cm/s^2) |
 | `planet_radius_range_cm` | vulcan only | [min, max] planet radius (cm) |
 | `stellar_radius_range_rsun` | vulcan only | [min, max] stellar radius (solar radii) |
@@ -189,6 +192,7 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 Normalization methods:
 - `"standard"`: z-score `(x - mean) / std`
 - `"log-standard"`: `(log10(clip(x, floor)) - mean) / std`
+- `"log-minmax"`: `(log10(clip(x, floor)) - min) / (max - min)`
 - `"none"`: pass-through (for boolean/one-hot features)
 
 ### `training`
@@ -265,8 +269,8 @@ Optional list of per-run science variations. Each preset supports:
 
 #### `vulcan.stellar_spectrum`
 
-Optional section used by the data generation pipeline (not the model).
-When present, supports:
+Required for data generation because VULCAN reads `sflux_file` unconditionally
+at startup, even when `use_photochemistry` is `False`. Not used by the model.
 
 | Key | Description |
 |-----|-------------|
@@ -276,4 +280,9 @@ When present, supports:
 | `max_tokens` | Maximum number of packed spectrum tokens |
 | `wavelength_min_nm` | Minimum wavelength (nm) |
 | `wavelength_max_nm` | Maximum wavelength (nm) |
-| `teff_k` | Optional provenance/template-generation metadata |
+| `dbin1_nm` | Short-wavelength bin width in nm (default: 0.1) |
+| `dbin2_nm` | Long-wavelength bin width in nm (default: 2.0) |
+| `dbin_12trans_nm` | Transition wavelength between bin regimes in nm (default: 240.0) |
+| `teff_k` | Effective temperature for blackbody template generation (default: 5485 K) |
+| `radius_rsun` | Optional provenance metadata: stellar radius in solar radii |
+| `semi_major_axis_au` | Optional provenance metadata: orbital separation in AU |

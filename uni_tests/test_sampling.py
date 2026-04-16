@@ -118,7 +118,7 @@ def test_shipped_config_uses_fixture_temperature_profiles():
     config["roth_sampler"]["data_glob"] = str(FIXTURE_PT_PATH)
     config["roth_sampler"]["filters"] = dict(config["temperature_profiles"]["filters"])
     assert config["roth_sampler"]["source_mode"] == "mixed"
-    assert config["roth_sampler"]["analytic_probability"] == pytest.approx(0.0)
+    assert config["roth_sampler"]["analytic_probability"] == pytest.approx(0.5)
     assert config["temperature_profiles"]["analytic_sampler"]["log10_delta_range"] == [-6.0, 6.0]
     pressure_bar = sample_pressure_grid(
         num_levels=int(config["sampling"]["num_levels"]),

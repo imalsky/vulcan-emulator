@@ -18,12 +18,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-# Fundamental physical constants in CGS units (CODATA 2018).
-C_LIGHT = 2.99792458e10  # speed of light [cm s-1]
-H_PLANCK = 6.62607015e-27  # Planck constant [erg s]
-K_BOLTZMANN = 1.380649e-16  # Boltzmann constant [erg K-1]
-R_SUN_CM = 6.957e10  # solar radius [cm] (IAU 2015 nominal)
-AU_CM = 1.495978707e13  # astronomical unit [cm] (IAU 2012)
+from ..constants import C_LIGHT, H_PLANCK, K_BOLTZMANN
 
 
 @dataclass(frozen=True)

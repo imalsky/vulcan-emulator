@@ -198,9 +198,7 @@
       "dbin2_nm": 2.0,
       "dbin_12trans_nm": 240.0,
       "max_tokens": 2610,
-      "teff_k": 5485.0,
-      "radius_rsun": 0.939,
-      "semi_major_axis_au": 0.04858
+      "teff_k": 5485.0
     }
   }
 }

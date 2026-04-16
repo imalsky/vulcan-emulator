@@ -98,7 +98,7 @@ def test_shipped_configs_use_single_dataset_root_layout(filename: str):
 def test_shipped_no_condensation_config_defaults_are_correct():
     config = load_and_validate_config(ROOT / "config" / "vulcan_no_condensation.json")
     assert config["temperature_profiles"]["source_mode"] == "mixed"
-    assert config["temperature_profiles"]["analytic_probability"] == pytest.approx(0.0)
+    assert config["temperature_profiles"]["analytic_probability"] == pytest.approx(0.5)
     assert config["temperature_profiles"]["analytic_sampler"]["t_int_k_range"] == [100.0, 800.0]
     assert config["temperature_profiles"]["analytic_sampler"]["log10_delta_range"] == [-6.0, 6.0]
     assert config["temperature_profiles"]["analytic_sampler"]["log10_p_trans_bar_range"] == [-5.0, 1.0]

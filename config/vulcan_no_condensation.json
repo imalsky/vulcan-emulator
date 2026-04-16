@@ -18,7 +18,7 @@
   },
   "sampling": {
     "num_levels": 64,
-    "pressure_top_bar": 1e-07,
+    "pressure_top_bar": 1e-05,
     "pressure_bottom_bar": 100.0,
     "temperature_range_k": [1.0, 3000.0],
     "he_frac_range": [0.06, 0.12],
@@ -36,7 +36,7 @@
   },
   "temperature_profiles": {
     "source_mode": "mixed",
-    "analytic_probability": 0.0,
+    "analytic_probability": 0.5,
     "data_glob": "assets/PTprofiles/*.dat",
     "filters": {
       "Teq": [1400.0, 2200.0],
@@ -61,7 +61,7 @@
   },
   "generation": {
     "mode": "vulcan",
-    "num_runs": 1000,
+    "num_runs": 500,
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
@@ -176,7 +176,9 @@
       "regenerate_chem_funs": true,
       "rocky": false,
       "atm_base": "H2",
-      "cfg_assignments": {},
+      "cfg_assignments": {
+        "runtime": 1e10
+      },
       "t_cross_sp": ["H2", "He"]
     },
     "stellar_spectrum": {
@@ -189,9 +191,7 @@
       "dbin2_nm": 2.0,
       "dbin_12trans_nm": 240.0,
       "max_tokens": 2610,
-      "teff_k": 5485.0,
-      "radius_rsun": 0.939,
-      "semi_major_axis_au": 0.04858
+      "teff_k": 5485.0
     }
   }
 }

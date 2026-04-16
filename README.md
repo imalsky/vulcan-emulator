@@ -7,7 +7,6 @@ Supported chemistry targets:
 - `vulcan`: final converged VULCAN chemistry from PT, Kzz, surface gravity, planet radius, profile-global `X/H`, runtime science knobs, atmosphere-base flags, and stellar spectrum
 
 Supported model families:
-- `mlp`
 - `transformer`
 
 Shipped configs:
@@ -20,6 +19,7 @@ CLI:
 python -m src.utils --config config/vulcan_no_condensation.json --stage generation
 python -m src.utils --config config/vulcan_no_condensation.json --stage normalization
 python -m src.utils --config config/vulcan_no_condensation.json --stage training
+python -m src.utils --config config/vulcan_no_condensation.json --stage export
 ```
 
 `--stage normalization` performs the full raw-to-processed step: split creation, train-only normalization fitting, and processed tensor writing.
@@ -41,7 +41,7 @@ Shipped defaults:
 - eddy diffusion is on
 - `vulcan.runtime.chemistry_file` is `thermo/SNCHO_photo_network_2025.txt`
 - `vulcan.runtime.regenerate_chem_funs` is enabled so worker-local runs rebuild `chem_funs.py` with photochemistry disabled
-- `vulcan.stellar_spectrum` is still part of the VULCAN run contract because the pipeline stores a spectrum and irradiation geometry for every run
+- `vulcan.stellar_spectrum` is required because VULCAN reads `sflux_file` unconditionally at startup (even with `use_photochemistry = false`); the pipeline generates a blackbody template and writes it for each worker run
 - when every science preset has `use_photochemistry = false`, `stellar_spectrum.template_file` may be omitted and the pipeline will synthesize the default WASP-39 template internally
 - Kzz is depth-constant from `sampling.kzz_cm2_s`
 - VULCAN surface gravity is sampled from `sampling.gravity_range_cm_s2`
