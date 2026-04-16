@@ -144,8 +144,8 @@ fi
 CONFIG_CHEMISTRY_TYPE="${CONFIG_SUMMARY[0]}"
 CONFIG_MODEL_TYPE="${CONFIG_SUMMARY[1]}"
 CONFIG_USE_CONDENSATION="${CONFIG_SUMMARY[2]}"
-if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ]; then
-  echo "ERROR: run.pbs is for the VULCAN pipeline, but chemistry_type=${CONFIG_CHEMISTRY_TYPE}."
+if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ] && [ "${CONFIG_CHEMISTRY_TYPE}" != "fastchem" ]; then
+  echo "ERROR: run.pbs supports vulcan and fastchem, but chemistry_type=${CONFIG_CHEMISTRY_TYPE}."
   exit 1
 fi
 if [ "${CONFIG_MODEL_TYPE}" != "transformer" ]; then
