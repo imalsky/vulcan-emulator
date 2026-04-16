@@ -433,6 +433,35 @@ def _load_tabular_roth_profile(path: Path) -> RothProfile:
     return RothProfile(pressure_bar=pressure_bar, temperature_k=temperature_k, metadata={"source_file": str(path)})
 
 
+def load_roth_profiles_native(
+    data_glob: str,
+    *,
+    filters: RothFilterConfig | None = None,
+) -> list[RothProfile]:
+    """Load and filter PT-library profiles at their native pressure grid.
+
+    No interpolation is done here — interpolation onto a per-run pressure
+    grid is the caller's responsibility. This split exists so the library
+    can be loaded from disk once and reused across many runs with
+    different pressure grids (see ``_load_configured_roth_profiles``).
+    """
+    result: list[RothProfile] = []
+    for path_str in sorted(glob.glob(data_glob)):
+        path = Path(path_str)
+        if path.suffix.lower() == ".dat":
+            source_metadata = _parse_pt_profile_filename(path)
+            if not _matches_filters(source_metadata, filters):
+                continue
+            loaded_profiles = _load_pt_dat_profiles(path)
+        else:
+            loaded_profile = _load_tabular_roth_profile(path)
+            if not _matches_filters(loaded_profile.metadata, filters):
+                continue
+            loaded_profiles = [loaded_profile]
+        result.extend(loaded_profiles)
+    return result
+
+
 def load_roth_profiles(
     data_glob: str,
     *,
@@ -460,30 +489,17 @@ def load_roth_profiles(
         the supplied constraints.
     """
     result: list[RothProfile] = []
-    for path_str in sorted(glob.glob(data_glob)):
-        path = Path(path_str)
-        if path.suffix.lower() == ".dat":
-            source_metadata = _parse_pt_profile_filename(path)
-            if not _matches_filters(source_metadata, filters):
-                continue
-            loaded_profiles = _load_pt_dat_profiles(path)
-        else:
-            loaded_profile = _load_tabular_roth_profile(path)
-            if not _matches_filters(loaded_profile.metadata, filters):
-                continue
-            loaded_profiles = [loaded_profile]
-
-        for profile in loaded_profiles:
-            interpolated = _interpolate_profile(
-                pressure_grid_bar,
-                profile.pressure_bar,
-                profile.temperature_k,
+    for profile in load_roth_profiles_native(data_glob, filters=filters):
+        interpolated = _interpolate_profile(
+            pressure_grid_bar,
+            profile.pressure_bar,
+            profile.temperature_k,
+        )
+        result.append(
+            RothProfile(
+                pressure_bar=np.asarray(pressure_grid_bar, dtype=np.float64),
+                temperature_k=interpolated,
+                metadata=dict(profile.metadata),
             )
-            result.append(
-                RothProfile(
-                    pressure_bar=np.asarray(pressure_grid_bar, dtype=np.float64),
-                    temperature_k=interpolated,
-                    metadata=dict(profile.metadata),
-                )
-            )
+        )
     return result

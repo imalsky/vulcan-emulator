@@ -28,7 +28,6 @@ chemistry runs.
 
 from __future__ import annotations
 
-import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,7 +43,12 @@ from ..constants import (
 )
 from ..utils.config import uses_fastchem
 from ..utils.helpers import get_logger
-from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
+from .roth_sampling import (
+    RothFilterValue,
+    RothProfile,
+    _interpolate_profile,
+    load_roth_profiles_native,
+)
 from .spectrum import (
     SpectrumRecord,
     generate_blackbody_template,
@@ -57,22 +61,13 @@ LOGGER = get_logger(__name__)
 # Maximum number of rejection-resampling attempts for analytic profiles.
 _MAX_PROFILE_ATTEMPTS = 100
 
-# Module-level cache for interpolated Roth PT-library profiles. Keyed by
-# (data_glob, pressure_grid_fingerprint, filter_items, validation_items) so
-# mixed sampling does not reload and interpolate the library on every call.
-# Kept at module scope (rather than inside the config dict) so that deep-copies
-# and checkpoint serialization of the config do not carry heavy profile data.
+# Module-level cache for Roth PT-library profiles at their NATIVE pressure
+# grid. Keyed by (data_glob, filter_items, validation_items). Interpolation
+# onto each run's pressure grid is done just-in-time in _sample_roth_profile,
+# so variable per-run grids do not invalidate this cache — previously the key
+# included a pressure fingerprint, causing a full library re-read on every
+# run when grids were randomized.
 _ROTH_PROFILE_CACHE: dict[tuple, list[RothProfile]] = {}
-
-
-def _pressure_grid_fingerprint(pressure_bar: np.ndarray) -> str:
-    """Return a stable short fingerprint of a pressure grid.
-
-    Uses the raw float64 bytes so grids that differ only in spacing—but not
-    endpoints or size—still produce distinct keys.
-    """
-    buffer = np.asarray(pressure_bar, dtype=np.float64).tobytes()
-    return hashlib.sha256(buffer).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -578,29 +573,21 @@ def _resolve_roth_data_glob(config: dict[str, Any], roth_cfg: dict[str, Any]) ->
 
 
 def _load_configured_roth_profiles(
-    pressure_bar: np.ndarray,
     *,
     config: dict[str, Any],
     roth_cfg: dict[str, Any],
 ) -> list[RothProfile]:
-    """Load, validate, cache, and interpolate configured PT-library profiles.
+    """Load, validate, and cache configured PT-library profiles at native resolution.
 
-    Parameters
-    ----------
-    pressure_bar : np.ndarray
-        Target pressure grid in bar with shape ``(nz,)``.
-    config : dict[str, Any]
-        Runtime config containing shared temperature validation bounds and an
-        internal cache.
-    roth_cfg : dict[str, Any]
-        Temperature-profile configuration containing the PT-library glob and
-        optional filters.
+    Profiles are cached at their native pressure grid, keyed on
+    ``(data_glob, filter_items, validation_items)``. Interpolation onto a
+    run's pressure grid is done by the caller on the single chosen profile
+    (see ``_sample_roth_profile``), so variable per-run pressure grids do
+    not cause cache misses.
 
-    Returns
-    -------
-    list[RothProfile]
-        Interpolated Roth profiles that satisfy both metadata filters and the
-        shared temperature validity bounds.
+    Temperature validation runs on native temperatures. PCHIP interpolation
+    is shape-preserving, so temperature bounds satisfied at the native
+    resolution remain satisfied on any in-range interpolated grid.
     """
     data_glob = _resolve_roth_data_glob(config, roth_cfg)
     filter_items: tuple[tuple[str, RothFilterValue], ...] = tuple(
@@ -609,14 +596,11 @@ def _load_configured_roth_profiles(
     validation_items = tuple(
         sorted(config["temperature_profiles"]["validation"].items())
     )
-    pressure_key = _pressure_grid_fingerprint(pressure_bar)
-    cache_key = (data_glob, pressure_key, filter_items, validation_items)
+    cache_key = (data_glob, filter_items, validation_items)
     profiles = _ROTH_PROFILE_CACHE.get(cache_key)
     if profiles is None:
-        # Cache the interpolated PT-library profiles so mixed sampling does not reload them per run.
-        loaded_profiles = load_roth_profiles(
+        loaded_profiles = load_roth_profiles_native(
             data_glob,
-            pressure_grid_bar=pressure_bar,
             filters=roth_cfg.get("filters", {}),
         )
         validation = config["temperature_profiles"]["validation"]
@@ -699,12 +683,18 @@ def _sample_roth_profile(
     RothProfile
         One interpolated profile sampled from the configured library.
     """
-    profiles = _load_configured_roth_profiles(
+    profiles = _load_configured_roth_profiles(config=config, roth_cfg=roth_cfg)
+    native = _choose_roth_profile(profiles, rng=rng)
+    interpolated_temperature_k = _interpolate_profile(
         pressure_bar,
-        config=config,
-        roth_cfg=roth_cfg,
+        native.pressure_bar,
+        native.temperature_k,
     )
-    return _choose_roth_profile(profiles, rng=rng)
+    return RothProfile(
+        pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
+        temperature_k=interpolated_temperature_k,
+        metadata=dict(native.metadata),
+    )
 
 
 def _temperature_profile_metadata(
@@ -768,18 +758,24 @@ def _sample_temperature_profile_record(
     roth_cfg = config.get("roth_sampler", {"enabled": False})
     if roth_cfg.get("enabled", False):
         if roth_cfg.get("source_mode", "roth") == "mixed":
-            profiles = _load_configured_roth_profiles(
-                pressure_bar,
-                config=config,
-                roth_cfg=roth_cfg,
-            )
+            profiles = _load_configured_roth_profiles(config=config, roth_cfg=roth_cfg)
             analytic_probability = float(roth_cfg["analytic_probability"])
             # Mixed mode lets one dataset cover both analytic shapes and PT-library profiles.
             if float(rng.random()) >= analytic_probability:
                 chosen = _choose_roth_profile(profiles, rng=rng)
+                interpolated = _interpolate_profile(
+                    pressure_bar,
+                    chosen.pressure_bar,
+                    chosen.temperature_k,
+                )
+                chosen_on_grid = RothProfile(
+                    pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
+                    temperature_k=interpolated,
+                    metadata=dict(chosen.metadata),
+                )
                 return (
-                    np.asarray(chosen.temperature_k, dtype=np.float64),
-                    _temperature_profile_metadata(chosen),
+                    np.asarray(interpolated, dtype=np.float64),
+                    _temperature_profile_metadata(chosen_on_grid),
                 )
         else:
             chosen = _sample_roth_profile(
