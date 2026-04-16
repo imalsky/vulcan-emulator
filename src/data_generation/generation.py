@@ -43,7 +43,12 @@ from ..utils.config import (
 from ..constants import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SOLAR_ABUNDANCES, SUPPORTED_ATM_BASES
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 from ..utils.provenance import manifest_for_files
-from .sampling import RunSpecification, sample_run_specifications
+from .sampling import (
+    RunSpecification,
+    build_sampling_plan,
+    sample_run_specifications,
+    sample_run_specifications_slice,
+)
 from .spectrum import write_vulcan_spectrum_txt
 
 LOGGER = get_logger(__name__)
@@ -1703,6 +1708,49 @@ def run_vulcan_generation(
     backfill = config["generation"].get("backfill", {"enabled": True, "max_retries": 3})
     target_count = num_runs or int(config["generation"]["num_runs"])
 
+    def _attach_species_metadata(
+        specs: list[RunSpecification],
+        *,
+        start_index: int | None = None,
+    ) -> list[RunSpecification]:
+        """Attach the current processed species contract and optionally re-ID specs.
+
+        Parameters
+        ----------
+        specs : list[RunSpecification]
+            Newly sampled specs from ``sample_run_specifications_slice`` or
+            ``sample_run_specifications``.
+        start_index : int or None, optional
+            If not None, run IDs are rewritten as ``run_{start_index + i:05d}``
+            in the order specs were received. Used for backfill batches whose
+            intrinsic indices start at zero for each re-sampling seed.
+        """
+        prepared: list[RunSpecification] = []
+        for offset, spec in enumerate(specs):
+            run_id = (
+                f"run_{start_index + offset:05d}"
+                if start_index is not None
+                else spec.run_id
+            )
+            prepared.append(
+                RunSpecification(
+                    run_id=run_id,
+                    pressure_bar=spec.pressure_bar,
+                    temperature_k=spec.temperature_k,
+                    globals=spec.globals,
+                    metadata={
+                        **spec.metadata,
+                        "state_species": list(config["data_spec"]["state_species"]),
+                        "output_species": list(config["data_spec"]["output_species"]),
+                    },
+                    kzz_cm2_s=spec.kzz_cm2_s,
+                    spectrum=spec.spectrum,
+                    elemental_abundances_frac=spec.elemental_abundances_frac,
+                    gravity_cm_s2=spec.gravity_cm_s2,
+                )
+            )
+        return prepared
+
     def _sample_and_prepare(n: int, seed: int, *, start_index: int) -> list[RunSpecification]:
         """Sample run specs and attach the current processed species contract.
 
@@ -1726,27 +1774,7 @@ def run_vulcan_generation(
             num_runs=n,
             seed=seed,
         )
-        prepared: list[RunSpecification] = []
-        for index_offset, spec in enumerate(specs):
-            run_id = f"run_{start_index + index_offset:05d}"
-            prepared.append(
-                RunSpecification(
-                    run_id=run_id,
-                    pressure_bar=spec.pressure_bar,
-                    temperature_k=spec.temperature_k,
-                    globals=spec.globals,
-                    metadata={
-                        **spec.metadata,
-                        "state_species": list(config["data_spec"]["state_species"]),
-                        "output_species": list(config["data_spec"]["output_species"]),
-                    },
-                    kzz_cm2_s=spec.kzz_cm2_s,
-                    spectrum=spec.spectrum,
-                    elemental_abundances_frac=spec.elemental_abundances_frac,
-                    gravity_cm_s2=spec.gravity_cm_s2,
-                )
-            )
-        return prepared
+        return _attach_species_metadata(specs, start_index=start_index)
 
     def _run_batch(specs: list[RunSpecification]) -> tuple[list[Path], list[str]]:
         """Execute one batch of run specifications through the active backend.
@@ -1813,27 +1841,54 @@ def run_vulcan_generation(
             runs_dir,
         )
 
-    # Initial batch.
+    # Initial batch, streamed in chunks so the first h5 appears within
+    # seconds instead of after the full ``target_count``-wide sampling loop.
     base_seed = int(config["generation"]["seed"])
     next_run_index = 0
-    prepared_specs = _sample_and_prepare(target_count, base_seed, start_index=next_run_index)
-    next_run_index += len(prepared_specs)
-
-    # Skip specs whose per-run HDF5 already exists.
     existing_stems = {p.stem for p in existing_run_files}
-    remaining_specs = [s for s in prepared_specs if s.run_id not in existing_stems]
-    skipped = len(prepared_specs) - len(remaining_specs)
-    if skipped:
-        LOGGER.info("Skipping %d already-completed runs", skipped)
-
     run_files: list[Path] = list(existing_run_files)
     all_failures: list[str] = []
-    all_specs = list(prepared_specs)
+    all_specs: list[RunSpecification] = []
 
-    if remaining_specs:
-        new_successes, new_failures = _run_batch(remaining_specs)
-        run_files.extend(new_successes)
-        all_failures.extend(new_failures)
+    configured_chunk = int(config["generation"].get("sample_chunk_size", 1000))
+    sample_chunk_size = max(1, min(configured_chunk, target_count))
+
+    plan = build_sampling_plan(
+        config=config,
+        project_root=project_root,
+        num_runs=target_count,
+        seed=base_seed,
+    )
+    LOGGER.info(
+        "Streaming generation: target_count=%d, sample_chunk_size=%d",
+        target_count,
+        sample_chunk_size,
+    )
+
+    skipped_total = 0
+    for chunk_start in range(0, target_count, sample_chunk_size):
+        chunk_end = min(chunk_start + sample_chunk_size, target_count)
+        raw_chunk = sample_run_specifications_slice(
+            plan, start=chunk_start, end=chunk_end,
+        )
+        chunk_specs = _attach_species_metadata(raw_chunk)
+        all_specs.extend(chunk_specs)
+        chunk_remaining = [s for s in chunk_specs if s.run_id not in existing_stems]
+        chunk_skipped = len(chunk_specs) - len(chunk_remaining)
+        skipped_total += chunk_skipped
+        if chunk_skipped:
+            LOGGER.info(
+                "Chunk [%d, %d): skipping %d already-completed runs",
+                chunk_start, chunk_end, chunk_skipped,
+            )
+        if chunk_remaining:
+            new_successes, new_failures = _run_batch(chunk_remaining)
+            run_files.extend(new_successes)
+            all_failures.extend(new_failures)
+
+    next_run_index = target_count
+    if skipped_total:
+        LOGGER.info("Resumed %d already-completed runs across all chunks", skipped_total)
 
     # Backfill rounds.
     if backfill.get("enabled", True) and all_failures:

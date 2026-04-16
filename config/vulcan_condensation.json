@@ -74,6 +74,7 @@
     "overwrite": false,
     "reuse_raw_if_present": true,
     "parallel_workers": 0,
+    "sample_chunk_size": 500,
     "backfill": {
       "enabled": true,
       "max_retries": 3

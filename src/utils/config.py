@@ -492,6 +492,8 @@ def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dic
             "conditioning_hidden_dim",
             "film_clamp",
             "output_head_divisor",
+            "activation",
+            "dropout_rate",
         ],
         scope,
     )
@@ -507,12 +509,10 @@ def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dic
         normalized[key] = _as_int(normalized[key], f"{scope}.{key}")
     normalized["film_clamp"] = _as_float(normalized["film_clamp"], f"{scope}.film_clamp")
     normalized["activation"] = _as_nonempty_str(
-        normalized.get("activation", "leaky_relu"),
-        f"{scope}.activation",
+        normalized["activation"], f"{scope}.activation"
     ).lower()
     normalized["dropout_rate"] = _as_float(
-        normalized.get("dropout_rate", 0.05),
-        f"{scope}.dropout_rate",
+        normalized["dropout_rate"], f"{scope}.dropout_rate"
     )
     if normalized["activation"] not in _ALLOWED_ACTIVATIONS:
         raise ConfigValidationError(
@@ -536,12 +536,12 @@ def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dic
 
 
 def _validate_training_scheduler(scheduler: Any, scope: str) -> dict[str, Any]:
-    """Validate and normalize the optional training-scheduler block.
+    """Validate and normalize the training-scheduler block.
 
     Parameters
     ----------
     scheduler : Any
-        Raw scheduler payload, or ``None`` to accept defaults.
+        Raw scheduler payload from the config.
     scope : str
         Fully qualified config scope used in validation errors.
 
@@ -551,15 +551,11 @@ def _validate_training_scheduler(scheduler: Any, scope: str) -> dict[str, Any]:
         Normalized scheduler payload for either cosine decay or
         reduce-on-plateau scheduling.
     """
-    if scheduler is None:
-        scheduler = {}
     if not isinstance(scheduler, dict):
         raise ConfigValidationError(f"{scope} must be a mapping.")
+    _require_keys(scheduler, ["name"], scope)
     normalized = dict(scheduler)
-    normalized["name"] = _as_nonempty_str(
-        normalized.get("name", "reduce_on_plateau"),
-        f"{scope}.name",
-    ).lower()
+    normalized["name"] = _as_nonempty_str(normalized["name"], f"{scope}.name").lower()
     if normalized["name"] not in _ALLOWED_LR_SCHEDULERS:
         raise ConfigValidationError(
             f"{scope}.name must be one of {_ALLOWED_LR_SCHEDULERS}."
@@ -567,18 +563,10 @@ def _validate_training_scheduler(scheduler: Any, scope: str) -> dict[str, Any]:
     if normalized["name"] == "cosine":
         return {"name": "cosine"}
 
-    normalized["factor"] = _as_float(
-        normalized.get("factor", 0.5),
-        f"{scope}.factor",
-    )
-    normalized["patience"] = _as_int(
-        normalized.get("patience", 10),
-        f"{scope}.patience",
-    )
-    normalized["threshold"] = _as_float(
-        normalized.get("threshold", 1.0e-4),
-        f"{scope}.threshold",
-    )
+    _require_keys(scheduler, ["factor", "patience", "threshold"], scope)
+    normalized["factor"] = _as_float(normalized["factor"], f"{scope}.factor")
+    normalized["patience"] = _as_int(normalized["patience"], f"{scope}.patience")
+    normalized["threshold"] = _as_float(normalized["threshold"], f"{scope}.threshold")
     if not 0.0 < normalized["factor"] < 1.0:
         raise ConfigValidationError(f"{scope}.factor must lie strictly between 0 and 1.")
     if normalized["patience"] < 0:
@@ -1147,6 +1135,14 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     if backfill["max_retries"] < 0:
         raise ConfigValidationError("generation.backfill.max_retries must be >= 0.")
     generation["backfill"] = backfill
+    sample_chunk_size = generation.get("sample_chunk_size", 1000)
+    generation["sample_chunk_size"] = _as_int(
+        sample_chunk_size, "generation.sample_chunk_size",
+    )
+    if generation["sample_chunk_size"] < 1:
+        raise ConfigValidationError(
+            "generation.sample_chunk_size must be >= 1."
+        )
 
 
     normalization = config["normalization"]
@@ -1208,22 +1204,20 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             "learning_rate",
             "min_lr",
             "warmup_epochs",
+            "early_stopping_patience",
             "weight_decay",
             "gradient_clip",
+            "scheduler",
             "loss",
         ],
         "training",
     )
-    for key in ("seed", "batch_size", "epochs", "warmup_epochs"):
+    for key in ("seed", "batch_size", "epochs", "warmup_epochs", "early_stopping_patience"):
         training[key] = _as_int(training[key], f"training.{key}")
-    training["early_stopping_patience"] = _as_int(
-        training.get("early_stopping_patience", 30),
-        "training.early_stopping_patience",
-    )
     for key in ("learning_rate", "min_lr", "weight_decay", "gradient_clip"):
         training[key] = _as_float(training[key], f"training.{key}")
     training["scheduler"] = _validate_training_scheduler(
-        training.get("scheduler"),
+        training["scheduler"],
         "training.scheduler",
     )
     if training["batch_size"] < 1 or training["epochs"] < 1:

@@ -1155,6 +1155,387 @@ def load_default_spectra(
     return _load_configured_spectrum_records(project_root=project_root, config=config)
 
 
+@dataclass(frozen=True)
+class SamplingPlan:
+    """Pre-built sampling state reused across slices of a generation run.
+
+    The LHS design matrix and per-run seed sequence are built once up front so
+    sampling can stream in chunks (``sample_run_specifications_slice``) without
+    reshuffling stratification or losing seed determinism.
+    """
+
+    config: dict[str, Any]
+    fastchem: bool
+    total_runs: int
+    design: np.ndarray
+    child_seeds: list[np.random.SeedSequence]
+    sampling_cfg: dict[str, Any]
+    roth_cfg: dict[str, Any]
+    # Pre-resolved fraction ranges/scales, shared across all runs.
+    he_frac_range: tuple[float, float]
+    he_frac_scale: str
+    c_frac_range: tuple[float, float]
+    c_frac_scale: str
+    o_frac_range: tuple[float, float]
+    o_frac_scale: str
+    n_frac_range: tuple[float, float]
+    n_frac_scale: str
+    s_frac_range: tuple[float, float]
+    s_frac_scale: str
+    # VULCAN-only fields; None for FastChem plans.
+    gravity_range: tuple[float, float] | None
+    gravity_scale: str | None
+    planet_radius_range: tuple[float, float] | None
+    planet_radius_scale: str | None
+    stellar_radius_range: tuple[float, float] | None
+    stellar_radius_scale: str | None
+    semi_major_axis_range: tuple[float, float] | None
+    semi_major_axis_scale: str | None
+    zenith_range: tuple[float, float] | None
+    zenith_scale: str | None
+    diurnal_range: tuple[float, float] | None
+    diurnal_scale: str | None
+    spectra: dict[str, SpectrumRecord] | None
+    spectrum_names: list[str] | None
+    science_presets: list[dict[str, Any]] | None
+
+
+def build_sampling_plan(
+    *,
+    config: dict[str, Any],
+    project_root: Path,
+    num_runs: int | None = None,
+    seed: int | None = None,
+) -> SamplingPlan:
+    """Construct a ``SamplingPlan`` covering every run for this generation.
+
+    Builds the Latin-hypercube design matrix and per-run seed sequence once
+    so downstream callers can pull specifications out slice-by-slice (see
+    :func:`sample_run_specifications_slice`) while preserving seed-level
+    determinism against the single-call :func:`sample_run_specifications`.
+    """
+    rng = np.random.default_rng(
+        int(config["generation"]["seed"] if seed is None else seed)
+    )
+    total_runs = int(config["generation"]["num_runs"] if num_runs is None else num_runs)
+    fastchem = uses_fastchem(config)
+
+    if fastchem:
+        # LHC over (He_H, C_H, O_H, N_H, S_H) — 5 dimensions.
+        design = _latin_hypercube_unit_samples(
+            num_samples=total_runs, num_dimensions=5, rng=rng,
+        )
+    else:
+        # LHC over (surface gravity, planet radius, stellar radius, orbit,
+        # zenith angle, diurnal factor, He_H, C_H, O_H, N_H, S_H).
+        design = _latin_hypercube_unit_samples(
+            num_samples=total_runs, num_dimensions=11, rng=rng,
+        )
+
+    spectra: dict[str, SpectrumRecord] | None = None
+    spectrum_names: list[str] | None = None
+    science_presets: list[dict[str, Any]] | None = None
+    if not fastchem:
+        spectra = load_default_spectra(project_root=project_root, config=config)
+        if not spectra:
+            raise RuntimeError("No stellar spectra available for sampling.")
+        spectrum_names = sorted(spectra.keys())
+        science_presets = list(config["science_presets"])
+
+    sampling_cfg = config["sampling"]
+    he_frac_range = (float(sampling_cfg["he_frac_range"][0]), float(sampling_cfg["he_frac_range"][1]))
+    c_frac_range = (float(sampling_cfg["c_frac_range"][0]), float(sampling_cfg["c_frac_range"][1]))
+    o_frac_range = (float(sampling_cfg["o_frac_range"][0]), float(sampling_cfg["o_frac_range"][1]))
+    n_frac_range = (float(sampling_cfg["n_frac_range"][0]), float(sampling_cfg["n_frac_range"][1]))
+    s_frac_range = (float(sampling_cfg["s_frac_range"][0]), float(sampling_cfg["s_frac_range"][1]))
+
+    gravity_range = gravity_scale = None
+    planet_radius_range = planet_radius_scale = None
+    stellar_radius_range = stellar_radius_scale = None
+    semi_major_axis_range = semi_major_axis_scale = None
+    zenith_range = zenith_scale = None
+    diurnal_range = diurnal_scale = None
+    if not fastchem:
+        gravity_range = (
+            float(sampling_cfg["gravity_range_cm_s2"][0]),
+            float(sampling_cfg["gravity_range_cm_s2"][1]),
+        )
+        gravity_scale = _sampling_scale(config, "gravity_cm_s2")
+        planet_radius_range = (
+            float(sampling_cfg["planet_radius_range_cm"][0]),
+            float(sampling_cfg["planet_radius_range_cm"][1]),
+        )
+        planet_radius_scale = _sampling_scale(config, "planet_radius_cm")
+        stellar_radius_range = (
+            float(sampling_cfg["stellar_radius_range_rsun"][0]),
+            float(sampling_cfg["stellar_radius_range_rsun"][1]),
+        )
+        stellar_radius_scale = _sampling_scale(config, "r_star_rsun")
+        semi_major_axis_range = (
+            float(sampling_cfg["semi_major_axis_range_au"][0]),
+            float(sampling_cfg["semi_major_axis_range_au"][1]),
+        )
+        semi_major_axis_scale = _sampling_scale(config, "semi_major_axis_au")
+        zenith_range = (
+            float(sampling_cfg["zenith_angle_range_deg"][0]),
+            float(sampling_cfg["zenith_angle_range_deg"][1]),
+        )
+        zenith_scale = _sampling_scale(config, "zenith_angle_deg")
+        diurnal_range = (
+            float(sampling_cfg["diurnal_factor_range"][0]),
+            float(sampling_cfg["diurnal_factor_range"][1]),
+        )
+        diurnal_scale = _sampling_scale(config, "diurnal_factor")
+
+    # Per-run independent RNG streams so the loop parallelizes without races.
+    child_seeds = np.random.SeedSequence(
+        int(config["generation"]["seed"] if seed is None else seed)
+    ).spawn(total_runs)
+
+    roth_cfg = config.get("roth_sampler", {"enabled": False})
+
+    return SamplingPlan(
+        config=config,
+        fastchem=fastchem,
+        total_runs=total_runs,
+        design=design,
+        child_seeds=list(child_seeds),
+        sampling_cfg=sampling_cfg,
+        roth_cfg=roth_cfg,
+        he_frac_range=he_frac_range,
+        he_frac_scale=_sampling_scale(config, "he_frac"),
+        c_frac_range=c_frac_range,
+        c_frac_scale=_sampling_scale(config, "c_frac"),
+        o_frac_range=o_frac_range,
+        o_frac_scale=_sampling_scale(config, "o_frac"),
+        n_frac_range=n_frac_range,
+        n_frac_scale=_sampling_scale(config, "n_frac"),
+        s_frac_range=s_frac_range,
+        s_frac_scale=_sampling_scale(config, "s_frac"),
+        gravity_range=gravity_range,
+        gravity_scale=gravity_scale,
+        planet_radius_range=planet_radius_range,
+        planet_radius_scale=planet_radius_scale,
+        stellar_radius_range=stellar_radius_range,
+        stellar_radius_scale=stellar_radius_scale,
+        semi_major_axis_range=semi_major_axis_range,
+        semi_major_axis_scale=semi_major_axis_scale,
+        zenith_range=zenith_range,
+        zenith_scale=zenith_scale,
+        diurnal_range=diurnal_range,
+        diurnal_scale=diurnal_scale,
+        spectra=spectra,
+        spectrum_names=spectrum_names,
+        science_presets=science_presets,
+    )
+
+
+def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
+    """Sample a single ``RunSpecification`` for ``run_idx`` against ``plan``.
+
+    Kept deliberately symmetric with the historical inline ``_sample_one`` so
+    seed-determinism is byte-identical to the pre-refactor code path.
+    """
+    design = plan.design
+    config = plan.config
+    sampling_cfg = plan.sampling_cfg
+    roth_cfg = plan.roth_cfg
+    fastchem = plan.fastchem
+
+    per_rng = np.random.default_rng(plan.child_seeds[run_idx])
+    # Decide profile source first so we can clip the pressure grid to the
+    # PT-library's native bounds when Roth is chosen — otherwise PCHIP
+    # would fall into its constant-extrapolation branch for target grids
+    # that extend outside the native range, producing flat plateaus and
+    # abrupt gradient kinks at the boundary.
+    profile_source = _decide_temperature_profile_source(roth_cfg, rng=per_rng)
+    native_p_bounds: tuple[float, float] | None = None
+    if profile_source == "roth":
+        native_p_bounds = _roth_library_native_bounds(
+            config=config, roth_cfg=roth_cfg,
+        )
+    pressure_bar = _sample_column_pressure_grid(
+        sampling_cfg, rng=per_rng, native_p_bounds=native_p_bounds,
+    )
+    if fastchem:
+        he_frac = _scale_unit_interval(
+            design[run_idx, 0], *plan.he_frac_range, plan.he_frac_scale,
+        )
+        c_frac = _scale_unit_interval(
+            design[run_idx, 1], *plan.c_frac_range, plan.c_frac_scale,
+        )
+        o_frac = _scale_unit_interval(
+            design[run_idx, 2], *plan.o_frac_range, plan.o_frac_scale,
+        )
+        n_frac = _scale_unit_interval(
+            design[run_idx, 3], *plan.n_frac_range, plan.n_frac_scale,
+        )
+        s_frac = _scale_unit_interval(
+            design[run_idx, 4], *plan.s_frac_range, plan.s_frac_scale,
+        )
+    else:
+        assert plan.gravity_range is not None and plan.gravity_scale is not None
+        assert plan.planet_radius_range is not None and plan.planet_radius_scale is not None
+        assert plan.stellar_radius_range is not None and plan.stellar_radius_scale is not None
+        assert plan.semi_major_axis_range is not None and plan.semi_major_axis_scale is not None
+        assert plan.zenith_range is not None and plan.zenith_scale is not None
+        assert plan.diurnal_range is not None and plan.diurnal_scale is not None
+        gravity = _scale_unit_interval(
+            design[run_idx, 0], *plan.gravity_range, plan.gravity_scale,
+        )
+        planet_radius_cm = _scale_unit_interval(
+            design[run_idx, 1], *plan.planet_radius_range, plan.planet_radius_scale,
+        )
+        stellar_radius_rsun = _scale_unit_interval(
+            design[run_idx, 2], *plan.stellar_radius_range, plan.stellar_radius_scale,
+        )
+        semi_major_axis_au = _scale_unit_interval(
+            design[run_idx, 3], *plan.semi_major_axis_range, plan.semi_major_axis_scale,
+        )
+        zenith_angle_deg = _scale_unit_interval(
+            design[run_idx, 4], *plan.zenith_range, plan.zenith_scale,
+        )
+        diurnal_factor = _scale_unit_interval(
+            design[run_idx, 5], *plan.diurnal_range, plan.diurnal_scale,
+        )
+        he_frac = _scale_unit_interval(
+            design[run_idx, 6], *plan.he_frac_range, plan.he_frac_scale,
+        )
+        c_frac = _scale_unit_interval(
+            design[run_idx, 7], *plan.c_frac_range, plan.c_frac_scale,
+        )
+        o_frac = _scale_unit_interval(
+            design[run_idx, 8], *plan.o_frac_range, plan.o_frac_scale,
+        )
+        n_frac = _scale_unit_interval(
+            design[run_idx, 9], *plan.n_frac_range, plan.n_frac_scale,
+        )
+        s_frac = _scale_unit_interval(
+            design[run_idx, 10], *plan.s_frac_range, plan.s_frac_scale,
+        )
+
+    temperature_k, temperature_metadata = _sample_temperature_profile_record(
+        pressure_bar,
+        config=config,
+        rng=per_rng,
+        source=profile_source,
+    )
+    if fastchem:
+        base_globals: dict[str, float] = {
+            "He_H": float(he_frac),
+            "C_H": float(c_frac),
+            "O_H": float(o_frac),
+            "N_H": float(n_frac),
+            "S_H": float(s_frac),
+        }
+        element_fractions = _element_fractions_from_sampled_globals(base_globals)
+        gravity_profile = _equilibrium_gravity_profile(
+            pressure_bar=pressure_bar,
+        )
+    else:
+        base_globals = {
+            "gravity_cm_s2": float(gravity),
+            "planet_radius_cm": float(planet_radius_cm),
+            "r_star_rsun": float(stellar_radius_rsun),
+            "semi_major_axis_au": float(semi_major_axis_au),
+            "zenith_angle_deg": float(zenith_angle_deg),
+            "diurnal_factor": float(diurnal_factor),
+            "He_H": float(he_frac),
+            "C_H": float(c_frac),
+            "O_H": float(o_frac),
+            "N_H": float(n_frac),
+            "S_H": float(s_frac),
+        }
+        element_fractions = _element_fractions_from_sampled_globals(base_globals)
+        gravity_profile = np.full(
+            pressure_bar.shape,
+            float(gravity),
+            dtype=np.float64,
+        )
+    if fastchem:
+        globals_map = {**base_globals, **element_fractions}
+        return RunSpecification(
+            run_id=f"run_{run_idx:05d}",
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            globals=globals_map,
+            metadata=temperature_metadata,
+            elemental_abundances_frac=None,
+            gravity_cm_s2=gravity_profile,
+        )
+    kzz = sample_kzz_profile(pressure_bar, config=config, rng=per_rng)
+    assert (
+        plan.spectra is not None
+        and plan.spectrum_names is not None
+        and plan.science_presets is not None
+    )
+    spectrum_names = plan.spectrum_names
+    spectrum_name = spectrum_names[int(per_rng.integers(0, len(spectrum_names)))]
+    template = plan.spectra[spectrum_name]
+    preset = plan.science_presets[int(per_rng.integers(0, len(plan.science_presets)))]
+    spectrum = SpectrumRecord(
+        name=f"{template.name}_run{run_idx:05d}",
+        wavelength_nm=template.wavelength_nm,
+        flux_erg_cm2_s_nm=template.flux_erg_cm2_s_nm,
+        metadata={**template.metadata, "template_name": template.name},
+    )
+    globals_map = {
+        **base_globals,
+        **element_fractions,
+        **_science_preset_conditioning_inputs(preset),
+    }
+    return RunSpecification(
+        run_id=f"run_{run_idx:05d}",
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        globals=globals_map,
+        metadata={
+            **temperature_metadata,
+            "spectrum_name": spectrum.name,
+            "science_preset_name": str(preset["name"]),
+        },
+        kzz_cm2_s=kzz,
+        spectrum=spectrum,
+        elemental_abundances_frac=None,
+        gravity_cm_s2=gravity_profile,
+    )
+
+
+def sample_run_specifications_slice(
+    plan: SamplingPlan,
+    *,
+    start: int,
+    end: int,
+) -> list[RunSpecification]:
+    """Sample the half-open ``[start, end)`` slice of ``plan`` in parallel.
+
+    Output is seed-identical to ``sample_run_specifications`` restricted to
+    the same index range; streaming a generation run chunk-by-chunk therefore
+    produces byte-identical specs to the historical one-shot call.
+    """
+    if start < 0 or end > plan.total_runs or start > end:
+        raise ValueError(
+            f"Invalid slice [{start}, {end}) for plan with {plan.total_runs} runs."
+        )
+    count = end - start
+    if count == 0:
+        return []
+    indices = range(start, end)
+    max_workers = max(1, min(os.cpu_count() or 1, 16))
+    if count == 1 or max_workers == 1:
+        specs = [_sample_one_from_plan(plan, i) for i in indices]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            specs = list(pool.map(lambda i: _sample_one_from_plan(plan, i), indices))
+    LOGGER.info(
+        "Sampled run specifications %d..%d / %d",
+        start,
+        end,
+        plan.total_runs,
+    )
+    return specs
+
+
 def sample_run_specifications(
     *,
     config: dict[str, Any],
@@ -1187,232 +1568,10 @@ def sample_run_specifications(
     list[RunSpecification]
         One specification per run, ready for raw data generation.
     """
-    rng = np.random.default_rng(
-        int(config["generation"]["seed"] if seed is None else seed)
+    plan = build_sampling_plan(
+        config=config,
+        project_root=project_root,
+        num_runs=num_runs,
+        seed=seed,
     )
-    total_runs = int(config["generation"]["num_runs"] if num_runs is None else num_runs)
-    fastchem = uses_fastchem(config)
-
-    if fastchem:
-        # LHC over (He_H, C_H, O_H, N_H, S_H) — 5 dimensions.
-        design = _latin_hypercube_unit_samples(
-            num_samples=total_runs, num_dimensions=5, rng=rng,
-        )
-    else:
-        # LHC over (surface gravity, planet radius, stellar radius, orbit,
-        # zenith angle, diurnal factor, He_H, C_H, O_H, N_H, S_H).
-        design = _latin_hypercube_unit_samples(
-            num_samples=total_runs, num_dimensions=11, rng=rng,
-        )
-
-    # Spectrum loading only needed for VULCAN chemistry.
-    spectra: dict[str, SpectrumRecord] | None = None
-    spectrum_names: list[str] | None = None
-    science_presets: list[dict[str, Any]] | None = None
-    if not fastchem:
-        spectra = load_default_spectra(project_root=project_root, config=config)
-        if not spectra:
-            raise RuntimeError("No stellar spectra available for sampling.")
-        spectrum_names = sorted(spectra.keys())
-        science_presets = list(config["science_presets"])
-
-    sampling_cfg = config["sampling"]
-    he_frac_lo, he_frac_hi = (float(x) for x in sampling_cfg["he_frac_range"])
-    he_frac_scale = _sampling_scale(config, "he_frac")
-    c_frac_lo, c_frac_hi = (float(x) for x in sampling_cfg["c_frac_range"])
-    c_frac_scale = _sampling_scale(config, "c_frac")
-    o_frac_lo, o_frac_hi = (float(x) for x in sampling_cfg["o_frac_range"])
-    o_frac_scale = _sampling_scale(config, "o_frac")
-    n_frac_lo, n_frac_hi = (float(x) for x in sampling_cfg["n_frac_range"])
-    n_frac_scale = _sampling_scale(config, "n_frac")
-    s_frac_lo, s_frac_hi = (float(x) for x in sampling_cfg["s_frac_range"])
-    s_frac_scale = _sampling_scale(config, "s_frac")
-    if not fastchem:
-        gravity_lo, gravity_hi = (float(x) for x in sampling_cfg["gravity_range_cm_s2"])
-        gravity_scale = _sampling_scale(config, "gravity_cm_s2")
-        planet_radius_lo, planet_radius_hi = (
-            float(x) for x in sampling_cfg["planet_radius_range_cm"]
-        )
-        planet_radius_scale = _sampling_scale(config, "planet_radius_cm")
-        stellar_radius_lo, stellar_radius_hi = (
-            float(x) for x in sampling_cfg["stellar_radius_range_rsun"]
-        )
-        stellar_radius_scale = _sampling_scale(config, "r_star_rsun")
-        semi_major_axis_lo, semi_major_axis_hi = (
-            float(x) for x in sampling_cfg["semi_major_axis_range_au"]
-        )
-        semi_major_axis_scale = _sampling_scale(config, "semi_major_axis_au")
-        zenith_lo, zenith_hi = (float(x) for x in sampling_cfg["zenith_angle_range_deg"])
-        zenith_scale = _sampling_scale(config, "zenith_angle_deg")
-        diurnal_lo, diurnal_hi = (float(x) for x in sampling_cfg["diurnal_factor_range"])
-        diurnal_scale = _sampling_scale(config, "diurnal_factor")
-
-    # Per-run independent RNG streams so the loop parallelizes without races.
-    child_seeds = np.random.SeedSequence(
-        int(config["generation"]["seed"] if seed is None else seed)
-    ).spawn(total_runs)
-
-    roth_cfg = config.get("roth_sampler", {"enabled": False})
-
-    def _sample_one(run_idx: int) -> RunSpecification:
-        per_rng = np.random.default_rng(child_seeds[run_idx])
-        # Decide profile source first so we can clip the pressure grid to the
-        # PT-library's native bounds when Roth is chosen — otherwise PCHIP
-        # would fall into its constant-extrapolation branch for target grids
-        # that extend outside the native range, producing flat plateaus and
-        # abrupt gradient kinks at the boundary.
-        profile_source = _decide_temperature_profile_source(roth_cfg, rng=per_rng)
-        native_p_bounds: tuple[float, float] | None = None
-        if profile_source == "roth":
-            native_p_bounds = _roth_library_native_bounds(
-                config=config, roth_cfg=roth_cfg,
-            )
-        pressure_bar = _sample_column_pressure_grid(
-            sampling_cfg, rng=per_rng, native_p_bounds=native_p_bounds,
-        )
-        if fastchem:
-            he_frac = _scale_unit_interval(
-                design[run_idx, 0], he_frac_lo, he_frac_hi, he_frac_scale,
-            )
-            c_frac = _scale_unit_interval(
-                design[run_idx, 1], c_frac_lo, c_frac_hi, c_frac_scale,
-            )
-            o_frac = _scale_unit_interval(
-                design[run_idx, 2], o_frac_lo, o_frac_hi, o_frac_scale,
-            )
-            n_frac = _scale_unit_interval(
-                design[run_idx, 3], n_frac_lo, n_frac_hi, n_frac_scale,
-            )
-            s_frac = _scale_unit_interval(
-                design[run_idx, 4], s_frac_lo, s_frac_hi, s_frac_scale,
-            )
-        else:
-            gravity = _scale_unit_interval(
-                design[run_idx, 0], gravity_lo, gravity_hi, gravity_scale,
-            )
-            planet_radius_cm = _scale_unit_interval(
-                design[run_idx, 1],
-                planet_radius_lo,
-                planet_radius_hi,
-                planet_radius_scale,
-            )
-            stellar_radius_rsun = _scale_unit_interval(
-                design[run_idx, 2],
-                stellar_radius_lo,
-                stellar_radius_hi,
-                stellar_radius_scale,
-            )
-            semi_major_axis_au = _scale_unit_interval(
-                design[run_idx, 3],
-                semi_major_axis_lo,
-                semi_major_axis_hi,
-                semi_major_axis_scale,
-            )
-            zenith_angle_deg = _scale_unit_interval(
-                design[run_idx, 4], zenith_lo, zenith_hi, zenith_scale,
-            )
-            diurnal_factor = _scale_unit_interval(
-                design[run_idx, 5], diurnal_lo, diurnal_hi, diurnal_scale,
-            )
-            he_frac = _scale_unit_interval(
-                design[run_idx, 6], he_frac_lo, he_frac_hi, he_frac_scale,
-            )
-            c_frac = _scale_unit_interval(
-                design[run_idx, 7], c_frac_lo, c_frac_hi, c_frac_scale,
-            )
-            o_frac = _scale_unit_interval(
-                design[run_idx, 8], o_frac_lo, o_frac_hi, o_frac_scale,
-            )
-            n_frac = _scale_unit_interval(
-                design[run_idx, 9], n_frac_lo, n_frac_hi, n_frac_scale,
-            )
-            s_frac = _scale_unit_interval(
-                design[run_idx, 10], s_frac_lo, s_frac_hi, s_frac_scale,
-            )
-
-        temperature_k, temperature_metadata = _sample_temperature_profile_record(
-            pressure_bar,
-            config=config,
-            rng=per_rng,
-            source=profile_source,
-        )
-        if fastchem:
-            base_globals: dict[str, float] = {
-                "He_H": float(he_frac),
-                "C_H": float(c_frac),
-                "O_H": float(o_frac),
-                "N_H": float(n_frac),
-                "S_H": float(s_frac),
-            }
-            element_fractions = _element_fractions_from_sampled_globals(base_globals)
-            gravity_profile = _equilibrium_gravity_profile(
-                pressure_bar=pressure_bar,
-            )
-        else:
-            base_globals = {
-                "gravity_cm_s2": float(gravity),
-                "planet_radius_cm": float(planet_radius_cm),
-                "r_star_rsun": float(stellar_radius_rsun),
-                "semi_major_axis_au": float(semi_major_axis_au),
-                "zenith_angle_deg": float(zenith_angle_deg),
-                "diurnal_factor": float(diurnal_factor),
-                "He_H": float(he_frac),
-                "C_H": float(c_frac),
-                "O_H": float(o_frac),
-                "N_H": float(n_frac),
-                "S_H": float(s_frac),
-            }
-            element_fractions = _element_fractions_from_sampled_globals(base_globals)
-            gravity_profile = np.full(
-                pressure_bar.shape,
-                float(gravity),
-                dtype=np.float64,
-            )
-        if fastchem:
-            globals_map = {**base_globals, **element_fractions}
-            return RunSpecification(
-                run_id=f"run_{run_idx:05d}",
-                pressure_bar=pressure_bar,
-                temperature_k=temperature_k,
-                globals=globals_map,
-                metadata=temperature_metadata,
-                elemental_abundances_frac=None,
-                gravity_cm_s2=gravity_profile,
-            )
-        kzz = sample_kzz_profile(pressure_bar, config=config, rng=per_rng)
-        assert spectra is not None and spectrum_names is not None and science_presets is not None
-        spectrum_name = spectrum_names[int(per_rng.integers(0, len(spectrum_names)))]
-        template = spectra[spectrum_name]
-        preset = science_presets[int(per_rng.integers(0, len(science_presets)))]
-        spectrum = SpectrumRecord(
-            name=f"{template.name}_run{run_idx:05d}",
-            wavelength_nm=template.wavelength_nm,
-            flux_erg_cm2_s_nm=template.flux_erg_cm2_s_nm,
-            metadata={**template.metadata, "template_name": template.name},
-        )
-        globals_map = {
-            **base_globals,
-            **element_fractions,
-            **_science_preset_conditioning_inputs(preset),
-        }
-        return RunSpecification(
-            run_id=f"run_{run_idx:05d}",
-            pressure_bar=pressure_bar,
-            temperature_k=temperature_k,
-            globals=globals_map,
-            metadata={
-                **temperature_metadata,
-                "spectrum_name": spectrum.name,
-                "science_preset_name": str(preset["name"]),
-            },
-            kzz_cm2_s=kzz,
-            spectrum=spectrum,
-            elemental_abundances_frac=None,
-            gravity_cm_s2=gravity_profile,
-        )
-
-    max_workers = max(1, min(os.cpu_count() or 1, 16))
-    if total_runs <= 1 or max_workers == 1:
-        return [_sample_one(i) for i in range(total_runs)]
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(_sample_one, range(total_runs)))
+    return sample_run_specifications_slice(plan, start=0, end=plan.total_runs)

@@ -16,9 +16,11 @@ from src.data_generation.sampling import (
     _decide_temperature_profile_source,
     _sample_column_pressure_grid,
     _sample_temperature_profile_record,
+    build_sampling_plan,
     sample_kzz_profile,
     sample_pressure_grid,
     sample_run_specifications,
+    sample_run_specifications_slice,
     sample_temperature_profile,
 )
 from src.utils.config import load_and_validate_config
@@ -347,3 +349,49 @@ def test_analytic_sampler_ranges_match_repo_config():
         assert sampler["log10_p_trans_bar_range"] == [-2.0, 2.0], cfg_name
         assert sampler["t_int_k_range"] == [50.0, 1000.0], cfg_name
         assert sampler["t_eq_k_range"] == [300.0, 3500.0], cfg_name
+
+
+def _specs_equal(a, b):
+    """Compare two RunSpecification objects structurally for test equality."""
+    assert a.run_id == b.run_id
+    np.testing.assert_array_equal(a.pressure_bar, b.pressure_bar)
+    np.testing.assert_array_equal(a.temperature_k, b.temperature_k)
+    np.testing.assert_array_equal(a.gravity_cm_s2, b.gravity_cm_s2)
+    assert a.globals == b.globals
+    assert a.metadata == b.metadata
+    if a.kzz_cm2_s is None:
+        assert b.kzz_cm2_s is None
+    else:
+        np.testing.assert_array_equal(a.kzz_cm2_s, b.kzz_cm2_s)
+
+
+def test_chunked_slice_matches_one_shot_sampling(tiny_config):
+    """Streaming the plan in slices reproduces ``sample_run_specifications`` byte-for-byte.
+
+    This protects against subtle regressions in the chunked-generation pipeline
+    (``generation.py``) where per-run sampling moved from a single ThreadPool
+    call to a loop of ``sample_run_specifications_slice(plan, start, end)``
+    invocations. Identical seeds must produce identical specs regardless of
+    how the total_runs interval is partitioned.
+    """
+    total_runs = 12
+    baseline = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=total_runs,
+        seed=7,
+    )
+    plan = build_sampling_plan(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=total_runs,
+        seed=7,
+    )
+    # Multiple slice partitions must all reproduce the one-shot result.
+    for partition in ([0, 4, 9, total_runs], [0, 12], [0, 1, 2, total_runs]):
+        streamed = []
+        for lo, hi in zip(partition[:-1], partition[1:]):
+            streamed.extend(sample_run_specifications_slice(plan, start=lo, end=hi))
+        assert len(streamed) == len(baseline)
+        for a, b in zip(baseline, streamed):
+            _specs_equal(a, b)

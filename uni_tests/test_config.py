@@ -164,17 +164,21 @@ def test_vulcan_block_is_required_only_for_vulcan(tmp_path):
         load_and_validate_config(_write_config(tmp_path, "vulcan_missing.json", vulcan))
 
 
-def test_model_defaults_are_applied(tmp_path):
+@pytest.mark.parametrize(
+    ("section", "key", "error_fragment"),
+    [
+        ("model", "activation", "model"),
+        ("model", "dropout_rate", "model"),
+        ("training", "early_stopping_patience", "training"),
+        ("training", "scheduler", "training"),
+    ],
+)
+def test_required_hyperparameters_must_be_explicit(tmp_path, section, key, error_fragment):
     payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
     payload = copy.deepcopy(payload)
-    payload["model"].pop("activation", None)
-    payload["model"].pop("dropout_rate", None)
-    payload["training"].pop("early_stopping_patience")
-    config = load_and_validate_config(_write_config(tmp_path, "fastchem_transformer_config.json", payload))
-    assert config["model_type"] == "transformer"
-    assert config["training"]["model"]["activation"] == "leaky_relu"
-    assert config["training"]["model"]["dropout_rate"] == pytest.approx(0.05)
-    assert config["training"]["early_stopping_patience"] == 30
+    payload[section].pop(key)
+    with pytest.raises(ConfigValidationError, match=error_fragment):
+        load_and_validate_config(_write_config(tmp_path, "missing_hparam.json", payload))
 
 
 @pytest.mark.parametrize(

@@ -178,6 +178,7 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 | `overwrite` | Whether to overwrite existing raw data |
 | `reuse_raw_if_present` | Skip generation if raw data exists |
 | `parallel_workers` | Number of parallel generation workers (`0` = auto-detect from PBS/SLURM/OS) |
+| `sample_chunk_size` | Runs per streaming sample+execute chunk (default `1000`). Smaller chunks surface the first `run_*.h5` sooner and interleave progress logging; values `>= num_runs` collapse to the historical one-shot behavior. |
 | `backfill` | `{enabled, max_retries}` for VULCAN failure recovery |
 
 ### `normalization`

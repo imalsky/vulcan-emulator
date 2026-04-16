@@ -166,8 +166,15 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "learning_rate": 0.0002,
                     "min_lr": 1e-05,
                     "warmup_epochs": 0,
+                    "early_stopping_patience": 30,
                     "weight_decay": 1e-05,
                     "gradient_clip": 1.0,
+                    "scheduler": {
+                        "name": "reduce_on_plateau",
+                        "factor": 0.5,
+                        "patience": 10,
+                        "threshold": 1.0e-4,
+                    },
                     "loss": {
                         "lambda_z": 1.0,
                         "lambda_phys": 0.1,
@@ -181,6 +188,8 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "conditioning_hidden_dim": 256,
                     "film_clamp": 1.5,
                     "output_head_divisor": 2,
+                    "activation": "leaky_relu",
+                    "dropout_rate": 0.05,
                 },
                 "vulcan": {
                     "physics_toggles": {
