@@ -52,7 +52,13 @@ def build_model_dimensions(
     config: dict, contract: dict
 ) -> TransformerDimensions:
     """Build the dimension dataclass for the active chemistry/model contract."""
-    model_cfg = config["training"]["model"]
+    try:
+        model_cfg = config["training"]["model"]
+    except KeyError as exc:
+        raise KeyError(
+            "config['training']['model'] is missing; ensure the config was passed "
+            "through load_and_validate_config(), which materializes this alias."
+        ) from exc
     sequence_dim = int(
         contract.get(
             "sequence_dim",
@@ -83,8 +89,8 @@ def build_model_dimensions(
         conditioning_hidden_dim=int(model_cfg["conditioning_hidden_dim"]),
         film_clamp=float(model_cfg["film_clamp"]),
         output_head_divisor=int(model_cfg["output_head_divisor"]),
-        activation=str(model_cfg.get("activation", "leaky_relu")).lower(),
-        dropout_rate=float(model_cfg.get("dropout_rate", 0.05)),
+        activation=str(model_cfg.get("activation", "gelu")).lower(),
+        dropout_rate=float(model_cfg.get("dropout_rate", 0.0)),
     )
 
 

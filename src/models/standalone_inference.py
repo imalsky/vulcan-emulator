@@ -3,6 +3,12 @@
 Self-contained: imports only JAX, NumPy, and the standard library.
 Embedded inside every exported .npz bundle under ``meta/vulcan_emulator_src``.
 
+NOTE: This module intentionally duplicates constants and primitives from
+``src/constants.py``, ``src/models/layers.py``, ``src/models/transformer.py``,
+and ``src/models/export_bundle.py`` so that bundles load without the training
+codebase installed. When changing any of those upstream modules, mirror the
+change here. Do NOT add imports from the ``src/`` tree into this file.
+
 Public API
 ----------
     model = load_model("best_exported.npz")
@@ -80,6 +86,7 @@ class TransformerDimensions:
 # ---------------------------------------------------------------------------
 
 _SINUSOIDAL_BASE_WAVELENGTH = 10_000.0
+_POSITION_SCALE = 64.0
 
 
 def _linear(params: dict[str, jax.Array], x: jax.Array) -> jax.Array:
@@ -113,16 +120,21 @@ def _layer_norm(params: dict[str, jax.Array], x: jax.Array, eps: float = 1.0e-5)
     return normalized * params["scale"] + params["bias"]
 
 
-def sinusoidal_position_encoding(length: int, dim: int, dtype: jnp.dtype = jnp.float32) -> jax.Array:
-    """Compute fixed sinusoidal positional encoding (Vaswani et al., 2017)."""
-    position = jnp.arange(length, dtype=dtype)[:, None]
-    index = jnp.arange(dim, dtype=dtype)[None, :]
+def sinusoidal_position_encoding_continuous(
+    position: jax.Array,
+    dim: int,
+    dtype: jnp.dtype = jnp.float32,
+) -> jax.Array:
+    """Continuous Vaswani-style PE over a real-valued coordinate."""
+    scaled = position.astype(dtype) * jnp.asarray(_POSITION_SCALE, dtype=dtype)
+    index = jnp.arange(dim, dtype=dtype)
     angle_rate = 1.0 / jnp.power(
         _SINUSOIDAL_BASE_WAVELENGTH,
         (2.0 * jnp.floor(index / 2.0)) / float(dim),
     )
-    angle = position * angle_rate
-    return jnp.where((jnp.arange(dim) % 2)[None, :] == 0, jnp.sin(angle), jnp.cos(angle))
+    angle = scaled[..., None] * angle_rate
+    even_mask = (jnp.arange(dim) % 2) == 0
+    return jnp.where(even_mask, jnp.sin(angle), jnp.cos(angle))
 
 
 def _resolve_activation(name: str) -> Callable[[jax.Array], jax.Array]:
@@ -178,7 +190,13 @@ def _multihead_attention_qkv(
     return _linear(o_params, attended)
 
 
-def _multihead_attention(params: dict[str, jax.Array], x: jax.Array, *, nhead: int) -> jax.Array:
+def _multihead_attention(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    *,
+    nhead: int,
+    key_mask: jax.Array | None = None,
+) -> jax.Array:
     """Convenience wrapper for bidirectional self-attention."""
     return _multihead_attention_qkv(
         params["q"],
@@ -188,6 +206,7 @@ def _multihead_attention(params: dict[str, jax.Array], x: jax.Array, *, nhead: i
         x,
         x,
         nhead=nhead,
+        source_mask=key_mask,
     )
 
 
@@ -197,6 +216,8 @@ def apply_transformer_model(
     global_inputs: jax.Array,
     dims: TransformerDimensions,
     *,
+    position_coord: jax.Array,
+    attention_mask: jax.Array | None = None,
     dropout_key: jax.Array | None = None,
     training: bool = False,
 ) -> tuple[jax.Array, dict[str, jax.Array | None]]:
@@ -205,6 +226,16 @@ def apply_transformer_model(
         raise ValueError("sequence_inputs must have shape [batch, nz, feature_dim].")
     if global_inputs.ndim != 2:
         raise ValueError("global_inputs must have shape [batch, global_dim].")
+    if position_coord.ndim != 2:
+        raise ValueError("position_coord must have shape [batch, nz].")
+    if position_coord.shape[0] != sequence_inputs.shape[0] or position_coord.shape[1] != sequence_inputs.shape[1]:
+        raise ValueError("position_coord must match sequence_inputs in (batch, nz).")
+    if attention_mask is not None:
+        if attention_mask.ndim != 2:
+            raise ValueError("attention_mask must have shape [batch, nz].")
+        if attention_mask.shape[0] != sequence_inputs.shape[0] or attention_mask.shape[1] != sequence_inputs.shape[1]:
+            raise ValueError("attention_mask must match sequence_inputs in (batch, nz).")
+        attention_mask = attention_mask.astype(jnp.bool_)
 
     act = _resolve_activation(dims.activation)
     _keys_per_layer = 2
@@ -226,7 +257,7 @@ def apply_transformer_model(
     film = film.reshape(sequence_inputs.shape[0], dims.num_layers, 2, dims.d_model)
 
     x = _linear(params["sequence_in"], sequence_inputs)
-    x = x + sinusoidal_position_encoding(sequence_inputs.shape[1], dims.d_model, x.dtype)[None, :, :]
+    x = x + sinusoidal_position_encoding_continuous(position_coord, dims.d_model, x.dtype)
 
     for layer_index, (layer, layer_keys) in enumerate(zip(params["layers"], layer_dropout_keys)):
         attn_dropout_key = layer_keys[0]
@@ -237,7 +268,7 @@ def apply_transformer_model(
 
         # (a) Self-attention
         x_norm = _layer_norm(layer["ln1"], x)
-        attn = _multihead_attention(layer, x_norm, nhead=dims.nhead)
+        attn = _multihead_attention(layer, x_norm, nhead=dims.nhead, key_mask=attention_mask)
         attn = _apply_dropout(
             attn,
             rate=dims.dropout_rate,
@@ -437,6 +468,63 @@ def _is_traced_array(value: Any) -> bool:
     return isinstance(value, jax.core.Tracer)
 
 
+def _log10_pressure_union_bounds(
+    data_contract: dict[str, Any],
+) -> tuple[float, float]:
+    """Return the training-range log10(P in bar) bounds recorded at export time."""
+    lo, hi = data_contract["log10_pressure_bar_union_range"]
+    return float(lo), float(hi)
+
+
+def _num_levels_training_range(data_contract: dict[str, Any]) -> tuple[int, int]:
+    """Return the training-time ``num_levels`` range."""
+    lo, hi = data_contract["num_levels_range"]
+    return int(lo), int(hi)
+
+
+def _position_coord_from_pressure_jax(
+    pressure_bar: jax.Array,
+    data_contract: dict[str, Any],
+) -> jax.Array:
+    """Build a normalized log10(P) position coordinate for the continuous PE."""
+    lo, hi = _log10_pressure_union_bounds(data_contract)
+    span = jnp.asarray(max(hi - lo, 1.0e-12), dtype=jnp.float32)
+    log_p = jnp.log10(jnp.asarray(pressure_bar, dtype=jnp.float32))
+    return (log_p - jnp.asarray(lo, dtype=jnp.float32)) / span
+
+
+def _validate_pressure_grid(
+    pressure_bar: jax.Array | np.ndarray,
+    data_contract: dict[str, Any],
+) -> None:
+    """Reject out-of-range pressure grids before invoking the jitted forward.
+
+    Runs eagerly on concrete arrays; traced inputs (inside ``jax.jit``) are
+    skipped so the check never appears in the JAX graph.
+    """
+    if _is_traced_array(pressure_bar):
+        return
+    arr = np.asarray(pressure_bar, dtype=np.float64)
+    if arr.ndim != 1:
+        return
+    nz = int(arr.shape[0])
+    nl_lo, nl_hi = _num_levels_training_range(data_contract)
+    if not (nl_lo <= nz <= nl_hi):
+        raise ValueError(
+            f"pressure_bar length {nz} is outside the training num_levels range "
+            f"[{nl_lo}, {nl_hi}]."
+        )
+    if np.any(arr <= 0):
+        raise ValueError("pressure_bar must contain strictly positive values.")
+    log_p = np.log10(arr)
+    lo, hi = _log10_pressure_union_bounds(data_contract)
+    if log_p.min() < lo - 1.0e-9 or log_p.max() > hi + 1.0e-9:
+        raise ValueError(
+            f"pressure_bar range [{arr.min():.3e}, {arr.max():.3e}] bar is outside "
+            f"the training pressure range [{10.0 ** lo:.3e}, {10.0 ** hi:.3e}] bar."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Section 6: Parameter tree utilities
 # ---------------------------------------------------------------------------
@@ -553,11 +641,15 @@ def _predict_fastchem_impl(
         normalization["global_static"],
     )  # shape: (1, global_dim)
 
+    position_coord = _position_coord_from_pressure_jax(pressure, data_contract)[None, :]
+    attention_mask = jnp.ones(sequence.shape[:2], dtype=jnp.bool_)
     pred_norm, _ = apply_transformer_model(
         params,
         sequence,
         globals_norm,
         dims,
+        position_coord=position_coord,
+        attention_mask=attention_mask,
     )
     pred_norm = pred_norm[0]
     if return_log10:
@@ -654,6 +746,7 @@ class ExportedModel:
         )
 
         def predictor(pressure_bar: Any, temperature_k: Any, global_inputs: Any) -> jax.Array:
+            _validate_pressure_grid(pressure_bar, self.data_contract)
             _validate_near_constant_standard_globals(
                 global_inputs,
                 list(self.data_contract["global_static_feature_order"]),
@@ -683,6 +776,7 @@ class ExportedModel:
         )
 
         def predictor(pressure_bar: Any, temperature_k: Any, global_inputs: Any) -> jax.Array:
+            _validate_pressure_grid(pressure_bar, self.data_contract)
             _validate_near_constant_standard_globals(
                 global_inputs,
                 list(self.data_contract["global_static_feature_order"]),
@@ -722,7 +816,11 @@ class ExportedModel:
         temperature_k : array-like
             Temperature profile in Kelvin, shape ``(nz,)``.
         global_inputs : dict or array-like
-            Global conditioning scalars.
+            Global conditioning scalars. Elemental entries (``He_H``,
+            ``C_H``, ``O_H``, ``N_H``, ``S_H``) are hydrogen-normalized
+            number fractions ``n_X / n_H`` (ratio of element-X atoms to
+            H atoms, matching VULCAN's ``O_H``, ``C_H`` convention) — not
+            mass fractions, not molecular volume fractions.
         return_log10 : bool
             If True, return log10 mixing ratios instead of linear.
 
@@ -733,6 +831,7 @@ class ExportedModel:
         """
         if not self.uses_fastchem:
             raise ValueError("predict_fastchem requires a fastchem export bundle.")
+        _validate_pressure_grid(pressure_bar, self.data_contract)
         _validate_near_constant_standard_globals(
             global_inputs,
             list(self.data_contract["global_static_feature_order"]),
@@ -770,7 +869,11 @@ class ExportedModel:
         kzz_cm2_s : array-like
             Vertical eddy diffusion coefficient in cm2 s-1, shape ``(nz,)``.
         global_inputs : dict or array-like
-            Global conditioning scalars.
+            Global conditioning scalars. Elemental entries (``He_H``,
+            ``C_H``, ``O_H``, ``N_H``, ``S_H``) are hydrogen-normalized
+            number fractions ``n_X / n_H`` (ratio of element-X atoms to
+            H atoms, matching VULCAN's ``O_H``, ``C_H`` convention) — not
+            mass fractions, not molecular volume fractions.
         return_log10 : bool
             If True, return log10 mixing ratios instead of linear.
 
@@ -781,6 +884,13 @@ class ExportedModel:
         """
         if not self.uses_vulcan_chemistry:
             raise ValueError("predict_vulcan requires a vulcan export bundle.")
+        _validate_pressure_grid(pressure_bar, self.data_contract)
+        _validate_near_constant_standard_globals(
+            global_inputs,
+            list(self.data_contract["global_static_feature_order"]),
+            self.normalization["global_static"],
+            field_name="global_inputs",
+        )
 
         pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
         temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
@@ -806,11 +916,15 @@ class ExportedModel:
             self.normalization["global_static"],
         )
 
+        position_coord = _position_coord_from_pressure_jax(pressure, self.data_contract)[None, :]
+        attention_mask = jnp.ones(sequence.shape[:2], dtype=jnp.bool_)
         pred_norm, _ = apply_transformer_model(
             self.params,
             sequence,
             globals_norm,
             self.dims,
+            position_coord=position_coord,
+            attention_mask=attention_mask,
         )
         pred_norm = pred_norm[0]
         if return_log10:

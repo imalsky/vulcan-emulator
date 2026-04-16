@@ -14,7 +14,7 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 
-from ..constants import _SINUSOIDAL_BASE_WAVELENGTH
+from ..constants import _POSITION_SCALE, _SINUSOIDAL_BASE_WAVELENGTH
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +181,55 @@ def sinusoidal_position_encoding(length: int, dim: int, dtype: jnp.dtype = jnp.f
     return jnp.where((jnp.arange(dim) % 2)[None, :] == 0, jnp.sin(angle), jnp.cos(angle))
 
 
+def sinusoidal_position_encoding_continuous(
+    position: jax.Array,
+    dim: int,
+    dtype: jnp.dtype = jnp.float32,
+) -> jax.Array:
+    """Continuous sinusoidal positional encoding over a real-valued coordinate.
+
+    Accepts any real-valued ``position`` array (e.g. normalized
+    log10-pressure) and returns the same Vaswani-style sin/cos bands as
+    :func:`sinusoidal_position_encoding`, but evaluated at the provided
+    positions rather than integer indices. This is the PE used for the
+    variable-grid emulator: two columns with different ``nz`` but the
+    same physical pressures produce identical PE at those pressures.
+
+    The raw position is multiplied by ``_POSITION_SCALE`` so that the
+    lowest frequency band spans roughly that many "steps" across the
+    training range, keeping the frequency content similar to the legacy
+    fixed-index encoding the model was tuned against.
+
+    Parameters
+    ----------
+    position : jax.Array
+        Position coordinate array of shape ``(..., nz)``, typically in
+        ``[0, 1]`` representing normalized log10(P).
+    dim : int
+        Encoding dimension (should equal ``d_model``).
+    dtype : jnp.dtype
+        Output dtype.
+
+    Returns
+    -------
+    jax.Array
+        Positional encoding tensor of shape ``(..., nz, dim)``.
+
+    Notes
+    -----
+    Smooth w.r.t. ``position``; ``jax.grad`` flows through.
+    """
+    scaled = position.astype(dtype) * jnp.asarray(_POSITION_SCALE, dtype=dtype)
+    index = jnp.arange(dim, dtype=dtype)
+    angle_rate = 1.0 / jnp.power(
+        _SINUSOIDAL_BASE_WAVELENGTH,
+        (2.0 * jnp.floor(index / 2.0)) / float(dim),
+    )
+    angle = scaled[..., None] * angle_rate
+    even_mask = (jnp.arange(dim) % 2) == 0
+    return jnp.where(even_mask, jnp.sin(angle), jnp.cos(angle))
+
+
 def _resolve_activation(name: str) -> Callable[[jax.Array], jax.Array]:
     """Resolve an activation name to the corresponding JAX callable.
 
@@ -250,8 +299,19 @@ def _multihead_attention_qkv(
     return _linear(o_params, attended)
 
 
-def _multihead_attention(params: dict[str, jax.Array], x: jax.Array, *, nhead: int) -> jax.Array:
-    """Convenience wrapper for bidirectional self-attention."""
+def _multihead_attention(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    *,
+    nhead: int,
+    key_mask: jax.Array | None = None,
+) -> jax.Array:
+    """Convenience wrapper for bidirectional self-attention.
+
+    ``key_mask`` (bool, shape ``(batch, nz)``) — when provided, attention
+    scores at padded key positions are driven to ``-inf`` before softmax
+    so padded tokens cannot contribute to any query's output.
+    """
     return _multihead_attention_qkv(
         params["q"],
         params["k"],
@@ -260,4 +320,5 @@ def _multihead_attention(params: dict[str, jax.Array], x: jax.Array, *, nhead: i
         x,
         x,
         nhead=nhead,
+        source_mask=key_mask,
     )

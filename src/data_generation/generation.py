@@ -419,12 +419,14 @@ def _sampling_coverage_payload(
     }
     temperature_range = [float(x) for x in config["sampling"]["temperature_range_k"]]
 
+    # Union of all physically reachable pressures: the widest log-range across
+    # (p_top_range, p_bottom_range). Reported from low (top) to high (bottom).
     configured_ranges: dict[str, Any] = {
         **{key: frac_ranges[key] for key in frac_keys},
         "temperature_k": temperature_range,
         "pressure_bar": [
-            float(config["sampling"]["pressure_top_bar"]),
-            float(config["sampling"]["pressure_bottom_bar"]),
+            float(config["sampling"]["pressure_top_bar_range"][0]),
+            float(config["sampling"]["pressure_bottom_bar_range"][1]),
         ],
     }
     realized: dict[str, Any] = {
@@ -857,7 +859,13 @@ def write_raw_run_hdf5(
         spectrum/flux_erg_cm2_s_nm   (n_wav,)
     """
     ensure_dir(path.parent)
-    output_species = list(output_species or spec.metadata.get("output_species", spec.metadata["state_species"]))
+    state_species = spec.metadata.get("state_species")
+    if state_species is None:
+        raise ValueError(
+            "RunSpecification.metadata is missing required key 'state_species'; "
+            "cannot write raw HDF5 run."
+        )
+    output_species = list(output_species or spec.metadata.get("output_species", state_species))
     element_profile = _element_profile_from_spec(spec)
     gravity_profile = _gravity_profile_from_spec(spec)
     with h5py.File(path, "w") as handle:
@@ -871,7 +879,7 @@ def write_raw_run_hdf5(
         inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
         inputs.create_dataset(
             "state_species",
-            data=np.asarray(spec.metadata["state_species"], dtype="S"),
+            data=np.asarray(state_species, dtype="S"),
         )
         inputs.create_dataset(
             "output_species",
@@ -1810,6 +1818,60 @@ def run_vulcan_generation(
     )
 
 
+def _path_is_under(candidate: Path, parent: Path) -> bool:
+    """Return True when ``candidate`` resolves inside ``parent``."""
+    try:
+        candidate.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _check_assets_availability(config: dict[str, Any], project_root: Path) -> None:
+    """Warn or error when ``assets/`` is missing, based on what the config needs.
+
+    The directory is only required when the active config depends on its
+    contents: Roth PT-library profiles or stellar spectra loaded from
+    ``assets/``. When analytic PT profiles cover every run and no spectrum
+    files are pulled from ``assets/``, a missing folder is just a warning.
+    """
+    assets_dir = (project_root / "assets").resolve()
+    if assets_dir.exists():
+        return
+
+    needs_roth = bool(config.get("roth_sampler", {}).get("enabled", False))
+
+    needs_spectra_from_assets = False
+    if not uses_fastchem(config):
+        spectrum_cfg = config.get("stellar_spectrum", {}) or {}
+        for key in ("template_file", "library_glob"):
+            ref = spectrum_cfg.get(key)
+            if not ref:
+                continue
+            ref_path = Path(str(ref))
+            if not ref_path.is_absolute():
+                ref_path = project_root / ref_path
+            if _path_is_under(ref_path, assets_dir):
+                needs_spectra_from_assets = True
+                break
+
+    if needs_roth or needs_spectra_from_assets:
+        reasons = []
+        if needs_roth:
+            reasons.append("Roth PT-library profiles are required")
+        if needs_spectra_from_assets:
+            reasons.append("stellar spectra are configured to load from assets/")
+        raise FileNotFoundError(
+            f"Assets folder is missing at {assets_dir}: " + "; ".join(reasons) + "."
+        )
+
+    LOGGER.warning(
+        "Assets folder is missing at %s; continuing because the active config "
+        "uses analytic PT profiles and does not load spectra from assets/.",
+        assets_dir,
+    )
+
+
 def generate_raw_dataset(
     config: dict[str, Any],
     *,
@@ -1832,6 +1894,7 @@ def generate_raw_dataset(
     GeneratedRawDataset
         Description of the generated or reused raw dataset.
     """
+    _check_assets_availability(config, project_root)
     mode = str(config["generation"]["mode"]).lower()
     if mode == "vulcan":
         return run_vulcan_generation(config, project_root=project_root, num_runs=num_runs)

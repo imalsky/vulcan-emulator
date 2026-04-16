@@ -528,15 +528,19 @@ def make_transformer_train_eval_functions(
                 batch["sequence"],
                 batch["global_inputs"],
                 dims,
+                position_coord=batch["position_coord"],
+                attention_mask=batch["valid_mask"],
                 dropout_key=dropout_key,
                 training=True,
             )
+            mask = batch["valid_mask"].astype(pred.dtype)[..., None]
+            mask_sum = jnp.maximum(jnp.sum(mask) * pred.shape[-1], 1.0)
             # MSE in normalized space (the primary training signal).
-            mse_norm = jnp.mean((pred - batch["target"]) ** 2)
+            mse_norm = jnp.sum(((pred - batch["target"]) ** 2) * mask) / mask_sum
             # MSE in log10 mixing-ratio space (physical-scale diagnostic).
             pred_log10 = pred * target_std + target_mean
             target_log10 = batch["target"] * target_std + target_mean
-            mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
+            mse_log10 = jnp.sum(((pred_log10 - target_log10) ** 2) * mask) / mask_sum
             total = (
                 float(loss_cfg["lambda_z"]) * mse_norm
                 + float(loss_cfg["lambda_phys"]) * mse_log10
@@ -580,11 +584,15 @@ def make_transformer_train_eval_functions(
             batch["sequence"],
             batch["global_inputs"],
             dims,
+            position_coord=batch["position_coord"],
+            attention_mask=batch["valid_mask"],
         )
-        mse_norm = jnp.mean((pred - batch["target"]) ** 2)
+        mask = batch["valid_mask"].astype(pred.dtype)[..., None]
+        mask_sum = jnp.maximum(jnp.sum(mask) * pred.shape[-1], 1.0)
+        mse_norm = jnp.sum(((pred - batch["target"]) ** 2) * mask) / mask_sum
         pred_log10 = pred * target_std + target_mean
         target_log10 = batch["target"] * target_std + target_mean
-        mse_log10 = jnp.mean((pred_log10 - target_log10) ** 2)
+        mse_log10 = jnp.sum(((pred_log10 - target_log10) ** 2) * mask) / mask_sum
         total = (
             float(loss_cfg["lambda_z"]) * mse_norm
             + float(loss_cfg["lambda_phys"]) * mse_log10
@@ -829,15 +837,10 @@ def _checkpoint_payload(
     dict[str, Any]
         Pickle-serializable checkpoint dictionary.
     """
-    config_payload = {
-        key: value
-        for key, value in config.items()
-        if key != "_roth_profile_cache"
-    }
     return {
         "params": jax.tree_util.tree_map(np.asarray, params),
         "model_dimensions": dims.to_dict(),
-        "config": config_payload,
+        "config": dict(config),
         "normalization": normalization,
         "data_contract": data_contract,
         "metrics": metrics,

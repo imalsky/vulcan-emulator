@@ -71,9 +71,9 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     ],
                 },
                 "sampling": {
-                    "num_levels": 64,
-                    "pressure_top_bar": 1e-07,
-                    "pressure_bottom_bar": 100.0,
+                    "num_levels_range": [40, 60],
+                    "pressure_top_bar_range": [1e-07, 1e-05],
+                    "pressure_bottom_bar_range": [50.0, 500.0],
                     "temperature_range_k": [1.0, 4000.0],
                     "gravity_range_cm_s2": [300.0, 900.0],
                     "planet_radius_range_cm": [7.0e9, 1.1e10],
@@ -98,7 +98,6 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                         "max_temperature_k": 3000.0,
                     },
                     "analytic_sampler": {
-                        "reference_gravity_m_s2": 24.79,
                         "t_int_k_range": [100.0, 800.0],
                         "t_eq_k_range": [300.0, 4000.0],
                         "log10_delta_range": [-6.0, 6.0],
@@ -287,7 +286,7 @@ def tiny_config(tmp_path):
     config["generation"]["num_runs"] = 4
     config["generation"]["seed"] = 11
     config["generation"]["parallel_workers"] = 1
-    config["sampling"]["num_levels"] = 12
+    config["sampling"]["num_levels_range"] = [12, 12]
 
     config["vulcan"]["stellar_spectrum"]["max_tokens"] = 32
     config["stellar_spectrum"]["max_tokens"] = 32

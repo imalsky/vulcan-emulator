@@ -53,12 +53,28 @@ def test_transformer_forward_grad_and_jvp(tiny_config):
 
     sequence = jnp.asarray(batch["sequence"])
     globals_ = jnp.asarray(batch["global_inputs"])
+    position_coord = jnp.asarray(batch["position_coord"])
+    valid_mask = jnp.asarray(batch["valid_mask"])
 
-    pred, aux = apply_transformer_model(params, sequence, globals_, dims)
+    pred, aux = apply_transformer_model(
+        params,
+        sequence,
+        globals_,
+        dims,
+        position_coord=position_coord,
+        attention_mask=valid_mask,
+    )
     assert pred.shape == batch["target"].shape
 
     def scalar_fn(seq: jax.Array) -> jax.Array:
-        out, _ = apply_transformer_model(params, seq, globals_, dims)
+        out, _ = apply_transformer_model(
+            params,
+            seq,
+            globals_,
+            dims,
+            position_coord=position_coord,
+            attention_mask=valid_mask,
+        )
         return jnp.sum(out)
 
     grad = jax.grad(scalar_fn)(sequence)
@@ -100,12 +116,16 @@ def test_dropout_is_stochastic_only_in_training_mode(tiny_config):
     dims, params = initialize_model(config, contract, seed=3)
     sequence = jnp.asarray(batch["sequence"])
     globals_ = jnp.asarray(batch["global_inputs"])
-    eval_a, _ = apply_transformer_model(params, sequence, globals_, dims)
+    position_coord = jnp.asarray(batch["position_coord"])
+    valid_mask = jnp.asarray(batch["valid_mask"])
+    fwd_kwargs = {"position_coord": position_coord, "attention_mask": valid_mask}
+    eval_a, _ = apply_transformer_model(params, sequence, globals_, dims, **fwd_kwargs)
     eval_b, _ = apply_transformer_model(
         params,
         sequence,
         globals_,
         dims,
+        **fwd_kwargs,
         dropout_key=jax.random.PRNGKey(4),
         training=False,
     )
@@ -114,6 +134,7 @@ def test_dropout_is_stochastic_only_in_training_mode(tiny_config):
         sequence,
         globals_,
         dims,
+        **fwd_kwargs,
         dropout_key=jax.random.PRNGKey(5),
         training=True,
     )
@@ -122,6 +143,7 @@ def test_dropout_is_stochastic_only_in_training_mode(tiny_config):
         sequence,
         globals_,
         dims,
+        **fwd_kwargs,
         dropout_key=jax.random.PRNGKey(6),
         training=True,
     )
@@ -144,6 +166,8 @@ def test_supported_activations_run_forward_passes(tiny_config, activation: str):
         jnp.asarray(batch["sequence"]),
         jnp.asarray(batch["global_inputs"]),
         dims,
+        position_coord=jnp.asarray(batch["position_coord"]),
+        attention_mask=jnp.asarray(batch["valid_mask"]),
     )
     assert pred.shape == batch["target"].shape
 

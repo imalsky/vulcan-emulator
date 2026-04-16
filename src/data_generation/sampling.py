@@ -28,6 +28,7 @@ chemistry runs.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,19 +36,43 @@ from typing import Any
 
 import numpy as np
 
-from ..constants import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SUPPORTED_ATM_BASES
+from ..constants import (
+    ANALYTIC_SAMPLER_GRAVITY_CM_S2,
+    ELEMENT_INPUT_ORDER,
+    PUBLIC_PHYSICS_TOGGLES,
+    SUPPORTED_ATM_BASES,
+)
 from ..utils.config import uses_fastchem
 from ..utils.helpers import get_logger
 from .roth_sampling import RothFilterValue, RothProfile, load_roth_profiles
 from .spectrum import (
     SpectrumRecord,
+    generate_blackbody_template,
     load_spectrum_records_from_glob,
+    read_vulcan_spectrum_txt,
 )
 
 LOGGER = get_logger(__name__)
 
 # Maximum number of rejection-resampling attempts for analytic profiles.
 _MAX_PROFILE_ATTEMPTS = 100
+
+# Module-level cache for interpolated Roth PT-library profiles. Keyed by
+# (data_glob, pressure_grid_fingerprint, filter_items, validation_items) so
+# mixed sampling does not reload and interpolate the library on every call.
+# Kept at module scope (rather than inside the config dict) so that deep-copies
+# and checkpoint serialization of the config do not carry heavy profile data.
+_ROTH_PROFILE_CACHE: dict[tuple, list[RothProfile]] = {}
+
+
+def _pressure_grid_fingerprint(pressure_bar: np.ndarray) -> str:
+    """Return a stable short fingerprint of a pressure grid.
+
+    Uses the raw float64 bytes so grids that differ only in spacing—but not
+    endpoints or size—still produce distinct keys.
+    """
+    buffer = np.asarray(pressure_bar, dtype=np.float64).tobytes()
+    return hashlib.sha256(buffer).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -120,26 +145,28 @@ def _element_profile_from_fractions(
 def _equilibrium_gravity_profile(
     *,
     pressure_bar: np.ndarray,
-    config: dict[str, Any],
 ) -> np.ndarray:
     """Build the per-level gravity array required by equilibrium datasets.
+
+    Uses the fixed ``ANALYTIC_SAMPLER_GRAVITY_CM_S2`` constant; see the
+    constants module for why this is not a sampling range (degenerate with
+    ``delta`` in the Guillot form).
 
     Parameters
     ----------
     pressure_bar : np.ndarray
         Pressure grid whose shape defines the output profile length.
-    config : dict[str, Any]
-        Validated config containing
-        ``temperature_profiles.analytic_sampler.reference_gravity_m_s2``.
 
     Returns
     -------
     np.ndarray
         Column-constant gravity profile with shape matching ``pressure_bar``.
     """
-    analytic_sampler = config["temperature_profiles"].get("analytic_sampler", {})
-    gravity_cm_s2 = 100.0 * float(analytic_sampler.get("reference_gravity_m_s2", 25.0))
-    return np.full(np.asarray(pressure_bar).shape, gravity_cm_s2, dtype=np.float64)
+    return np.full(
+        np.asarray(pressure_bar).shape,
+        ANALYTIC_SAMPLER_GRAVITY_CM_S2,
+        dtype=np.float64,
+    )
 
 
 def sample_pressure_grid(
@@ -171,6 +198,34 @@ def sample_pressure_grid(
         math.log10(pressure_top_bar),
         int(num_levels),
         dtype=np.float64,
+    )
+
+
+def _sample_column_pressure_grid(
+    sampling_cfg: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw one per-run pressure grid from the configured (num_levels, p_top, p_bottom) ranges.
+
+    num_levels is drawn uniformly (integer); p_top and p_bottom are each
+    drawn uniformly in log10(bar) so the distribution is flat on the
+    physically meaningful axis.  Returns a log-spaced 1-D pressure grid
+    (bar), ordered from high pressure (bottom) to low pressure (top).
+    """
+    nl_lo, nl_hi = sampling_cfg["num_levels_range"]
+    num_levels = int(rng.integers(int(nl_lo), int(nl_hi) + 1))
+
+    top_lo, top_hi = sampling_cfg["pressure_top_bar_range"]
+    bot_lo, bot_hi = sampling_cfg["pressure_bottom_bar_range"]
+    log_top = rng.uniform(math.log10(float(top_lo)), math.log10(float(top_hi)))
+    log_bottom = rng.uniform(math.log10(float(bot_lo)), math.log10(float(bot_hi)))
+    p_top = 10.0**log_top
+    p_bottom = 10.0**log_bottom
+    return sample_pressure_grid(
+        num_levels=num_levels,
+        pressure_top_bar=p_top,
+        pressure_bottom_bar=p_bottom,
     )
 
 
@@ -519,7 +574,7 @@ def _resolve_roth_data_glob(config: dict[str, Any], roth_cfg: dict[str, Any]) ->
     glob_path = Path(data_glob)
     if glob_path.is_absolute():
         return data_glob
-    return str((Path(project_root) / glob_path).resolve())
+    return str((project_root / glob_path).resolve())
 
 
 def _load_configured_roth_profiles(
@@ -554,10 +609,9 @@ def _load_configured_roth_profiles(
     validation_items = tuple(
         sorted(config["temperature_profiles"]["validation"].items())
     )
-    pressure_key = tuple(np.asarray(pressure_bar, dtype=np.float64).tolist())
+    pressure_key = _pressure_grid_fingerprint(pressure_bar)
     cache_key = (data_glob, pressure_key, filter_items, validation_items)
-    cache = config.setdefault("_roth_profile_cache", {})
-    profiles = cache.get(cache_key)
+    profiles = _ROTH_PROFILE_CACHE.get(cache_key)
     if profiles is None:
         # Cache the interpolated PT-library profiles so mixed sampling does not reload them per run.
         loaded_profiles = load_roth_profiles(
@@ -588,7 +642,7 @@ def _load_configured_roth_profiles(
                 "Rejected %d PT-library profiles outside shared temperature bounds.",
                 rejected_profiles,
             )
-        cache[cache_key] = profiles
+        _ROTH_PROFILE_CACHE[cache_key] = profiles
     if not profiles:
         raise FileNotFoundError(
             "roth_sampler.enabled=true but no temperature profiles matched "
@@ -846,7 +900,12 @@ def _latin_hypercube_unit_samples(
     return samples
 
 
-def _scale_unit_interval(value: float, lower: float, upper: float) -> float:
+def _scale_unit_interval(
+    value: float,
+    lower: float,
+    upper: float,
+    scale: str = "linear",
+) -> float:
     """Map a unit-interval coordinate onto a physical parameter range.
 
     Parameters
@@ -857,13 +916,40 @@ def _scale_unit_interval(value: float, lower: float, upper: float) -> float:
         Physical lower bound for the parameter.
     upper : float
         Physical upper bound for the parameter.
+    scale : {"linear", "log"}
+        If ``"log"``, interpolate log10-uniformly between ``lower`` and
+        ``upper`` (both must be strictly positive). Otherwise interpolate
+        linearly.
 
     Returns
     -------
     float
-        Linearly rescaled value in ``[lower, upper]``.
+        Rescaled value in ``[lower, upper]``.
     """
+    if scale == "log":
+        if lower <= 0.0 or upper <= 0.0:
+            raise ValueError(
+                f"log-scale sampling requires positive bounds; got [{lower}, {upper}]"
+            )
+        log_lower = math.log10(lower)
+        log_upper = math.log10(upper)
+        return float(10.0 ** (log_lower + value * (log_upper - log_lower)))
     return float(lower + value * (upper - lower))
+
+
+def _sampling_scale(config: dict[str, Any], key: str, default: str = "linear") -> str:
+    """Return the sampling scale (``"linear"`` or ``"log"``) for a given key.
+
+    Sampling scales live under ``sampling.scales`` in the config. Missing
+    entries fall back to linear so existing configs keep their old behavior.
+    """
+    scales = config.get("sampling", {}).get("scales", {}) or {}
+    mode = str(scales.get(key, default)).lower()
+    if mode not in ("linear", "log"):
+        raise ValueError(
+            f"sampling.scales.{key} must be 'linear' or 'log', got {mode!r}"
+        )
+    return mode
 
 
 def _ensure_stellar_template(
@@ -889,8 +975,6 @@ def _ensure_stellar_template(
     spectrum_cfg = config["stellar_spectrum"]
     template_file = spectrum_cfg.get("template_file")
     if template_file in {None, ""}:
-        from .spectrum import generate_blackbody_template
-
         return generate_blackbody_template(
             wavelength_min_nm=float(spectrum_cfg["wavelength_min_nm"]),
             wavelength_max_nm=float(spectrum_cfg["wavelength_max_nm"]),
@@ -904,8 +988,6 @@ def _ensure_stellar_template(
         raise FileNotFoundError(
             f"Configured stellar_spectrum.template_file does not exist: {template_path}"
         )
-    from .spectrum import read_vulcan_spectrum_txt
-
     return read_vulcan_spectrum_txt(template_path, name=spectrum_cfg["template_name"])
 
 
@@ -1073,78 +1155,90 @@ def sample_run_specifications(
         spectrum_names = sorted(spectra.keys())
         science_presets = list(config["science_presets"])
 
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(config["sampling"]["num_levels"]),
-        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
-    )
     result: list[RunSpecification] = []
     for run_idx in range(total_runs):
+        pressure_bar = _sample_column_pressure_grid(config["sampling"], rng=rng)
         if fastchem:
             he_frac = _scale_unit_interval(
                 design[run_idx, 0],
                 *[float(x) for x in config["sampling"]["he_frac_range"]],
+                scale=_sampling_scale(config, "he_frac"),
             )
             c_frac = _scale_unit_interval(
                 design[run_idx, 1],
                 *[float(x) for x in config["sampling"]["c_frac_range"]],
+                scale=_sampling_scale(config, "c_frac"),
             )
             o_frac = _scale_unit_interval(
                 design[run_idx, 2],
                 *[float(x) for x in config["sampling"]["o_frac_range"]],
+                scale=_sampling_scale(config, "o_frac"),
             )
             n_frac = _scale_unit_interval(
                 design[run_idx, 3],
                 *[float(x) for x in config["sampling"]["n_frac_range"]],
+                scale=_sampling_scale(config, "n_frac"),
             )
             s_frac = _scale_unit_interval(
                 design[run_idx, 4],
                 *[float(x) for x in config["sampling"]["s_frac_range"]],
+                scale=_sampling_scale(config, "s_frac"),
             )
         else:
             gravity = _scale_unit_interval(
                 design[run_idx, 0],
                 *[float(x) for x in config["sampling"]["gravity_range_cm_s2"]],
+                scale=_sampling_scale(config, "gravity_cm_s2"),
             )
             planet_radius_cm = _scale_unit_interval(
                 design[run_idx, 1],
                 *[float(x) for x in config["sampling"]["planet_radius_range_cm"]],
+                scale=_sampling_scale(config, "planet_radius_cm"),
             )
             stellar_radius_rsun = _scale_unit_interval(
                 design[run_idx, 2],
                 *[float(x) for x in config["sampling"]["stellar_radius_range_rsun"]],
+                scale=_sampling_scale(config, "r_star_rsun"),
             )
             semi_major_axis_au = _scale_unit_interval(
                 design[run_idx, 3],
                 *[float(x) for x in config["sampling"]["semi_major_axis_range_au"]],
+                scale=_sampling_scale(config, "semi_major_axis_au"),
             )
             zenith_angle_deg = _scale_unit_interval(
                 design[run_idx, 4],
                 *[float(x) for x in config["sampling"]["zenith_angle_range_deg"]],
+                scale=_sampling_scale(config, "zenith_angle_deg"),
             )
             diurnal_factor = _scale_unit_interval(
                 design[run_idx, 5],
                 *[float(x) for x in config["sampling"]["diurnal_factor_range"]],
+                scale=_sampling_scale(config, "diurnal_factor"),
             )
             he_frac = _scale_unit_interval(
                 design[run_idx, 6],
                 *[float(x) for x in config["sampling"]["he_frac_range"]],
+                scale=_sampling_scale(config, "he_frac"),
             )
             c_frac = _scale_unit_interval(
                 design[run_idx, 7],
                 *[float(x) for x in config["sampling"]["c_frac_range"]],
+                scale=_sampling_scale(config, "c_frac"),
             )
             o_frac = _scale_unit_interval(
                 design[run_idx, 8],
                 *[float(x) for x in config["sampling"]["o_frac_range"]],
+                scale=_sampling_scale(config, "o_frac"),
             )
             n_frac = _scale_unit_interval(
                 design[run_idx, 9],
                 *[float(x) for x in config["sampling"]["n_frac_range"]],
+                scale=_sampling_scale(config, "n_frac"),
             )
             s_frac = _scale_unit_interval(
                 design[run_idx, 10],
                 *[float(x) for x in config["sampling"]["s_frac_range"]],
+                scale=_sampling_scale(config, "s_frac"),
             )
 
         temperature_k, temperature_metadata = _sample_temperature_profile_record(
@@ -1163,7 +1257,6 @@ def sample_run_specifications(
             element_fractions = _element_fractions_from_sampled_globals(base_globals)
             gravity_profile = _equilibrium_gravity_profile(
                 pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
-                config=config,
             )
         else:
             base_globals = {

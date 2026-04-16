@@ -17,9 +17,9 @@
     ]
   },
   "sampling": {
-    "num_levels": 64,
-    "pressure_top_bar": 1e-07,
-    "pressure_bottom_bar": 100.0,
+    "num_levels_range": [40, 60],
+    "pressure_top_bar_range": [1e-07, 1e-05],
+    "pressure_bottom_bar_range": [50.0, 500.0],
     "temperature_range_k": [1.0, 3000.0],
     "he_frac_range": [0.06, 0.12],
     "c_frac_range": [1e-5, 5e-3],
@@ -32,7 +32,15 @@
     "semi_major_axis_range_au": [0.03, 0.08],
     "zenith_angle_range_deg": [30.0, 75.0],
     "diurnal_factor_range": [0.25, 0.75],
-    "kzz_cm2_s": 1000000000.0
+    "kzz_cm2_s": 1000000000.0,
+    "scales": {
+      "he_frac": "linear",
+      "c_frac":  "log",
+      "o_frac":  "log",
+      "n_frac":  "log",
+      "s_frac":  "log",
+      "gravity_cm_s2": "log"
+    }
   },
   "temperature_profiles": {
     "source_mode": "mixed",
@@ -48,7 +56,6 @@
       "max_temperature_k": 3000.0
     },
     "analytic_sampler": {
-      "reference_gravity_m_s2": 25,
       "t_int_k_range": [100.0, 800.0],
       "t_eq_k_range": [300.0, 4000.0],
       "log10_delta_range": [-6.0, 6.0],

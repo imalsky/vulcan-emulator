@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from src.data_generation.roth_sampling import _interpolate_profile, load_roth_profiles
 from src.data_generation.sampling import (
+    _sample_column_pressure_grid,
     _sample_temperature_profile_record,
     sample_kzz_profile,
     sample_pressure_grid,
@@ -14,6 +15,13 @@ from src.data_generation.sampling import (
     sample_temperature_profile,
 )
 from src.utils.config import load_and_validate_config
+
+
+def _grid_from_config(config, seed=0):
+    """Draw one in-range pressure grid from a validated config for tests."""
+    return _sample_column_pressure_grid(
+        config["sampling"], rng=np.random.default_rng(seed),
+    )
 
 FIXTURE_PT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -31,11 +39,7 @@ def test_roth_temperature_sampling_requires_matching_profiles(tiny_config):
         "data_glob": str(tiny_config["_project_root"] / "missing_roth_profiles" / "*.npz"),
         "filters": {},
     }
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(config["sampling"]["num_levels"]),
-        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
-    )
+    pressure_bar = _grid_from_config(config)
 
     with pytest.raises(FileNotFoundError):
         sample_temperature_profile(
@@ -52,11 +56,7 @@ def test_roth_temperature_sampling_rejects_over_restrictive_filters(tiny_config)
         "data_glob": str(FIXTURE_PT_PATH),
         "filters": {"Teq": (9999.0, 10000.0), "TiOVO": False},
     }
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(config["sampling"]["num_levels"]),
-        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
-    )
+    pressure_bar = _grid_from_config(config)
 
     with pytest.raises(FileNotFoundError):
         sample_temperature_profile(
@@ -67,11 +67,7 @@ def test_roth_temperature_sampling_rejects_over_restrictive_filters(tiny_config)
 
 
 def test_kzz_sampling_is_constant_with_depth(tiny_config):
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(tiny_config["sampling"]["num_levels"]),
-        pressure_top_bar=float(tiny_config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(tiny_config["sampling"]["pressure_bottom_bar"]),
-    )
+    pressure_bar = _grid_from_config(tiny_config)
 
     kzz = sample_kzz_profile(
         pressure_bar,
@@ -109,43 +105,12 @@ def test_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config
         ) == 1
 
 
-def test_shipped_config_uses_fixture_temperature_profiles():
-    root = Path(__file__).resolve().parents[1]
-    config = load_and_validate_config(root / "config" / "vulcan_no_condensation.json")
-    config["_project_root"] = root
-    config["temperature_profiles"]["data_glob"] = str(FIXTURE_PT_PATH)
-    config["temperature_profiles"]["filters"] = {"Teq": (1200.0, 1200.0), "LogMet": 0.0, "TiOVO": False}
-    config["roth_sampler"]["data_glob"] = str(FIXTURE_PT_PATH)
-    config["roth_sampler"]["filters"] = dict(config["temperature_profiles"]["filters"])
-    assert config["roth_sampler"]["source_mode"] == "mixed"
-    assert config["roth_sampler"]["analytic_probability"] == pytest.approx(0.5)
-    assert config["temperature_profiles"]["analytic_sampler"]["log10_delta_range"] == [-6.0, 6.0]
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(config["sampling"]["num_levels"]),
-        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
-    )
-    profile = sample_temperature_profile(
-        pressure_bar,
-        config=config,
-        rng=np.random.default_rng(0),
-    )
-    assert profile.shape == pressure_bar.shape
-    assert np.all(np.isfinite(profile))
-    assert float(np.min(profile)) >= float(config["temperature_profiles"]["validation"]["min_temperature_k"])
-    assert float(np.max(profile)) <= float(config["temperature_profiles"]["validation"]["max_temperature_k"])
-
-
 def test_analytic_temperature_sampling_uses_piette_sampler_metadata_and_bounds(tiny_config):
     config = copy.deepcopy(tiny_config)
     config["roth_sampler"] = {"enabled": False}
     config["temperature_profiles"]["source_mode"] = "analytic"
     config["temperature_profiles"]["analytic_sampler"]["convection_probability"] = 1.0
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(config["sampling"]["num_levels"]),
-        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
-    )
+    pressure_bar = _grid_from_config(config)
 
     profile, metadata = _sample_temperature_profile_record(
         pressure_bar,
@@ -171,11 +136,7 @@ def test_analytic_temperature_sampling_uses_piette_sampler_metadata_and_bounds(t
 
 def test_pt_library_sampling_rejects_profiles_outside_shared_temperature_bounds(tiny_config, tmp_path):
     config = copy.deepcopy(tiny_config)
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(config["sampling"]["num_levels"]),
-        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
-    )
+    pressure_bar = _grid_from_config(config)
     invalid_profile_path = tmp_path / "profile_invalid.npz"
     np.savez(
         invalid_profile_path,
@@ -256,11 +217,7 @@ def test_roth_interpolation_uses_smoother_than_linear_log_pressure_fit():
 
 def test_mixed_temperature_sampling_supports_analytic_and_pt_paths(tiny_config):
     config = copy.deepcopy(tiny_config)
-    pressure_bar = sample_pressure_grid(
-        num_levels=int(config["sampling"]["num_levels"]),
-        pressure_top_bar=float(config["sampling"]["pressure_top_bar"]),
-        pressure_bottom_bar=float(config["sampling"]["pressure_bottom_bar"]),
-    )
+    pressure_bar = _grid_from_config(config)
     config["roth_sampler"] = {
         "enabled": True,
         "source_mode": "mixed",

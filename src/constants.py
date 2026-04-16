@@ -34,7 +34,11 @@ AU_CM = 1.495978707e13
 # Solar reference abundances — Asplund et al. (2009)
 # =========================================================================
 
-# Hydrogen-normalized elemental number fractions (n_X / n_H).
+# Hydrogen-normalized elemental number fractions (n_X / n_H):
+# total X-element atoms (nuclei) per total H atoms (nuclei).
+# NOT mass fractions, NOT molecular volume fractions. Matches VULCAN's
+# convention (see VULCAN build_atm.py: the {O,C,N,S,He}_H values satisfy
+# n_X = X_H * n_H in the equilibrium solver).
 # Used as the baseline for metallicity-scaled sampling.
 SOLAR_ABUNDANCES: dict[str, float] = {
     "He_H": 7.84e-2,
@@ -43,6 +47,21 @@ SOLAR_ABUNDANCES: dict[str, float] = {
     "N_H": 6.76e-5,
     "S_H": 1.32e-5,
 }
+
+# =========================================================================
+# Analytic PT sampler constants
+# =========================================================================
+
+# Reference surface gravity used by the Piette & Madhusudhan (2019) Guillot
+# analytic PT sampler [cm s-2].
+#
+# This is fixed on purpose and deliberately NOT exposed as a sampling range:
+# the Guillot form enters only through ``delta = kappa_IR / g``, and
+# ``log10_delta_range`` already spans many decades.  Varying g alongside
+# delta would re-sample the same PT manifold (gravity is fully degenerate
+# with delta).  Kinetic / VULCAN runs sample gravity independently because
+# there it drives scale height and Kzz — that is a different code path.
+ANALYTIC_SAMPLER_GRAVITY_CM_S2 = 2500.0
 
 # =========================================================================
 # Species molar masses — g mol-1
@@ -236,7 +255,12 @@ EXPORT_FORMAT = "jax_physical_bundle"
 EXPORT_VERSION = 6
 
 # Bump when the processed tensor layout changes incompatibly.
-PROCESSED_DATA_VERSION = 18
+# v19: variable num_levels + variable pressure ranges. Adds per-run valid_mask
+# and position_coord (normalized log10(P) in [0, 1]) tensors alongside
+# sequence_inputs/target_outputs, and records (num_levels_range,
+# pressure_top_bar_range, pressure_bottom_bar_range,
+# log10_pressure_bar_union_range) in the data contract.
+PROCESSED_DATA_VERSION = 19
 
 # Subdirectory name for shared metadata within a processed dataset.
 PROCESSED_INFO_DIRNAME = "info"
@@ -261,6 +285,15 @@ ROTH_FILTER_KEYS = (*ROTH_NUMERIC_FILTER_KEYS, *ROTH_BOOLEAN_FILTER_KEYS)
 # Base wavelength for the standard sinusoidal positional encoding
 # (Vaswani et al., 2017).
 _SINUSOIDAL_BASE_WAVELENGTH = 10_000.0
+
+# Canonical pseudo-length used to scale the continuous positional
+# encoding input. Positions live in ``[0, 1]`` (normalized log10-pressure)
+# and are multiplied by this constant before entering the sinusoidal
+# encoder, so the lowest frequency band spans roughly this many "steps"
+# across the full training pressure range. Keeping it in the same order
+# of magnitude as the historical fixed ``num_levels`` (~64) preserves
+# the frequency bands the model was tuned against.
+_POSITION_SCALE = 64.0
 
 # =========================================================================
 # ExoJAX-facing label lists

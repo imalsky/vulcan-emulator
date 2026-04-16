@@ -44,6 +44,9 @@ _PT_PROFILE_FILENAME_PATTERN = re.compile(
     r"logG_(?P<logG>[-]?[\d.]+)-"
     r"TiOVO_(?P<TiOVO>true|false)"
 )
+# Matches a line that begins with a signed decimal (integer index column of a
+# data row). Used to skip header/metadata lines in Roth .dat files.
+_ROW_LEADING_NUMERIC_RE = re.compile(r"^-?\d")
 
 
 @dataclass(frozen=True)
@@ -324,16 +327,23 @@ def _load_pt_profile_rows(path: Path) -> np.ndarray:
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
-            if not stripped:
+            if not stripped or stripped.startswith("#"):
                 continue
-            if (
-                (stripped[0].isdigit() or (stripped[0] == "-" and len(stripped) > 1 and stripped[1].isdigit()))
-                and stripped.count(",") >= 4
-            ):
-                numeric_lines.append(stripped)
+            if stripped.count(",") < 4:
+                # Roth PT ``.dat`` files may begin with a short (e.g. 3-column)
+                # header row; data rows always have at least five comma-separated
+                # columns (index, lon, lat, pressure, temperature).
+                continue
+            if not _ROW_LEADING_NUMERIC_RE.match(stripped):
+                continue
+            numeric_lines.append(stripped)
     if not numeric_lines:
         raise ValueError(f"PT profile file {path} does not contain any numeric rows.")
-    rows = np.genfromtxt(io.StringIO("\n".join(numeric_lines)), delimiter=",", dtype=np.float64)
+    rows = np.genfromtxt(
+        io.StringIO("\n".join(numeric_lines)),
+        delimiter=",",
+        dtype=np.float64,
+    )
     if rows.ndim == 1:
         rows = rows[None, :]
     if rows.ndim != 2 or rows.shape[1] < 5:

@@ -170,6 +170,8 @@ def _make_fastchem_payload() -> tuple[dict, dict, TransformerDimensions]:
             "model_type": "transformer",
             "global_static_feature_order": list(FASTCHEM_GLOBAL_ORDER),
             "output_species_order": ["H2O", "CO"],
+            "num_levels_range": [3, 16],
+            "log10_pressure_bar_union_range": [-3.0, 3.0],
         },
         "config": {"chemistry_type": "fastchem", "model_type": "transformer"},
     }
@@ -189,6 +191,8 @@ def _make_vulcan_payload() -> tuple[dict, dict, TransformerDimensions]:
             "model_type": "transformer",
             "global_static_feature_order": list(VULCAN_GLOBAL_ORDER),
             "output_species_order": ["H2O", "CO"],
+            "num_levels_range": [3, 16],
+            "log10_pressure_bar_union_range": [-3.0, 3.0],
         },
         "config": {
             "chemistry_type": "vulcan",
@@ -196,6 +200,14 @@ def _make_vulcan_payload() -> tuple[dict, dict, TransformerDimensions]:
         },
     }
     return payload, normalization, dims
+
+
+def _position_coord_from_pressure_np(
+    pressure_bar: np.ndarray,
+    union_range: tuple[float, float] = (-3.0, 3.0),
+) -> np.ndarray:
+    lo, hi = union_range
+    return ((np.log10(np.asarray(pressure_bar, dtype=np.float64)) - lo) / max(hi - lo, 1e-12)).astype(np.float32)
 
 
 def _expected_fastchem_prediction(
@@ -212,11 +224,15 @@ def _expected_fastchem_prediction(
         np.array([[global_inputs[name] for name in FASTCHEM_GLOBAL_ORDER]], dtype=np.float64),
         normalization["global_static"],
     )
+    position_coord = _position_coord_from_pressure_np(pressure_bar)[None, :]
+    attention_mask = jnp.ones((1, pressure_bar.shape[0]), dtype=jnp.bool_)
     expected_norm, _ = apply_transformer_model(
         params,
         jnp.asarray(sequence_norm[None, :, :], dtype=jnp.float32),
         jnp.asarray(globals_norm, dtype=jnp.float32),
         dims,
+        position_coord=jnp.asarray(position_coord, dtype=jnp.float32),
+        attention_mask=attention_mask,
     )
     expected_physical = inverse_block(np.asarray(expected_norm[0]), normalization["target"])
     expected_log10 = (
@@ -242,11 +258,15 @@ def _expected_vulcan_prediction(
         np.array([[global_inputs[name] for name in VULCAN_GLOBAL_ORDER]], dtype=np.float64),
         normalization["global_static"],
     )
+    position_coord = _position_coord_from_pressure_np(pressure_bar)[None, :]
+    attention_mask = jnp.ones((1, pressure_bar.shape[0]), dtype=jnp.bool_)
     expected_norm, _ = apply_transformer_model(
         params,
         jnp.asarray(sequence_norm[None, :, :], dtype=jnp.float32),
         jnp.asarray(globals_norm, dtype=jnp.float32),
         dims,
+        position_coord=jnp.asarray(position_coord, dtype=jnp.float32),
+        attention_mask=attention_mask,
     )
     expected_physical = inverse_block(np.asarray(expected_norm[0]), normalization["target"])
     expected_log10 = (

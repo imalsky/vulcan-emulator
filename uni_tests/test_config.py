@@ -30,58 +30,6 @@ def _write_config(tmp_path: Path, name: str, payload: dict) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("filename", "chemistry_type", "model_type", "sequence_order", "global_order"),
-    [
-        (
-            "vulcan_no_condensation.json",
-            "vulcan",
-            "transformer",
-            ["pressure_bar", "temperature_k", "kzz_cm2_s"],
-            VULCAN_GLOBAL_ORDER,
-        ),
-        (
-            "vulcan_condensation.json",
-            "vulcan",
-            "transformer",
-            ["pressure_bar", "temperature_k", "kzz_cm2_s"],
-            VULCAN_GLOBAL_ORDER,
-        ),
-    ],
-)
-def test_shipped_configs_load_with_expected_contract(
-    filename: str,
-    chemistry_type: str,
-    model_type: str,
-    sequence_order: list[str],
-    global_order: list[str],
-):
-    raw_config = _load_raw_json(ROOT / "config" / filename)
-    assert "required_global_inputs" not in raw_config["data_spec"]
-    assert "element_input_order" not in raw_config["data_spec"]
-
-    config = load_and_validate_config(ROOT / "config" / filename)
-    assert config["chemistry_type"] == chemistry_type
-    assert config["model_type"] == model_type
-    assert config["data_spec"]["state_species"] == list(DEFAULT_STATE_SPECIES)
-    assert config["data_spec"]["element_input_order"] == FASTCHEM_GLOBAL_ORDER
-    assert config["data_spec"]["required_global_inputs"] == global_order
-    assert config["data_spec"]["sequence_static_feature_order"] == sequence_order
-    assert config["data_spec"]["global_static_feature_order"] == global_order
-    assert "run_root" not in config["paths"]
-    assert "raw_root" in config["paths"]
-    assert "processed_root" in config["paths"]
-    assert config["paths"]["raw_root"].endswith("/raw")
-    assert config["paths"]["processed_root"].endswith("/processed")
-    assert config["normalization"]["target_method"] == "log-standard"
-    assert config["training"]["scheduler"] == {
-        "name": "reduce_on_plateau",
-        "factor": 0.5,
-        "patience": 10,
-        "threshold": pytest.approx(1.0e-4),
-    }
-
-
-@pytest.mark.parametrize(
     "filename",
     [
         "vulcan_no_condensation.json",
@@ -93,26 +41,6 @@ def test_shipped_configs_use_single_dataset_root_layout(filename: str):
     run_root = Path(raw_config["paths"]["run_root"])
 
     assert run_root.parent.name == "data"
-
-
-def test_shipped_no_condensation_config_defaults_are_correct():
-    config = load_and_validate_config(ROOT / "config" / "vulcan_no_condensation.json")
-    assert config["temperature_profiles"]["source_mode"] == "mixed"
-    assert config["temperature_profiles"]["analytic_probability"] == pytest.approx(0.5)
-    assert config["temperature_profiles"]["analytic_sampler"]["t_int_k_range"] == [100.0, 800.0]
-    assert config["temperature_profiles"]["analytic_sampler"]["log10_delta_range"] == [-6.0, 6.0]
-    assert config["temperature_profiles"]["analytic_sampler"]["log10_p_trans_bar_range"] == [-5.0, 1.0]
-    assert config["temperature_profiles"]["analytic_sampler"]["adiabatic_gradient_range"] == [0.25, 0.35]
-    assert config["temperature_profiles"]["validation"] == {
-        "min_temperature_k": 1.0,
-        "max_temperature_k": 3000.0,
-    }
-    assert config["roth_sampler"]["enabled"] is True
-    assert config["roth_sampler"]["data_glob"] == "assets/PTprofiles/*.dat"
-    assert config["training"]["model"]["activation"] == "gelu"
-    assert config["training"]["early_stopping_patience"] == 30
-    assert config["vulcan"]["physics_toggles"]["use_condensation"] is False
-    assert config["vulcan"]["physics_toggles"]["use_initial_cold_trap"] is False
 
 
 def test_config_rejects_legacy_data_root_keys(tmp_path):

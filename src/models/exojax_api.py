@@ -99,12 +99,17 @@ def _maybe_require_column_constant(values: Any, *, name: str) -> None:
     if isinstance(values, jax.core.Tracer):
         return
     arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        return
     if arr.ndim == 1:
         is_constant = np.allclose(arr, arr[0], rtol=1.0e-8, atol=0.0)
     elif arr.ndim == 2:
         is_constant = np.allclose(arr, arr[0][None, :], rtol=1.0e-8, atol=0.0)
     else:
-        return
+        raise ValueError(
+            f"{name} must be a scalar, 1-D profile, or 2-D stacked profile; "
+            f"got ndim={arr.ndim}."
+        )
     if not is_constant:
         raise ValueError(f"{name} must be vertically constant in the current ExoJAX contract.")
 

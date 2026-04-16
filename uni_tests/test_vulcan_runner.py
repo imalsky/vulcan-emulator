@@ -73,18 +73,18 @@ def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
         element_labels = [item.decode("utf-8") for item in handle["inputs/element_input_order"][:]]
         final_state = np.asarray(handle["final_state/ymix_output"])
         assert "trajectory" not in handle
-        assert final_state.shape[0] == int(tiny_config["sampling"]["num_levels"])
+        nl_lo, nl_hi = tiny_config["sampling"]["num_levels_range"]
+        assert nl_lo <= final_state.shape[0] <= nl_hi
+        nz = int(final_state.shape[0])
         assert final_state.shape[1] == len(tiny_config["data_spec"]["output_species"])
         assert np.all(np.isfinite(final_state))
         assert species == list(tiny_config["data_spec"]["state_species"])
         assert element_labels == ["He_H", "C_H", "O_H", "N_H", "S_H"]
         assert np.asarray(handle["inputs/elemental_abundances_frac"]).shape == (
-            int(tiny_config["sampling"]["num_levels"]),
+            nz,
             len(element_labels),
         )
-        assert np.asarray(handle["inputs/gravity_cm_s2"]).shape == (
-            int(tiny_config["sampling"]["num_levels"]),
-        )
+        assert np.asarray(handle["inputs/gravity_cm_s2"]).shape == (nz,)
         spectrum = np.asarray(handle["spectrum/flux_erg_cm2_s_nm"])
         assert spectrum.size > 10
         assert "target_mode" not in handle["inputs"]
@@ -242,7 +242,7 @@ def test_shipped_vulcan_transformer_smoke_runs_local_checkout(tmp_path):
     raw_config["paths"]["run_root"] = str(tmp_path / "vulcan_transformer")
     raw_config["paths"]["checkpoints_root"] = str(tmp_path / "checkpoints")
     raw_config["paths"]["vulcan_source_root"] = str(source_root)
-    raw_config["sampling"]["num_levels"] = 12
+    raw_config["sampling"]["num_levels_range"] = [12, 12]
     raw_config["sampling"]["gravity_range_cm_s2"] = [900.0, 950.0]
     raw_config["sampling"]["planet_radius_range_cm"] = [8.0e9, 8.2e9]
     raw_config["sampling"]["stellar_radius_range_rsun"] = [0.95, 0.95]

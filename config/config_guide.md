@@ -153,6 +153,7 @@ data/<run_name>/
 | `zenith_angle_range_deg` | vulcan only | [min, max] stellar zenith angle (degrees) |
 | `diurnal_factor_range` | vulcan only | [min, max] diurnal averaging factor |
 | `kzz_cm2_s` | vulcan only | Constant eddy diffusion coefficient |
+| `scales` | optional | Per-parameter sampling scale, `"linear"` (default) or `"log"`. Applies to any of `he_frac`, `c_frac`, `o_frac`, `n_frac`, `s_frac`. Use `log` when the corresponding `*_frac_range` spans more than ~1 dex so samples are not biased toward the upper bound. |
 
 ### `temperature_profiles`
 

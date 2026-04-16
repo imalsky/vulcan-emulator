@@ -54,7 +54,7 @@ def _load_config(config_path: str | Path, project_root: Path) -> dict[str, Any]:
         path = project_root / path
     config = load_and_validate_config(path)
     # Persist the resolved project root for downstream path resolution.
-    config["_project_root"] = str(project_root.resolve())
+    config["_project_root"] = project_root.resolve()
     return config
 
 

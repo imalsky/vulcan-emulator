@@ -689,7 +689,6 @@ def _validate_analytic_temperature_sampler(sampler_config: Any) -> dict[str, Any
     _require_keys(
         normalized,
         [
-            "reference_gravity_m_s2",
             "t_int_k_range",
             "t_eq_k_range",
             "log10_delta_range",
@@ -701,12 +700,6 @@ def _validate_analytic_temperature_sampler(sampler_config: Any) -> dict[str, Any
         ],
         scope,
     )
-    normalized["reference_gravity_m_s2"] = _as_float(
-        normalized["reference_gravity_m_s2"],
-        f"{scope}.reference_gravity_m_s2",
-    )
-    if normalized["reference_gravity_m_s2"] <= 0.0:
-        raise ConfigValidationError(f"{scope}.reference_gravity_m_s2 must be positive.")
 
     for key in (
         "t_int_k_range",
@@ -982,9 +975,9 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
 
     sampling = config["sampling"]
     required_sampling = [
-        "num_levels",
-        "pressure_top_bar",
-        "pressure_bottom_bar",
+        "num_levels_range",
+        "pressure_top_bar_range",
+        "pressure_bottom_bar_range",
         "temperature_range_k",
         "he_frac_range",
         "c_frac_range",
@@ -1003,6 +996,12 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             "kzz_cm2_s",
         ]
     _require_keys(sampling, required_sampling, "sampling")
+    for legacy_key in ("num_levels", "pressure_top_bar", "pressure_bottom_bar"):
+        if legacy_key in sampling:
+            raise ConfigValidationError(
+                f"sampling.{legacy_key} is no longer supported. Use sampling.{legacy_key}_range "
+                "with a [lower, upper] pair instead."
+            )
     if chemistry_type == "fastchem":
         disallowed_sampling = [
             key for key in ("gravity_range_cm_s2", "planet_radius_range_cm", "kzz_cm2_s")
@@ -1013,21 +1012,35 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 "sampling contains VULCAN-only keys for chemistry_type='fastchem': "
                 f"{disallowed_sampling}"
             )
-    sampling["num_levels"] = _as_int(sampling["num_levels"], "sampling.num_levels")
-    if sampling["num_levels"] < 4:
-        raise ConfigValidationError("sampling.num_levels must be >= 4.")
-    sampling["pressure_top_bar"] = _as_float(
-        sampling["pressure_top_bar"],
-        "sampling.pressure_top_bar",
-    )
-    sampling["pressure_bottom_bar"] = _as_float(
-        sampling["pressure_bottom_bar"],
-        "sampling.pressure_bottom_bar",
-    )
-    if sampling["pressure_top_bar"] <= 0.0 or sampling["pressure_bottom_bar"] <= 0.0:
-        raise ConfigValidationError("Pressure bounds must be positive.")
-    if sampling["pressure_top_bar"] >= sampling["pressure_bottom_bar"]:
-        raise ConfigValidationError("pressure_top_bar must be smaller than pressure_bottom_bar.")
+
+    num_levels_range = sampling["num_levels_range"]
+    if not isinstance(num_levels_range, list) or len(num_levels_range) != 2:
+        raise ConfigValidationError("sampling.num_levels_range must be a length-2 list.")
+    nl_lo = _as_int(num_levels_range[0], "sampling.num_levels_range[0]")
+    nl_hi = _as_int(num_levels_range[1], "sampling.num_levels_range[1]")
+    if nl_lo < 4:
+        raise ConfigValidationError("sampling.num_levels_range[0] must be >= 4.")
+    if nl_lo > nl_hi:
+        raise ConfigValidationError("sampling.num_levels_range must satisfy lower <= upper.")
+    sampling["num_levels_range"] = [nl_lo, nl_hi]
+
+    for pkey in ("pressure_top_bar_range", "pressure_bottom_bar_range"):
+        values = sampling[pkey]
+        if not isinstance(values, list) or len(values) != 2:
+            raise ConfigValidationError(f"sampling.{pkey} must be a length-2 list.")
+        lo = _as_float(values[0], f"sampling.{pkey}[0]")
+        hi = _as_float(values[1], f"sampling.{pkey}[1]")
+        if lo <= 0.0 or hi <= 0.0:
+            raise ConfigValidationError(f"sampling.{pkey} bounds must be strictly positive (bar).")
+        if lo > hi:
+            raise ConfigValidationError(f"sampling.{pkey} must satisfy lower <= upper.")
+        sampling[pkey] = [lo, hi]
+
+    if sampling["pressure_top_bar_range"][1] >= sampling["pressure_bottom_bar_range"][0]:
+        raise ConfigValidationError(
+            "sampling.pressure_top_bar_range must lie strictly below sampling.pressure_bottom_bar_range "
+            "so every sampled column has p_top < p_bottom."
+        )
     range_keys = [
         "temperature_range_k",
         "he_frac_range",

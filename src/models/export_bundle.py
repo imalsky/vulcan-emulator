@@ -255,7 +255,12 @@ def _apply_sequence_static_block_jax(
     sequence_static: jax.Array | np.ndarray,
     payload: dict[str, Any],
 ) -> jax.Array:
-    """Normalize sequence-static features block by block in JAX.
+    """Normalize sequence-static features in one vectorized pass.
+
+    Each feature column is normalized by the corresponding block in
+    ``payload["blocks"]``. Supported methods reduce to a common form
+    ``y = (x_work - offset) / scale`` where ``x_work`` is either ``x`` or
+    ``log10(max(x, floor))`` depending on the method.
 
     Parameters
     ----------
@@ -272,11 +277,46 @@ def _apply_sequence_static_block_jax(
         Normalized sequence tensor with the same shape as ``sequence_static``.
     """
     arr = jnp.asarray(sequence_static, dtype=jnp.float32)
-    parts = [
-        apply_block_jax(arr[..., idx : idx + 1], block)
-        for idx, block in enumerate(payload["blocks"])
-    ]
-    return jnp.concatenate(parts, axis=-1)
+    blocks = payload["blocks"]
+
+    def _scalar(value: Any) -> float:
+        return float(np.asarray(value).reshape(-1)[0])
+
+    offsets: list[float] = []
+    scales: list[float] = []
+    floors: list[float] = []
+    use_log: list[bool] = []
+    for block in blocks:
+        method = str(block["method"]).lower()
+        if method == "none":
+            offsets.append(0.0)
+            scales.append(1.0)
+            floors.append(1.0)
+            use_log.append(False)
+        elif method == "standard":
+            offsets.append(_scalar(block["mean"]))
+            scales.append(_scalar(block["std"]))
+            floors.append(1.0)
+            use_log.append(False)
+        elif method == "log-standard":
+            offsets.append(_scalar(block["mean"]))
+            scales.append(_scalar(block["std"]))
+            floors.append(_scalar(block["floor"]))
+            use_log.append(True)
+        elif method == "log-minmax":
+            offsets.append(_scalar(block["log10_min"]))
+            scales.append(_scalar(block["span"]))
+            floors.append(_scalar(block["floor"]))
+            use_log.append(True)
+        else:
+            raise ValueError(f"Unsupported normalization method: {method}")
+
+    offset_arr = jnp.asarray(offsets, dtype=arr.dtype)
+    scale_arr = jnp.asarray(scales, dtype=arr.dtype)
+    floor_arr = jnp.asarray(floors, dtype=arr.dtype)
+    use_log_arr = jnp.asarray(use_log, dtype=jnp.bool_)
+    x_work = jnp.where(use_log_arr, jnp.log10(jnp.maximum(arr, floor_arr)), arr)
+    return (x_work - offset_arr) / scale_arr
 
 
 def _ordered_feature_vector(
@@ -367,6 +407,61 @@ def _is_traced_array(value: Any) -> bool:
     return isinstance(value, jax.core.Tracer)
 
 
+def _log10_pressure_union_bounds(
+    data_contract: dict[str, Any],
+) -> tuple[float, float]:
+    """Return the training-range log10(P in bar) lower/upper bounds."""
+    lo, hi = data_contract["log10_pressure_bar_union_range"]
+    return float(lo), float(hi)
+
+
+def _validate_pressure_grid(
+    pressure_bar: jax.Array | np.ndarray,
+    data_contract: dict[str, Any],
+) -> None:
+    """Reject out-of-range pressure grids before the jitted forward runs.
+
+    Runs eagerly on concrete arrays; traced inputs inside ``jax.jit`` are
+    skipped so the check never appears in the JAX graph.
+    """
+    if _is_traced_array(pressure_bar):
+        return
+    arr = np.asarray(pressure_bar, dtype=np.float64)
+    if arr.ndim != 1:
+        return
+    nz = int(arr.shape[0])
+    nl_range = data_contract.get("num_levels_range")
+    if nl_range is not None:
+        nl_lo, nl_hi = int(nl_range[0]), int(nl_range[1])
+        if not (nl_lo <= nz <= nl_hi):
+            raise ValueError(
+                f"pressure_bar length {nz} is outside the training num_levels range "
+                f"[{nl_lo}, {nl_hi}]."
+            )
+    if "log10_pressure_bar_union_range" not in data_contract:
+        return
+    if np.any(arr <= 0):
+        raise ValueError("pressure_bar must contain strictly positive values.")
+    log_p = np.log10(arr)
+    lo, hi = _log10_pressure_union_bounds(data_contract)
+    if log_p.min() < lo - 1.0e-9 or log_p.max() > hi + 1.0e-9:
+        raise ValueError(
+            f"pressure_bar range [{arr.min():.3e}, {arr.max():.3e}] bar is outside "
+            f"the training pressure range [{10.0 ** lo:.3e}, {10.0 ** hi:.3e}] bar."
+        )
+
+
+def _position_coord_from_pressure_jax(
+    pressure_bar: jax.Array,
+    data_contract: dict[str, Any],
+) -> jax.Array:
+    """Build a normalized log10(P) position coordinate for the continuous PE."""
+    lo, hi = _log10_pressure_union_bounds(data_contract)
+    span = jnp.asarray(max(hi - lo, 1.0e-12), dtype=jnp.float32)
+    log_p = jnp.log10(jnp.asarray(pressure_bar, dtype=jnp.float32))
+    return (log_p - jnp.asarray(lo, dtype=jnp.float32)) / span
+
+
 def _predict_fastchem_profile_impl(
     *,
     params: Any,
@@ -424,11 +519,94 @@ def _predict_fastchem_profile_impl(
         normalization["global_static"],
     )  # shape: (1, global_dim)
 
+    position_coord = _position_coord_from_pressure_jax(pressure, data_contract)[None, :]
+    attention_mask = jnp.ones(sequence.shape[:2], dtype=jnp.bool_)
     pred_norm, _ = apply_transformer_model(
         params,
         sequence,
         globals_norm,
         dims,
+        position_coord=position_coord,
+        attention_mask=attention_mask,
+    )
+    pred_norm = pred_norm[0]
+    if return_log10:
+        return _restore_block_transform_space_jax(pred_norm, normalization["target"])
+    return inverse_block_jax(pred_norm, normalization["target"])
+
+
+def _predict_vulcan_profile_impl(
+    *,
+    params: Any,
+    dims: TransformerDimensions,
+    normalization: dict[str, Any],
+    data_contract: dict[str, Any],
+    pressure_bar: jax.Array | np.ndarray,
+    temperature_k: jax.Array | np.ndarray,
+    kzz_cm2_s: jax.Array | np.ndarray,
+    global_inputs: dict[str, float] | jax.Array | np.ndarray,
+    return_log10: bool,
+) -> jax.Array:
+    """Run VULCAN inference from physical inputs using shared bundle logic.
+
+    Parameters
+    ----------
+    params : Any
+        Nested JAX parameter tree for the model.
+    dims : TransformerDimensions
+        Architecture dimensionality constants.
+    normalization : dict[str, Any]
+        Full normalization payload (sequence_static, global_static, target).
+    data_contract : dict[str, Any]
+        Data contract specifying feature orders and target shape.
+    pressure_bar : jax.Array or np.ndarray
+        Pressure grid in bar, shape ``(nz,)``.
+    temperature_k : jax.Array or np.ndarray
+        Temperature profile in Kelvin, shape ``(nz,)``.
+    kzz_cm2_s : jax.Array or np.ndarray
+        Eddy diffusion profile in cm^2 s^-1, shape ``(nz,)``.
+    global_inputs : dict[str, float] or array-like
+        Global conditioning scalars (planetary, elemental, stellar, toggles).
+    return_log10 : bool
+        If True, return log10 mixing ratios instead of linear.
+
+    Returns
+    -------
+    jax.Array
+        Predicted mixing ratios, shape ``(nz, target_dim)``.
+    """
+    pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
+    temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
+    kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)
+    if pressure.ndim != 1 or temperature.ndim != 1 or kzz.ndim != 1:
+        raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must be 1-D arrays.")
+    if not (pressure.shape == temperature.shape == kzz.shape):
+        raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must share the same shape.")
+
+    static_inputs = jnp.stack([pressure, temperature, kzz], axis=-1)
+    sequence = _apply_sequence_static_block_jax(
+        static_inputs,
+        normalization["sequence_static"],
+    )[None, :, :]
+    global_vector = _ordered_feature_vector(
+        global_inputs,
+        list(data_contract["global_static_feature_order"]),
+        field_name="global_inputs",
+    )
+    globals_norm = apply_mixed_block_jax(
+        global_vector[None, :],
+        normalization["global_static"],
+    )
+
+    position_coord = _position_coord_from_pressure_jax(pressure, data_contract)[None, :]
+    attention_mask = jnp.ones(sequence.shape[:2], dtype=jnp.bool_)
+    pred_norm, _ = apply_transformer_model(
+        params,
+        sequence,
+        globals_norm,
+        dims,
+        position_coord=position_coord,
+        attention_mask=attention_mask,
     )
     pred_norm = pred_norm[0]
     if return_log10:
@@ -651,64 +829,42 @@ class ExportedJAXModel:
             ) from None
 
     @cached_property
-    def _compiled_fastchem_profile_predictor(
+    def _compiled_fastchem_predictors(
         self: "ExportedJAXModel",
-    ) -> Callable[[Any, Any, Any], jax.Array]:
-        """Cache a compiled FastChem predictor for repeated linear-space calls."""
-        compiled = jax.jit(
-            lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
-                params=self.params,
-                dims=self.dims,
-                normalization=self.normalization,
-                data_contract=self.data_contract,
-                pressure_bar=pressure_bar,
-                temperature_k=temperature_k,
-                global_inputs=global_inputs,
-                return_log10=False,
+    ) -> dict[bool, Callable[[Any, Any, Any], jax.Array]]:
+        """Cache compiled FastChem predictors keyed by the log10 flag."""
+        predictors: dict[bool, Callable[[Any, Any, Any], jax.Array]] = {}
+        for return_log10 in (False, True):
+            compiled = jax.jit(
+                lambda pressure_bar, temperature_k, global_inputs, _flag=return_log10: _predict_fastchem_profile_impl(
+                    params=self.params,
+                    dims=self.dims,
+                    normalization=self.normalization,
+                    data_contract=self.data_contract,
+                    pressure_bar=pressure_bar,
+                    temperature_k=temperature_k,
+                    global_inputs=global_inputs,
+                    return_log10=_flag,
+                )
             )
-        )
 
-        def predictor(pressure_bar: Any, temperature_k: Any, global_inputs: Any) -> jax.Array:
-            """Validate global inputs and run the compiled FastChem predictor."""
-            _validate_near_constant_standard_globals(
-                global_inputs,
-                list(self.data_contract["global_static_feature_order"]),
-                self.normalization["global_static"],
-                field_name="global_inputs",
-            )
-            return compiled(pressure_bar, temperature_k, global_inputs)
+            def predictor(
+                pressure_bar: Any,
+                temperature_k: Any,
+                global_inputs: Any,
+                _compiled: Callable[[Any, Any, Any], jax.Array] = compiled,
+            ) -> jax.Array:
+                _validate_pressure_grid(pressure_bar, self.data_contract)
+                _validate_near_constant_standard_globals(
+                    global_inputs,
+                    list(self.data_contract["global_static_feature_order"]),
+                    self.normalization["global_static"],
+                    field_name="global_inputs",
+                )
+                return _compiled(pressure_bar, temperature_k, global_inputs)
 
-        return predictor
-
-    @cached_property
-    def _compiled_fastchem_profile_predictor_log10(
-        self: "ExportedJAXModel",
-    ) -> Callable[[Any, Any, Any], jax.Array]:
-        """Cache a compiled FastChem predictor for repeated log10-space calls."""
-        compiled = jax.jit(
-            lambda pressure_bar, temperature_k, global_inputs: _predict_fastchem_profile_impl(
-                params=self.params,
-                dims=self.dims,
-                normalization=self.normalization,
-                data_contract=self.data_contract,
-                pressure_bar=pressure_bar,
-                temperature_k=temperature_k,
-                global_inputs=global_inputs,
-                return_log10=True,
-            )
-        )
-
-        def predictor(pressure_bar: Any, temperature_k: Any, global_inputs: Any) -> jax.Array:
-            """Validate global inputs and run the compiled FastChem log10 predictor."""
-            _validate_near_constant_standard_globals(
-                global_inputs,
-                list(self.data_contract["global_static_feature_order"]),
-                self.normalization["global_static"],
-                field_name="global_inputs",
-            )
-            return compiled(pressure_bar, temperature_k, global_inputs)
-
-        return predictor
+            predictors[return_log10] = predictor
+        return predictors
 
     def make_compiled_fastchem_profile_predictor(
         self: "ExportedJAXModel",
@@ -735,9 +891,7 @@ class ExportedJAXModel:
         """
         if not self.uses_fastchem:
             raise ValueError("make_compiled_fastchem_profile_predictor requires a fastchem export bundle.")
-        if return_log10:
-            return self._compiled_fastchem_profile_predictor_log10
-        return self._compiled_fastchem_profile_predictor
+        return self._compiled_fastchem_predictors[bool(return_log10)]
 
     def predict_fastchem_profile(
         self: "ExportedJAXModel",
@@ -776,6 +930,7 @@ class ExportedJAXModel:
         """
         if not self.uses_fastchem:
             raise ValueError("predict_fastchem_profile requires a fastchem export bundle.")
+        _validate_pressure_grid(pressure_bar, self.data_contract)
         _validate_near_constant_standard_globals(
             global_inputs,
             list(self.data_contract["global_static_feature_order"]),
@@ -826,41 +981,24 @@ class ExportedJAXModel:
         """
         if not self.uses_vulcan_chemistry:
             raise ValueError("predict_vulcan_profile requires a vulcan export bundle.")
-
-        pressure = jnp.asarray(pressure_bar, dtype=jnp.float32)
-        temperature = jnp.asarray(temperature_k, dtype=jnp.float32)
-        kzz = jnp.asarray(kzz_cm2_s, dtype=jnp.float32)
-        if pressure.ndim != 1 or temperature.ndim != 1 or kzz.ndim != 1:
-            raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must be 1-D arrays.")
-        if not (pressure.shape == temperature.shape == kzz.shape):
-            raise ValueError("pressure_bar, temperature_k, and kzz_cm2_s must share the same shape.")
-
-        static_inputs = jnp.stack([pressure, temperature, kzz], axis=-1)
-        sequence = _apply_sequence_static_block_jax(
-            static_inputs,
-            self.normalization["sequence_static"],
-        )[None, :, :]
-
-        global_vector = _ordered_feature_vector(
+        _validate_pressure_grid(pressure_bar, self.data_contract)
+        _validate_near_constant_standard_globals(
             global_inputs,
             list(self.data_contract["global_static_feature_order"]),
+            self.normalization["global_static"],
             field_name="global_inputs",
         )
-        globals_norm = apply_mixed_block_jax(
-            global_vector[None, :],
-            self.normalization["global_static"],
+        return _predict_vulcan_profile_impl(
+            params=self.params,
+            dims=self.dims,
+            normalization=self.normalization,
+            data_contract=self.data_contract,
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            kzz_cm2_s=kzz_cm2_s,
+            global_inputs=global_inputs,
+            return_log10=return_log10,
         )
-
-        pred_norm, _ = apply_transformer_model(
-            self.params,
-            sequence,
-            globals_norm,
-            self.dims,
-        )
-        pred_norm = pred_norm[0]
-        if return_log10:
-            return _restore_block_transform_space_jax(pred_norm, self.normalization["target"])
-        return inverse_block_jax(pred_norm, self.normalization["target"])
 
 
 def load_exported_model(
@@ -911,8 +1049,6 @@ def load_exported_model(
         lambda x: jax.device_put(jnp.asarray(x), target_device) if target_device is not None else jnp.asarray(x),
         params,
     )
-    chemistry_type = chemistry_type or str(data_contract.get("chemistry_type", "")).lower()
-    model_type = model_type or str(data_contract.get("model_type", "")).lower()
     if chemistry_type not in {"fastchem", "vulcan"} or model_type != "transformer":
         raise ValueError(
             f"Unsupported chemistry_type={chemistry_type!r} or model_type={model_type!r}."

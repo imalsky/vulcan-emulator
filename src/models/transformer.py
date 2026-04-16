@@ -28,13 +28,19 @@ from .layers import (
     _linear,
     _multihead_attention,
     _resolve_activation,
-    sinusoidal_position_encoding,
+    sinusoidal_position_encoding_continuous,
 )
 
 
 @dataclass(frozen=True)
 class TransformerDimensions:
-    """All dimensionality and architecture hyper-parameters for the surrogate."""
+    """All dimensionality and architecture hyper-parameters for the surrogate.
+
+    ``film_clamp`` bounds the per-layer FiLM gamma/beta magnitudes. Typical
+    safe values are ``[5.0, 20.0]`` in float32; values above ~65 risk pushing
+    activations outside the float16 dynamic range (relevant if mixed-precision
+    training is ever enabled).
+    """
 
     sequence_dim: int
     global_dim: int
@@ -116,36 +122,68 @@ def apply_transformer_model(
     global_inputs: jax.Array,
     dims: TransformerDimensions,
     *,
+    position_coord: jax.Array,
+    attention_mask: jax.Array | None = None,
     dropout_key: jax.Array | None = None,
     training: bool = False,
 ) -> tuple[jax.Array, dict[str, jax.Array | None]]:
-    """Run the Transformer forward pass in normalized space."""
+    """Run the Transformer forward pass in normalized space.
+
+    Parameters
+    ----------
+    position_coord : jax.Array
+        Per-level position coordinate of shape ``(batch, nz)``, typically
+        normalized log10(pressure) in ``[0, 1]``. Used to build the
+        continuous sinusoidal positional encoding.
+    attention_mask : jax.Array or None
+        Optional per-level validity mask of shape ``(batch, nz)`` (bool
+        or {0, 1}). Padded positions (False / 0) are excluded from every
+        layer's attention key set. When ``None``, every position is
+        treated as valid.
+    """
     if sequence_inputs.ndim != 3:
         raise ValueError("sequence_inputs must have shape [batch, nz, feature_dim].")
     if global_inputs.ndim != 2:
         raise ValueError("global_inputs must have shape [batch, global_dim].")
+    if position_coord.ndim != 2:
+        raise ValueError("position_coord must have shape [batch, nz].")
+    if position_coord.shape[0] != sequence_inputs.shape[0] or position_coord.shape[1] != sequence_inputs.shape[1]:
+        raise ValueError("position_coord must match sequence_inputs in (batch, nz).")
+    if attention_mask is not None:
+        if attention_mask.ndim != 2:
+            raise ValueError("attention_mask must have shape [batch, nz].")
+        if attention_mask.shape[0] != sequence_inputs.shape[0] or attention_mask.shape[1] != sequence_inputs.shape[1]:
+            raise ValueError("attention_mask must match sequence_inputs in (batch, nz).")
+        attention_mask = attention_mask.astype(jnp.bool_)
 
     act = _resolve_activation(dims.activation)
     _keys_per_layer = 2  # attn + ffn
     layer_dropout_keys: list[tuple[jax.Array | None, ...]] = [
-        tuple(None for _ in range(_keys_per_layer)) for _ in range(dims.num_layers)
+        (None,) * _keys_per_layer for _ in range(dims.num_layers)
     ]
     output_dropout_key: jax.Array | None = None
     if training and dims.dropout_rate > 0.0 and dropout_key is not None:
         total_dropout_keys = (dims.num_layers * _keys_per_layer) + 1
-        dropout_keys = iter(jax.random.split(dropout_key, total_dropout_keys))
+        dropout_keys = jax.random.split(dropout_key, total_dropout_keys)
+        if dropout_keys.shape[0] != total_dropout_keys:
+            raise RuntimeError(
+                f"Expected {total_dropout_keys} dropout keys, got {dropout_keys.shape[0]}."
+            )
         layer_dropout_keys = [
-            tuple(next(dropout_keys) for _ in range(_keys_per_layer))
-            for _ in range(dims.num_layers)
+            tuple(
+                dropout_keys[layer_idx * _keys_per_layer + within_layer]
+                for within_layer in range(_keys_per_layer)
+            )
+            for layer_idx in range(dims.num_layers)
         ]
-        output_dropout_key = next(dropout_keys)
+        output_dropout_key = dropout_keys[dims.num_layers * _keys_per_layer]
 
     context = act(_linear(params["context_in"], global_inputs))
     film = _linear(params["context_out"], context)
     film = film.reshape(sequence_inputs.shape[0], dims.num_layers, 2, dims.d_model)
 
     x = _linear(params["sequence_in"], sequence_inputs)
-    x = x + sinusoidal_position_encoding(sequence_inputs.shape[1], dims.d_model, x.dtype)[None, :, :]
+    x = x + sinusoidal_position_encoding_continuous(position_coord, dims.d_model, x.dtype)
 
     for layer_index, (layer, layer_keys) in enumerate(zip(params["layers"], layer_dropout_keys)):
         attn_dropout_key = layer_keys[0]
@@ -156,7 +194,9 @@ def apply_transformer_model(
 
         # (a) Self-attention
         x_norm = _layer_norm(layer["ln1"], x)
-        attn = _multihead_attention(layer, x_norm, nhead=dims.nhead)
+        attn = _multihead_attention(
+            layer, x_norm, nhead=dims.nhead, key_mask=attention_mask,
+        )
         attn = _apply_dropout(
             attn,
             rate=dims.dropout_rate,

@@ -8,28 +8,19 @@
 #PBS -m abe
 
 # =============================================================================
-# VULCAN Emulator Extras — PBS Submission Script
+# VULCAN Emulator Extras -- PBS Submission Script
 #
-# Runs the extras scripts sequentially on a GPU node so the JAX standalone
-# benchmark/demo can use the accelerator-backed runtime.
+# Executes the consolidated extras notebook on a GPU node.
 #
 # Usage:
 #   qsub extras/run_extras.pbs
-#   qsub -v CONFIG_PATH=uni_tests/fixtures/fastchem_transformer_config.json extras/run_extras.pbs
-#   qsub -v BUNDLE_PATH=models/fastchem_transformer/best_exported.npz extras/run_extras.pbs
-#
-# Environment Variables:
-#   CONFIG_PATH  — FastChem config file path
-#                  (default: uni_tests/fixtures/fastchem_transformer_config.json)
-#   BUNDLE_PATH  — optional explicit exported bundle path for standalone extras
-#   CONDA_ENV    — conda environment name (default: pyt2_8_gh)
+#   qsub -v MODEL=fastchem_no_condensation extras/run_extras.pbs
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-DEFAULT_PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
-PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd -P)}"
 cd -P "${PROJECT_ROOT}"
 
 LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
@@ -40,31 +31,13 @@ module purge
 module use -a /swbuild/analytix/tools/modulefiles
 module load miniconda3/gh2
 
-if ! command -v conda >/dev/null 2>&1; then
-  echo "ERROR: conda not found after module load."
-  exit 1
-fi
-
 CONDA_BASE="$(conda info --base)"
 # shellcheck disable=SC1090
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
-
-CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
-set +e
-conda activate "${CONDA_ENV}"
-rc=$?
-set -e
-if [ "${rc}" -ne 0 ]; then
-  echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
-  conda info --envs || true
-  exit 2
-fi
+conda activate "${CONDA_ENV:-pyt2_8_gh}"
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-uni_tests/fixtures/fastchem_transformer_config.json}"
-BUNDLE_PATH="${BUNDLE_PATH:-}"
-DISABLE_TRITON_GEMM="${DISABLE_TRITON_GEMM:-1}"
-REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
+MODEL="${MODEL:-fastchem_no_condensation}"
 
 # --- Environment ---
 export HDF5_USE_FILE_LOCKING=FALSE
@@ -74,139 +47,21 @@ export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
-export REQUIRE_JAX_GPU
-export PIP_DISABLE_PIP_VERSION_CHECK=1
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0"
 
-XLA_FLAGS_VALUE="${XLA_FLAGS:-}"
-if [ "${DISABLE_TRITON_GEMM}" = "1" ]; then
-  XLA_FLAGS_VALUE="${XLA_FLAGS_VALUE} --xla_gpu_enable_triton_gemm=false"
-fi
-XLA_FLAGS_VALUE="${XLA_FLAGS_VALUE} --xla_gpu_autotune_level=0"
-export XLA_FLAGS="${XLA_FLAGS_VALUE# }"
-unset XLA_FLAGS_VALUE
+# Override the MODEL variable at the top of the notebook via env var.
+export VULCAN_EXTRAS_MODEL="${MODEL}"
 
-# --- Preflight Checks ---
-if [ ! -f "${CONFIG_PATH}" ]; then
-  echo "ERROR: config not found: ${CONFIG_PATH}"
-  exit 1
-fi
-if [ ! -d "${PROJECT_ROOT}/extras" ]; then
-  echo "ERROR: extras directory not found: ${PROJECT_ROOT}/extras"
-  exit 1
-fi
-if [ ! -d "${PROJECT_ROOT}/src" ]; then
-  echo "ERROR: source directory not found: ${PROJECT_ROOT}/src"
-  exit 1
-fi
-
-echo "Config path: $(python - "${CONFIG_PATH}" <<'PY'
-from pathlib import Path
-import sys
-print(Path(sys.argv[1]).resolve())
-PY
-)"
-echo "BUNDLE_PATH=${BUNDLE_PATH:-<auto>}"
-echo "JAX_ENABLE_X64=${JAX_ENABLE_X64} REQUIRE_JAX_GPU=${REQUIRE_JAX_GPU}"
+echo "MODEL=${MODEL}"
 
 if [ -n "${PBS_JOBID:-}" ]; then
   export VULCAN_LIVE_LOG_PATH="${VULCAN_LIVE_LOG_PATH:-${LOG_ROOT}/pbs_${PBS_JOBID}.log}"
   touch "${VULCAN_LIVE_LOG_PATH}"
-  echo "PBS_JOBID: ${PBS_JOBID}"
   echo "Live log: ${VULCAN_LIVE_LOG_PATH}"
 fi
 
-if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
-  echo "ERROR: No visible NVIDIA GPU in this PBS job."
-  exit 1
-fi
-
-if ! python - "${CONFIG_PATH}" <<'PY'
-from pathlib import Path
-import sys
-
-import jax
-
-from src.utils.config import load_and_validate_config
-
-config = load_and_validate_config(Path(sys.argv[1]).resolve())
-if config["chemistry_type"] != "fastchem":
-    raise SystemExit("ERROR: run_extras.pbs requires a fastchem config.")
-
-jax_backend = str(jax.default_backend()).lower()
-if jax_backend not in {"gpu", "cuda", "rocm", "metal"}:
-    raise SystemExit(f"ERROR: REQUIRE_JAX_GPU=1 but jax backend is '{jax_backend}'")
-
-print(f"chemistry_type={config['chemistry_type']}")
-print(f"model_type={config['model_type']}")
-print(f"JAX backend: {jax_backend}")
-PY
-then
-  echo "ERROR: runtime preflight failed."
-  exit 1
-fi
-
-run_extra() {
-  local stage_name="$1"
-  shift
-  echo ""
-  echo "========== Extra: ${stage_name} =========="
-  "$@"
-}
-
-CHECKPOINTS_ROOT="$(python - "${CONFIG_PATH}" <<'PY'
-from pathlib import Path
-import sys
-
-from src.utils.config import load_and_validate_config
-from src.utils.helpers import resolve_path
-
-config = load_and_validate_config(Path(sys.argv[1]).resolve())
-print(resolve_path(config["paths"]["checkpoints_root"], Path.cwd()))
-PY
-)"
-
-if [ -n "${BUNDLE_PATH}" ]; then
-  if [ ! -f "${BUNDLE_PATH}" ]; then
-    echo "ERROR: explicit BUNDLE_PATH not found: ${BUNDLE_PATH}"
-    exit 1
-  fi
-else
-  DEFAULT_BUNDLE="${CHECKPOINTS_ROOT}/best_exported.npz"
-  mapfile -t BUNDLE_CANDIDATES < <(find "${CHECKPOINTS_ROOT}" -maxdepth 1 -type f -name '*_exported.npz' | sort)
-  if [ -f "${DEFAULT_BUNDLE}" ]; then
-    BUNDLE_PATH="${DEFAULT_BUNDLE}"
-  elif [ "${#BUNDLE_CANDIDATES[@]}" -eq 1 ]; then
-    BUNDLE_PATH="${BUNDLE_CANDIDATES[0]}"
-  elif [ "${#BUNDLE_CANDIDATES[@]}" -gt 1 ]; then
-    echo "ERROR: multiple exported bundles found under ${CHECKPOINTS_ROOT}; set BUNDLE_PATH explicitly."
-    printf '  %s\n' "${BUNDLE_CANDIDATES[@]}"
-    exit 1
-  elif [ -f "${CHECKPOINTS_ROOT}/best.pt" ]; then
-    echo ""
-    echo "========== Extra: export_bundle =========="
-    python -u -m src.utils --config "${CONFIG_PATH}" --stage export
-    if [ ! -f "${DEFAULT_BUNDLE}" ]; then
-      echo "ERROR: export stage completed but did not create ${DEFAULT_BUNDLE}"
-      exit 1
-    fi
-    BUNDLE_PATH="${DEFAULT_BUNDLE}"
-  else
-    echo "ERROR: no exported bundle found under ${CHECKPOINTS_ROOT} and no best.pt available for export."
-    exit 1
-  fi
-fi
-
-echo "Resolved bundle: ${BUNDLE_PATH}"
-BUNDLE_ARGS=(--bundle "${BUNDLE_PATH}")
-
-run_extra "plot_test_profiles" \
-  python -u extras/plot_test_profiles.py --config "${CONFIG_PATH}"
-
-run_extra "fastchem_comparison" \
-  python -u extras/fastchem_comparison.py --config "${CONFIG_PATH}"
-
-run_extra "emulator_demo" \
-  python -u extras/emulator_demo.py --config "${CONFIG_PATH}" "${BUNDLE_ARGS[@]}"
-
-echo ""
-echo "========== Extras complete =========="
+jupyter nbconvert \
+  --to notebook --execute \
+  --ExecutePreprocessor.timeout=3600 \
+  --output extras_executed.ipynb \
+  extras/extras.ipynb

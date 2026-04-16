@@ -84,6 +84,13 @@ def manifest_for_files(paths: list[Path]) -> list[dict[str, Any]]:
     list[dict[str, Any]]
         Sorted manifest entries containing the filename, full path, size,
         nanosecond mtime, and SHA-256 hash for each file.
+
+    Notes
+    -----
+    ``mtime_ns`` is not reproducible across machines or fresh checkouts, so
+    callers that need a content-stable fingerprint should strip it before
+    passing the manifest to :func:`fingerprint_payload`. The ``sha256`` field
+    is the authoritative content identifier.
     """
     manifest: list[dict[str, Any]] = []
     for path in sorted(paths):

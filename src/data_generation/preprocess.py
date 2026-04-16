@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import h5py
 import numpy as np
@@ -764,6 +764,33 @@ def _normalization_payload(
     }
 
 
+def _log10_pressure_union_range(config: dict[str, Any]) -> tuple[float, float]:
+    """Return the widest log10(P [bar]) range physically reachable by the config.
+
+    The training distribution draws p_top ~ U(log) over
+    pressure_top_bar_range and p_bottom ~ U(log) over
+    pressure_bottom_bar_range, so any valid sampled level lies within
+    [min(top_range), max(bottom_range)] on the pressure axis. The
+    returned pair is in log10(bar).
+    """
+    top_lo = float(config["sampling"]["pressure_top_bar_range"][0])
+    bot_hi = float(config["sampling"]["pressure_bottom_bar_range"][1])
+    return (float(np.log10(top_lo)), float(np.log10(bot_hi)))
+
+
+def _position_coord_from_pressure(
+    pressure_bar: np.ndarray,
+    *,
+    log10_union_range: tuple[float, float],
+) -> np.ndarray:
+    """Map a 1-D pressure grid (bar) to normalized log10 position in [0, 1]."""
+    lo, hi = log10_union_range
+    if hi <= lo:
+        raise ValueError("log10 pressure union range must be strictly increasing.")
+    logp = np.log10(np.asarray(pressure_bar, dtype=np.float64))
+    return ((logp - lo) / (hi - lo)).astype(np.float32)
+
+
 def _apply_sequence_static_normalization(x: np.ndarray, payload: dict[str, Any]) -> np.ndarray:
     """Apply per-feature sequence-static normalization blocks.
 
@@ -989,6 +1016,71 @@ def _discover_raw_runs(raw_root: Path) -> tuple[Path | None, list[str]]:
     return None, []
 
 
+def _write_processed_info_dir(
+    info_dir: Path,
+    *,
+    normalization: dict[str, Any],
+    data_contract: dict[str, Any],
+    split_indices: dict[str, list[int]],
+    raw_source_files: list[Path],
+    chemistry_type: str,
+    model_type: str,
+) -> None:
+    """Write the four shared info-dir artifacts for a processed dataset.
+
+    Produces ``normalization.json``, ``data_contract.json``, ``splits.json``,
+    and ``processed_manifest.json`` in ``info_dir`` using the same layout for
+    both FastChem and VULCAN preprocessing.
+    """
+    (info_dir / "normalization.json").write_text(
+        json.dumps(normalization, indent=2) + "\n", encoding="utf-8",
+    )
+    (info_dir / "data_contract.json").write_text(
+        json.dumps(data_contract, indent=2) + "\n", encoding="utf-8",
+    )
+    (info_dir / "splits.json").write_text(
+        json.dumps(split_indices, indent=2) + "\n", encoding="utf-8",
+    )
+    processed_manifest = {
+        "raw_files": manifest_for_files(raw_source_files),
+        "splits": split_indices,
+        "chemistry_type": chemistry_type,
+        "model_type": model_type,
+        "normalization_fingerprint": fingerprint_payload(normalization),
+    }
+    (info_dir / "processed_manifest.json").write_text(
+        json.dumps(processed_manifest, indent=2) + "\n", encoding="utf-8",
+    )
+
+
+def _load_raw_runs(
+    raw_root: Path,
+    *,
+    config: dict[str, Any],
+    load_run_fn: Callable[..., Any],
+) -> tuple[list[Any], list[Path]]:
+    """Load raw runs from either a consolidated HDF5 file or per-run files."""
+    consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
+    if consolidated_path is not None:
+        LOGGER.info(
+            "Reading %d runs from consolidated %s", len(consolidated_ids), consolidated_path,
+        )
+        with h5py.File(consolidated_path, "r") as f:
+            raw_runs = [
+                load_run_fn(f[rid], config=config, run_id=rid) for rid in consolidated_ids
+            ]
+        return raw_runs, [consolidated_path]
+
+    raw_run_files = sorted((raw_root / "runs").glob("run_*.h5"))
+    if not raw_run_files:
+        raise FileNotFoundError(
+            f"No raw run files found under {raw_root / 'runs'} and no runs.h5 found."
+        )
+    LOGGER.info("Found %d raw run files in %s", len(raw_run_files), raw_root / "runs")
+    raw_runs = [load_run_fn(path, config=config) for path in raw_run_files]
+    return raw_runs, list(raw_run_files)
+
+
 def preprocess_equilibrium_dataset(
     config: dict[str, Any],
     *,
@@ -1017,24 +1109,9 @@ def preprocess_equilibrium_dataset(
     ensure_dir(processed_root)
     info_dir = ensure_dir(processed_info_dir(processed_root))
 
-    consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
-    if consolidated_path is not None:
-        LOGGER.info("Reading %d runs from consolidated %s", len(consolidated_ids), consolidated_path)
-        raw_source_files: list[Path] = [consolidated_path]
-        with h5py.File(consolidated_path, "r") as f:
-            raw_runs_unfiltered = [
-                load_raw_equilibrium_run(f[rid], config=config, run_id=rid)
-                for rid in consolidated_ids
-            ]
-    else:
-        raw_run_files = sorted((raw_root / "runs").glob("run_*.h5"))
-        if not raw_run_files:
-            raise FileNotFoundError(
-                f"No raw run files found under {raw_root / 'runs'} and no runs.h5 found."
-            )
-        LOGGER.info("Found %d raw run files in %s", len(raw_run_files), raw_root / "runs")
-        raw_source_files = list(raw_run_files)
-        raw_runs_unfiltered = [load_raw_equilibrium_run(path, config=config) for path in raw_run_files]
+    raw_runs_unfiltered, raw_source_files = _load_raw_runs(
+        raw_root, config=config, load_run_fn=load_raw_equilibrium_run,
+    )
 
     # Filter out runs where VULCAN produced non-finite equilibrium mixing ratios.
     # This can happen for extreme parameter combinations (very low abundances).
@@ -1063,27 +1140,48 @@ def preprocess_equilibrium_dataset(
         train_runs, config=config, global_static_order=global_static_order,
     )
     sequence_feature_order = list(config["data_spec"]["sequence_static_feature_order"])
+    num_levels_range = [
+        int(config["sampling"]["num_levels_range"][0]),
+        int(config["sampling"]["num_levels_range"][1]),
+    ]
+    max_num_levels = num_levels_range[1]
+    log10_p_union = _log10_pressure_union_range(config)
 
     for split_name, indices in split_indices.items():
         split_dir = ensure_dir(processed_root / split_name)
         runs = [raw_runs[i] for i in indices]
-        nz = runs[0].pressure_bar.size
         target_dim = runs[0].equilibrium_ymix.shape[-1]
         n_seq_features = len(sequence_feature_order)
 
-        sequence_inputs = np.zeros((len(runs), nz, n_seq_features), dtype=np.float32)
-        target_outputs = np.zeros((len(runs), nz, target_dim), dtype=np.float32)
+        sequence_inputs = np.zeros(
+            (len(runs), max_num_levels, n_seq_features), dtype=np.float32
+        )
+        target_outputs = np.zeros(
+            (len(runs), max_num_levels, target_dim), dtype=np.float32
+        )
+        valid_mask = np.zeros((len(runs), max_num_levels), dtype=bool)
+        position_coord = np.zeros((len(runs), max_num_levels), dtype=np.float32)
         global_inputs = np.zeros((len(runs), len(global_static_order)), dtype=np.float32)
         run_ids: list[str] = []
 
         for idx, run in enumerate(runs):
+            nz_i = int(run.pressure_bar.size)
+            if nz_i < num_levels_range[0] or nz_i > num_levels_range[1]:
+                raise ValueError(
+                    f"Run {run.run_id} has num_levels={nz_i}, outside the configured "
+                    f"range {num_levels_range}."
+                )
             static = np.stack([run.pressure_bar, run.temperature_k], axis=-1)
-            sequence_inputs[idx] = _apply_sequence_static_normalization(
+            sequence_inputs[idx, :nz_i] = _apply_sequence_static_normalization(
                 static, normalization["sequence_static"]
             ).astype(np.float32)
-            target_outputs[idx] = apply_block(
+            target_outputs[idx, :nz_i] = apply_block(
                 run.equilibrium_ymix, normalization["target"]
             ).astype(np.float32)
+            position_coord[idx, :nz_i] = _position_coord_from_pressure(
+                run.pressure_bar, log10_union_range=log10_p_union,
+            )
+            valid_mask[idx, :nz_i] = True
             global_vector = np.array(
                 [run.globals[name] for name in global_static_order], dtype=np.float64,
             )
@@ -1098,7 +1196,8 @@ def preprocess_equilibrium_dataset(
             "model_type": model_type,
             "split": split_name,
             "num_runs": len(runs),
-            "num_levels": nz,
+            "max_num_levels": max_num_levels,
+            "num_levels_range": num_levels_range,
             "sequence_feature_order": sequence_feature_order,
             "output_species_order": list(config["data_spec"]["output_species"]),
             "global_static_feature_order": global_static_order,
@@ -1107,6 +1206,8 @@ def preprocess_equilibrium_dataset(
         np.save(split_dir / "sequence_inputs.npy", sequence_inputs)
         np.save(split_dir / "target_outputs.npy", target_outputs)
         np.save(split_dir / "global_inputs.npy", global_inputs)
+        np.save(split_dir / "valid_mask.npy", valid_mask)
+        np.save(split_dir / "position_coord.npy", position_coord)
         (split_dir / "run_ids.json").write_text(
             json.dumps(run_ids, indent=2) + "\n", encoding="utf-8",
         )
@@ -1126,25 +1227,26 @@ def preprocess_equilibrium_dataset(
         "sequence_dim": n_seq_features,
         "target_dim": len(config["data_spec"]["output_species"]),
         "global_dim": len(global_static_order),
+        "max_num_levels": max_num_levels,
+        "num_levels_range": num_levels_range,
+        "pressure_top_bar_range": [
+            float(config["sampling"]["pressure_top_bar_range"][0]),
+            float(config["sampling"]["pressure_top_bar_range"][1]),
+        ],
+        "pressure_bottom_bar_range": [
+            float(config["sampling"]["pressure_bottom_bar_range"][0]),
+            float(config["sampling"]["pressure_bottom_bar_range"][1]),
+        ],
+        "log10_pressure_bar_union_range": [log10_p_union[0], log10_p_union[1]],
     }
-    (info_dir / "normalization.json").write_text(
-        json.dumps(normalization, indent=2) + "\n", encoding="utf-8",
-    )
-    (info_dir / "data_contract.json").write_text(
-        json.dumps(data_contract, indent=2) + "\n", encoding="utf-8",
-    )
-    (info_dir / "splits.json").write_text(
-        json.dumps(split_indices, indent=2) + "\n", encoding="utf-8",
-    )
-    processed_manifest = {
-        "raw_files": manifest_for_files(raw_source_files),
-        "splits": split_indices,
-        "chemistry_type": chemistry_type,
-        "model_type": model_type,
-        "normalization_fingerprint": fingerprint_payload(normalization),
-    }
-    (info_dir / "processed_manifest.json").write_text(
-        json.dumps(processed_manifest, indent=2) + "\n", encoding="utf-8",
+    _write_processed_info_dir(
+        info_dir,
+        normalization=normalization,
+        data_contract=data_contract,
+        split_indices=split_indices,
+        raw_source_files=raw_source_files,
+        chemistry_type=chemistry_type,
+        model_type=model_type,
     )
     LOGGER.info("FastChem preprocessing complete -> %s", processed_root)
     return {
@@ -1187,24 +1289,9 @@ def preprocess_raw_dataset(
     info_dir = ensure_dir(processed_info_dir(processed_root))
 
 
-    consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
-    if consolidated_path is not None:
-        LOGGER.info("Reading %d runs from consolidated %s", len(consolidated_ids), consolidated_path)
-        raw_source_files: list[Path] = [consolidated_path]
-        with h5py.File(consolidated_path, "r") as f:
-            raw_runs = [
-                load_raw_run(f[rid], config=config, run_id=rid)
-                for rid in consolidated_ids
-            ]
-    else:
-        raw_run_files = sorted((raw_root / "runs").glob("run_*.h5"))
-        if not raw_run_files:
-            raise FileNotFoundError(
-                f"No raw run files found under {raw_root / 'runs'} and no runs.h5 found."
-            )
-        LOGGER.info("Found %d raw run files in %s", len(raw_run_files), raw_root / "runs")
-        raw_source_files = list(raw_run_files)
-        raw_runs = [load_raw_run(path, config=config) for path in raw_run_files]
+    raw_runs, raw_source_files = _load_raw_runs(
+        raw_root, config=config, load_run_fn=load_raw_run,
+    )
     split_indices = _split_indices(len(raw_runs), config=config)
     train_runs = [raw_runs[i] for i in split_indices["train"]]
     global_static_order = list(config["data_spec"]["global_static_feature_order"])
@@ -1214,26 +1301,44 @@ def preprocess_raw_dataset(
         global_static_order=global_static_order,
     )
 
+    num_levels_range = [
+        int(config["sampling"]["num_levels_range"][0]),
+        int(config["sampling"]["num_levels_range"][1]),
+    ]
+    max_num_levels = num_levels_range[1]
+    log10_p_union = _log10_pressure_union_range(config)
+
     for split_name, indices in split_indices.items():
         split_dir = ensure_dir(processed_root / split_name)
         runs = [raw_runs[i] for i in indices]
-        nz = runs[0].pressure_bar.size
         target_dim = runs[0].final_ymix_output.shape[-1]
 
-        sequence_inputs = np.zeros((len(runs), nz, 3), dtype=np.float32)
-        target_outputs = np.zeros((len(runs), nz, target_dim), dtype=np.float32)
+        sequence_inputs = np.zeros((len(runs), max_num_levels, 3), dtype=np.float32)
+        target_outputs = np.zeros((len(runs), max_num_levels, target_dim), dtype=np.float32)
+        valid_mask = np.zeros((len(runs), max_num_levels), dtype=bool)
+        position_coord = np.zeros((len(runs), max_num_levels), dtype=np.float32)
         global_inputs = np.zeros((len(runs), len(global_static_order)), dtype=np.float32)
         run_ids: list[str] = []
 
         for idx, run in enumerate(runs):
+            nz_i = int(run.pressure_bar.size)
+            if nz_i < num_levels_range[0] or nz_i > num_levels_range[1]:
+                raise ValueError(
+                    f"Run {run.run_id} has num_levels={nz_i}, outside the configured "
+                    f"range {num_levels_range}."
+                )
             static = np.stack([run.pressure_bar, run.temperature_k, run.kzz_cm2_s], axis=-1)
-            sequence_inputs[idx] = _apply_sequence_static_normalization(
+            sequence_inputs[idx, :nz_i] = _apply_sequence_static_normalization(
                 static,
                 normalization["sequence_static"],
             ).astype(np.float32)
-            target_outputs[idx] = apply_block(run.final_ymix_output, normalization["target"]).astype(
-                np.float32
+            target_outputs[idx, :nz_i] = apply_block(
+                run.final_ymix_output, normalization["target"]
+            ).astype(np.float32)
+            position_coord[idx, :nz_i] = _position_coord_from_pressure(
+                run.pressure_bar, log10_union_range=log10_p_union,
             )
+            valid_mask[idx, :nz_i] = True
             static_inputs = resolve_conditioning_inputs(
                 raw_global_inputs=run.globals,
                 required_global_inputs=list(config["data_spec"]["required_global_inputs"]),
@@ -1251,7 +1356,8 @@ def preprocess_raw_dataset(
             "model_type": model_type,
             "split": split_name,
             "num_runs": len(runs),
-            "num_levels": nz,
+            "max_num_levels": max_num_levels,
+            "num_levels_range": num_levels_range,
             "sequence_feature_order": ["pressure_bar", "temperature_k", "kzz_cm2_s"],
             "output_species_order": list(config["data_spec"]["output_species"]),
             "element_input_order": list(config["data_spec"]["element_input_order"]),
@@ -1261,6 +1367,8 @@ def preprocess_raw_dataset(
         np.save(split_dir / "sequence_inputs.npy", sequence_inputs)
         np.save(split_dir / "target_outputs.npy", target_outputs)
         np.save(split_dir / "global_inputs.npy", global_inputs)
+        np.save(split_dir / "valid_mask.npy", valid_mask)
+        np.save(split_dir / "position_coord.npy", position_coord)
         (split_dir / "run_ids.json").write_text(json.dumps(run_ids, indent=2) + "\n", encoding="utf-8")
         (split_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -1275,29 +1383,26 @@ def preprocess_raw_dataset(
         "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
         "sequence_dim": 3,
         "target_dim": len(config["data_spec"]["output_species"]),
+        "max_num_levels": max_num_levels,
+        "num_levels_range": num_levels_range,
+        "pressure_top_bar_range": [
+            float(config["sampling"]["pressure_top_bar_range"][0]),
+            float(config["sampling"]["pressure_top_bar_range"][1]),
+        ],
+        "pressure_bottom_bar_range": [
+            float(config["sampling"]["pressure_bottom_bar_range"][0]),
+            float(config["sampling"]["pressure_bottom_bar_range"][1]),
+        ],
+        "log10_pressure_bar_union_range": [log10_p_union[0], log10_p_union[1]],
     }
-    (info_dir / "normalization.json").write_text(
-        json.dumps(normalization, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (info_dir / "data_contract.json").write_text(
-        json.dumps(data_contract, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (info_dir / "splits.json").write_text(
-        json.dumps(split_indices, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    processed_manifest = {
-        "raw_files": manifest_for_files(raw_source_files),
-        "splits": split_indices,
-        "chemistry_type": chemistry_type,
-        "model_type": model_type,
-        "normalization_fingerprint": fingerprint_payload(normalization),
-    }
-    (info_dir / "processed_manifest.json").write_text(
-        json.dumps(processed_manifest, indent=2) + "\n",
-        encoding="utf-8",
+    _write_processed_info_dir(
+        info_dir,
+        normalization=normalization,
+        data_contract=data_contract,
+        split_indices=split_indices,
+        raw_source_files=raw_source_files,
+        chemistry_type=chemistry_type,
+        model_type=model_type,
     )
     LOGGER.info("Full VULCAN preprocessing complete -> %s", processed_root)
     return {
