@@ -24,6 +24,7 @@ import pickle
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,10 +48,6 @@ from .spectrum import write_vulcan_spectrum_txt
 
 LOGGER = get_logger(__name__)
 _FASTCHEM_METALLICITY_SCALED_ELEMENTS = {
-    "C",
-    "N",
-    "O",
-    "S",
     "P",
     "Si",
     "Ti",
@@ -63,6 +60,19 @@ _FASTCHEM_METALLICITY_SCALED_ELEMENTS = {
     "Ca",
     "Fe",
 }
+
+# Inverse-variance weights (σ⁻², normalized) for combining volatile [X/H]
+# measurements into a single bulk-metallicity proxy. GALAH DR3 per-element
+# scatters are σ_C≈0.08, σ_O≈0.10, σ_S≈0.12 dex; N is deliberately excluded
+# because its secondary-nucleosynthesis slope vs [Fe/H] (Vincenzo+2016,
+# Suárez-Andrés+2016, Kobayashi+2020) biases the mean upward at subsolar
+# metallicity.
+_FEMH_VOLATILE_WEIGHTS = {"C_H": 0.48, "O_H": 0.31, "S_H": 0.21}
+
+# Galactic thin-disk [α/Fe] vs [Fe/H] slope near solar (Bertran de Lis+2015,
+# Amarsi+2019 NLTE, Bedell+2018). Inverting [α/H] = (1 − slope)·[Fe/H] gives
+# [Fe/H] ≈ [α/H] / (1 − slope), i.e. the ~18% correction applied below.
+_ALPHA_FE_SLOPE = 0.15
 
 
 @dataclass(frozen=True)
@@ -391,21 +401,18 @@ def _sampling_coverage_payload(
         parameters.
     """
     fastchem = uses_fastchem(config)
+    del run_files  # In-memory specs already carry the realized profiles.
     frac_keys = ("He_H", "C_H", "O_H", "N_H", "S_H")
     frac_arrays = {
         key: np.asarray([spec.globals[key] for spec in specs], dtype=np.float64)
         for key in frac_keys
     }
-    temperature_rows: list[np.ndarray] = []
-    pressure_rows: list[np.ndarray] = []
-    for path in run_files:
-        with h5py.File(path, "r") as handle:
-            sources = [handle] if "inputs" in handle else [handle[run_id] for run_id in sorted(handle.keys())]
-            for source in sources:
-                temperature_rows.append(np.asarray(source["inputs/temperature_k"], dtype=np.float64))
-                pressure_rows.append(np.asarray(source["inputs/pressure_bar"], dtype=np.float64))
-    temperature = np.concatenate(temperature_rows, axis=0)
-    pressure = np.concatenate(pressure_rows, axis=0)
+    # Temperature and pressure are written to HDF5 from these same spec arrays
+    # (see write_*_run_hdf5 below), so reading them back from the consolidated
+    # file for a coverage diagnostic just repeats work: the specs already hold
+    # the realized profiles. Concatenate directly instead.
+    temperature = np.concatenate([spec.temperature_k for spec in specs])
+    pressure = np.concatenate([spec.pressure_bar for spec in specs])
     _element_to_config_key = {
         "He_H": "he_frac_range",
         "C_H": "c_frac_range",
@@ -461,18 +468,16 @@ def _sampling_coverage_payload(
             [spec.globals["planet_radius_cm"] for spec in specs],
             dtype=np.float64,
         )
-        log10_kzz_rows: list[np.ndarray] = []
-        for path in run_files:
-            with h5py.File(path, "r") as handle:
-                sources = [handle] if "inputs" in handle else [handle[run_id] for run_id in sorted(handle.keys())]
-                for source in sources:
-                    log10_kzz_rows.append(np.log10(np.asarray(source["inputs/kzz_cm2_s"], dtype=np.float64)))
-        log10_kzz = np.concatenate(log10_kzz_rows, axis=0)
+        log10_kzz = np.log10(
+            np.concatenate([spec.kzz_cm2_s for spec in specs])
+        )
         gravity_range = [float(x) for x in config["sampling"]["gravity_range_cm_s2"]]
         planet_radius_range = [float(x) for x in config["sampling"]["planet_radius_range_cm"]]
-        kzz_value = float(config["sampling"]["kzz_cm2_s"])
-        log10_kzz_value = float(np.log10(max(kzz_value, 1.0e-30)))
-        kzz_range = [log10_kzz_value, log10_kzz_value]
+        kzz_lo, kzz_hi = (float(x) for x in config["sampling"]["kzz_range_cm2_s"])
+        kzz_range = [
+            float(np.log10(max(kzz_lo, 1.0e-30))),
+            float(np.log10(max(kzz_hi, 1.0e-30))),
+        ]
         configured_ranges.update({
             "gravity_cm_s2": gravity_range,
             "planet_radius_cm": planet_radius_range,
@@ -602,7 +607,15 @@ def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
 
     The run specification carries elemental *number fractions* (summing with
     hydrogen to 1).  This function validates the fractions and computes the
-    auxiliary ``fastchem_met_scale`` scalar.
+    auxiliary ``fastchem_met_scale`` scalar used to scale refractory minor
+    elements (Si, Mg, Ca, Ti, V, P, Cl, K, Na, F, Fe) in the FastChem input
+    file.
+
+    The metallicity proxy is an inverse-variance-weighted mean of the
+    volatile [X/H] offsets for X ∈ {C, O, S}, multiplied by 1/(1 − 0.15) to
+    convert α-element metallicity to [Fe/H] using the Galactic thin-disk
+    [α/Fe]-vs-[Fe/H] slope. N is excluded because secondary-production
+    trends bias it relative to Fe.
 
     Parameters
     ----------
@@ -638,11 +651,14 @@ def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
             f"Elemental fractions sum to >= 1.0 (H_frac={h_frac:.6f}); "
             "hydrogen remainder is non-positive."
         )
+    volatile_dex = sum(
+        weight * np.log10(fractions[name] / SOLAR_ABUNDANCES[name])
+        for name, weight in _FEMH_VOLATILE_WEIGHTS.items()
+    )
+    feh_proxy = volatile_dex / (1.0 - _ALPHA_FE_SLOPE)
     return {
         **fractions,
-        "fastchem_met_scale": float(
-            fractions["O_H"] / SOLAR_ABUNDANCES["O_H"]
-        ),
+        "fastchem_met_scale": float(10.0 ** feh_proxy),
     }
 
 
@@ -799,8 +815,8 @@ def write_equilibrium_hdf5(
     gravity_profile = _gravity_profile_from_spec(spec)
     with h5py.File(path, "w") as handle:
         inputs = handle.create_group("inputs")
-        inputs.create_dataset("pressure_bar", data=np.asarray(spec.pressure_bar, dtype=np.float64))
-        inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
+        inputs.create_dataset("pressure_bar", data=spec.pressure_bar)
+        inputs.create_dataset("temperature_k", data=spec.temperature_k)
         inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
         inputs.create_dataset("elemental_abundances_frac", data=element_profile)
         inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
@@ -870,10 +886,10 @@ def write_raw_run_hdf5(
     gravity_profile = _gravity_profile_from_spec(spec)
     with h5py.File(path, "w") as handle:
         inputs = handle.create_group("inputs")
-        inputs.create_dataset("pressure_bar", data=np.asarray(spec.pressure_bar, dtype=np.float64))
-        inputs.create_dataset("temperature_k", data=np.asarray(spec.temperature_k, dtype=np.float64))
+        inputs.create_dataset("pressure_bar", data=spec.pressure_bar)
+        inputs.create_dataset("temperature_k", data=spec.temperature_k)
         if spec.kzz_cm2_s is not None:
-            inputs.create_dataset("kzz_cm2_s", data=np.asarray(spec.kzz_cm2_s, dtype=np.float64))
+            inputs.create_dataset("kzz_cm2_s", data=spec.kzz_cm2_s)
         inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
         inputs.create_dataset("elemental_abundances_frac", data=element_profile)
         inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
@@ -974,6 +990,78 @@ def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
     )
     ensure_dir(fastchem_root / "output")
     return fastchem_root
+
+
+_VULCAN_TREE_READY_MARKER = ".vulcan_tree_ready"
+_FASTCHEM_TREE_READY_MARKER = ".fastchem_tree_ready"
+_VULCAN_CHEM_FUNS_MARKER = ".chem_funs_ready"
+
+
+def _ensure_vulcan_worker_tree(source_root: Path, worker_root: Path) -> None:
+    """Idempotently seed ``worker_root`` with the VULCAN source tree."""
+    marker = worker_root / _VULCAN_TREE_READY_MARKER
+    if marker.exists():
+        return
+    _copy_vulcan_source(source_root, worker_root)
+    marker.write_text("")
+
+
+def _ensure_fastchem_worker_tree(source_root: Path, worker_root: Path) -> Path:
+    """Idempotently seed ``worker_root`` with the FastChem runtime."""
+    marker = worker_root / _FASTCHEM_TREE_READY_MARKER
+    fastchem_root = worker_root / "fastchem_vulcan"
+    if marker.exists():
+        return fastchem_root
+    _copy_fastchem_runtime(source_root, worker_root)
+    marker.write_text("")
+    return fastchem_root
+
+
+def _reset_vulcan_worker_between_runs(
+    source_root: Path,
+    worker_root: Path,
+    *,
+    cfg_relpath: str,
+) -> None:
+    """Clear volatile per-run state (output/, atm/, patched cfg) in a reused VULCAN worker."""
+    output_dir = worker_root / "output"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    atm_dir = worker_root / "atm"
+    if atm_dir.exists():
+        shutil.rmtree(atm_dir)
+    shutil.copy2(source_root / cfg_relpath, worker_root / cfg_relpath)
+
+
+def _reset_fastchem_worker_between_runs(fastchem_root: Path) -> None:
+    """Clear FastChem ``output/`` between runs in a reused worker tree."""
+    output_dir = fastchem_root / "output"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_vulcan_chem_funs(worker_root: Path, python_executable: str) -> None:
+    """Run ``make_chem_funs.py`` once per worker tree; the network is constant."""
+    marker = worker_root / _VULCAN_CHEM_FUNS_MARKER
+    if marker.exists():
+        return
+    subprocess.run(
+        [python_executable, "make_chem_funs.py"],
+        cwd=worker_root,
+        check=True,
+    )
+    marker.write_text("")
+
+
+def _cleanup_worker_base(worker_base: Path) -> None:
+    """Remove every per-thread worker tree created under ``worker_base``."""
+    if not worker_base.exists():
+        return
+    for child in worker_base.iterdir():
+        if child.is_dir() and child.name.startswith("thread_"):
+            shutil.rmtree(child, ignore_errors=True)
 
 
 def _write_worker_inputs(worker_root: Path, spec: RunSpecification) -> tuple[Path, Path]:
@@ -1472,44 +1560,39 @@ def _run_single_vulcan_spec(
     Path
         Path to the written raw-run HDF5 file.
     """
-    worker_root = worker_base / spec.run_id
-    try:
-        _copy_vulcan_source(source_root, worker_root)
-        tp_file, spectrum_file = _write_worker_inputs(worker_root, spec)
-        cfg_file = worker_root / config["vulcan_runtime"]["cfg_file"]
-        _patch_vulcan_cfg(
-            cfg_file,
-            spec=spec,
-            config=config,
-            tp_file=tp_file,
-            spectrum_file=spectrum_file,
-        )
-        python_executable = str(config["vulcan_runtime"]["python_executable"])
-        if bool(config["vulcan_runtime"]["regenerate_chem_funs"]):
-            subprocess.run(
-                [python_executable, "make_chem_funs.py"],
-                cwd=worker_root,
-                check=True,
-            )
-            vulcan_cmd = [python_executable, "vulcan.py", "-n"]
-        else:
-            vulcan_cmd = [python_executable, "vulcan.py"]
-        subprocess.run(vulcan_cmd, cwd=worker_root, check=True)
+    worker_root = worker_base / f"thread_{threading.get_ident()}"
+    cfg_relpath = str(config["vulcan_runtime"]["cfg_file"])
+    _ensure_vulcan_worker_tree(source_root, worker_root)
+    _reset_vulcan_worker_between_runs(source_root, worker_root, cfg_relpath=cfg_relpath)
+    tp_file, spectrum_file = _write_worker_inputs(worker_root, spec)
+    cfg_file = worker_root / cfg_relpath
+    _patch_vulcan_cfg(
+        cfg_file,
+        spec=spec,
+        config=config,
+        tp_file=tp_file,
+        spectrum_file=spectrum_file,
+    )
+    python_executable = str(config["vulcan_runtime"]["python_executable"])
+    if bool(config["vulcan_runtime"]["regenerate_chem_funs"]):
+        _ensure_vulcan_chem_funs(worker_root, python_executable)
+        vulcan_cmd = [python_executable, "vulcan.py", "-n"]
+    else:
+        vulcan_cmd = [python_executable, "vulcan.py"]
+    subprocess.run(vulcan_cmd, cwd=worker_root, check=True)
 
-        output_candidates = sorted((worker_root / "output").glob("*.vul"))
-        if not output_candidates:
-            raise FileNotFoundError(
-                f"No VULCAN output file found for run {spec.run_id} under {worker_root / 'output'}."
-            )
-        output_h5 = runs_dir / f"{spec.run_id}.h5"
-        return convert_vulcan_output_to_hdf5(
-            output_candidates[-1],
-            output_h5_path=output_h5,
-            spec=spec,
-            config=config,
+    output_candidates = sorted((worker_root / "output").glob("*.vul"))
+    if not output_candidates:
+        raise FileNotFoundError(
+            f"No VULCAN output file found for run {spec.run_id} under {worker_root / 'output'}."
         )
-    finally:
-        _cleanup_worker_root(worker_root)
+    output_h5 = runs_dir / f"{spec.run_id}.h5"
+    return convert_vulcan_output_to_hdf5(
+        output_candidates[-1],
+        output_h5_path=output_h5,
+        spec=spec,
+        config=config,
+    )
 
 
 def _run_single_fastchem_spec(
@@ -1540,30 +1623,28 @@ def _run_single_fastchem_spec(
     Path
         Path to the written equilibrium raw-run HDF5 file.
     """
-    worker_root = worker_base / spec.run_id
-    try:
-        fastchem_root = _copy_fastchem_runtime(source_root, worker_root)
-        _write_fastchem_element_abundances(
-            fastchem_root,
-            spec=spec,
-            config=config,
+    worker_root = worker_base / f"thread_{threading.get_ident()}"
+    fastchem_root = _ensure_fastchem_worker_tree(source_root, worker_root)
+    _reset_fastchem_worker_between_runs(fastchem_root)
+    _write_fastchem_element_abundances(
+        fastchem_root,
+        spec=spec,
+        config=config,
+    )
+    _write_fastchem_tp_profile(fastchem_root, spec)
+    subprocess.run(["./fastchem", "input/config.input"], cwd=fastchem_root, check=True)
+    fastchem_output = fastchem_root / "output" / "vulcan_EQ.dat"
+    if not fastchem_output.exists():
+        raise FileNotFoundError(
+            f"No FastChem equilibrium output found for run {spec.run_id} under {fastchem_output}."
         )
-        _write_fastchem_tp_profile(fastchem_root, spec)
-        subprocess.run(["./fastchem", "input/config.input"], cwd=fastchem_root, check=True)
-        fastchem_output = fastchem_root / "output" / "vulcan_EQ.dat"
-        if not fastchem_output.exists():
-            raise FileNotFoundError(
-                f"No FastChem equilibrium output found for run {spec.run_id} under {fastchem_output}."
-            )
-        output_h5 = runs_dir / f"{spec.run_id}.h5"
-        return convert_fastchem_output_to_hdf5(
-            fastchem_output,
-            output_h5_path=output_h5,
-            spec=spec,
-            config=config,
-        )
-    finally:
-        _cleanup_worker_root(worker_root)
+    output_h5 = runs_dir / f"{spec.run_id}.h5"
+    return convert_fastchem_output_to_hdf5(
+        fastchem_output,
+        output_h5_path=output_h5,
+        spec=spec,
+        config=config,
+    )
 
 
 def run_vulcan_generation(
@@ -1799,6 +1880,7 @@ def run_vulcan_generation(
     # directory only after consolidation succeeds.
     if runs_dir.exists() and not any(runs_dir.iterdir()):
         runs_dir.rmdir()
+    _cleanup_worker_base(worker_base)
     failed_ids = set(all_failures)
     successful_specs = [s for s in all_specs if s.run_id not in failed_ids]
     manifest_path, coverage_path = _write_generation_metadata(

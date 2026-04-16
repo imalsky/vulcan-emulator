@@ -82,7 +82,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "o_frac_range": [1e-5, 5e-3],
                     "n_frac_range": [1e-6, 1e-3],
                     "s_frac_range": [1e-7, 5e-4],
-                    "kzz_cm2_s": 1.0e8,
+                    "kzz_range_cm2_s": [1.0e6, 1.0e10],
                     "stellar_radius_range_rsun": [0.8, 1.2],
                     "semi_major_axis_range_au": [0.03, 0.06],
                     "zenith_angle_range_deg": [0.0, 89.0],

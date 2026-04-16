@@ -152,8 +152,8 @@ data/<run_name>/
 | `semi_major_axis_range_au` | vulcan only | [min, max] orbital separation (AU) |
 | `zenith_angle_range_deg` | vulcan only | [min, max] stellar zenith angle (degrees) |
 | `diurnal_factor_range` | vulcan only | [min, max] diurnal averaging factor |
-| `kzz_cm2_s` | vulcan only | Constant eddy diffusion coefficient |
-| `scales` | optional | Per-parameter sampling scale, `"linear"` (default) or `"log"`. Applies to any of `he_frac`, `c_frac`, `o_frac`, `n_frac`, `s_frac`. Use `log` when the corresponding `*_frac_range` spans more than ~1 dex so samples are not biased toward the upper bound. |
+| `kzz_range_cm2_s` | vulcan only | [min, max] per-run eddy diffusion coefficient (cm²/s). Log-sampled by default — override via `scales.kzz_cm2_s`. Kzz remains depth-constant within each run. |
+| `scales` | optional | Per-parameter sampling scale, `"linear"` (default) or `"log"`. Applies to any of `he_frac`, `c_frac`, `o_frac`, `n_frac`, `s_frac`, `kzz_cm2_s`. Use `log` when the range spans more than ~1 dex so samples are not biased toward the upper bound. |
 
 ### `temperature_profiles`
 

@@ -43,7 +43,7 @@ Shipped defaults:
 - `vulcan.runtime.regenerate_chem_funs` is enabled so worker-local runs rebuild `chem_funs.py` with photochemistry disabled
 - `vulcan.stellar_spectrum` is required because VULCAN reads `sflux_file` unconditionally at startup (even with `use_photochemistry = false`); the pipeline generates a blackbody template and writes it for each worker run
 - when every science preset has `use_photochemistry = false`, `stellar_spectrum.template_file` may be omitted and the pipeline will synthesize the default WASP-39 template internally
-- Kzz is depth-constant from `sampling.kzz_cm2_s`
+- Kzz is depth-constant; the per-run value is log-sampled from `sampling.kzz_range_cm2_s`
 - VULCAN surface gravity is sampled from `sampling.gravity_range_cm_s2`
 - VULCAN planet radius is sampled from `sampling.planet_radius_range_cm`
 - `vulcan.runtime.rocky` defaults to `false`

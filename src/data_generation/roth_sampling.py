@@ -433,6 +433,32 @@ def _load_tabular_roth_profile(path: Path) -> RothProfile:
     return RothProfile(pressure_bar=pressure_bar, temperature_k=temperature_k, metadata={"source_file": str(path)})
 
 
+def roth_library_pressure_bounds(
+    profiles: list[RothProfile],
+) -> tuple[float, float]:
+    """Return ``(min_bar, max_bar)`` across the union of native pressure grids.
+
+    Used by the sampler to clip per-run target pressure grids to the range
+    covered by the loaded PT library so PCHIP interpolation never falls into
+    the constant-extrapolation branch.
+
+    Parameters
+    ----------
+    profiles : list[RothProfile]
+        Non-empty list of PT-library profiles loaded at native resolution.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(min_pressure_bar, max_pressure_bar)`` across all supplied profiles.
+    """
+    if not profiles:
+        raise ValueError("Cannot compute native pressure bounds from an empty profile list.")
+    mins = [float(np.min(profile.pressure_bar)) for profile in profiles]
+    maxs = [float(np.max(profile.pressure_bar)) for profile in profiles]
+    return min(mins), max(maxs)
+
+
 def load_roth_profiles_native(
     data_glob: str,
     *,

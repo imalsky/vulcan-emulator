@@ -29,6 +29,8 @@ chemistry runs.
 from __future__ import annotations
 
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,7 @@ from .roth_sampling import (
     RothProfile,
     _interpolate_profile,
     load_roth_profiles_native,
+    roth_library_pressure_bounds,
 )
 from .spectrum import (
     SpectrumRecord,
@@ -68,6 +71,9 @@ _MAX_PROFILE_ATTEMPTS = 100
 # included a pressure fingerprint, causing a full library re-read on every
 # run when grids were randomized.
 _ROTH_PROFILE_CACHE: dict[tuple, list[RothProfile]] = {}
+# Native pressure bounds (min_bar, max_bar) paired with each cached profile
+# list. Computed once per cache entry so per-run grid clipping is O(1).
+_ROTH_BOUNDS_CACHE: dict[tuple, tuple[float, float]] = {}
 
 
 @dataclass(frozen=True)
@@ -200,6 +206,7 @@ def _sample_column_pressure_grid(
     sampling_cfg: dict[str, Any],
     *,
     rng: np.random.Generator,
+    native_p_bounds: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """Draw one per-run pressure grid from the configured (num_levels, p_top, p_bottom) ranges.
 
@@ -207,14 +214,32 @@ def _sample_column_pressure_grid(
     drawn uniformly in log10(bar) so the distribution is flat on the
     physically meaningful axis.  Returns a log-spaced 1-D pressure grid
     (bar), ordered from high pressure (bottom) to low pressure (top).
+
+    When ``native_p_bounds`` is supplied the configured ``p_top`` and
+    ``p_bottom`` ranges are intersected with the native PT-library
+    ``[min_bar, max_bar]`` bounds so the resulting grid never extends
+    outside the library's coverage. This prevents the PCHIP interpolator
+    from falling into its constant-extrapolation branch for Roth profiles.
     """
     nl_lo, nl_hi = sampling_cfg["num_levels_range"]
     num_levels = int(rng.integers(int(nl_lo), int(nl_hi) + 1))
 
-    top_lo, top_hi = sampling_cfg["pressure_top_bar_range"]
-    bot_lo, bot_hi = sampling_cfg["pressure_bottom_bar_range"]
-    log_top = rng.uniform(math.log10(float(top_lo)), math.log10(float(top_hi)))
-    log_bottom = rng.uniform(math.log10(float(bot_lo)), math.log10(float(bot_hi)))
+    top_lo, top_hi = (float(x) for x in sampling_cfg["pressure_top_bar_range"])
+    bot_lo, bot_hi = (float(x) for x in sampling_cfg["pressure_bottom_bar_range"])
+    if native_p_bounds is not None:
+        native_min, native_max = native_p_bounds
+        top_lo = max(top_lo, native_min)
+        top_hi = max(top_hi, native_min)
+        bot_lo = min(bot_lo, native_max)
+        bot_hi = min(bot_hi, native_max)
+        if top_lo > top_hi or bot_lo > bot_hi or top_hi >= bot_lo:
+            raise ValueError(
+                "Configured pressure_top/pressure_bottom ranges do not "
+                f"intersect the native PT-library bounds {native_p_bounds!r}."
+            )
+
+    log_top = rng.uniform(math.log10(top_lo), math.log10(top_hi))
+    log_bottom = rng.uniform(math.log10(bot_lo), math.log10(bot_hi))
     p_top = 10.0**log_top
     p_bottom = 10.0**log_bottom
     return sample_pressure_grid(
@@ -383,15 +408,17 @@ def _apply_convective_adjustment(
         Adjusted temperature profile, shape ``(nz,)``.
     """
     adjusted = np.copy(temperature_k)
+    if adjusted.size < 2:
+        return adjusted
     log_p = np.log10(pressure_bar)
     log_t = np.log10(temperature_k)
-    for i in range(1, len(adjusted)):
-        gradient = (log_t[i] - log_t[i - 1]) / (log_p[i] - log_p[i - 1])
-        if gradient > adiabatic_gradient:
-            p_top = pressure_bar[i - 1]
-            t_top = adjusted[i - 1]
-            adjusted[i:] = t_top * (pressure_bar[i:] / p_top) ** adiabatic_gradient
-            break
+    gradients = np.diff(log_t) / np.diff(log_p)
+    crossings = np.flatnonzero(gradients > adiabatic_gradient)
+    if crossings.size:
+        first = int(crossings[0]) + 1
+        p_top = pressure_bar[first - 1]
+        t_top = adjusted[first - 1]
+        adjusted[first:] = t_top * (pressure_bar[first:] / p_top) ** adiabatic_gradient
     return adjusted
 
 
@@ -627,12 +654,56 @@ def _load_configured_roth_profiles(
                 rejected_profiles,
             )
         _ROTH_PROFILE_CACHE[cache_key] = profiles
+        if profiles:
+            _ROTH_BOUNDS_CACHE[cache_key] = roth_library_pressure_bounds(profiles)
     if not profiles:
         raise FileNotFoundError(
             "roth_sampler.enabled=true but no temperature profiles matched "
             f"{data_glob!r} after applying filters and shared temperature validation."
         )
     return profiles
+
+
+def _roth_library_native_bounds(
+    *,
+    config: dict[str, Any],
+    roth_cfg: dict[str, Any],
+) -> tuple[float, float]:
+    """Return cached ``(min_bar, max_bar)`` bounds for the configured PT library.
+
+    Lazily loads and caches the Roth profile library on first call (via
+    :func:`_load_configured_roth_profiles`) so the cache key matches the
+    profile cache exactly.
+    """
+    _load_configured_roth_profiles(config=config, roth_cfg=roth_cfg)
+    data_glob = _resolve_roth_data_glob(config, roth_cfg)
+    filter_items: tuple[tuple[str, RothFilterValue], ...] = tuple(
+        sorted(roth_cfg.get("filters", {}).items())
+    )
+    validation_items = tuple(
+        sorted(config["temperature_profiles"]["validation"].items())
+    )
+    return _ROTH_BOUNDS_CACHE[(data_glob, filter_items, validation_items)]
+
+
+def _decide_temperature_profile_source(
+    roth_cfg: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+) -> str:
+    """Return ``"roth"`` or ``"analytic"`` for this run, per config + RNG.
+
+    Consumes one ``rng.random()`` draw only when the sampler is in ``mixed``
+    mode; otherwise deterministic given ``roth_cfg``. Deciding the source
+    before the pressure grid is drawn lets the caller clip the grid to the
+    PT library's native range when Roth is chosen.
+    """
+    if not roth_cfg.get("enabled", False):
+        return "analytic"
+    if roth_cfg.get("source_mode", "roth") == "mixed":
+        analytic_probability = float(roth_cfg["analytic_probability"])
+        return "analytic" if float(rng.random()) < analytic_probability else "roth"
+    return "roth"
 
 
 def _choose_roth_profile(
@@ -736,6 +807,7 @@ def _sample_temperature_profile_record(
     *,
     config: dict[str, Any],
     rng: np.random.Generator,
+    source: str | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Sample one temperature profile together with provenance metadata.
 
@@ -748,6 +820,12 @@ def _sample_temperature_profile_record(
         associated sampler settings.
     rng : np.random.Generator
         Random generator used for mixed-mode branching and parameter draws.
+    source : str, optional
+        Pre-decided source (``"roth"`` or ``"analytic"``). If ``None``, the
+        source is decided here using one ``rng`` draw (mixed mode). Callers
+        that also need to clip the pressure grid to native bounds should
+        decide upfront via :func:`_decide_temperature_profile_source` and
+        pass the choice in.
 
     Returns
     -------
@@ -756,38 +834,19 @@ def _sample_temperature_profile_record(
         metadata dictionary describing the sampled source and parameters.
     """
     roth_cfg = config.get("roth_sampler", {"enabled": False})
-    if roth_cfg.get("enabled", False):
-        if roth_cfg.get("source_mode", "roth") == "mixed":
-            profiles = _load_configured_roth_profiles(config=config, roth_cfg=roth_cfg)
-            analytic_probability = float(roth_cfg["analytic_probability"])
-            # Mixed mode lets one dataset cover both analytic shapes and PT-library profiles.
-            if float(rng.random()) >= analytic_probability:
-                chosen = _choose_roth_profile(profiles, rng=rng)
-                interpolated = _interpolate_profile(
-                    pressure_bar,
-                    chosen.pressure_bar,
-                    chosen.temperature_k,
-                )
-                chosen_on_grid = RothProfile(
-                    pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
-                    temperature_k=interpolated,
-                    metadata=dict(chosen.metadata),
-                )
-                return (
-                    np.asarray(interpolated, dtype=np.float64),
-                    _temperature_profile_metadata(chosen_on_grid),
-                )
-        else:
-            chosen = _sample_roth_profile(
-                pressure_bar,
-                config=config,
-                roth_cfg=roth_cfg,
-                rng=rng,
-            )
-            return (
-                np.asarray(chosen.temperature_k, dtype=np.float64),
-                _temperature_profile_metadata(chosen),
-            )
+    chosen_source = source if source is not None else _decide_temperature_profile_source(roth_cfg, rng=rng)
+
+    if chosen_source == "roth":
+        chosen = _sample_roth_profile(
+            pressure_bar,
+            config=config,
+            roth_cfg=roth_cfg,
+            rng=rng,
+        )
+        return (
+            np.asarray(chosen.temperature_k, dtype=np.float64),
+            _temperature_profile_metadata(chosen),
+        )
 
     analytic_profile, analytic_metadata = _sample_analytic_temperature_profile_record(
         pressure_bar,
@@ -836,25 +895,31 @@ def sample_kzz_profile(
     config: dict[str, Any],
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Construct the configured depth-constant eddy-diffusion profile.
+    """Sample a depth-constant eddy-diffusion profile from the configured range.
 
     Parameters
     ----------
     pressure_bar : np.ndarray
         Pressure grid whose shape defines the output profile length.
     config : dict[str, Any]
-        Validated config containing ``sampling.kzz_cm2_s``.
+        Validated config containing ``sampling.kzz_range_cm2_s`` (a pair)
+        and an optional ``sampling.scales.kzz_cm2_s`` entry.
     rng : np.random.Generator
-        Unused random generator kept for a uniform sampler interface.
+        Random generator used to draw the per-run constant Kzz value.
 
     Returns
     -------
     np.ndarray
         Constant ``Kzz`` profile with shape matching ``pressure_bar``.
     """
-    del rng
-    kzz_value = float(np.clip(config["sampling"]["kzz_cm2_s"], 1.0, None))
-    return np.full(np.asarray(pressure_bar).shape, kzz_value, dtype=np.float64)
+    lo, hi = (float(x) for x in config["sampling"]["kzz_range_cm2_s"])
+    scale = _sampling_scale(config, "kzz_cm2_s", default="log")
+    kzz_value = float(np.clip(
+        _scale_unit_interval(float(rng.random()), lo, hi, scale),
+        1.0,
+        None,
+    ))
+    return np.full(pressure_bar.shape, kzz_value, dtype=np.float64)
 
 
 def _latin_hypercube_unit_samples(
@@ -1151,96 +1216,125 @@ def sample_run_specifications(
         spectrum_names = sorted(spectra.keys())
         science_presets = list(config["science_presets"])
 
-    result: list[RunSpecification] = []
-    for run_idx in range(total_runs):
-        pressure_bar = _sample_column_pressure_grid(config["sampling"], rng=rng)
+    sampling_cfg = config["sampling"]
+    he_frac_lo, he_frac_hi = (float(x) for x in sampling_cfg["he_frac_range"])
+    he_frac_scale = _sampling_scale(config, "he_frac")
+    c_frac_lo, c_frac_hi = (float(x) for x in sampling_cfg["c_frac_range"])
+    c_frac_scale = _sampling_scale(config, "c_frac")
+    o_frac_lo, o_frac_hi = (float(x) for x in sampling_cfg["o_frac_range"])
+    o_frac_scale = _sampling_scale(config, "o_frac")
+    n_frac_lo, n_frac_hi = (float(x) for x in sampling_cfg["n_frac_range"])
+    n_frac_scale = _sampling_scale(config, "n_frac")
+    s_frac_lo, s_frac_hi = (float(x) for x in sampling_cfg["s_frac_range"])
+    s_frac_scale = _sampling_scale(config, "s_frac")
+    if not fastchem:
+        gravity_lo, gravity_hi = (float(x) for x in sampling_cfg["gravity_range_cm_s2"])
+        gravity_scale = _sampling_scale(config, "gravity_cm_s2")
+        planet_radius_lo, planet_radius_hi = (
+            float(x) for x in sampling_cfg["planet_radius_range_cm"]
+        )
+        planet_radius_scale = _sampling_scale(config, "planet_radius_cm")
+        stellar_radius_lo, stellar_radius_hi = (
+            float(x) for x in sampling_cfg["stellar_radius_range_rsun"]
+        )
+        stellar_radius_scale = _sampling_scale(config, "r_star_rsun")
+        semi_major_axis_lo, semi_major_axis_hi = (
+            float(x) for x in sampling_cfg["semi_major_axis_range_au"]
+        )
+        semi_major_axis_scale = _sampling_scale(config, "semi_major_axis_au")
+        zenith_lo, zenith_hi = (float(x) for x in sampling_cfg["zenith_angle_range_deg"])
+        zenith_scale = _sampling_scale(config, "zenith_angle_deg")
+        diurnal_lo, diurnal_hi = (float(x) for x in sampling_cfg["diurnal_factor_range"])
+        diurnal_scale = _sampling_scale(config, "diurnal_factor")
+
+    # Per-run independent RNG streams so the loop parallelizes without races.
+    child_seeds = np.random.SeedSequence(
+        int(config["generation"]["seed"] if seed is None else seed)
+    ).spawn(total_runs)
+
+    roth_cfg = config.get("roth_sampler", {"enabled": False})
+
+    def _sample_one(run_idx: int) -> RunSpecification:
+        per_rng = np.random.default_rng(child_seeds[run_idx])
+        # Decide profile source first so we can clip the pressure grid to the
+        # PT-library's native bounds when Roth is chosen — otherwise PCHIP
+        # would fall into its constant-extrapolation branch for target grids
+        # that extend outside the native range, producing flat plateaus and
+        # abrupt gradient kinks at the boundary.
+        profile_source = _decide_temperature_profile_source(roth_cfg, rng=per_rng)
+        native_p_bounds: tuple[float, float] | None = None
+        if profile_source == "roth":
+            native_p_bounds = _roth_library_native_bounds(
+                config=config, roth_cfg=roth_cfg,
+            )
+        pressure_bar = _sample_column_pressure_grid(
+            sampling_cfg, rng=per_rng, native_p_bounds=native_p_bounds,
+        )
         if fastchem:
             he_frac = _scale_unit_interval(
-                design[run_idx, 0],
-                *[float(x) for x in config["sampling"]["he_frac_range"]],
-                scale=_sampling_scale(config, "he_frac"),
+                design[run_idx, 0], he_frac_lo, he_frac_hi, he_frac_scale,
             )
             c_frac = _scale_unit_interval(
-                design[run_idx, 1],
-                *[float(x) for x in config["sampling"]["c_frac_range"]],
-                scale=_sampling_scale(config, "c_frac"),
+                design[run_idx, 1], c_frac_lo, c_frac_hi, c_frac_scale,
             )
             o_frac = _scale_unit_interval(
-                design[run_idx, 2],
-                *[float(x) for x in config["sampling"]["o_frac_range"]],
-                scale=_sampling_scale(config, "o_frac"),
+                design[run_idx, 2], o_frac_lo, o_frac_hi, o_frac_scale,
             )
             n_frac = _scale_unit_interval(
-                design[run_idx, 3],
-                *[float(x) for x in config["sampling"]["n_frac_range"]],
-                scale=_sampling_scale(config, "n_frac"),
+                design[run_idx, 3], n_frac_lo, n_frac_hi, n_frac_scale,
             )
             s_frac = _scale_unit_interval(
-                design[run_idx, 4],
-                *[float(x) for x in config["sampling"]["s_frac_range"]],
-                scale=_sampling_scale(config, "s_frac"),
+                design[run_idx, 4], s_frac_lo, s_frac_hi, s_frac_scale,
             )
         else:
             gravity = _scale_unit_interval(
-                design[run_idx, 0],
-                *[float(x) for x in config["sampling"]["gravity_range_cm_s2"]],
-                scale=_sampling_scale(config, "gravity_cm_s2"),
+                design[run_idx, 0], gravity_lo, gravity_hi, gravity_scale,
             )
             planet_radius_cm = _scale_unit_interval(
                 design[run_idx, 1],
-                *[float(x) for x in config["sampling"]["planet_radius_range_cm"]],
-                scale=_sampling_scale(config, "planet_radius_cm"),
+                planet_radius_lo,
+                planet_radius_hi,
+                planet_radius_scale,
             )
             stellar_radius_rsun = _scale_unit_interval(
                 design[run_idx, 2],
-                *[float(x) for x in config["sampling"]["stellar_radius_range_rsun"]],
-                scale=_sampling_scale(config, "r_star_rsun"),
+                stellar_radius_lo,
+                stellar_radius_hi,
+                stellar_radius_scale,
             )
             semi_major_axis_au = _scale_unit_interval(
                 design[run_idx, 3],
-                *[float(x) for x in config["sampling"]["semi_major_axis_range_au"]],
-                scale=_sampling_scale(config, "semi_major_axis_au"),
+                semi_major_axis_lo,
+                semi_major_axis_hi,
+                semi_major_axis_scale,
             )
             zenith_angle_deg = _scale_unit_interval(
-                design[run_idx, 4],
-                *[float(x) for x in config["sampling"]["zenith_angle_range_deg"]],
-                scale=_sampling_scale(config, "zenith_angle_deg"),
+                design[run_idx, 4], zenith_lo, zenith_hi, zenith_scale,
             )
             diurnal_factor = _scale_unit_interval(
-                design[run_idx, 5],
-                *[float(x) for x in config["sampling"]["diurnal_factor_range"]],
-                scale=_sampling_scale(config, "diurnal_factor"),
+                design[run_idx, 5], diurnal_lo, diurnal_hi, diurnal_scale,
             )
             he_frac = _scale_unit_interval(
-                design[run_idx, 6],
-                *[float(x) for x in config["sampling"]["he_frac_range"]],
-                scale=_sampling_scale(config, "he_frac"),
+                design[run_idx, 6], he_frac_lo, he_frac_hi, he_frac_scale,
             )
             c_frac = _scale_unit_interval(
-                design[run_idx, 7],
-                *[float(x) for x in config["sampling"]["c_frac_range"]],
-                scale=_sampling_scale(config, "c_frac"),
+                design[run_idx, 7], c_frac_lo, c_frac_hi, c_frac_scale,
             )
             o_frac = _scale_unit_interval(
-                design[run_idx, 8],
-                *[float(x) for x in config["sampling"]["o_frac_range"]],
-                scale=_sampling_scale(config, "o_frac"),
+                design[run_idx, 8], o_frac_lo, o_frac_hi, o_frac_scale,
             )
             n_frac = _scale_unit_interval(
-                design[run_idx, 9],
-                *[float(x) for x in config["sampling"]["n_frac_range"]],
-                scale=_sampling_scale(config, "n_frac"),
+                design[run_idx, 9], n_frac_lo, n_frac_hi, n_frac_scale,
             )
             s_frac = _scale_unit_interval(
-                design[run_idx, 10],
-                *[float(x) for x in config["sampling"]["s_frac_range"]],
-                scale=_sampling_scale(config, "s_frac"),
+                design[run_idx, 10], s_frac_lo, s_frac_hi, s_frac_scale,
             )
 
         temperature_k, temperature_metadata = _sample_temperature_profile_record(
             pressure_bar,
             config=config,
-            rng=rng,
+            rng=per_rng,
+            source=profile_source,
         )
         if fastchem:
             base_globals: dict[str, float] = {
@@ -1252,7 +1346,7 @@ def sample_run_specifications(
             }
             element_fractions = _element_fractions_from_sampled_globals(base_globals)
             gravity_profile = _equilibrium_gravity_profile(
-                pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
+                pressure_bar=pressure_bar,
             )
         else:
             base_globals = {
@@ -1270,60 +1364,55 @@ def sample_run_specifications(
             }
             element_fractions = _element_fractions_from_sampled_globals(base_globals)
             gravity_profile = np.full(
-                np.asarray(pressure_bar).shape,
+                pressure_bar.shape,
                 float(gravity),
                 dtype=np.float64,
             )
-        elemental_profile = _element_profile_from_fractions(
-            element_fractions,
-            num_levels=np.asarray(pressure_bar).size,
-        )
-
         if fastchem:
             globals_map = {**base_globals, **element_fractions}
-            result.append(
-                RunSpecification(
-                    run_id=f"run_{run_idx:05d}",
-                    pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
-                    temperature_k=np.asarray(temperature_k, dtype=np.float64),
-                    globals=globals_map,
-                    metadata=dict(temperature_metadata),
-                    elemental_abundances_frac=elemental_profile,
-                    gravity_cm_s2=gravity_profile,
-                )
+            return RunSpecification(
+                run_id=f"run_{run_idx:05d}",
+                pressure_bar=pressure_bar,
+                temperature_k=temperature_k,
+                globals=globals_map,
+                metadata=temperature_metadata,
+                elemental_abundances_frac=None,
+                gravity_cm_s2=gravity_profile,
             )
-        else:
-            kzz = sample_kzz_profile(pressure_bar, config=config, rng=rng)
-            assert spectra is not None and spectrum_names is not None and science_presets is not None
-            spectrum_name = spectrum_names[int(rng.integers(0, len(spectrum_names)))]
-            template = spectra[spectrum_name]
-            preset = science_presets[int(rng.integers(0, len(science_presets)))]
-            spectrum = SpectrumRecord(
-                name=f"{template.name}_run{run_idx:05d}",
-                wavelength_nm=np.asarray(template.wavelength_nm, dtype=np.float64),
-                flux_erg_cm2_s_nm=np.asarray(template.flux_erg_cm2_s_nm, dtype=np.float64),
-                metadata={**template.metadata, "template_name": template.name},
-            )
-            globals_map = {
-                **base_globals,
-                **element_fractions,
-                **_science_preset_conditioning_inputs(preset),
-            }
-            result.append(
-                RunSpecification(
-                    run_id=f"run_{run_idx:05d}",
-                    pressure_bar=np.asarray(pressure_bar, dtype=np.float64),
-                    temperature_k=np.asarray(temperature_k, dtype=np.float64),
-                    globals=globals_map,
-                    metadata={
-                        **temperature_metadata,
-                        "spectrum_name": spectrum.name,
-                        "science_preset_name": str(preset["name"]),
-                    },
-                    kzz_cm2_s=np.asarray(kzz, dtype=np.float64),
-                    spectrum=spectrum,
-                    elemental_abundances_frac=elemental_profile,
-                    gravity_cm_s2=gravity_profile,
-                )
-            )
-    return result
+        kzz = sample_kzz_profile(pressure_bar, config=config, rng=per_rng)
+        assert spectra is not None and spectrum_names is not None and science_presets is not None
+        spectrum_name = spectrum_names[int(per_rng.integers(0, len(spectrum_names)))]
+        template = spectra[spectrum_name]
+        preset = science_presets[int(per_rng.integers(0, len(science_presets)))]
+        spectrum = SpectrumRecord(
+            name=f"{template.name}_run{run_idx:05d}",
+            wavelength_nm=template.wavelength_nm,
+            flux_erg_cm2_s_nm=template.flux_erg_cm2_s_nm,
+            metadata={**template.metadata, "template_name": template.name},
+        )
+        globals_map = {
+            **base_globals,
+            **element_fractions,
+            **_science_preset_conditioning_inputs(preset),
+        }
+        return RunSpecification(
+            run_id=f"run_{run_idx:05d}",
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            globals=globals_map,
+            metadata={
+                **temperature_metadata,
+                "spectrum_name": spectrum.name,
+                "science_preset_name": str(preset["name"]),
+            },
+            kzz_cm2_s=kzz,
+            spectrum=spectrum,
+            elemental_abundances_frac=None,
+            gravity_cm_s2=gravity_profile,
+        )
+
+    max_workers = max(1, min(os.cpu_count() or 1, 16))
+    if total_runs <= 1 or max_workers == 1:
+        return [_sample_one(i) for i in range(total_runs)]
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(_sample_one, range(total_runs)))

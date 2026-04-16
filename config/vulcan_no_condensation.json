@@ -3,7 +3,8 @@
     "purpose": "FastChem emulator tuned for ExoJAX HMC-NUTS retrievals. Training samples abundances in log-uniform so solar (AAS) compositions are well-represented; pressure grid is 1e-7..100 bar to match the standard ExoJAX atmosphere; elemental ranges span ~[-1, +1] dex around AAS.",
     "retrain_log": [
       "2026-04-16 — switched C/O/N/S sampling to log-uniform, set He_H to linear [0.03, 0.18], raised num_runs from 500 to 8000, extended pressure grid down to 1e-7 bar, broadened Teq filter and T_eq analytic range, added dropout 0.05, dropped d_model to 192 for a ~2M-param model that fits the enlarged dataset without overfitting.",
-      "Reason: the previous bundle linearly sampled element fractions over 2-3 dex, so AAS solar values landed in the sparse lower-abundance tail. The exogibbs_vs_emulator notebook surfaced the resulting disagreement on H2O and NH3."
+      "Reason: the previous bundle linearly sampled element fractions over 2-3 dex, so AAS solar values landed in the sparse lower-abundance tail. The exogibbs_vs_emulator notebook surfaced the resulting disagreement on H2O and NH3.",
+      "2026-04-16 — (TP generation correctness) narrowed analytic_sampler to Mollière+2019 Table 6 extended ~1 decade: log10_gamma [-1,1], log10_delta [-3,1], alpha [0,0.9], log10_p_trans [-2,2], t_int [50,1000], t_eq [300,3500]. Old bounds produced extreme inversions like run_07390 (gamma=27.3). Also clipped the per-run pressure grid to the Roth library's native range [2.4e-6, 170] bar when a PT-library profile is chosen, eliminating PCHIP constant-extrapolation plateaus that were hitting ~65% of Roth runs."
     ],
     "chemistry_type_options": {
       "fastchem": "Pure chemical equilibrium via FastChem. Fast (seconds per run). Inputs: T-P profile + elemental abundances.",
@@ -60,12 +61,12 @@
       "max_temperature_k": 3500.0
     },
     "analytic_sampler": {
-      "t_int_k_range": [100.0, 800.0],
-      "t_eq_k_range": [300.0, 3000.0],
-      "log10_delta_range": [-6.0, 6.0],
-      "log10_gamma_range": [-2.0, 2.0],
-      "alpha_range": [0.0, 0.99],
-      "log10_p_trans_bar_range": [-6.0, 1.0],
+      "t_int_k_range": [50.0, 1000.0],
+      "t_eq_k_range": [300.0, 3500.0],
+      "log10_delta_range": [-3.0, 1.0],
+      "log10_gamma_range": [-1.0, 1.0],
+      "alpha_range": [0.0, 0.9],
+      "log10_p_trans_bar_range": [-2.0, 2.0],
       "convection_probability": 0.2,
       "adiabatic_gradient_range": [0.25, 0.35]
     }
@@ -117,7 +118,7 @@
       "patience": 15,
       "threshold": 0.0001
     },
-    "weight_decay": 1e-05,
+    "weight_decay": 1e-04,
     "gradient_clip": 1.0,
     "loss": {
       "lambda_z": 1.0,
@@ -125,14 +126,14 @@
     }
   },
   "model": {
-    "d_model": 256,
+    "d_model": 192,
     "nhead": 8,
     "num_layers": 4,
-    "dim_feedforward": 1024,
+    "dim_feedforward": 768,
     "conditioning_hidden_dim": 256,
     "film_clamp": 100.0,
     "output_head_divisor": 2,
     "activation": "gelu",
-    "dropout_rate": 0.00
+    "dropout_rate": 0.1
   }
 }

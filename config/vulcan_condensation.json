@@ -32,14 +32,15 @@
     "semi_major_axis_range_au": [0.03, 0.08],
     "zenith_angle_range_deg": [30.0, 75.0],
     "diurnal_factor_range": [0.25, 0.75],
-    "kzz_cm2_s": 1000000000.0,
+    "kzz_range_cm2_s": [1.0e6, 1.0e12],
     "scales": {
       "he_frac": "linear",
       "c_frac":  "log",
       "o_frac":  "log",
       "n_frac":  "log",
       "s_frac":  "log",
-      "gravity_cm_s2": "log"
+      "gravity_cm_s2": "log",
+      "kzz_cm2_s": "log"
     }
   },
   "temperature_profiles": {
@@ -56,12 +57,12 @@
       "max_temperature_k": 3000.0
     },
     "analytic_sampler": {
-      "t_int_k_range": [100.0, 800.0],
-      "t_eq_k_range": [300.0, 4000.0],
-      "log10_delta_range": [-6.0, 6.0],
-      "log10_gamma_range": [-2.0, 2.0],
-      "alpha_range": [0.0, 0.99],
-      "log10_p_trans_bar_range": [-5.0, 1.0],
+      "t_int_k_range": [50.0, 1000.0],
+      "t_eq_k_range": [300.0, 3500.0],
+      "log10_delta_range": [-3.0, 1.0],
+      "log10_gamma_range": [-1.0, 1.0],
+      "alpha_range": [0.0, 0.9],
+      "log10_p_trans_bar_range": [-2.0, 2.0],
       "convection_probability": 0.333,
       "adiabatic_gradient_range": [0.25, 0.35]
     }

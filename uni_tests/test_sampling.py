@@ -5,8 +5,15 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from src.data_generation.roth_sampling import _interpolate_profile, load_roth_profiles
+from src.data_generation.roth_sampling import (
+    _interpolate_profile,
+    load_roth_profiles,
+    load_roth_profiles_native,
+    roth_library_pressure_bounds,
+)
+from src.data_generation.generation import _element_profile_from_spec
 from src.data_generation.sampling import (
+    _decide_temperature_profile_source,
     _sample_column_pressure_grid,
     _sample_temperature_profile_record,
     sample_kzz_profile,
@@ -77,7 +84,8 @@ def test_kzz_sampling_is_constant_with_depth(tiny_config):
 
     assert kzz.shape == pressure_bar.shape
     np.testing.assert_allclose(kzz, np.full_like(kzz, kzz[0]))
-    np.testing.assert_allclose(kzz[0], float(tiny_config["sampling"]["kzz_cm2_s"]))
+    lo, hi = (float(x) for x in tiny_config["sampling"]["kzz_range_cm2_s"])
+    assert lo <= float(kzz[0]) <= hi
 
 
 def test_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config):
@@ -92,7 +100,8 @@ def test_vulcan_sampling_emits_elemental_globals_and_curated_presets(tiny_config
     assert preset_names == {preset["name"] for preset in tiny_config["science_presets"]}
     assert len({spec.metadata["spectrum_name"] for spec in specs}) >= 2
     for spec in specs:
-        assert spec.elemental_abundances_frac.shape[-1] == len(tiny_config["data_spec"]["element_input_order"])
+        profile = _element_profile_from_spec(spec)
+        assert profile.shape[-1] == len(tiny_config["data_spec"]["element_input_order"])
         for name in ("He_H", "C_H", "O_H", "N_H", "S_H"):
             assert name in spec.globals
         assert "gravity_cm_s2" in spec.globals
@@ -243,3 +252,98 @@ def test_mixed_temperature_sampling_supports_analytic_and_pt_paths(tiny_config):
     assert sampled_pt_profile.shape == pressure_bar.shape
     assert np.all(np.isfinite(sampled_pt_profile))
     assert not np.allclose(sampled_pt_profile, analytic_profile)
+
+
+def test_roth_library_pressure_bounds_returns_union_range():
+    profiles = load_roth_profiles_native(str(FIXTURE_PT_PATH))
+    assert profiles
+    native_min, native_max = roth_library_pressure_bounds(profiles)
+    observed_min = min(float(np.min(p.pressure_bar)) for p in profiles)
+    observed_max = max(float(np.max(p.pressure_bar)) for p in profiles)
+    assert native_min == pytest.approx(observed_min)
+    assert native_max == pytest.approx(observed_max)
+
+
+def test_sample_column_pressure_grid_clips_to_native_bounds():
+    """When native bounds are tighter than the configured ranges, the sampled
+    grid must sit strictly inside [native_min, native_max]."""
+    sampling_cfg = {
+        "num_levels_range": [40, 60],
+        "pressure_top_bar_range": [1.0e-9, 1.0e-3],
+        "pressure_bottom_bar_range": [10.0, 1000.0],
+    }
+    native_bounds = (1.0e-6, 10.0)
+    for seed in range(20):
+        grid = _sample_column_pressure_grid(
+            sampling_cfg,
+            rng=np.random.default_rng(seed),
+            native_p_bounds=native_bounds,
+        )
+        assert float(grid.min()) >= native_bounds[0] - 1e-12
+        assert float(grid.max()) <= native_bounds[1] + 1e-12
+
+
+def test_decide_temperature_profile_source_honors_mode():
+    rng = np.random.default_rng(0)
+    assert _decide_temperature_profile_source({"enabled": False}, rng=rng) == "analytic"
+    assert _decide_temperature_profile_source(
+        {"enabled": True, "source_mode": "roth"}, rng=rng,
+    ) == "roth"
+    # Mixed mode: analytic_probability=0 -> always Roth.
+    always_roth = {"enabled": True, "source_mode": "mixed", "analytic_probability": 0.0}
+    assert _decide_temperature_profile_source(always_roth, rng=rng) == "roth"
+    # Mixed mode: analytic_probability=1 -> always analytic.
+    always_analytic = {"enabled": True, "source_mode": "mixed", "analytic_probability": 1.0}
+    assert _decide_temperature_profile_source(always_analytic, rng=rng) == "analytic"
+
+
+def test_roth_profile_has_no_constant_plateau_near_toa(tiny_config):
+    """With upfront source decision + native clipping, a Roth-chosen run must
+    interpolate rather than clamp at the TOA, so consecutive temperatures
+    near the top should not be bit-identical."""
+    config = copy.deepcopy(tiny_config)
+    config["sampling"]["pressure_top_bar_range"] = [1.0e-9, 1.0e-5]
+    config["sampling"]["pressure_bottom_bar_range"] = [10.0, 200.0]
+    config["sampling"]["num_levels_range"] = [52, 52]
+    config["roth_sampler"] = {
+        "enabled": True,
+        "source_mode": "mixed",
+        "analytic_probability": 0.0,
+        "data_glob": str(FIXTURE_PT_PATH),
+        "filters": {"Teq": (1200.0, 1200.0), "LogMet": 0.0, "TiOVO": False},
+    }
+    specs = sample_run_specifications(
+        config=config,
+        project_root=config["_project_root"],
+        num_runs=4,
+        seed=7,
+    )
+    for spec in specs:
+        assert spec.metadata.get("temperature_profile_source") == "pt_library"
+        # Inside the native library range — no clamp should occur.
+        assert spec.pressure_bar.min() >= 1.0e-6 - 1e-12
+        assert spec.pressure_bar.max() <= 10.0 + 1e-12
+        top_slice = spec.temperature_k[-5:]
+        # Require that the top levels vary (no constant plateau).
+        assert np.any(np.abs(np.diff(top_slice)) > 1.0e-6)
+
+
+def test_analytic_sampler_ranges_match_repo_config():
+    """Pin the narrowed analytic-sampler ranges — changes should be explicit.
+
+    Catches accidental reversions to the old wide bounds that produced the
+    extreme ``run_07390`` inversion.
+    """
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    for cfg_name in ("vulcan_no_condensation.json", "vulcan_condensation.json"):
+        cfg_path = root / "config" / cfg_name
+        cfg = json.loads(cfg_path.read_text())
+        sampler = cfg["temperature_profiles"]["analytic_sampler"]
+        assert sampler["log10_gamma_range"] == [-1.0, 1.0], cfg_name
+        assert sampler["log10_delta_range"] == [-3.0, 1.0], cfg_name
+        assert sampler["alpha_range"] == [0.0, 0.9], cfg_name
+        assert sampler["log10_p_trans_bar_range"] == [-2.0, 2.0], cfg_name
+        assert sampler["t_int_k_range"] == [50.0, 1000.0], cfg_name
+        assert sampler["t_eq_k_range"] == [300.0, 3500.0], cfg_name

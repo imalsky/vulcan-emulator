@@ -993,7 +993,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
             "semi_major_axis_range_au",
             "zenith_angle_range_deg",
             "diurnal_factor_range",
-            "kzz_cm2_s",
+            "kzz_range_cm2_s",
         ]
     _require_keys(sampling, required_sampling, "sampling")
     for legacy_key in ("num_levels", "pressure_top_bar", "pressure_bottom_bar"):
@@ -1002,9 +1002,15 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 f"sampling.{legacy_key} is no longer supported. Use sampling.{legacy_key}_range "
                 "with a [lower, upper] pair instead."
             )
+    if "kzz_cm2_s" in sampling:
+        raise ConfigValidationError(
+            "sampling.kzz_cm2_s (scalar) is no longer supported. Use "
+            "sampling.kzz_range_cm2_s with a [lower, upper] pair (log-sampled by default)."
+        )
     if chemistry_type == "fastchem":
         disallowed_sampling = [
-            key for key in ("gravity_range_cm_s2", "planet_radius_range_cm", "kzz_cm2_s")
+            key
+            for key in ("gravity_range_cm_s2", "planet_radius_range_cm", "kzz_range_cm2_s")
             if key in sampling
         ]
         if disallowed_sampling:
@@ -1058,6 +1064,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 "semi_major_axis_range_au",
                 "zenith_angle_range_deg",
                 "diurnal_factor_range",
+                "kzz_range_cm2_s",
             ]
         )
     allow_equal_range_keys = {
@@ -1100,9 +1107,9 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
                 "sampling.zenith_angle_range_deg must lie within [0, 90)."
             )
     if chemistry_type == "vulcan":
-        sampling["kzz_cm2_s"] = _as_float(sampling["kzz_cm2_s"], "sampling.kzz_cm2_s")
-        if sampling["kzz_cm2_s"] <= 0.0:
-            raise ConfigValidationError("sampling.kzz_cm2_s must be positive.")
+        kzz_range = sampling["kzz_range_cm2_s"]
+        if kzz_range[0] <= 0.0:
+            raise ConfigValidationError("sampling.kzz_range_cm2_s must be strictly positive.")
 
     config["temperature_profiles"] = _validate_temperature_profiles(config["temperature_profiles"])
 

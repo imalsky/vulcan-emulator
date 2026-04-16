@@ -638,10 +638,10 @@ def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) 
         "export_version": str(EXPORT_VERSION),
         "chemistry_type": str(payload["config"]["chemistry_type"]),
         "model_type": str(payload["config"]["model_type"]),
-        "model_dimensions": json.dumps(payload["model_dimensions"]),
-        "normalization": json.dumps(payload["normalization"]),
-        "data_contract": json.dumps(payload["data_contract"]),
-        "config": json.dumps(payload["config"]),
+        "model_dimensions": json.dumps(payload["model_dimensions"], default=str),
+        "normalization": json.dumps(payload["normalization"], default=str),
+        "data_contract": json.dumps(payload["data_contract"], default=str),
+        "config": json.dumps(payload["config"], default=str),
     }
     standalone_src = (Path(__file__).parent / "standalone_inference.py").read_text(encoding="utf-8")
     np.savez(
