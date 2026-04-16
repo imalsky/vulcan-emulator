@@ -67,10 +67,9 @@ source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
 CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
 set +e
-conda activate "${CONDA_ENV}"
-rc=$?
+conda activate "${CONDA_ENV}" 2>&1
 set -e
-if [ "${rc}" -ne 0 ]; then
+if [[ "$(basename "${CONDA_PREFIX:-}")" != "${CONDA_ENV}" ]]; then
   echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
   conda info --envs || true
   exit 2
