@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import gc
 import json
 import shutil
@@ -137,15 +138,35 @@ def _study_root(base_config: dict[str, Any], project_root: Path) -> Path:
     return base_ckpt_root / "optuna"
 
 
-def _make_callback(trial: optuna.Trial):
-    """Build an ``on_epoch_end`` callback that reports val loss and prunes."""
+_CSV_FIELDS = (
+    "epoch",
+    "combined_loss",
+    "mse_norm",
+    "mae_log10",
+)
+
+
+def _make_callback(trial: optuna.Trial, csv_path: Path):
+    """Build an ``on_epoch_end`` callback that reports, logs to CSV, and prunes."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = csv_path.open("w", encoding="utf-8", newline="")
+    writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+    writer.writeheader()
+    handle.flush()
 
     def _callback(epoch: int, val_summary: dict[str, float]) -> None:
         value = float(val_summary["combined_loss"])
+        row = {"epoch": epoch}
+        for key in _CSV_FIELDS[1:]:
+            row[key] = f"{float(val_summary[key]):.8g}" if key in val_summary else ""
+        writer.writerow(row)
+        handle.flush()
         trial.report(value, step=epoch)
         if trial.should_prune():
+            handle.close()
             raise optuna.TrialPruned()
 
+    _callback.close = handle.close  # type: ignore[attr-defined]
     return _callback
 
 
@@ -180,15 +201,25 @@ def _make_objective(
             ),
         )
 
-        artifacts = train_model(
-            trial_config,
-            project_root=project_root,
-            preloaded=preloaded,
-            on_epoch_end=_make_callback(trial),
-        )
+        csv_path = trial_ckpt / "val_metrics.csv"
+        callback = _make_callback(trial, csv_path)
+        try:
+            artifacts = train_model(
+                trial_config,
+                project_root=project_root,
+                preloaded=preloaded,
+                on_epoch_end=callback,
+            )
+        finally:
+            callback.close()
         metrics = json.loads(Path(artifacts.metrics_path).read_text())
         best_val = float(metrics["best_val_combined_loss"])
-        LOGGER.info("Trial %04d best_val_combined_loss=%.6f", trial.number, best_val)
+        LOGGER.info(
+            "Trial %04d best_val_combined_loss=%.6f | csv=%s",
+            trial.number,
+            best_val,
+            csv_path,
+        )
         return best_val
 
     return _objective

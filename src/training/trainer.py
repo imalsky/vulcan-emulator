@@ -920,6 +920,7 @@ def train_model(
         processed_root = _ensure_processed(config, project_root=project_root)
         splits, normalization, contract = load_processed_dataset(processed_root)
     else:
+        processed_root = Path("<preloaded>")
         splits, normalization, contract = preloaded
 
     train_split = splits["train"]
