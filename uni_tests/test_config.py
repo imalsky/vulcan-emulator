@@ -221,11 +221,11 @@ def test_invalid_early_stopping_patience_is_rejected(tmp_path):
         load_and_validate_config(_write_config(tmp_path, "invalid_patience.json", payload))
 
 
-def test_vulcan_requires_lambda_z_and_lambda_phys_only(tmp_path):
+def test_vulcan_requires_lambda_z_and_lambda_log10_mae_only(tmp_path):
     payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"].pop("lambda_phys")
-    with pytest.raises(ConfigValidationError, match="lambda_phys"):
-        load_and_validate_config(_write_config(tmp_path, "vulcan_missing_lambda_phys.json", payload))
+    payload["training"]["loss"].pop("lambda_log10_mae")
+    with pytest.raises(ConfigValidationError, match="lambda_log10_mae"):
+        load_and_validate_config(_write_config(tmp_path, "vulcan_missing_lambda_log10_mae.json", payload))
 
 
 def test_vulcan_requires_planet_radius_sampling_range(tmp_path):

@@ -9,7 +9,10 @@ scheduling keeps linear warmup for all runs, defaults to reduce-on-plateau
 after warmup, and retains the pre-existing cosine-annealing path when
 explicitly requested in the config.
 
-The combined loss is ``lambda_z * MSE_norm + lambda_phys * MSE_log10``.
+The combined loss is ``lambda_z * MSE_norm + lambda_log10_mae * MAE_log10``.
+``MAE_log10`` is mean absolute error in physical log10 space (equivalently,
+``|log10(pred_VMR / target_VMR)|``), which optimizes the typical fractional
+error instead of being dominated by outliers as squared error would be.
 """
 
 from __future__ import annotations
@@ -173,6 +176,18 @@ def _adamw_update(
         v_hat,
     )
     return new_params, {"m": m, "v": v, "t": t}
+
+
+@jax.jit
+def _ema_update(ema: Any, params: Any, decay: jax.Array) -> Any:
+    """Exponential-moving-average update of a shadow parameter tree.
+
+    ``ema_new = decay * ema + (1 - decay) * params``. Applied every optimizer
+    step; the shadow tree is the one exported and used for validation/test.
+    """
+    return jax.tree_util.tree_map(
+        lambda e, p: decay * e + (1.0 - decay) * p, ema, params
+    )
 
 
 def _warmup_learning_rate(
@@ -535,20 +550,21 @@ def make_transformer_train_eval_functions(
             )
             mask = batch["valid_mask"].astype(pred.dtype)[..., None]
             mask_sum = jnp.maximum(jnp.sum(mask) * pred.shape[-1], 1.0)
-            # MSE in normalized space (the primary training signal).
+            # MSE in normalized space (smooth regularizer).
             mse_norm = jnp.sum(((pred - batch["target"]) ** 2) * mask) / mask_sum
-            # MSE in log10 mixing-ratio space (physical-scale diagnostic).
+            # MAE in log10 mixing-ratio space (primary physical-scale signal —
+            # equals |log10(pred_VMR / target_VMR)|, i.e. log-fractional error).
             pred_log10 = pred * target_std + target_mean
             target_log10 = batch["target"] * target_std + target_mean
-            mse_log10 = jnp.sum(((pred_log10 - target_log10) ** 2) * mask) / mask_sum
+            mae_log10 = jnp.sum(jnp.abs(pred_log10 - target_log10) * mask) / mask_sum
             total = (
                 float(loss_cfg["lambda_z"]) * mse_norm
-                + float(loss_cfg["lambda_phys"]) * mse_log10
+                + float(loss_cfg["lambda_log10_mae"]) * mae_log10
             )
             metrics = {
                 "combined_loss": total,
                 "mse_norm": mse_norm,
-                "mse_log10": mse_log10,
+                "mae_log10": mae_log10,
             }
             return total, metrics
 
@@ -592,15 +608,15 @@ def make_transformer_train_eval_functions(
         mse_norm = jnp.sum(((pred - batch["target"]) ** 2) * mask) / mask_sum
         pred_log10 = pred * target_std + target_mean
         target_log10 = batch["target"] * target_std + target_mean
-        mse_log10 = jnp.sum(((pred_log10 - target_log10) ** 2) * mask) / mask_sum
+        mae_log10 = jnp.sum(jnp.abs(pred_log10 - target_log10) * mask) / mask_sum
         total = (
             float(loss_cfg["lambda_z"]) * mse_norm
-            + float(loss_cfg["lambda_phys"]) * mse_log10
+            + float(loss_cfg["lambda_log10_mae"]) * mae_log10
         )
         return {
             "combined_loss": total,
             "mse_norm": mse_norm,
-            "mse_log10": mse_log10,
+            "mae_log10": mae_log10,
         }
 
     return train_step, eval_step
@@ -624,7 +640,7 @@ def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
         return {
             "combined_loss": float("nan"),
             "mse_norm": float("nan"),
-            "mse_log10": float("nan"),
+            "mae_log10": float("nan"),
         }
     keys = metrics[0].keys()
     return {
@@ -904,6 +920,14 @@ def train_model(
         count_parameters(params),
     )
     opt_state = _init_adamw_state(params)
+
+    ema_cfg = dict(config["training"].get("ema", {"enabled": False, "decay": 0.0}))
+    ema_enabled = bool(ema_cfg["enabled"])
+    ema_decay = float(ema_cfg["decay"])
+    ema_params = jax.tree_util.tree_map(lambda x: x, params) if ema_enabled else None
+    ema_decay_scalar = jnp.asarray(ema_decay, dtype=jnp.float32) if ema_enabled else None
+    if ema_enabled:
+        LOGGER.info("EMA enabled with decay=%.6f.", ema_decay)
     train_step, eval_step = make_transformer_train_eval_functions(
         dims=dims,
         normalization=normalization,
@@ -977,16 +1001,19 @@ def train_model(
                 jnp.asarray(lr, dtype=jnp.float32),
                 step_dropout_key,
             )
+            if ema_enabled:
+                ema_params = _ema_update(ema_params, params, ema_decay_scalar)
             train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
             global_step += 1
             train_steps += 1
 
+        eval_params = ema_params if ema_enabled else params
         val_batches = iter_batches(val_split, batch_size=batch_size, rng=rng)
         val_metrics_epoch: list[dict[str, float]] = []
         val_steps = 0
         for batch in val_batches:
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
-            metrics = eval_step(params, device_batch)
+            metrics = eval_step(eval_params, device_batch)
             val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
             val_steps += 1
 
@@ -1028,7 +1055,7 @@ def train_model(
         )
 
         current_payload = _checkpoint_payload(
-            params=params,
+            params=eval_params,
             dims=dims,
             config=config,
             normalization=normalization,

@@ -281,7 +281,7 @@ All processed datasets write:
 
 `training.loss` always requires:
 - `lambda_z`
-- `lambda_phys`
+- `lambda_log10_mae`
 
 Architecture behavior:
 - `fastchem + transformer`: PT + `X/H`

@@ -177,7 +177,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     },
                     "loss": {
                         "lambda_z": 1.0,
-                        "lambda_phys": 0.1,
+                        "lambda_log10_mae": 0.1,
                     },
                 },
                 "model": {

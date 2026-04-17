@@ -1231,12 +1231,20 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     if training["gradient_clip"] <= 0.0:
         raise ConfigValidationError("training.gradient_clip must be positive.")
     loss = training["loss"]
-    loss_required = ["lambda_z", "lambda_phys"]
+    loss_required = ["lambda_z", "lambda_log10_mae"]
     _require_keys(loss, loss_required, "training.loss")
     for key in loss_required:
         loss[key] = _as_float(loss[key], f"training.loss.{key}")
         if loss[key] < 0.0:
             raise ConfigValidationError(f"training.loss.{key} must be non-negative.")
+    ema = training.get("ema", {"enabled": False, "decay": 0.0})
+    if not isinstance(ema, dict):
+        raise ConfigValidationError("training.ema must be a mapping.")
+    ema["enabled"] = _as_bool(ema.get("enabled", False), "training.ema.enabled")
+    ema["decay"] = _as_float(ema.get("decay", 0.0), "training.ema.decay")
+    if ema["enabled"] and not (0.0 <= ema["decay"] < 1.0):
+        raise ConfigValidationError("training.ema.decay must be in [0, 1) when enabled.")
+    training["ema"] = ema
     model = config["model"]
 
     if not isinstance(model, dict):
@@ -1488,6 +1496,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
         "gradient_clip": training["gradient_clip"],
         "model": training["model"],
         "loss": training["loss"],
+        "ema": training["ema"],
     }
     config["roth_sampler"] = {
         "enabled": config["temperature_profiles"]["source_mode"] in {"pt_library", "mixed"},

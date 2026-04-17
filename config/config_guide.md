@@ -217,8 +217,8 @@ Normalization methods:
 
 | Key | Required for | Description |
 |-----|-------------|-------------|
-| `lambda_z` | both | Weight on MSE in normalized space (primary signal) |
-| `lambda_phys` | both | Weight on MSE in log10 physical space |
+| `lambda_z` | both | Weight on MSE in normalized space (smoothness regularizer) |
+| `lambda_log10_mae` | both | Weight on MAE in log10 physical space (primary signal: `|log10(pred_VMR / target_VMR)|`) |
 
 ### `model`
 
