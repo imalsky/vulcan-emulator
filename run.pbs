@@ -295,18 +295,25 @@ if [ "${DATA_ONLY}" = "1" ]; then
 fi
 
 # =============================================================================
-# Stage 3: Training (requires GPU)
+# Stage 3: Training (requires GPU) — disabled for hyperparameter sweep
 # =============================================================================
-echo ""
-echo "========== Stage: training =========="
-python -u -m src.utils --config "${CONFIG_PATH}" --stage training
+# echo ""
+# echo "========== Stage: training =========="
+# python -u -m src.utils --config "${CONFIG_PATH}" --stage training
 
 # =============================================================================
-# Stage 4: Export (convert best checkpoint to portable NPZ bundle)
+# Stage 4: Export (convert best checkpoint to portable NPZ bundle) — disabled
+# =============================================================================
+# echo ""
+# echo "========== Stage: export =========="
+# python -u -m src.utils --config "${CONFIG_PATH}" --stage export
+
+# =============================================================================
+# Stage 3 (alt): Hyperparameter tuning via Optuna (requires GPU)
 # =============================================================================
 echo ""
-echo "========== Stage: export =========="
-python -u -m src.utils --config "${CONFIG_PATH}" --stage export
+echo "========== Stage: hyperparameter tuning =========="
+python -u -m src.tuning --config "${CONFIG_PATH}" --trials 100 --epochs 100
 
 echo ""
 echo "========== Pipeline complete =========="

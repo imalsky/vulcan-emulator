@@ -12,6 +12,7 @@ dependencies = [
   "jax>=0.4",
   "numpy>=1.24",
   "h5py>=3.8",
+  "optuna>=3.5",
 ]
 
 [project.optional-dependencies]

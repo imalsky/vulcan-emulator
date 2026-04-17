@@ -889,6 +889,8 @@ def train_model(
     config: dict[str, Any],
     *,
     project_root: Path,
+    preloaded: tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None = None,
+    on_epoch_end: Callable[[int, dict[str, float]], None] | None = None,
 ) -> TrainingArtifacts:
     """Train the active chemistry/model combination end to end.
 
@@ -899,14 +901,26 @@ def train_model(
         weights, and training schedule.
     project_root : Path
         Repository root used to resolve data and checkpoint paths.
+    preloaded : tuple or None, optional
+        Optional ``(splits, normalization, contract)`` tuple matching the
+        output of ``load_processed_dataset``. When provided, the processed
+        dataset is not re-read from disk, which is useful for hyperparameter
+        sweeps that share a dataset across many trials.
+    on_epoch_end : callable or None, optional
+        Optional callback ``(epoch_1_indexed, val_summary)`` invoked after
+        each epoch's validation pass and checkpoint write. The callback may
+        raise to abort training early (e.g. for Optuna pruning).
 
     Returns
     -------
     TrainingArtifacts
         Paths to the best checkpoint, epoch history, and final metrics files.
     """
-    processed_root = _ensure_processed(config, project_root=project_root)
-    splits, normalization, contract = load_processed_dataset(processed_root)
+    if preloaded is None:
+        processed_root = _ensure_processed(config, project_root=project_root)
+        splits, normalization, contract = load_processed_dataset(processed_root)
+    else:
+        splits, normalization, contract = preloaded
 
     train_split = splits["train"]
     val_split = splits["val"]
@@ -1080,6 +1094,9 @@ def train_model(
                     best_epoch,
                 )
                 break
+
+        if on_epoch_end is not None:
+            on_epoch_end(epoch + 1, dict(val_summary))
 
     if best_payload is None:
         raise RuntimeError("Training completed without producing a best checkpoint.")
