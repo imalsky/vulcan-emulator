@@ -7,7 +7,8 @@
       "2026-04-16 — (TP generation correctness) narrowed analytic_sampler to Mollière+2019 Table 6 extended ~1 decade: log10_gamma [-1,1], log10_delta [-3,1], alpha [0,0.9], log10_p_trans [-2,2], t_int [50,1000], t_eq [300,3500]. Old bounds produced extreme inversions like run_07390 (gamma=27.3). Also clipped the per-run pressure grid to the Roth library's native range [2.4e-6, 170] bar when a PT-library profile is chosen, eliminating PCHIP constant-extrapolation plateaus that were hitting ~65% of Roth runs.",
       "2026-04-16 — (loss) swapped the physical-space loss term from MSE in log10 space to MAE (|log10(pred_VMR / target_VMR)|). Renamed training.loss.lambda_phys -> lambda_log10_mae. Motivation: fractional error is the science-relevant target, and MAE in log-space optimizes median fractional error rather than being dominated by a few low-abundance-tail outliers. Historical mse_log10 values in history.json from older runs are not comparable with the new mae_log10.",
       "2026-04-16 — (accuracy) d_model 192->256, num_layers 4->6, dim_ff 768->1024, activation gelu->silu, dropout 0.1->0.0, added training.ema (decay=0.999) whose shadow weights are used for validation/test/export. No data regeneration; the processed-data contract is unchanged. Prior-architecture checkpoint is not compatible; retrain from scratch.",
-      "2026-04-16 — (accuracy) output_head_divisor 2->1 (drop the 256->128 bottleneck before the 17-species projection; adds ~65k params) and conditioning_hidden_dim 256->512 (wider FiLM conditioning MLP, the only path composition reaches the attention stack; adds ~400k params). Architecture change; retrain from scratch."
+      "2026-04-16 — (accuracy) output_head_divisor 2->1 (drop the 256->128 bottleneck before the 17-species projection; adds ~65k params) and conditioning_hidden_dim 256->512 (wider FiLM conditioning MLP, the only path composition reaches the attention stack; adds ~400k params). Architecture change; retrain from scratch.",
+      "2026-04-17 — (accuracy) adopted the winner of the 100-trial Optuna study 'vulcan_emulator_arch_v1' (trial #47, val combined_loss 0.04732). Changes: d_model 256->192, num_layers 6->4, nhead 8->12, dim_feedforward 704->768, conditioning_hidden_dim 512->1024, norm_type rmsnorm->layernorm, training.weight_decay 1e-4->5e-4. Kept activation=silu, use_qk_norm=true, ffn_type=swiglu, zero_init_film=true. dropout_rate forced to 0.0 (winner used 0.026, but sweep showed no regularization signal in this range and we want maximum capacity at full training length). Architecture change; retrain from scratch."
     ],
     "chemistry_type_options": {
       "fastchem": "Pure chemical equilibrium via FastChem. Fast (seconds per run). Inputs: T-P profile + elemental abundances.",
@@ -122,7 +123,7 @@
       "patience": 15,
       "threshold": 0.0001
     },
-    "weight_decay": 1e-04,
+    "weight_decay": 5e-04,
     "gradient_clip": 1.0,
     "loss": {
       "lambda_z": 1.0,
@@ -134,16 +135,16 @@
     }
   },
   "model": {
-    "d_model": 256,
-    "nhead": 8,
-    "num_layers": 6,
-    "dim_feedforward": 704,
-    "conditioning_hidden_dim": 512,
+    "d_model": 192,
+    "nhead": 12,
+    "num_layers": 4,
+    "dim_feedforward": 768,
+    "conditioning_hidden_dim": 1024,
     "film_clamp": 100.0,
     "output_head_divisor": 1,
     "activation": "silu",
     "dropout_rate": 0.0,
-    "norm_type": "rmsnorm",
+    "norm_type": "layernorm",
     "use_qk_norm": true,
     "ffn_type": "swiglu",
     "zero_init_film": true
