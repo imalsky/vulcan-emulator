@@ -6,8 +6,16 @@ Architecture:
     3. Per block:
        a. Pre-norm (ln1) -> multi-head self-attention -> dropout -> residual add
        b. FiLM: x = x * (1 + gamma) + beta
-       c. Pre-norm (ln_ffn) -> FFN (up-project, act, dropout, down-project) -> residual add
-    4. Output head: LayerNorm -> act -> bottleneck -> final projection.
+       c. Pre-norm (ln_ffn) -> FFN -> residual add
+    4. Output head: norm -> act -> bottleneck -> final projection.
+
+The ``norm_type`` flag on :class:`TransformerDimensions` selects LayerNorm or
+RMSNorm for every normalization site (ln1, ln_ffn, out_norm); ``ffn_type``
+selects the dense ``Linear -> act -> Linear`` FFN or the SwiGLU gated variant
+``(act(ff1(x)) * ff_gate(x)) -> ff2``; ``use_qk_norm`` adds per-head RMSNorm
+to Q/K inside attention; ``zero_init_film`` zeroes the ``context_out``
+projection so every layer starts at an identity FiLM transform (DiT's
+AdaLN-Zero pattern).
 
 All operations are pure JAX and compatible with ``jax.grad`` / ``jax.jvp``.
 """
@@ -22,9 +30,10 @@ import jax.numpy as jnp
 
 from .layers import (
     _apply_dropout,
-    _init_layer_norm,
+    _apply_norm,
     _init_linear,
-    _layer_norm,
+    _init_norm,
+    _init_rms_norm,
     _linear,
     _multihead_attention,
     _resolve_activation,
@@ -40,6 +49,29 @@ class TransformerDimensions:
     safe values are ``[5.0, 20.0]`` in float32; values above ~65 risk pushing
     activations outside the float16 dynamic range (relevant if mixed-precision
     training is ever enabled).
+
+    Fields ``norm_type``, ``use_qk_norm``, ``ffn_type``, and ``zero_init_film``
+    default to the legacy configuration so pre-existing checkpoints and tests
+    keep working; opt in via the model config block.
+
+    Attributes
+    ----------
+    norm_type : str
+        ``"layernorm"`` (default) or ``"rmsnorm"``. Selects the normalization
+        used at every site (ln1, ln_ffn, out_norm).
+    use_qk_norm : bool
+        When True, add per-head RMSNorm to Q and K inside each attention
+        layer to cap the attention-logit magnitude.
+    ffn_type : str
+        ``"dense"`` (default) for ``Linear -> act -> Linear`` or ``"swiglu"``
+        for the gated ``(act(ff1(x)) * ff_gate(x)) -> ff2`` FFN. SwiGLU adds
+        a third ``d_model -> dim_feedforward`` projection per layer; rebudget
+        ``dim_feedforward`` to roughly ``2/3`` of the dense setting to hold
+        the parameter count constant.
+    zero_init_film : bool
+        When True, zero-initialize the ``context_out`` projection so every
+        layer's (gamma, beta) starts at (0, 0) — identity FiLM at step 0,
+        following the AdaLN-Zero pattern from DiT.
     """
 
     sequence_dim: int
@@ -54,6 +86,10 @@ class TransformerDimensions:
     output_head_divisor: int
     activation: str = "gelu"
     dropout_rate: float = 0.0
+    norm_type: str = "layernorm"
+    use_qk_norm: bool = False
+    ffn_type: str = "dense"
+    zero_init_film: bool = False
 
     def to_dict(self: "TransformerDimensions") -> dict[str, Any]:
         """Serialize the dataclass fields into a plain Python mapping."""
@@ -71,10 +107,19 @@ class TransformerDimensions:
 def init_transformer_params(key: jax.Array, dims: TransformerDimensions) -> dict[str, Any]:
     """Allocate and Xavier-initialize all Transformer parameters.
 
-    Splits the PRNG key into enough sub-keys for every linear layer and
-    LayerNorm in the model.  The key budget is:
-    - 5 top-level: sequence_in, context_in, context_out, out_head_hidden, out_head_final
-    - 6 per transformer layer: Q, K, V, O projections + 2 FFN layers
+    Splits the PRNG key into enough sub-keys for every linear layer in the
+    model. Per-layer key budget depends on ``dims.ffn_type`` (dense FFN
+    uses 2 projections; SwiGLU uses 3). Norm and QK-Norm scales are
+    deterministic (ones / ones) and do not draw from the PRNG stream.
+
+    Optional additions controlled by flags on ``dims``:
+    - ``ffn_type == "swiglu"`` allocates an extra ``ff_gate`` projection
+      per layer (third ``d_model -> dim_feedforward`` matrix).
+    - ``use_qk_norm`` allocates per-layer ``q_norm`` and ``k_norm`` RMSNorm
+      scales over ``head_dim = d_model // nhead``.
+    - ``zero_init_film`` zeros the ``context_out`` weight and bias so every
+      layer's (gamma, beta) starts at (0, 0) — identity FiLM at step 0,
+      matching the AdaLN-Zero pattern from DiT.
 
     Parameters
     ----------
@@ -88,29 +133,47 @@ def init_transformer_params(key: jax.Array, dims: TransformerDimensions) -> dict
     dict[str, Any]
         Nested parameter tree ready for ``apply_transformer_model``.
     """
-    total_key_count = 5 + dims.num_layers * 6
+    ff_keys_per_layer = 3 if dims.ffn_type == "swiglu" else 2
+    per_layer_keys = 4 + ff_keys_per_layer  # q, k, v, o + FFN projections
+    total_key_count = 5 + dims.num_layers * per_layer_keys
     keys = iter(jax.random.split(key, total_key_count))
+
+    context_out = _init_linear(
+        next(keys), dims.conditioning_hidden_dim, dims.num_layers * 2 * dims.d_model
+    )
+    if dims.zero_init_film:
+        context_out = {
+            "weight": jnp.zeros_like(context_out["weight"]),
+            "bias": jnp.zeros_like(context_out["bias"]),
+        }
+
     params: dict[str, Any] = {
         "sequence_in": _init_linear(next(keys), dims.sequence_dim, dims.d_model),
         "context_in": _init_linear(next(keys), dims.global_dim, dims.conditioning_hidden_dim),
-        "context_out": _init_linear(next(keys), dims.conditioning_hidden_dim, dims.num_layers * 2 * dims.d_model),
-        "out_norm": _init_layer_norm(dims.d_model),
+        "context_out": context_out,
+        "out_norm": _init_norm(dims.d_model, dims.norm_type),
         "out_head_hidden": _init_linear(next(keys), dims.d_model, max(1, dims.d_model // dims.output_head_divisor)),
         "out_head_final": _init_linear(next(keys), max(1, dims.d_model // dims.output_head_divisor), dims.target_dim),
     }
 
+    head_dim = dims.d_model // dims.nhead
     layers: list[dict[str, Any]] = []
     for _ in range(dims.num_layers):
         layer_params: dict[str, Any] = {
-            "ln1": _init_layer_norm(dims.d_model),
+            "ln1": _init_norm(dims.d_model, dims.norm_type),
             "q": _init_linear(next(keys), dims.d_model, dims.d_model),
             "k": _init_linear(next(keys), dims.d_model, dims.d_model),
             "v": _init_linear(next(keys), dims.d_model, dims.d_model),
             "o": _init_linear(next(keys), dims.d_model, dims.d_model),
-            "ln_ffn": _init_layer_norm(dims.d_model),
+            "ln_ffn": _init_norm(dims.d_model, dims.norm_type),
             "ff1": _init_linear(next(keys), dims.d_model, dims.dim_feedforward),
             "ff2": _init_linear(next(keys), dims.dim_feedforward, dims.d_model),
         }
+        if dims.ffn_type == "swiglu":
+            layer_params["ff_gate"] = _init_linear(next(keys), dims.d_model, dims.dim_feedforward)
+        if dims.use_qk_norm:
+            layer_params["q_norm"] = _init_rms_norm(head_dim)
+            layer_params["k_norm"] = _init_rms_norm(head_dim)
         layers.append(layer_params)
     params["layers"] = layers
     return params
@@ -193,7 +256,7 @@ def apply_transformer_model(
         beta = jnp.clip(film[:, layer_index, 1], -dims.film_clamp, dims.film_clamp)
 
         # (a) Self-attention
-        x_norm = _layer_norm(layer["ln1"], x)
+        x_norm = _apply_norm(layer["ln1"], x, dims.norm_type)
         attn = _multihead_attention(
             layer, x_norm, nhead=dims.nhead, key_mask=attention_mask,
         )
@@ -209,8 +272,11 @@ def apply_transformer_model(
         x = x * (1.0 + gamma[:, None, :]) + beta[:, None, :]
 
         # (c) FFN
-        ff_in = _layer_norm(layer["ln_ffn"], x)
-        ff_hidden = act(_linear(layer["ff1"], ff_in))
+        ff_in = _apply_norm(layer["ln_ffn"], x, dims.norm_type)
+        if dims.ffn_type == "swiglu":
+            ff_hidden = act(_linear(layer["ff1"], ff_in)) * _linear(layer["ff_gate"], ff_in)
+        else:
+            ff_hidden = act(_linear(layer["ff1"], ff_in))
         ff_hidden = _apply_dropout(
             ff_hidden,
             rate=dims.dropout_rate,
@@ -220,7 +286,7 @@ def apply_transformer_model(
         ff = _linear(layer["ff2"], ff_hidden)
         x = x + ff
 
-    x = _layer_norm(params["out_norm"], x)
+    x = _apply_norm(params["out_norm"], x, dims.norm_type)
     x = act(_linear(params["out_head_hidden"], x))
     x = _apply_dropout(
         x,

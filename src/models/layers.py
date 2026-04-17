@@ -150,6 +150,43 @@ def _layer_norm(params: dict[str, jax.Array], x: jax.Array, eps: float = 1.0e-5)
     return normalized * params["scale"] + params["bias"]
 
 
+def _init_rms_norm(dim: int) -> dict[str, jax.Array]:
+    """Initialize RMSNorm learnable parameters: scale=1 only (no bias)."""
+    return {"scale": jnp.ones((dim,), dtype=jnp.float32)}
+
+
+def _rms_norm(params: dict[str, jax.Array], x: jax.Array, eps: float = 1.0e-6) -> jax.Array:
+    """Apply RMSNorm (Zhang & Sennrich, 2019) over the last axis.
+
+    Computes ``y = x / sqrt(mean(x^2) + eps) * scale``. Drops the mean
+    subtraction and bias of LayerNorm; ~10% faster at equivalent quality.
+    """
+    rms = jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    return (x / rms) * params["scale"]
+
+
+def _init_norm(dim: int, norm_type: str) -> dict[str, jax.Array]:
+    """Initialize a normalization block chosen by ``norm_type``."""
+    if norm_type == "layernorm":
+        return _init_layer_norm(dim)
+    if norm_type == "rmsnorm":
+        return _init_rms_norm(dim)
+    raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
+def _apply_norm(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    norm_type: str,
+) -> jax.Array:
+    """Apply the normalization block selected by ``norm_type``."""
+    if norm_type == "layernorm":
+        return _layer_norm(params, x)
+    if norm_type == "rmsnorm":
+        return _rms_norm(params, x)
+    raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
 def sinusoidal_position_encoding(length: int, dim: int, dtype: jnp.dtype = jnp.float32) -> jax.Array:
     """Compute fixed sinusoidal positional encoding (Vaswani et al., 2017).
 
@@ -274,8 +311,16 @@ def _multihead_attention_qkv(
     *,
     nhead: int,
     source_mask: jax.Array | None = None,
+    q_norm: dict[str, jax.Array] | None = None,
+    k_norm: dict[str, jax.Array] | None = None,
 ) -> jax.Array:
-    """Scaled dot-product attention from ``query`` tokens over ``source`` tokens."""
+    """Scaled dot-product attention from ``query`` tokens over ``source`` tokens.
+
+    When ``q_norm`` / ``k_norm`` are provided, Q and K are RMSNorm'd along
+    the per-head feature axis before the dot product (QK-Norm, Henry et al.
+    2020; adopted in Gemini/DeepSeek stacks to prevent attention-logit
+    explosion).
+    """
     batch_size, query_len, d_model = query.shape
     source_len = source.shape[1]
     head_dim = d_model // nhead
@@ -283,6 +328,11 @@ def _multihead_attention_qkv(
     q = _linear(q_params, query).reshape(batch_size, query_len, nhead, head_dim).transpose(0, 2, 1, 3)
     k = _linear(k_params, source).reshape(batch_size, source_len, nhead, head_dim).transpose(0, 2, 1, 3)
     v = _linear(v_params, source).reshape(batch_size, source_len, nhead, head_dim).transpose(0, 2, 1, 3)
+
+    if q_norm is not None:
+        q = _rms_norm(q_norm, q)
+    if k_norm is not None:
+        k = _rms_norm(k_norm, k)
 
     scale = 1.0 / math.sqrt(float(head_dim))
     logits = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
@@ -311,6 +361,10 @@ def _multihead_attention(
     ``key_mask`` (bool, shape ``(batch, nz)``) — when provided, attention
     scores at padded key positions are driven to ``-inf`` before softmax
     so padded tokens cannot contribute to any query's output.
+
+    QK-Norm is applied when the layer params tree contains ``q_norm`` and
+    ``k_norm`` entries (added by ``init_transformer_params`` when the
+    ``use_qk_norm`` flag is on).
     """
     return _multihead_attention_qkv(
         params["q"],
@@ -321,4 +375,6 @@ def _multihead_attention(
         x,
         nhead=nhead,
         source_mask=key_mask,
+        q_norm=params.get("q_norm"),
+        k_norm=params.get("k_norm"),
     )

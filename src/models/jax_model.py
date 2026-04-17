@@ -7,10 +7,15 @@ Implements a FiLM-conditioned Transformer architecture:
     3. Per block:
        a. Pre-norm (ln1) -> multi-head self-attention -> dropout -> residual add
        b. FiLM: x = x * (1 + gamma) + beta
-       c. Pre-norm (ln_ffn) -> FFN (up-project, act, dropout, down-project) -> residual add
-    4. Output head: LayerNorm -> act -> bottleneck -> final projection.
+       c. Pre-norm (ln_ffn) -> FFN -> residual add
+          (FFN is dense ``act(W1 x) -> W2`` or gated SwiGLU
+          ``act(W1 x) * (Wg x) -> W2`` depending on ``ffn_type``)
+    4. Output head: norm -> act -> bottleneck -> final projection.
 
-All operations are pure JAX and compatible with ``jax.grad`` / ``jax.jvp``.
+Norms are LayerNorm or RMSNorm per ``TransformerDimensions.norm_type``;
+attention optionally applies QK-RMSNorm before the dot product when
+``use_qk_norm`` is set.  All operations are pure JAX and compatible with
+``jax.grad`` / ``jax.jvp``.
 
 This module is a convenience aggregation point.  The actual implementations
 live in :mod:`~.layers` and :mod:`~.transformer`.
@@ -91,6 +96,10 @@ def build_model_dimensions(
         output_head_divisor=int(model_cfg["output_head_divisor"]),
         activation=str(model_cfg.get("activation", "gelu")).lower(),
         dropout_rate=float(model_cfg.get("dropout_rate", 0.0)),
+        norm_type=str(model_cfg.get("norm_type", "layernorm")).lower(),
+        use_qk_norm=bool(model_cfg.get("use_qk_norm", False)),
+        ffn_type=str(model_cfg.get("ffn_type", "dense")).lower(),
+        zero_init_film=bool(model_cfg.get("zero_init_film", False)),
     )
 
 

@@ -53,7 +53,13 @@ FASTCHEM_GLOBAL_LABELS: list[str] = ["He_H", "C_H", "O_H", "N_H", "S_H"]
 
 @dataclass(frozen=True)
 class TransformerDimensions:
-    """All dimensionality and architecture hyper-parameters for the surrogate."""
+    """All dimensionality and architecture hyper-parameters for the surrogate.
+
+    The trailing ``norm_type``, ``use_qk_norm``, ``ffn_type``, and
+    ``zero_init_film`` fields default to the legacy configuration so
+    bundles exported before these flags existed still deserialize.
+    See ``src/models/transformer.py`` for the authoritative definition.
+    """
 
     sequence_dim: int
     global_dim: int
@@ -67,6 +73,10 @@ class TransformerDimensions:
     output_head_divisor: int
     activation: str = "gelu"
     dropout_rate: float = 0.0
+    norm_type: str = "layernorm"
+    use_qk_norm: bool = False
+    ffn_type: str = "dense"
+    zero_init_film: bool = False
 
     def to_dict(self: "TransformerDimensions") -> dict[str, Any]:
         """Serialize the dataclass fields into a plain Python mapping."""
@@ -120,6 +130,25 @@ def _layer_norm(params: dict[str, jax.Array], x: jax.Array, eps: float = 1.0e-5)
     return normalized * params["scale"] + params["bias"]
 
 
+def _rms_norm(params: dict[str, jax.Array], x: jax.Array, eps: float = 1.0e-6) -> jax.Array:
+    """Apply RMSNorm across the last dimension."""
+    rms = jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    return (x / rms) * params["scale"]
+
+
+def _apply_norm(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    norm_type: str,
+) -> jax.Array:
+    """Dispatch between LayerNorm and RMSNorm by name."""
+    if norm_type == "layernorm":
+        return _layer_norm(params, x)
+    if norm_type == "rmsnorm":
+        return _rms_norm(params, x)
+    raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
 def sinusoidal_position_encoding_continuous(
     position: jax.Array,
     dim: int,
@@ -165,6 +194,8 @@ def _multihead_attention_qkv(
     *,
     nhead: int,
     source_mask: jax.Array | None = None,
+    q_norm: dict[str, jax.Array] | None = None,
+    k_norm: dict[str, jax.Array] | None = None,
 ) -> jax.Array:
     """Scaled dot-product attention from ``query`` tokens over ``source`` tokens."""
     batch_size, query_len, d_model = query.shape
@@ -174,6 +205,11 @@ def _multihead_attention_qkv(
     q = _linear(q_params, query).reshape(batch_size, query_len, nhead, head_dim).transpose(0, 2, 1, 3)
     k = _linear(k_params, source).reshape(batch_size, source_len, nhead, head_dim).transpose(0, 2, 1, 3)
     v = _linear(v_params, source).reshape(batch_size, source_len, nhead, head_dim).transpose(0, 2, 1, 3)
+
+    if q_norm is not None:
+        q = _rms_norm(q_norm, q)
+    if k_norm is not None:
+        k = _rms_norm(k_norm, k)
 
     scale = 1.0 / math.sqrt(float(head_dim))
     logits = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
@@ -207,6 +243,8 @@ def _multihead_attention(
         x,
         nhead=nhead,
         source_mask=key_mask,
+        q_norm=params.get("q_norm"),
+        k_norm=params.get("k_norm"),
     )
 
 
@@ -267,7 +305,7 @@ def apply_transformer_model(
         beta = jnp.clip(film[:, layer_index, 1], -dims.film_clamp, dims.film_clamp)
 
         # (a) Self-attention
-        x_norm = _layer_norm(layer["ln1"], x)
+        x_norm = _apply_norm(layer["ln1"], x, dims.norm_type)
         attn = _multihead_attention(layer, x_norm, nhead=dims.nhead, key_mask=attention_mask)
         attn = _apply_dropout(
             attn,
@@ -281,8 +319,11 @@ def apply_transformer_model(
         x = x * (1.0 + gamma[:, None, :]) + beta[:, None, :]
 
         # (c) FFN
-        ff_in = _layer_norm(layer["ln_ffn"], x)
-        ff_hidden = act(_linear(layer["ff1"], ff_in))
+        ff_in = _apply_norm(layer["ln_ffn"], x, dims.norm_type)
+        if dims.ffn_type == "swiglu":
+            ff_hidden = act(_linear(layer["ff1"], ff_in)) * _linear(layer["ff_gate"], ff_in)
+        else:
+            ff_hidden = act(_linear(layer["ff1"], ff_in))
         ff_hidden = _apply_dropout(
             ff_hidden,
             rate=dims.dropout_rate,
@@ -292,7 +333,7 @@ def apply_transformer_model(
         ff = _linear(layer["ff2"], ff_hidden)
         x = x + ff
 
-    x = _layer_norm(params["out_norm"], x)
+    x = _apply_norm(params["out_norm"], x, dims.norm_type)
     x = act(_linear(params["out_head_hidden"], x))
     x = _apply_dropout(
         x,

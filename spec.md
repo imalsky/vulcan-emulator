@@ -111,6 +111,17 @@ Valid keys:
 - `output_head_divisor`
 - optional `activation`
 - optional `dropout_rate`
+- optional `norm_type` — `"layernorm"` (default, legacy) or `"rmsnorm"`
+  (drops mean subtraction and bias; modern default, ~10% faster).
+- optional `ffn_type` — `"dense"` (default, legacy) or `"swiglu"`
+  (gated FFN: `act(W1 x) * (W_gate x) → W2`; re-budget
+  `dim_feedforward` to `~2/3 × dense` for param parity).
+- optional `use_qk_norm` — `false` (default) or `true`.  Applies
+  RMSNorm to Q and K along `head_dim` before the attention dot
+  product (stabilizes logits, essential past ~12 layers).
+- optional `zero_init_film` — `false` (default) or `true`.  Zeroes
+  the final FiLM projection (`context_out`) so γ=β=0 at step 0,
+  matching DiT's AdaLN-Zero; improves early-training stability.
 
 ### `vulcan`
 
@@ -283,9 +294,40 @@ All processed datasets write:
 - `lambda_z`
 - `lambda_log10_mae`
 
+The composite loss is:
+
+```
+L = lambda_z         * mean MSE in normalized target space
+  + lambda_log10_mae * mean |log10(pred_VMR / target_VMR)|
+```
+
+The first term trains the network against the log-standard normalized
+targets; the second term is the science-relevant fractional error in
+physical mixing-ratio space (`src/training/trainer.py`).
+
+Optional EMA shadow weights:
+- `training.ema.enabled` (bool, default `false`)
+- `training.ema.decay` (float in `[0, 1)`, required when enabled)
+
+When enabled, validation, test, and exported weights use the EMA shadow
+copy; the raw optimizer state is retained only for training continuation.
+
 Architecture behavior:
 - `fastchem + transformer`: PT + `X/H`
 - `vulcan + transformer`: PT + Kzz + surface gravity + planet radius + sampled irradiation geometry + runtime globals
+
+### Variable-grid contract
+
+Per-run level counts vary within `sampling.num_levels_range`.  Preprocessing
+pads every run to `max_num_levels` across the training set and writes a
+boolean `valid_mask.npy` plus a `position_coord.npy` built from normalized
+`log10(pressure_bar)` over the union training pressure range
+(`src/data_generation/preprocess.py`).  The transformer forward pass
+consumes both arrays: the mask gates attention keys per level, and the
+position coordinate drives the continuous sinusoidal positional encoding.
+This is what makes the position encoding physical-coordinate aware rather
+than index-aware, and what lets the exported bundle accept arbitrary
+in-range grids at inference time.
 
 ## Architecture Contract
 
@@ -330,12 +372,17 @@ Pre-norm transformer with FiLM modulation from global inputs.
 Input:    Linear(sequence_dim → d_model) + sinusoidal positional encoding
 
 Per block:
-  a. Pre-norm (ln1) → multi-head self-attention → dropout → residual add
+  a. Pre-norm (ln1) → multi-head self-attention [+ optional QK-Norm]
+     → dropout → residual add
   b. FiLM: x = x * (1 + gamma) + beta
-  c. Pre-norm (ln_ffn) → FFN (up-project, activation, dropout, down-project) → residual add
+  c. Pre-norm (ln_ffn) → FFN → residual add
+     (FFN is dense `act(W1 x) → W2` or gated SwiGLU
+      `act(W1 x) * (W_gate x) → W2`, per `ffn_type`)
 
-Output head: LayerNorm → activation → Linear(d_model → d_model // output_head_divisor) → dropout → Linear(→ target_dim)
+Output head: norm → activation → Linear(d_model → d_model // output_head_divisor) → dropout → Linear(→ target_dim)
 ```
+
+Norms are LayerNorm or RMSNorm per `model.norm_type`.
 
 #### Design notes
 
@@ -343,6 +390,17 @@ Output head: LayerNorm → activation → Linear(d_model → d_model // output_h
   pre-norm transformer pattern. FiLM conditioning is applied directly
   to the residual stream before the FFN pre-norm.
 - **Residual connections**: after self-attention and FFN sub-layers.
+- **QK-Norm**: when `model.use_qk_norm` is `true`, per-head Q and K
+  are RMS-normalized along `head_dim` before the scaled dot-product,
+  preventing attention-logit explosion.
+- **Zero-init FiLM**: when `model.zero_init_film` is `true`, the
+  final FiLM projection (`context_out`) is zero-initialized so the
+  model starts as identity FiLM (γ = β = 0), improving early-training
+  stability.
+- **SwiGLU FFN**: when `model.ffn_type == "swiglu"`, the FFN gains a
+  third projection `W_gate` alongside `W1` and the hidden activation
+  becomes `act(W1 x) * (W_gate x)`.  Exported parameter trees then
+  include `layers[i].ff_gate` in addition to `ff1`/`ff2`.
 
 ### Normalization
 

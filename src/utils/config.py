@@ -514,9 +514,25 @@ def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dic
     normalized["dropout_rate"] = _as_float(
         normalized["dropout_rate"], f"{scope}.dropout_rate"
     )
+    normalized["norm_type"] = _as_nonempty_str(
+        normalized.get("norm_type", "layernorm"), f"{scope}.norm_type"
+    ).lower()
+    normalized["ffn_type"] = _as_nonempty_str(
+        normalized.get("ffn_type", "dense"), f"{scope}.ffn_type"
+    ).lower()
+    normalized["use_qk_norm"] = bool(normalized.get("use_qk_norm", False))
+    normalized["zero_init_film"] = bool(normalized.get("zero_init_film", False))
     if normalized["activation"] not in _ALLOWED_ACTIVATIONS:
         raise ConfigValidationError(
             f"{scope}.activation must be one of {_ALLOWED_ACTIVATIONS}."
+        )
+    if normalized["norm_type"] not in {"layernorm", "rmsnorm"}:
+        raise ConfigValidationError(
+            f"{scope}.norm_type must be one of 'layernorm' or 'rmsnorm'."
+        )
+    if normalized["ffn_type"] not in {"dense", "swiglu"}:
+        raise ConfigValidationError(
+            f"{scope}.ffn_type must be one of 'dense' or 'swiglu'."
         )
     if normalized["d_model"] < 8 or normalized["nhead"] < 1 or normalized["num_layers"] < 1:
         raise ConfigValidationError(f"{scope} dimensions are too small.")
