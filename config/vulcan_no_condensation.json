@@ -8,7 +8,8 @@
       "2026-04-16 — (loss) swapped the physical-space loss term from MSE in log10 space to MAE (|log10(pred_VMR / target_VMR)|). Renamed training.loss.lambda_phys -> lambda_log10_mae. Motivation: fractional error is the science-relevant target, and MAE in log-space optimizes median fractional error rather than being dominated by a few low-abundance-tail outliers. Historical mse_log10 values in history.json from older runs are not comparable with the new mae_log10.",
       "2026-04-16 — (accuracy) d_model 192->256, num_layers 4->6, dim_ff 768->1024, activation gelu->silu, dropout 0.1->0.0, added training.ema (decay=0.999) whose shadow weights are used for validation/test/export. No data regeneration; the processed-data contract is unchanged. Prior-architecture checkpoint is not compatible; retrain from scratch.",
       "2026-04-16 — (accuracy) output_head_divisor 2->1 (drop the 256->128 bottleneck before the 17-species projection; adds ~65k params) and conditioning_hidden_dim 256->512 (wider FiLM conditioning MLP, the only path composition reaches the attention stack; adds ~400k params). Architecture change; retrain from scratch.",
-      "2026-04-17 — (accuracy) adopted the winner of the 100-trial Optuna study 'vulcan_emulator_arch_v1' (trial #47, val combined_loss 0.04732). Changes: d_model 256->192, num_layers 6->4, nhead 8->12, dim_feedforward 704->768, conditioning_hidden_dim 512->1024, norm_type rmsnorm->layernorm, training.weight_decay 1e-4->5e-4. Kept activation=silu, use_qk_norm=true, ffn_type=swiglu, zero_init_film=true. dropout_rate forced to 0.0 (winner used 0.026, but sweep showed no regularization signal in this range and we want maximum capacity at full training length). Architecture change; retrain from scratch."
+      "2026-04-17 — (accuracy) adopted the winner of the 100-trial Optuna study 'vulcan_emulator_arch_v1' (trial #47, val combined_loss 0.04732). Changes: d_model 256->192, num_layers 6->4, nhead 8->12, dim_feedforward 704->768, conditioning_hidden_dim 512->1024, norm_type rmsnorm->layernorm, training.weight_decay 1e-4->5e-4. Kept activation=silu, use_qk_norm=true, ffn_type=swiglu, zero_init_film=true. dropout_rate forced to 0.0 (winner used 0.026, but sweep showed no regularization signal in this range and we want maximum capacity at full training length). Architecture change; retrain from scratch.",
+      "2026-04-17 — (regression fix) reverted the sizing/regularization half of the Optuna winner after the full 400-epoch production run landed at val 0.0339, worse than the pre-sweep baseline of 0.0304 (same data, same LR schedule, same EMA). Root cause: the sweep evaluated at 100 epochs with an aggressive MedianPruner, which biases selection toward fast-early-learners; trial #47 beat the baseline at epoch 100 (0.047 vs 0.054) but plateaued higher at epoch 400. Train loss was unchanged across the two runs (0.0064 vs 0.0067), so the regression is a widened generalization gap, not underfit. Restored d_model 192->256, num_layers 4->6, nhead 12->8, dim_feedforward 768->1024, conditioning_hidden_dim 1024->256, output_head_divisor 1->2, training.weight_decay 5e-4->1e-4. Kept the sweep-era formulation wins that were neutral-or-good across top trials: norm_type=layernorm, use_qk_norm=true, ffn_type=swiglu, zero_init_film=true, activation=silu, dropout_rate=0.0. EMA stays on with decay=0.999. Architecture change; retrain from scratch. See training_diary.md."
     ],
     "chemistry_type_options": {
       "fastchem": "Pure chemical equilibrium via FastChem. Fast (seconds per run). Inputs: T-P profile + elemental abundances.",
@@ -123,7 +124,7 @@
       "patience": 15,
       "threshold": 0.0001
     },
-    "weight_decay": 5e-04,
+    "weight_decay": 1e-04,
     "gradient_clip": 1.0,
     "loss": {
       "lambda_z": 1.0,
@@ -135,11 +136,11 @@
     }
   },
   "model": {
-    "d_model": 192,
-    "nhead": 12,
-    "num_layers": 4,
-    "dim_feedforward": 768,
-    "conditioning_hidden_dim": 1024,
+    "d_model": 256,
+    "nhead": 8,
+    "num_layers": 6,
+    "dim_feedforward": 1024,
+    "conditioning_hidden_dim": 256,
     "film_clamp": 100.0,
     "output_head_divisor": 1,
     "activation": "silu",

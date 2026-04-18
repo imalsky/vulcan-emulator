@@ -212,6 +212,7 @@ Normalization methods:
 | `weight_decay` | AdamW weight decay |
 | `gradient_clip` | Global L2 gradient norm clip |
 | `loss` | Loss weights (see below) |
+| `ema` | Optional. `{enabled, decay}`. Omit or set `enabled: false` to train without EMA; when on, `decay=0.999` is the usual default and EMA shadow weights are used for validation/test/export. |
 
 ### `training.loss`
 

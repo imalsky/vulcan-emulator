@@ -41,9 +41,37 @@ from ..utils.helpers import ensure_dir, get_logger, resolve_path, resolve_projec
 
 LOGGER = get_logger(__name__)
 
-STUDY_NAME = "vulcan_emulator_arch_v1"
+STUDY_NAME = "vulcan_emulator_arch_v2"
 
 _NHEAD_CANDIDATES = (4, 6, 8, 12, 16)
+
+# Formulation knobs held fixed in v2 (sweep v1 agreed these are neutral-or-good
+# across the top completed trials, so we spend budget on sizing + regularization
+# instead). activation=silu, ffn_type=swiglu, use_qk_norm=true,
+# zero_init_film=true. Overridden *in the base config*, not per-trial.
+_FIXED_FORMULATION = {
+    "activation": "silu",
+    "ffn_type": "swiglu",
+    "use_qk_norm": True,
+    "zero_init_film": True,
+}
+
+# Incumbent architecture enqueued as trial #0 so every sweep has a known
+# benchmark. Under _FIXED_FORMULATION the sampled config is the 2026-04-17
+# "hybrid" arch (2026-04-16 sizing + 2026-04-17 sweep formulation wins); if
+# the hybrid run ships, its numbers become the bar any new trial has to clear.
+INCUMBENT_PARAMS = {
+    "d_model": 256,
+    "nhead_for_d256": 8,
+    "num_layers": 6,
+    "dim_ff_mult": 4.0,
+    "conditioning_hidden_dim": 256,
+    "output_head_divisor": 2,
+    "norm_type": "layernorm",
+    "dropout_rate": 0.0,
+    "weight_decay": 1e-4,
+    "ema_enabled": True,
+}
 
 
 def _valid_nheads(d_model: int) -> list[int]:
@@ -54,25 +82,26 @@ def _valid_nheads(d_model: int) -> list[int]:
 def _sample_trial_overrides(trial: optuna.Trial) -> dict[str, Any]:
     """Sample architectural + regularization hyperparameters for one trial.
 
-    Returns a flat dict ready to be merged into a copy of the base config.
-    All constraints (``d_model % nhead == 0``, ``dim_feedforward >= d_model``)
+    v2 search space: sizing and regularization only. Formulation knobs that
+    sweep v1 showed were consistently good (silu / swiglu / qk_norm /
+    zero_init_film) are fixed in the base config; see ``_FIXED_FORMULATION``.
+
+    Constraints (``d_model % nhead == 0``, ``dim_feedforward >= d_model``)
     are enforced by construction here; the final config is also re-run
     through :func:`_validate_transformer_model_config` before training.
     """
-    d_model = trial.suggest_categorical("d_model", [128, 192, 256, 384, 512])
+    d_model = trial.suggest_categorical("d_model", [192, 256, 384])
     nhead = trial.suggest_categorical(f"nhead_for_d{d_model}", _valid_nheads(d_model))
-    num_layers = trial.suggest_int("num_layers", 3, 8)
-    dim_ff_mult = trial.suggest_float("dim_ff_mult", 2.0, 4.0)
+    num_layers = trial.suggest_int("num_layers", 4, 8)
+    dim_ff_mult = trial.suggest_float("dim_ff_mult", 2.5, 4.0)
     conditioning_hidden_dim = trial.suggest_categorical(
         "conditioning_hidden_dim", [128, 256, 512, 1024]
     )
-    activation = trial.suggest_categorical("activation", ["silu", "gelu", "relu", "elu"])
+    output_head_divisor = trial.suggest_categorical("output_head_divisor", [1, 2])
     norm_type = trial.suggest_categorical("norm_type", ["layernorm", "rmsnorm"])
-    use_qk_norm = trial.suggest_categorical("use_qk_norm", [True, False])
-    ffn_type = trial.suggest_categorical("ffn_type", ["dense", "swiglu"])
-    zero_init_film = trial.suggest_categorical("zero_init_film", [True, False])
-    dropout_rate = trial.suggest_float("dropout_rate", 0.0, 0.20)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    dropout_rate = trial.suggest_float("dropout_rate", 0.0, 0.1)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 5e-3, log=True)
+    ema_enabled = trial.suggest_categorical("ema_enabled", [True, False])
 
     dim_feedforward = int(round(d_model * dim_ff_mult))
     if dim_feedforward < d_model:
@@ -84,13 +113,11 @@ def _sample_trial_overrides(trial: optuna.Trial) -> dict[str, Any]:
         "num_layers": int(num_layers),
         "dim_feedforward": int(dim_feedforward),
         "conditioning_hidden_dim": int(conditioning_hidden_dim),
-        "activation": activation,
+        "output_head_divisor": int(output_head_divisor),
         "norm_type": norm_type,
-        "use_qk_norm": bool(use_qk_norm),
-        "ffn_type": ffn_type,
-        "zero_init_film": bool(zero_init_film),
         "dropout_rate": float(dropout_rate),
         "weight_decay": float(weight_decay),
+        "ema_enabled": bool(ema_enabled),
     }
 
 
@@ -111,14 +138,13 @@ def _apply_overrides(
         "num_layers",
         "dim_feedforward",
         "conditioning_hidden_dim",
-        "activation",
+        "output_head_divisor",
         "norm_type",
-        "use_qk_norm",
-        "ffn_type",
-        "zero_init_film",
         "dropout_rate",
     ):
         model[key] = overrides[key]
+    for key, value in _FIXED_FORMULATION.items():
+        model[key] = value
 
     cfg["model"] = _validate_transformer_model_config(model, "model")
     cfg["training"]["model"] = dict(cfg["model"])
@@ -127,6 +153,10 @@ def _apply_overrides(
     training["weight_decay"] = overrides["weight_decay"]
     training["epochs"] = int(epochs)
     training["early_stopping_patience"] = max(5, min(20, int(epochs) // 5))
+    ema_cfg = dict(training.get("ema", {"enabled": False, "decay": 0.999}))
+    ema_cfg["enabled"] = bool(overrides["ema_enabled"])
+    ema_cfg.setdefault("decay", 0.999)
+    training["ema"] = ema_cfg
 
     cfg["paths"]["checkpoints_root"] = str(checkpoints_root)
     return cfg
@@ -251,12 +281,32 @@ def main(argv: list[str] | None = None) -> int:
         default="config/vulcan_no_condensation.json",
         help="Path to the base configuration JSON file.",
     )
-    parser.add_argument("--trials", type=int, default=100, help="Number of Optuna trials.")
+    parser.add_argument("--trials", type=int, default=60, help="Number of Optuna trials.")
     parser.add_argument(
         "--epochs",
         type=int,
-        default=100,
-        help="Training epochs per trial (overrides config.training.epochs).",
+        default=300,
+        help="Maximum training epochs per trial (HyperbandPruner max_resource; "
+        "overrides config.training.epochs).",
+    )
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=30,
+        help="Minimum epochs a trial runs before it can be pruned "
+        "(HyperbandPruner min_resource).",
+    )
+    parser.add_argument(
+        "--reduction-factor",
+        type=int,
+        default=3,
+        help="HyperbandPruner reduction factor (bracket aggressiveness).",
+    )
+    parser.add_argument(
+        "--skip-incumbent",
+        action="store_true",
+        help="Skip enqueueing INCUMBENT_PARAMS as trial #0 (by default the "
+        "incumbent arch is always included as a baseline).",
     )
     parser.add_argument(
         "--study-name",
@@ -288,10 +338,13 @@ def main(argv: list[str] | None = None) -> int:
     LOGGER.info("Optuna storage: %s | study: %s", storage, args.study_name)
 
     sampler = optuna.samplers.TPESampler(seed=123, multivariate=True, group=True)
-    pruner = optuna.pruners.MedianPruner(
-        n_startup_trials=5,
-        n_warmup_steps=10,
-        interval_steps=1,
+    # HyperbandPruner funnels compute to survivors so winners are evaluated at
+    # real training length. MedianPruner (sweep v1) killed ~88% of trials before
+    # epoch 30 and biased selection toward fast-early-learners.
+    pruner = optuna.pruners.HyperbandPruner(
+        min_resource=int(args.min_epochs),
+        max_resource=int(args.epochs),
+        reduction_factor=int(args.reduction_factor),
     )
     study = optuna.create_study(
         study_name=args.study_name,
@@ -301,6 +354,20 @@ def main(argv: list[str] | None = None) -> int:
         pruner=pruner,
         load_if_exists=True,
     )
+
+    # Always benchmark against the known-good pre-sweep architecture: enqueue it
+    # as the first trial. Skipped if already present in a resumed study, or
+    # when --skip-incumbent is set.
+    if not args.skip_incumbent:
+        existing_params = {
+            frozenset(t.params.items())
+            for t in study.get_trials(deepcopy=False, states=None)
+        }
+        if frozenset(INCUMBENT_PARAMS.items()) not in existing_params:
+            study.enqueue_trial(INCUMBENT_PARAMS)
+            LOGGER.info("Enqueued incumbent arch as baseline trial: %s", INCUMBENT_PARAMS)
+        else:
+            LOGGER.info("Incumbent arch already present in study; not re-enqueueing.")
 
     objective = _make_objective(
         base_config,

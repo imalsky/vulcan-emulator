@@ -313,7 +313,7 @@ fi
 # =============================================================================
 echo ""
 echo "========== Stage: hyperparameter tuning =========="
-python -u -m src.tuning --config "${CONFIG_PATH}" --trials 100 --epochs 100
+python -u -m src.tuning --config "${CONFIG_PATH}" --trials 60 --epochs 300 --min-epochs 30 --reduction-factor 3
 
 echo ""
 echo "========== Pipeline complete =========="
