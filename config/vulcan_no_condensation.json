@@ -9,7 +9,8 @@
       "2026-04-16 — (accuracy) d_model 192->256, num_layers 4->6, dim_ff 768->1024, activation gelu->silu, dropout 0.1->0.0, added training.ema (decay=0.999) whose shadow weights are used for validation/test/export. No data regeneration; the processed-data contract is unchanged. Prior-architecture checkpoint is not compatible; retrain from scratch.",
       "2026-04-16 — (accuracy) output_head_divisor 2->1 (drop the 256->128 bottleneck before the 17-species projection; adds ~65k params) and conditioning_hidden_dim 256->512 (wider FiLM conditioning MLP, the only path composition reaches the attention stack; adds ~400k params). Architecture change; retrain from scratch.",
       "2026-04-17 — (accuracy) adopted the winner of the 100-trial Optuna study 'vulcan_emulator_arch_v1' (trial #47, val combined_loss 0.04732). Changes: d_model 256->192, num_layers 6->4, nhead 8->12, dim_feedforward 704->768, conditioning_hidden_dim 512->1024, norm_type rmsnorm->layernorm, training.weight_decay 1e-4->5e-4. Kept activation=silu, use_qk_norm=true, ffn_type=swiglu, zero_init_film=true. dropout_rate forced to 0.0 (winner used 0.026, but sweep showed no regularization signal in this range and we want maximum capacity at full training length). Architecture change; retrain from scratch.",
-      "2026-04-17 — (regression fix) reverted the sizing/regularization half of the Optuna winner after the full 400-epoch production run landed at val 0.0339, worse than the pre-sweep baseline of 0.0304 (same data, same LR schedule, same EMA). Root cause: the sweep evaluated at 100 epochs with an aggressive MedianPruner, which biases selection toward fast-early-learners; trial #47 beat the baseline at epoch 100 (0.047 vs 0.054) but plateaued higher at epoch 400. Train loss was unchanged across the two runs (0.0064 vs 0.0067), so the regression is a widened generalization gap, not underfit. Restored d_model 192->256, num_layers 4->6, nhead 12->8, dim_feedforward 768->1024, conditioning_hidden_dim 1024->256, output_head_divisor 1->2, training.weight_decay 5e-4->1e-4. Kept the sweep-era formulation wins that were neutral-or-good across top trials: norm_type=layernorm, use_qk_norm=true, ffn_type=swiglu, zero_init_film=true, activation=silu, dropout_rate=0.0. EMA stays on with decay=0.999. Architecture change; retrain from scratch. See training_diary.md."
+      "2026-04-17 — (regression fix) reverted the sizing/regularization half of the Optuna winner after the full 400-epoch production run landed at val 0.0339, worse than the pre-sweep baseline of 0.0304 (same data, same LR schedule, same EMA). Root cause: the sweep evaluated at 100 epochs with an aggressive MedianPruner, which biases selection toward fast-early-learners; trial #47 beat the baseline at epoch 100 (0.047 vs 0.054) but plateaued higher at epoch 400. Train loss was unchanged across the two runs (0.0064 vs 0.0067), so the regression is a widened generalization gap, not underfit. Restored d_model 192->256, num_layers 4->6, nhead 12->8, dim_feedforward 768->1024, conditioning_hidden_dim 1024->256, output_head_divisor 1->2, training.weight_decay 5e-4->1e-4. Kept the sweep-era formulation wins that were neutral-or-good across top trials: norm_type=layernorm, use_qk_norm=true, ffn_type=swiglu, zero_init_film=true, activation=silu, dropout_rate=0.0. EMA stays on with decay=0.999. Architecture change; retrain from scratch. See training_diary.md.",
+      "2026-04-17 — (regression fix, round 2) the 'hybrid' run above regressed further: best val 0.0395 at ep 137, early-stopped at ep 177, val ~0.045 at ep 100 (faster-early than baseline's 0.054, then plateaued). Same fast-early/plateau-higher signature as trial #47 — the sweep-era formulation knobs we kept (`norm_type=layernorm`, `use_qk_norm=true`, `ffn_type=swiglu`, `zero_init_film=true`) were judged 'neutral-or-good' on the same 100-ep proxy that mis-ranked trial #47 in the first place. Primary suspect: `zero_init_film=true` + narrow `conditioning_hidden_dim=256` together starve the composition pathway at init, letting the (now larger, via swiglu + divisor=1) attention/FFN stack memorize T,P-only while FiLM catches up too slowly. Reverting all four formulation knobs to their pre-sweep values to re-anchor on the known 0.0304 recipe: norm_type layernorm->rmsnorm, use_qk_norm true->false, ffn_type swiglu->dense, zero_init_film true->false. Also restoring output_head_divisor 1->2 (the retrain_log entry above said this was restored but the config still had 1 — now genuinely restored). Architecture change; retrain from scratch. If this matches 0.0304 the four knobs are the culprit and can be ablated one-at-a-time under the v2 Hyperband sweep (300-ep budget). See training_diary.md."
     ],
     "chemistry_type_options": {
       "fastchem": "Pure chemical equilibrium via FastChem. Fast (seconds per run). Inputs: T-P profile + elemental abundances.",
@@ -142,12 +143,12 @@
     "dim_feedforward": 1024,
     "conditioning_hidden_dim": 256,
     "film_clamp": 100.0,
-    "output_head_divisor": 1,
+    "output_head_divisor": 2,
     "activation": "silu",
     "dropout_rate": 0.0,
-    "norm_type": "layernorm",
-    "use_qk_norm": true,
-    "ffn_type": "swiglu",
-    "zero_init_film": true
+    "norm_type": "rmsnorm",
+    "use_qk_norm": false,
+    "ffn_type": "dense",
+    "zero_init_film": false
   }
 }
