@@ -51,7 +51,7 @@ export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
 
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel
-  python -m pip install -U jax numpy h5py optuna optax pydantic
+  python -m pip install -U jax numpy scipy h5py optuna optax orbax-checkpoint pydantic
   python -m pip install -e . --no-deps
 fi
 

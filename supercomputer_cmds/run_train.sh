@@ -58,7 +58,7 @@ export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false --xla_gpu_au
 
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel
-  python -m pip install -U "jax[cuda12]" numpy h5py optuna optax pydantic
+  python -m pip install -U "jax[cuda12]" numpy scipy h5py optuna optax orbax-checkpoint pydantic
   python -m pip install -e . --no-deps
 fi
 
