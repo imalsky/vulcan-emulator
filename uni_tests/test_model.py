@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import pickle
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +17,7 @@ from src.models.jax_model import (
     init_transformer_params,
     initialize_model,
 )
-from src.training.trainer import train_model
+from src.training.trainer import _read_checkpoint, train_model
 
 
 def _prepare_batch(tiny_config: dict) -> tuple[dict[str, np.ndarray], dict, dict]:
@@ -44,6 +43,10 @@ def _fastchem_transformer_dims() -> TransformerDimensions:
         output_head_divisor=2,
         activation="gelu",
         dropout_rate=0.0,
+        norm_type="layernorm",
+        use_qk_norm=False,
+        ffn_type="dense",
+        zero_init_film=False,
     )
 
 
@@ -92,8 +95,7 @@ def test_training_checkpoint_smoke(tiny_config):
     assert artifacts.history_path.exists()
     assert artifacts.metrics_path.exists()
 
-    with artifacts.checkpoint_path.open("rb") as handle:
-        payload = pickle.load(handle)
+    payload = _read_checkpoint(artifacts.checkpoint_path)
     assert "params" in payload
     assert "model_dimensions" in payload
     assert "normalization" in payload
@@ -186,6 +188,10 @@ def test_transformer_dimensions_round_trip():
         output_head_divisor=2,
         activation="gelu",
         dropout_rate=0.1,
+        norm_type="layernorm",
+        use_qk_norm=False,
+        ffn_type="dense",
+        zero_init_film=False,
     )
     restored = TransformerDimensions.from_dict(dims.to_dict())
     assert restored == dims

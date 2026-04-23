@@ -7,6 +7,7 @@ out of the data-generation, preprocessing, and training modules.
 from __future__ import annotations
 
 import logging
+import logging.config
 import os
 import sys
 from pathlib import Path
@@ -26,102 +27,70 @@ _NOISY_LOGGER_NAMES = (
 )
 _LIVE_LOG_ENV = "VULCAN_LIVE_LOG_PATH"
 _PROJECT_ROOT_ENV = "VULCAN_PROJECT_ROOT"
+_LOGGING_CONFIGURED = False
 
 
-def _configure_standard_streams() -> None:
-    """Enable line-buffered stdout and stderr when the runtime supports it.
+def _resolve_live_log_path() -> Path | None:
+    """Return the resolved live-log path when the launcher requested one."""
+    live_log_path = os.environ.get(_LIVE_LOG_ENV, "").strip()
+    if not live_log_path:
+        return None
+    resolved_path = Path(live_log_path).expanduser().resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    return resolved_path
 
-    Parameters
-    ----------
-    None
-        Stream reconfiguration operates on the process-global standard streams.
 
-    Returns
-    -------
-    None
-        Standard streams are reconfigured in place to flush promptly during
-        long-running jobs and PBS log capture.
+def _configure_logging() -> None:
+    """One-shot project logging setup via :mod:`logging.config`.
+
+    Idempotent: subsequent calls return immediately. Flushes stdout/stderr
+    line-buffered, attaches an INFO-level stream handler on the root logger,
+    optionally attaches a file handler at ``$VULCAN_LIVE_LOG_PATH``, and
+    mutes noisy third-party device-discovery loggers.
     """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         if stream is not None and hasattr(stream, "reconfigure"):
             stream.reconfigure(line_buffering=True, write_through=True)
 
+    handlers: dict[str, dict[str, object]] = {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "stream": "ext://sys.stdout",
+            "level": "INFO",
+        },
+    }
+    root_handlers = ["console"]
+    live_path = _resolve_live_log_path()
+    if live_path is not None:
+        handlers["live_file"] = {
+            "class": "logging.FileHandler",
+            "formatter": "default",
+            "filename": str(live_path),
+            "mode": "a",
+            "encoding": "utf-8",
+            "level": "INFO",
+        }
+        root_handlers.append("live_file")
 
-def _configure_live_file_logging(root_logger: logging.Logger) -> None:
-    """Attach a live file handler when the launcher requests one.
-
-    Parameters
-    ----------
-    root_logger : logging.Logger
-        Root logger that may receive a shared file handler pointing at the
-        live log path.
-
-    Returns
-    -------
-    None
-        The logger is updated in place when live-file logging is requested.
-    """
-    live_log_path = os.environ.get(_LIVE_LOG_ENV, "").strip()
-    if not live_log_path:
-        return
-    resolved_path = Path(live_log_path).expanduser().resolve()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    for handler in root_logger.handlers:
-        if isinstance(handler, logging.FileHandler):
-            base_filename = getattr(handler, "baseFilename", "")
-            if base_filename and Path(base_filename).resolve() == resolved_path:
-                return
-    file_handler = logging.FileHandler(resolved_path, mode="a", encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-    root_logger.addHandler(file_handler)
-
-
-def _configure_console_logging() -> None:
-    """Configure shared console logging and suppress noisy third-party logs.
-
-    This function is idempotent across repeated logger requests and keeps the
-    project's INFO-level logs visible while muting backend discovery noise.
-
-    Parameters
-    ----------
-    None
-        Logging is configured through process-global logger state.
-
-    Returns
-    -------
-    None
-        Root logging handlers and third-party logger levels are normalized in
-        place.
-    """
-    _configure_standard_streams()
-    root_logger = logging.getLogger()
-    if not root_logger.handlers:
-        logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, stream=sys.stdout)
-    else:
-        root_logger.setLevel(logging.INFO)
-    _configure_live_file_logging(root_logger)
-    # Keep project INFO logs while muting third-party device diagnostics.
-    for logger_name in _NOISY_LOGGER_NAMES:
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    logging.config.dictConfig({
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {"default": {"format": _LOG_FORMAT}},
+        "handlers": handlers,
+        "loggers": {name: {"level": "WARNING"} for name in _NOISY_LOGGER_NAMES},
+        "root": {"level": "INFO", "handlers": root_handlers},
+    })
+    _LOGGING_CONFIGURED = True
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a logger after applying the project's shared logging setup.
-
-    Parameters
-    ----------
-    name : str
-        Logger name, typically ``__name__`` from the calling module.
-
-    Returns
-    -------
-    logging.Logger
-        Logger configured to share the project's console and optional live-file
-        handlers.
-    """
-    _configure_console_logging()
+    """Return a logger after applying the project's shared logging setup."""
+    _configure_logging()
     return logging.getLogger(name)
 
 
@@ -145,14 +114,16 @@ def ensure_dir(path: Path) -> Path:
 def resolve_project_root(start: Path | None = None) -> Path:
     """Walk upward from ``start`` until the repository root markers are found.
 
-    Looks for a supported set of co-located root indicators. The primary
-    marker set is ``pyproject.toml`` plus the top-level ``src`` directory;
-    ``spec.md`` is accepted as an additional legacy marker. When the runtime
-    exports ``VULCAN_PROJECT_ROOT``, that location is trusted first so batch
-    launchers can pin the working tree explicitly. When ``start`` points into
-    a detached source tree, the current working directory is used as a fallback
-    search origin. Raises ``FileNotFoundError`` if neither location contains a
-    supported marker set.
+    Looks for any supported pair of co-located root indicators
+    (``PROJECT_MARKERS``): either ``pyproject.toml`` + ``src/`` or
+    ``pyproject.toml`` + ``spec.md``. Both pairs are first-class; the
+    ``spec.md`` pair lets detached source trees without a top-level ``src``
+    directory still identify the project root. When the runtime exports
+    ``VULCAN_PROJECT_ROOT``, that location is trusted first so batch
+    launchers can pin the working tree explicitly. When ``start`` points
+    into a detached source tree, the current working directory is used as a
+    fallback search origin. Raises ``FileNotFoundError`` if neither location
+    contains a supported marker set.
 
     Parameters
     ----------

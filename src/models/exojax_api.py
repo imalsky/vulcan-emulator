@@ -83,6 +83,17 @@ def _validate_vulcan_bundle_global_order(bundle: ExportedJAXModel) -> None:
 def _maybe_require_column_constant(values: Any, *, name: str) -> None:
     """Reject eager inputs that violate the column-constant ExoJAX contract.
 
+    The current ExoJAX integration requires column-constant values for
+    ``gravity_cm_s2`` and ``planet_radius_cm`` (i.e. the same value at every
+    vertical level). This helper enforces that for eager ``np.ndarray`` /
+    Python-scalar inputs. Under ``jax.jit`` / ``jax.grad`` the values arrive
+    as :class:`jax.core.Tracer` instances, where we cannot peek at the
+    underlying array without breaking tracing — so the tracer path returns
+    silently and callers should treat it as an unchecked precondition. If a
+    traced call violates the contract at runtime, downstream ExoJAX code
+    will produce a gradient-sampling error rather than a contract error;
+    validate eagerly once with representative inputs before jitting.
+
     Parameters
     ----------
     values : Any

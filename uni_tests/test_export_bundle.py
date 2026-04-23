@@ -138,6 +138,11 @@ def _fastchem_transformer_dims() -> TransformerDimensions:
         film_clamp=1.5,
         output_head_divisor=2,
         activation="gelu",
+        dropout_rate=0.0,
+        norm_type="layernorm",
+        use_qk_norm=False,
+        ffn_type="dense",
+        zero_init_film=False,
     )
 
 
@@ -154,6 +159,11 @@ def _vulcan_transformer_dims() -> TransformerDimensions:
         film_clamp=1.5,
         output_head_divisor=2,
         activation="gelu",
+        dropout_rate=0.0,
+        norm_type="layernorm",
+        use_qk_norm=False,
+        ffn_type="dense",
+        zero_init_film=False,
     )
 
 
@@ -385,26 +395,24 @@ def test_exported_vulcan_transformer_bundle_predicts_from_physical_inputs(tmp_pa
 
     np.testing.assert_allclose(np.asarray(predicted_physical), expected_physical, rtol=1.0e-5, atol=1.0e-6)
     np.testing.assert_allclose(np.asarray(predicted_log10), expected_log10, rtol=1.0e-5, atol=1.0e-6)
-    assert bundle.export_format == "jax_physical_bundle"
-    assert bundle.export_version == 6
 
 
-def test_export_loader_rejects_legacy_task_based_bundle(tmp_path):
+def test_export_loader_rejects_bundle_missing_required_metadata(tmp_path):
     payload, _, dims = _make_fastchem_payload()
-    bundle_path = export_checkpoint_payload(payload, tmp_path / "legacy_export.npz")
+    bundle_path = export_checkpoint_payload(payload, tmp_path / "bundle.npz")
     with np.load(Path(bundle_path), allow_pickle=False) as arrays:
         rewritten = {
             name: arrays[name]
             for name in arrays.files
             if name not in {"meta/chemistry_type", "meta/model_type"}
         }
-        legacy_contract = dict(payload["data_contract"])
-        legacy_contract.pop("chemistry_type")
-        legacy_contract.pop("model_type")
-        rewritten["meta/data_contract"] = np.array(json.dumps(legacy_contract))
+        stripped_contract = dict(payload["data_contract"])
+        stripped_contract.pop("chemistry_type")
+        stripped_contract.pop("model_type")
+        rewritten["meta/data_contract"] = np.array(json.dumps(stripped_contract))
         rewritten["meta/config"] = np.array(json.dumps({"task": {"kind": "equilibrium_only"}}))
-    legacy_path = tmp_path / "legacy_export_missing_metadata.npz"
-    np.savez(legacy_path, **rewritten)
+    stripped_path = tmp_path / "bundle_missing_metadata.npz"
+    np.savez(stripped_path, **rewritten)
 
     with pytest.raises(KeyError):
-        load_exported_model(legacy_path)
+        load_exported_model(stripped_path)

@@ -22,9 +22,6 @@ Two top-level entry points handle the two chemistry types:
   (no spectrum).
 * ``preprocess_raw_dataset`` — for VULCAN chemistry
   (final-state + spectrum).
-
-``PROCESSED_DATA_VERSION`` is bumped whenever the on-disk tensor
-layout changes in a backwards-incompatible way.
 """
 
 from __future__ import annotations
@@ -37,7 +34,7 @@ from typing import Any, Callable
 import h5py
 import numpy as np
 
-from ..constants import ELEMENT_INPUT_ORDER, PROCESSED_DATA_VERSION
+from ..constants import ELEMENT_INPUT_ORDER, NORM_STD_FLOOR
 from ..utils.config import (
     get_chemistry_type,
     get_model_type,
@@ -131,10 +128,10 @@ def _require_column_constant(
     arr = np.asarray(values, dtype=np.float64)
     if arr.ndim == 1:
         reference = arr[0]
-        is_constant = np.allclose(arr, reference, rtol=1.0e-8, atol=0.0)
+        is_constant = np.allclose(arr, reference, rtol=NORM_STD_FLOOR, atol=0.0)
     elif arr.ndim == 2:
         reference = arr[0]
-        is_constant = np.allclose(arr, reference[None, :], rtol=1.0e-8, atol=0.0)
+        is_constant = np.allclose(arr, reference[None, :], rtol=NORM_STD_FLOOR, atol=0.0)
     else:
         raise ValueError(f"{run_label}: {name} must be 1-D or 2-D, got shape {arr.shape}.")
     if not is_constant:
@@ -230,7 +227,7 @@ def _fit_standard(arr: np.ndarray) -> dict[str, Any]:
     arr2 = np.reshape(arr, (-1, arr.shape[-1]))
     mean = np.mean(arr2, axis=0)
     std = np.std(arr2, axis=0)
-    std = np.where(std < 1.0e-8, 1.0, std)
+    std = np.where(std < NORM_STD_FLOOR, 1.0, std)
     return {"method": "standard", "mean": mean.tolist(), "std": std.tolist()}
 
 
@@ -274,7 +271,7 @@ def _fit_log_standard(arr: np.ndarray, *, floor: float) -> dict[str, Any]:
     log10_arr = np.log10(arr2)
     mean = np.mean(log10_arr, axis=0)
     std = np.std(log10_arr, axis=0)
-    std = np.where(std < 1.0e-8, 1.0, std)
+    std = np.where(std < NORM_STD_FLOOR, 1.0, std)
     return {
         "method": "log-standard",
         "mean": mean.tolist(),
@@ -309,7 +306,7 @@ def _fit_log_minmax(arr: np.ndarray, *, floor: float) -> dict[str, Any]:
     log10_min = np.min(log10_arr, axis=0)
     log10_max = np.max(log10_arr, axis=0)
     span = log10_max - log10_min
-    span = np.where(span < 1.0e-8, 1.0, span)
+    span = np.where(span < NORM_STD_FLOOR, 1.0, span)
     return {
         "method": "log-minmax",
         "log10_min": log10_min.tolist(),
@@ -462,10 +459,10 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
         elif method == "standard":
             mean = float(np.mean(column))
             raw_std = float(np.std(column))
-            # Clamp to 1.0 (not 1e-8) for near-constant features, matching
-            # _fit_standard.  Using 1e-8 would amplify float-precision noise
-            # into enormous normalized values at inference time.
-            std = raw_std if raw_std >= 1.0e-8 else 1.0
+            # Clamp to 1.0 (not the floor) for near-constant features, matching
+            # _fit_standard.  Using the floor directly would amplify float-
+            # precision noise into enormous normalized values at inference time.
+            std = raw_std if raw_std >= NORM_STD_FLOOR else 1.0
             means.append(mean)
             stds.append(std)
             floors.append(None)
@@ -475,7 +472,7 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
             log_column = np.log10(np.clip(column, floor, None))
             mean = float(np.mean(log_column))
             raw_std = float(np.std(log_column))
-            std = raw_std if raw_std >= 1.0e-8 else 1.0
+            std = raw_std if raw_std >= NORM_STD_FLOOR else 1.0
             means.append(mean)
             stds.append(std)
             floors.append(floor)
@@ -486,7 +483,7 @@ def _fit_mixed_block(arr: np.ndarray, methods: list[str]) -> dict[str, Any]:
             log_min = float(np.min(log_column))
             log_max = float(np.max(log_column))
             raw_span = log_max - log_min
-            span = raw_span if raw_span >= 1.0e-8 else 1.0
+            span = raw_span if raw_span >= NORM_STD_FLOOR else 1.0
             means.append(log_min)
             stds.append(span)
             floors.append(floor)
@@ -570,40 +567,32 @@ def inverse_mixed_block(x: np.ndarray, block: dict[str, Any]) -> np.ndarray:
 
 
 def load_raw_run(
-    source: str | Path | h5py.Group,
+    source: h5py.Group,
     *,
     config: dict[str, Any],
-    run_id: str | None = None,
+    run_id: str,
 ) -> RawRun:
-    """Load one raw HDF5 full-VULCAN run and align it to the configured species contract."""
+    """Load one raw HDF5 full-VULCAN run and align it to the configured species contract.
+
+    ``source`` must be an already-opened group from the consolidated
+    ``runs.h5`` (the only format produced by the current data generator).
+    """
     requested_output_species = list(config["data_spec"]["output_species"])
 
-    def _extract(handle: h5py.Group) -> dict[str, Any]:
-        """Read the raw HDF5 datasets needed to build one aligned run record."""
-        return {
-            "pressure_bar": np.asarray(handle["inputs/pressure_bar"], dtype=np.float64),
-            "temperature_k": np.asarray(handle["inputs/temperature_k"], dtype=np.float64),
-            "kzz_cm2_s": np.asarray(handle["inputs/kzz_cm2_s"], dtype=np.float64),
-            "element_input_order": _decode_species(np.asarray(handle["inputs/element_input_order"])),
-            "elemental_abundances_frac": np.asarray(handle["inputs/elemental_abundances_frac"], dtype=np.float64),
-            "gravity_cm_s2": np.asarray(handle["inputs/gravity_cm_s2"], dtype=np.float64),
-            "stored_output_species": _decode_species(np.asarray(handle["inputs/output_species"])),
-            "final_ymix_output": np.asarray(handle["final_state/ymix_output"], dtype=np.float64),
-            "globals_map": {
-                key: float(np.asarray(handle[f"globals/{key}"]))
-                for key in handle["globals"].keys()
-            },
-        }
-
-    if isinstance(source, h5py.Group):
-        d = _extract(source)
-        label = run_id or "unknown"
-    else:
-        with h5py.File(source, "r") as handle:
-            d = _extract(handle)
-        label = Path(source).stem
-        if run_id is None:
-            run_id = label
+    d = {
+        "pressure_bar": np.asarray(source["inputs/pressure_bar"], dtype=np.float64),
+        "temperature_k": np.asarray(source["inputs/temperature_k"], dtype=np.float64),
+        "kzz_cm2_s": np.asarray(source["inputs/kzz_cm2_s"], dtype=np.float64),
+        "element_input_order": _decode_species(np.asarray(source["inputs/element_input_order"])),
+        "elemental_abundances_frac": np.asarray(source["inputs/elemental_abundances_frac"], dtype=np.float64),
+        "gravity_cm_s2": np.asarray(source["inputs/gravity_cm_s2"], dtype=np.float64),
+        "stored_output_species": _decode_species(np.asarray(source["inputs/output_species"])),
+        "final_ymix_output": np.asarray(source["final_state/ymix_output"], dtype=np.float64),
+        "globals_map": {
+            key: float(np.asarray(source[f"globals/{key}"]))
+            for key in source["globals"].keys()
+        },
+    }
 
     pressure_bar = d["pressure_bar"]
     temperature_k = d["temperature_k"]
@@ -611,21 +600,23 @@ def load_raw_run(
     final_ymix_output = d["final_ymix_output"]
 
     if not np.all(np.isfinite(pressure_bar)):
-        raise ValueError(f"{label}: non-finite pressure values detected.")
+        raise ValueError(f"{run_id}: non-finite pressure values detected.")
     if not np.all(np.isfinite(temperature_k)):
-        raise ValueError(f"{label}: non-finite temperature values detected.")
+        raise ValueError(f"{run_id}: non-finite temperature values detected.")
     if not np.all(np.isfinite(kzz_cm2_s)):
-        raise ValueError(f"{label}: non-finite Kzz values detected.")
+        raise ValueError(f"{run_id}: non-finite Kzz values detected.")
+    if not np.all(np.isfinite(final_ymix_output)):
+        raise ValueError(f"{run_id}: non-finite final-state abundance values detected.")
     if not np.all(np.isfinite(d["elemental_abundances_frac"])):
-        raise ValueError(f"{label}: non-finite elemental abundance values detected.")
+        raise ValueError(f"{run_id}: non-finite elemental abundance values detected.")
     if not np.all(np.isfinite(d["gravity_cm_s2"])):
-        raise ValueError(f"{label}: non-finite gravity values detected.")
+        raise ValueError(f"{run_id}: non-finite gravity values detected.")
     if final_ymix_output.shape[0] != pressure_bar.size:
-        raise ValueError(f"{label}: final_ymix_output vertical dimension does not match pressure grid.")
+        raise ValueError(f"{run_id}: final_ymix_output vertical dimension does not match pressure grid.")
     if d["elemental_abundances_frac"].shape[0] != pressure_bar.size:
-        raise ValueError(f"{label}: elemental abundance profile does not match pressure grid.")
+        raise ValueError(f"{run_id}: elemental abundance profile does not match pressure grid.")
     if d["gravity_cm_s2"].shape != pressure_bar.shape:
-        raise ValueError(f"{label}: gravity profile does not match pressure grid.")
+        raise ValueError(f"{run_id}: gravity profile does not match pressure grid.")
 
     output_indices = [d["stored_output_species"].index(name) for name in requested_output_species]
     element_order = list(config["data_spec"]["element_input_order"])
@@ -634,7 +625,7 @@ def load_raw_run(
     gravity_profile = np.asarray(d["gravity_cm_s2"], dtype=np.float64)
     element_globals = _elemental_conditioning_globals(
         elemental_profile=elemental_profile,
-        run_label=label,
+        run_label=run_id,
     )
     reduced_globals = dict(d["globals_map"])
     reduced_globals.update(element_globals)
@@ -643,7 +634,7 @@ def load_raw_run(
     final_ymix_output = final_ymix_output[:, output_indices]
 
     return RawRun(
-        run_id=run_id or label,
+        run_id=run_id,
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         kzz_cm2_s=kzz_cm2_s,
@@ -814,23 +805,22 @@ def _apply_sequence_static_normalization(x: np.ndarray, payload: dict[str, Any])
 
 
 def load_raw_equilibrium_run(
-    source: str | Path | h5py.Group,
+    source: h5py.Group,
     *,
     config: dict[str, Any],
-    run_id: str | None = None,
+    run_id: str,
 ) -> RawEquilibriumRun:
     """Load one raw equilibrium HDF5 run.
 
     Parameters
     ----------
-    source : str, Path, or h5py.Group
-        Raw equilibrium source expressed as a legacy per-file path or an
-        already opened group from ``runs.h5``.
+    source : h5py.Group
+        Already opened group from the consolidated ``runs.h5`` dataset.
     config : dict[str, Any]
         Validated config defining the requested output-species and
         conditioning-input contract.
-    run_id : str or None, optional
-        Explicit run ID required when ``source`` is an ``h5py.Group``.
+    run_id : str
+        Run identifier used in error messages and the returned record.
 
     Returns
     -------
@@ -840,75 +830,49 @@ def load_raw_equilibrium_run(
     """
     requested_output_species = list(config["data_spec"]["output_species"])
 
-    def _extract(handle: h5py.Group) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, dict[str, float]]:
-        """Extract one raw FastChem-equilibrium run from an open HDF5 group.
-
-        Parameters
-        ----------
-        handle : h5py.Group
-            Group containing the equilibrium raw-run contract.
-
-        Returns
-        -------
-        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, dict[str, float]]
-            Pressure profile, temperature profile, reordered elemental
-            abundance profile, gravity profile, stored output-species labels,
-            equilibrium mixing-ratio array, and raw globals mapping.
-        """
-        pressure_bar = np.asarray(handle["inputs/pressure_bar"], dtype=np.float64)
-        temperature_k = np.asarray(handle["inputs/temperature_k"], dtype=np.float64)
-        element_input_order = _decode_species(np.asarray(handle["inputs/element_input_order"]))
-        elemental_abundances_frac = np.asarray(handle["inputs/elemental_abundances_frac"], dtype=np.float64)
-        gravity_cm_s2 = np.asarray(handle["inputs/gravity_cm_s2"], dtype=np.float64)
-        stored_output_species = _decode_species(np.asarray(handle["inputs/output_species"]))
-        equilibrium_ymix = np.asarray(handle["equilibrium/ymix"], dtype=np.float64)
-        globals_map = {
-            key: float(np.asarray(handle[f"globals/{key}"]))
-            for key in handle["globals"].keys()
-        }
-        element_order = list(config["data_spec"]["element_input_order"])
-        element_indices = [element_input_order.index(name) for name in element_order]
-        elemental_profile = elemental_abundances_frac[:, element_indices]
-        return pressure_bar, temperature_k, elemental_profile, gravity_cm_s2, stored_output_species, equilibrium_ymix, globals_map
-
-    if isinstance(source, h5py.Group):
-        pressure_bar, temperature_k, elemental_profile, gravity_profile, stored_output_species, equilibrium_ymix, globals_map = _extract(source)
-        label = run_id or "unknown"
-    else:
-        with h5py.File(source, "r") as handle:
-            pressure_bar, temperature_k, elemental_profile, gravity_profile, stored_output_species, equilibrium_ymix, globals_map = _extract(handle)
-        label = Path(source).stem
-        if run_id is None:
-            run_id = label
+    pressure_bar = np.asarray(source["inputs/pressure_bar"], dtype=np.float64)
+    temperature_k = np.asarray(source["inputs/temperature_k"], dtype=np.float64)
+    element_input_order = _decode_species(np.asarray(source["inputs/element_input_order"]))
+    elemental_abundances_frac = np.asarray(source["inputs/elemental_abundances_frac"], dtype=np.float64)
+    gravity_profile = np.asarray(source["inputs/gravity_cm_s2"], dtype=np.float64)
+    stored_output_species = _decode_species(np.asarray(source["inputs/output_species"]))
+    equilibrium_ymix = np.asarray(source["equilibrium/ymix"], dtype=np.float64)
+    globals_map = {
+        key: float(np.asarray(source[f"globals/{key}"]))
+        for key in source["globals"].keys()
+    }
+    element_order = list(config["data_spec"]["element_input_order"])
+    element_indices = [element_input_order.index(name) for name in element_order]
+    elemental_profile = elemental_abundances_frac[:, element_indices]
 
     if not np.all(np.isfinite(pressure_bar)):
-        raise ValueError(f"{label}: non-finite pressure values detected.")
+        raise ValueError(f"{run_id}: non-finite pressure values detected.")
     if not np.all(np.isfinite(temperature_k)):
-        raise ValueError(f"{label}: non-finite temperature values detected.")
+        raise ValueError(f"{run_id}: non-finite temperature values detected.")
     if not np.all(np.isfinite(elemental_profile)):
-        raise ValueError(f"{label}: non-finite elemental abundance values detected.")
+        raise ValueError(f"{run_id}: non-finite elemental abundance values detected.")
     if not np.all(np.isfinite(gravity_profile)):
-        raise ValueError(f"{label}: non-finite gravity values detected.")
+        raise ValueError(f"{run_id}: non-finite gravity values detected.")
     if elemental_profile.shape[0] != pressure_bar.size:
-        raise ValueError(f"{label}: elemental abundance profile does not match pressure grid.")
+        raise ValueError(f"{run_id}: elemental abundance profile does not match pressure grid.")
     if gravity_profile.shape != pressure_bar.shape:
-        raise ValueError(f"{label}: gravity profile does not match pressure grid.")
-    _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=label)
+        raise ValueError(f"{run_id}: gravity profile does not match pressure grid.")
+    _require_column_constant(gravity_profile, name="gravity_cm_s2", run_label=run_id)
     globals_map = dict(globals_map)
     globals_map.update(
         _elemental_conditioning_globals(
             elemental_profile=elemental_profile,
-            run_label=label,
+            run_label=run_id,
         )
     )
     globals_map = _require_elemental_conditioning_globals(
         globals_map=globals_map,
-        run_label=label,
+        run_label=run_id,
     )
     output_indices = [stored_output_species.index(name) for name in requested_output_species]
     equilibrium_ymix = equilibrium_ymix[:, output_indices]
     return RawEquilibriumRun(
-        run_id=run_id or label,
+        run_id=run_id,
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         equilibrium_ymix=equilibrium_ymix,
@@ -1005,9 +969,8 @@ def _discover_raw_runs(raw_root: Path) -> tuple[Path | None, list[str]]:
     Returns
     -------
     tuple[Path | None, list[str]]
-        Consolidated file path plus sorted run IDs when ``runs.h5`` exists, or
-        ``(None, [])`` when callers should fall back to the legacy per-file
-        layout.
+        Consolidated file path plus sorted run IDs when ``runs.h5`` exists,
+        otherwise ``(None, [])``.
     """
     consolidated = raw_root / "runs.h5"
     if consolidated.exists():
@@ -1059,26 +1022,21 @@ def _load_raw_runs(
     config: dict[str, Any],
     load_run_fn: Callable[..., Any],
 ) -> tuple[list[Any], list[Path]]:
-    """Load raw runs from either a consolidated HDF5 file or per-run files."""
+    """Load raw runs from the consolidated ``runs.h5`` file."""
     consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
-    if consolidated_path is not None:
-        LOGGER.info(
-            "Reading %d runs from consolidated %s", len(consolidated_ids), consolidated_path,
-        )
-        with h5py.File(consolidated_path, "r") as f:
-            raw_runs = [
-                load_run_fn(f[rid], config=config, run_id=rid) for rid in consolidated_ids
-            ]
-        return raw_runs, [consolidated_path]
-
-    raw_run_files = sorted((raw_root / "runs").glob("run_*.h5"))
-    if not raw_run_files:
+    if consolidated_path is None:
         raise FileNotFoundError(
-            f"No raw run files found under {raw_root / 'runs'} and no runs.h5 found."
+            f"No consolidated runs.h5 found under {raw_root}. Run data generation "
+            "first; preprocessing requires the merged raw dataset."
         )
-    LOGGER.info("Found %d raw run files in %s", len(raw_run_files), raw_root / "runs")
-    raw_runs = [load_run_fn(path, config=config) for path in raw_run_files]
-    return raw_runs, list(raw_run_files)
+    LOGGER.info(
+        "Reading %d runs from consolidated %s", len(consolidated_ids), consolidated_path,
+    )
+    with h5py.File(consolidated_path, "r") as f:
+        raw_runs = [
+            load_run_fn(f[rid], config=config, run_id=rid) for rid in consolidated_ids
+        ]
+    return raw_runs, [consolidated_path]
 
 
 def preprocess_equilibrium_dataset(
@@ -1191,7 +1149,6 @@ def preprocess_equilibrium_dataset(
             run_ids.append(run.run_id)
 
         metadata = {
-            "processed_data_version": PROCESSED_DATA_VERSION,
             "chemistry_type": chemistry_type,
             "model_type": model_type,
             "split": split_name,
@@ -1216,7 +1173,6 @@ def preprocess_equilibrium_dataset(
         )
 
     data_contract = {
-        "processed_data_version": PROCESSED_DATA_VERSION,
         "chemistry_type": chemistry_type,
         "model_type": model_type,
         "state_species_order": list(config["data_spec"]["state_species"]),
@@ -1351,7 +1307,6 @@ def preprocess_raw_dataset(
             run_ids.append(run.run_id)
 
         metadata = {
-            "processed_data_version": PROCESSED_DATA_VERSION,
             "chemistry_type": chemistry_type,
             "model_type": model_type,
             "split": split_name,
@@ -1373,7 +1328,6 @@ def preprocess_raw_dataset(
         (split_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
     data_contract = {
-        "processed_data_version": PROCESSED_DATA_VERSION,
         "chemistry_type": chemistry_type,
         "model_type": model_type,
         "output_species_order": list(config["data_spec"]["output_species"]),

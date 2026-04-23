@@ -12,9 +12,9 @@
 #
 # Executes the consolidated extras notebook on a GPU node.
 #
-# Usage:
-#   qsub extras/run_extras.pbs
-#   qsub -v MODEL=fastchem_no_condensation extras/run_extras.pbs
+# Usage (submit from anywhere; the script self-locates the project root):
+#   qsub supercomputer_cmds/run_extras.pbs
+#   qsub -v MODEL=fastchem_no_condensation supercomputer_cmds/run_extras.pbs
 # =============================================================================
 
 set -euo pipefail

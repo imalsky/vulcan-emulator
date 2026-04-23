@@ -9,18 +9,33 @@ scheduling keeps linear warmup for all runs, defaults to reduce-on-plateau
 after warmup, and retains the pre-existing cosine-annealing path when
 explicitly requested in the config.
 
-The combined loss is ``lambda_z * MSE_norm + lambda_log10_mae * MAE_log10``.
-``MAE_log10`` is mean absolute error in physical log10 space (equivalently,
-``|log10(pred_VMR / target_VMR)|``), which optimizes the typical fractional
-error instead of being dominated by outliers as squared error would be.
+When ``training.ema.enabled`` is true, an exponential-moving-average
+shadow of the parameters is maintained and used for all validation, test,
+and exported weights; the raw optimizer state is kept only for training
+continuation.
+
+The physical-space loss term is selected by ``training.loss.type``:
+
+* ``"mae"``  — combined loss is
+  ``lambda_z * MSE_norm + lambda_log10_mae * MAE_log10``.
+  ``MAE_log10`` is mean absolute error of the log-ratio residual
+  ``r = log10(pred_VMR / target_VMR)``. Constant gradient at all scales;
+  optimizes median log-fractional error.
+* ``"huber"`` — combined loss is
+  ``lambda_z * MSE_norm + lambda_log10_huber * Huber_log10``.
+  ``Huber_log10`` is the Huber loss on the same residual, with transition
+  point ``huber_delta_log10`` (dex). Quadratic in ``|r| <= delta``
+  (smooth gradient on already-accurate predictions), linear beyond
+  (outlier-robust).
+
+In either case, the physical-space term is reported in metrics under the
+unified key ``log10_loss``.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
-import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +44,8 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+import orbax.checkpoint as ocp
 
 from ..data_generation.data_loader import (
     iter_batches,
@@ -36,7 +53,7 @@ from ..data_generation.data_loader import (
     processed_info_dir,
 )
 from ..data_generation.generation import generate_raw_dataset
-from ..data_generation.preprocess import PROCESSED_DATA_VERSION, preprocess_raw_dataset
+from ..data_generation.preprocess import preprocess_raw_dataset
 from ..models.jax_model import (
     TransformerDimensions,
     apply_transformer_model,
@@ -58,124 +75,22 @@ class TrainingArtifacts:
     metrics_path: Path
 
 
-@dataclass(frozen=True)
-class ReduceOnPlateauState:
-    """Track post-warmup reduce-on-plateau learning-rate state."""
+def _build_optimizer(
+    *, gradient_clip: float, weight_decay: float
+) -> optax.GradientTransformation:
+    """Construct the AdamW optimizer with global-norm gradient clipping.
 
-    current_lr: float
-    best_metric: float | None
-    bad_epochs: int
-
-
-def _tree_global_norm(tree: Any) -> jax.Array:
-    """Compute the global L2 norm of a nested JAX parameter or gradient tree.
-
-    Parameters
-    ----------
-    tree : Any
-        Nested JAX pytree whose leaves are numeric arrays.
-
-    Returns
-    -------
-    jax.Array
-        Scalar ``float32`` array containing the global L2 norm across all
-        leaves.
+    The returned transformation produces updates in the *gradient* sign;
+    ``train_step`` scales them by ``-learning_rate`` before
+    ``optax.apply_updates``. Splitting the LR scaling out this way lets the
+    epoch-level scheduler (warmup + reduce-on-plateau, or cosine) control the
+    per-step LR without rebuilding the optimizer.
     """
-    leaves = jax.tree_util.tree_leaves(tree)
-    if not leaves:
-        return jnp.asarray(0.0, dtype=jnp.float32)
-    return jnp.sqrt(sum(jnp.sum(jnp.square(leaf)) for leaf in leaves))
-
-
-def _clip_tree(tree: Any, max_norm: float) -> Any:
-    """Clip all leaves in a tree so the global L2 norm does not exceed *max_norm*.
-
-    Parameters
-    ----------
-    tree : Any
-        Nested JAX pytree whose leaves are numeric arrays.
-    max_norm : float
-        Maximum allowed global L2 norm.
-
-    Returns
-    -------
-    Any
-        Tree with the same structure as ``tree`` after global-norm clipping.
-    """
-    norm = _tree_global_norm(tree)
-    scale = jnp.minimum(1.0, float(max_norm) / jnp.maximum(norm, 1.0e-12))
-    return jax.tree_util.tree_map(lambda x: x * scale, tree)
-
-
-def _init_adamw_state(params: Any) -> dict[str, Any]:
-    """Initialize AdamW optimizer state: zero first-moment (m), second-moment (v), and step counter.
-
-    Parameters
-    ----------
-    params : Any
-        Parameter pytree whose structure defines the optimizer moment trees.
-
-    Returns
-    -------
-    dict[str, Any]
-        Optimizer state dictionary containing zero-valued ``m`` and ``v``
-        trees plus the scalar step counter ``t``.
-    """
-    zeros = jax.tree_util.tree_map(jnp.zeros_like, params)
-    return {"m": zeros, "v": zeros, "t": jnp.asarray(0, dtype=jnp.int32)}
-
-
-def _adamw_update(
-    params: Any,
-    grads: Any,
-    state: dict[str, Any],
-    *,
-    learning_rate: jax.Array,
-    weight_decay: float,
-    beta1: float = 0.9,
-    beta2: float = 0.999,
-    eps: float = 1.0e-8,
-) -> tuple[Any, dict[str, Any]]:
-    """Apply one AdamW parameter update step (Loshchilov & Hutter, 2019).
-
-    AdamW decouples weight decay from the adaptive gradient step:
-        p_new = p - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * p)
-
-    Parameters
-    ----------
-    params : Any
-        Current parameter tree.
-    grads : Any
-        Gradient tree (same structure as *params*).
-    state : dict
-        Optimizer state with keys ``"m"``, ``"v"``, ``"t"``.
-    learning_rate : jax.Array
-        Current learning rate (scalar).
-    weight_decay : float
-        L2 weight decay coefficient.
-
-    Returns
-    -------
-    tuple[Any, dict]
-        ``(new_params, new_state)``.
-    """
-    t = state["t"] + 1
-    # Update biased first-moment (mean) and second-moment (variance) estimates.
-    m = jax.tree_util.tree_map(lambda m_, g_: beta1 * m_ + (1.0 - beta1) * g_, state["m"], grads)
-    v = jax.tree_util.tree_map(lambda v_, g_: beta2 * v_ + (1.0 - beta2) * (g_ * g_), state["v"], grads)
-    # Bias correction for the exponential moving averages.
-    bias1 = 1.0 - jnp.power(jnp.asarray(beta1, dtype=jnp.float32), t.astype(jnp.float32))
-    bias2 = 1.0 - jnp.power(jnp.asarray(beta2, dtype=jnp.float32), t.astype(jnp.float32))
-    m_hat = jax.tree_util.tree_map(lambda x: x / bias1, m)
-    v_hat = jax.tree_util.tree_map(lambda x: x / bias2, v)
-    # AdamW: decoupled weight decay applied directly to params (Loshchilov & Hutter, 2019).
-    new_params = jax.tree_util.tree_map(
-        lambda p, m_h, v_h: p - learning_rate * (m_h / (jnp.sqrt(v_h) + eps) + weight_decay * p),
-        params,
-        m_hat,
-        v_hat,
+    return optax.chain(
+        optax.clip_by_global_norm(gradient_clip),
+        optax.scale_by_adam(),
+        optax.add_decayed_weights(weight_decay),
     )
-    return new_params, {"m": m, "v": v, "t": t}
 
 
 @jax.jit
@@ -228,26 +143,9 @@ def _cosine_learning_rate_schedule(
     """Compute the warmup-plus-cosine-annealing learning rate for one step.
 
     During warmup (step < warmup_steps), the learning rate increases linearly
-    from 0 to base_lr.  After warmup, it decays following a cosine curve
-    from base_lr to min_lr over the remaining steps.
-
-    Parameters
-    ----------
-    step : int
-        Current global training step.
-    total_steps : int
-        Total number of training steps across all epochs.
-    base_lr : float
-        Peak learning rate (reached at end of warmup).
-    min_lr : float
-        Minimum learning rate (reached at end of training).
-    warmup_steps : int
-        Number of linear warmup steps.
-
-    Returns
-    -------
-    float
-        Learning rate for the current step.
+    from 0 to base_lr.  After warmup, decay follows
+    :func:`optax.cosine_decay_schedule` from ``base_lr`` down to ``min_lr``
+    over the remaining steps.
     """
     warmup_lr = _warmup_learning_rate(
         step=step,
@@ -256,88 +154,12 @@ def _cosine_learning_rate_schedule(
     )
     if warmup_lr is not None:
         return warmup_lr
-    if total_steps <= warmup_steps:
-        return base_lr
-    # Cosine annealing from base_lr down to min_lr over the remaining steps.
-    progress = float(step - warmup_steps) / float(max(total_steps - warmup_steps, 1))
-    progress = min(max(progress, 0.0), 1.0)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return min_lr + (base_lr - min_lr) * cosine
-
-
-def _init_reduce_on_plateau_state(base_lr: float) -> ReduceOnPlateauState:
-    """Create the initial scheduler state for reduce-on-plateau learning-rate decay.
-
-    Parameters
-    ----------
-    base_lr : float
-        Starting learning rate before any plateau-triggered reductions.
-
-    Returns
-    -------
-    ReduceOnPlateauState
-        Scheduler state with the current learning rate set to ``base_lr`` and
-        no recorded best validation metric yet.
-    """
-    return ReduceOnPlateauState(
-        current_lr=base_lr,
-        best_metric=None,
-        bad_epochs=0,
+    decay_steps = max(total_steps - warmup_steps, 1)
+    alpha = (min_lr / base_lr) if base_lr > 0.0 else 0.0
+    schedule = optax.cosine_decay_schedule(
+        init_value=base_lr, decay_steps=decay_steps, alpha=alpha,
     )
-
-
-def _update_reduce_on_plateau(
-    state: ReduceOnPlateauState,
-    metric: float,
-    *,
-    factor: float,
-    patience: int,
-    threshold: float,
-    min_lr: float,
-) -> ReduceOnPlateauState:
-    """Apply one epoch-end reduce-on-plateau scheduler update.
-
-    Parameters
-    ----------
-    state : ReduceOnPlateauState
-        Current scheduler state.
-    metric : float
-        Validation metric to monitor, where lower is better.
-    factor : float
-        Multiplicative learning-rate decay factor.
-    patience : int
-        Number of non-improving epochs to tolerate before decaying.
-    threshold : float
-        Minimum absolute improvement required to reset the bad-epoch counter.
-    min_lr : float
-        Lower bound on the scheduled learning rate.
-
-    Returns
-    -------
-    ReduceOnPlateauState
-        Updated scheduler state after considering the current validation
-        metric.
-    """
-    if state.best_metric is None or metric < (state.best_metric - threshold):
-        return ReduceOnPlateauState(
-            current_lr=state.current_lr,
-            best_metric=metric,
-            bad_epochs=0,
-        )
-
-    bad_epochs = state.bad_epochs + 1
-    if bad_epochs <= patience or state.current_lr <= min_lr:
-        return ReduceOnPlateauState(
-            current_lr=state.current_lr,
-            best_metric=state.best_metric,
-            bad_epochs=bad_epochs,
-        )
-
-    return ReduceOnPlateauState(
-        current_lr=max(min_lr, state.current_lr * factor),
-        best_metric=state.best_metric,
-        bad_epochs=0,
-    )
+    return float(schedule(step - warmup_steps))
 
 
 def _scheduled_learning_rate(
@@ -348,31 +170,15 @@ def _scheduled_learning_rate(
     min_lr: float,
     warmup_steps: int,
     scheduler: dict[str, Any],
-    plateau_state: ReduceOnPlateauState | None,
 ) -> float:
     """Compute the active learning rate for the current training step.
 
-    Parameters
-    ----------
-    step : int
-        Current global optimizer step.
-    total_steps : int
-        Total planned optimizer steps across the full run.
-    base_lr : float
-        Peak learning rate.
-    min_lr : float
-        Minimum learning rate used by cosine / plateau decay.
-    warmup_steps : int
-        Number of linear warmup steps.
-    scheduler : dict[str, Any]
-        Validated scheduler config.
-    plateau_state : ReduceOnPlateauState or None
-        Current reduce-on-plateau state when that scheduler is active.
-
-    Returns
-    -------
-    float
-        Learning rate to apply at this step.
+    Returns the linear-warmup value while ``step < warmup_steps``. After
+    warmup, dispatches on ``scheduler["name"]``: ``"cosine"`` returns the
+    warmup+cosine-annealed value; ``"reduce_on_plateau"`` returns the
+    constant peak LR — the plateau-driven scale factor is maintained
+    separately via :func:`optax.contrib.reduce_on_plateau` and multiplied
+    into the update inside ``train_step``.
     """
     warmup_lr = _warmup_learning_rate(
         step=step,
@@ -391,53 +197,37 @@ def _scheduled_learning_rate(
             warmup_steps=warmup_steps,
         )
     if scheduler["name"] == "reduce_on_plateau":
-        return base_lr if plateau_state is None else plateau_state.current_lr
+        return base_lr
     raise ValueError(f"Unsupported scheduler: {scheduler['name']!r}")
 
 
-def _maybe_update_plateau_scheduler(
-    *,
+def _build_plateau_transform(
     scheduler: dict[str, Any],
-    plateau_state: ReduceOnPlateauState | None,
-    metric: float,
-    global_step: int,
-    warmup_steps: int,
+    *,
+    base_lr: float,
     min_lr: float,
-) -> ReduceOnPlateauState | None:
-    """Update reduce-on-plateau state after validation when applicable.
+) -> optax.GradientTransformationExtraArgs:
+    """Build the :func:`optax.contrib.reduce_on_plateau` state machine.
 
-    Parameters
-    ----------
-    scheduler : dict[str, Any]
-        Validated scheduler config.
-    plateau_state : ReduceOnPlateauState or None
-        Current plateau scheduler state.
-    metric : float
-        Validation metric used for plateau detection.
-    global_step : int
-        Global optimizer step reached at the end of the epoch.
-    warmup_steps : int
-        Number of warmup steps that must finish before plateau updates start.
-    min_lr : float
-        Lower learning-rate bound.
+    Patience is interpreted in *epochs* (matching the public config
+    contract); the transform is called once per validation epoch, so
+    optax's per-``update`` counter coincides with epochs. ``atol`` is the
+    absolute improvement floor (``rtol`` is disabled), and ``min_scale``
+    lower-bounds the scale at ``min_lr / base_lr``.
 
-    Returns
-    -------
-    ReduceOnPlateauState or None
-        Updated plateau state, or the original state when the scheduler does
-        not require an update.
+    The ``+ 1`` on ``patience`` preserves the legacy semantics where
+    ``bad_epochs > patience`` triggered a reduction (first reduction
+    after ``patience + 1`` non-improving epochs); optax triggers at
+    ``plateau_count >= patience`` — one epoch earlier — so the offset
+    restores bit-for-bit compatibility.
     """
-    if scheduler["name"] != "reduce_on_plateau" or plateau_state is None:
-        return plateau_state
-    if global_step < warmup_steps:
-        return plateau_state
-    return _update_reduce_on_plateau(
-        plateau_state,
-        metric,
+    min_scale = (min_lr / base_lr) if base_lr > 0.0 else 0.0
+    return optax.contrib.reduce_on_plateau(
         factor=float(scheduler["factor"]),
-        patience=int(scheduler["patience"]),
-        threshold=float(scheduler["threshold"]),
-        min_lr=min_lr,
+        patience=int(scheduler["patience"]) + 1,
+        atol=float(scheduler["threshold"]),
+        rtol=0.0,
+        min_scale=float(min_scale),
     )
 
 
@@ -461,6 +251,42 @@ def _state_stats(normalization: dict[str, Any]) -> tuple[jax.Array, jax.Array]:
     return mean, std
 
 
+def _huber_log10_loss(
+    pred_log10: jax.Array,
+    target_log10: jax.Array,
+    mask: jax.Array,
+    mask_sum: jax.Array,
+    *,
+    delta: float,
+) -> jax.Array:
+    """Mask-weighted Huber loss in log10 mixing-ratio space.
+
+    The residual is ``r = pred_log10 - target_log10 = log10(pred_VMR /
+    target_VMR)``. Uses the scaled form with continuous first derivative
+    at the transition point:
+
+        L(r) = 0.5 * r^2 / delta   if |r| <= delta
+               |r| - 0.5 * delta   otherwise
+
+    This is ``optax.huber_loss / delta``: the unscaled Huber returns
+    ``0.5 r^2`` in the quadratic regime and ``delta * |r| - 0.5 delta^2``
+    outside it, so dividing by ``delta`` recovers the scaled form whose
+    tail matches ``|r|`` (comparable to log10-MAE within ``delta/2``).
+    """
+    elem = optax.huber_loss(pred_log10, target_log10, delta=delta) / delta
+    return jnp.sum(elem * mask) / mask_sum
+
+
+def _mae_log10_loss(
+    pred_log10: jax.Array,
+    target_log10: jax.Array,
+    mask: jax.Array,
+    mask_sum: jax.Array,
+) -> jax.Array:
+    """Mask-weighted MAE of the log-ratio residual ``log10(pred_VMR/target_VMR)``."""
+    return jnp.sum(jnp.abs(pred_log10 - target_log10) * mask) / mask_sum
+
+
 def make_transformer_train_eval_functions(
     *,
     dims: TransformerDimensions,
@@ -469,10 +295,11 @@ def make_transformer_train_eval_functions(
     gradient_clip: float,
     weight_decay: float,
 ) -> tuple[
-    Callable[[Any, dict[str, Any], dict[str, jax.Array], jax.Array, jax.Array], tuple[Any, dict[str, Any], dict[str, jax.Array]]],
+    optax.GradientTransformation,
+    Callable[[Any, Any, dict[str, jax.Array], jax.Array, jax.Array], tuple[Any, Any, dict[str, jax.Array]]],
     Callable[[Any, dict[str, jax.Array]], dict[str, jax.Array]],
 ]:
-    """Build JIT-compiled train/eval functions for the Transformer model.
+    """Build the optax optimizer plus JIT-compiled train/eval steps.
 
     Parameters
     ----------
@@ -481,7 +308,10 @@ def make_transformer_train_eval_functions(
     normalization : dict[str, Any]
         Normalization payload used to recover target-space log10 statistics.
     loss_cfg : dict[str, float]
-        Loss weights for normalized-space and physical-space losses.
+        Loss weights plus selector ``type`` (``"mae"`` or ``"huber"``).
+        MAE requires ``lambda_z`` and ``lambda_log10_mae``; Huber requires
+        ``lambda_z``, ``lambda_log10_huber``, and ``huber_delta_log10``
+        (transition point in dex).
     gradient_clip : float
         Global L2 gradient-clip threshold.
     weight_decay : float
@@ -489,40 +319,45 @@ def make_transformer_train_eval_functions(
 
     Returns
     -------
-    tuple[callable, callable]
-        ``(train_step, eval_step)`` closures that consume normalized batch
-        dictionaries.
+    tuple[optax.GradientTransformation, callable, callable]
+        ``(optimizer, train_step, eval_step)``. Caller is responsible for
+        ``opt_state = optimizer.init(params)`` and threading ``opt_state``
+        through successive ``train_step`` calls.
     """
+    optimizer = _build_optimizer(
+        gradient_clip=gradient_clip, weight_decay=weight_decay
+    )
     target_mean, target_std = _state_stats(normalization)
+    lambda_z = float(loss_cfg["lambda_z"])
+    loss_type = loss_cfg["type"]
+    if loss_type == "huber":
+        huber_delta = float(loss_cfg["huber_delta_log10"])
+        lambda_log10 = float(loss_cfg["lambda_log10_huber"])
+
+        def _log10_loss(pred_log10, target_log10, mask, mask_sum):
+            return _huber_log10_loss(
+                pred_log10, target_log10, mask, mask_sum, delta=huber_delta
+            )
+    else:  # "mae" — validated upstream
+        lambda_log10 = float(loss_cfg["lambda_log10_mae"])
+        _log10_loss = _mae_log10_loss
 
     @jax.jit
     def train_step(
         params: Any,
-        opt_state: dict[str, Any],
+        opt_state: Any,
         batch: dict[str, jax.Array],
         learning_rate: jax.Array,
+        plateau_scale: jax.Array,
         dropout_key: jax.Array,
-    ) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
+    ) -> tuple[Any, Any, dict[str, jax.Array]]:
         """Run one Transformer optimizer step on a normalized batch.
 
-        Parameters
-        ----------
-        params : Any
-            Current Transformer parameter tree.
-        opt_state : dict[str, Any]
-            AdamW optimizer state.
-        batch : dict[str, jax.Array]
-            Normalized batch containing ``sequence``, ``global_inputs``, and ``target``.
-        learning_rate : jax.Array
-            Scalar learning rate for this step.
-        dropout_key : jax.Array
-            PRNG key used for hidden-layer dropout.
-
-        Returns
-        -------
-        tuple[Any, dict[str, Any], dict[str, jax.Array]]
-            Updated parameter tree, updated optimizer state, and scalar
-            training metrics.
+        ``plateau_scale`` is the multiplicative factor produced by the
+        external :func:`optax.contrib.reduce_on_plateau` state machine; it
+        is ``1.0`` when the active scheduler is cosine (no plateau decay
+        applied) and drops toward the configured ``min_lr / base_lr`` when
+        validation stagnates.
         """
         def loss_fn(model_params: Any) -> tuple[jax.Array, dict[str, jax.Array]]:
             """Compute weighted Transformer losses and scalar metrics.
@@ -550,33 +385,27 @@ def make_transformer_train_eval_functions(
             )
             mask = batch["valid_mask"].astype(pred.dtype)[..., None]
             mask_sum = jnp.maximum(jnp.sum(mask) * pred.shape[-1], 1.0)
-            # MSE in normalized space (smooth regularizer).
             mse_norm = jnp.sum(((pred - batch["target"]) ** 2) * mask) / mask_sum
-            # MAE in log10 mixing-ratio space (primary physical-scale signal —
-            # equals |log10(pred_VMR / target_VMR)|, i.e. log-fractional error).
             pred_log10 = pred * target_std + target_mean
             target_log10 = batch["target"] * target_std + target_mean
-            mae_log10 = jnp.sum(jnp.abs(pred_log10 - target_log10) * mask) / mask_sum
-            total = (
-                float(loss_cfg["lambda_z"]) * mse_norm
-                + float(loss_cfg["lambda_log10_mae"]) * mae_log10
-            )
+            log10_loss = _log10_loss(pred_log10, target_log10, mask, mask_sum)
+            total = lambda_z * mse_norm + lambda_log10 * log10_loss
             metrics = {
                 "combined_loss": total,
                 "mse_norm": mse_norm,
-                "mae_log10": mae_log10,
+                "log10_loss": log10_loss,
             }
             return total, metrics
 
         (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        grads = _clip_tree(grads, gradient_clip)
-        new_params, new_opt_state = _adamw_update(
-            params,
-            grads,
-            opt_state,
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-        )
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        # ``_build_optimizer`` produces updates in the gradient sign; scale by
+        # ``-learning_rate * plateau_scale`` so per-step LR scheduling
+        # (warmup + cosine) and the optax plateau state machine both stay
+        # outside the optimizer's closure-captured hyperparameters.
+        scale = -learning_rate * plateau_scale
+        updates = jax.tree_util.tree_map(lambda u: scale * u, updates)
+        new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, metrics
 
     @jax.jit
@@ -608,27 +437,36 @@ def make_transformer_train_eval_functions(
         mse_norm = jnp.sum(((pred - batch["target"]) ** 2) * mask) / mask_sum
         pred_log10 = pred * target_std + target_mean
         target_log10 = batch["target"] * target_std + target_mean
-        mae_log10 = jnp.sum(jnp.abs(pred_log10 - target_log10) * mask) / mask_sum
-        total = (
-            float(loss_cfg["lambda_z"]) * mse_norm
-            + float(loss_cfg["lambda_log10_mae"]) * mae_log10
-        )
+        log10_loss = _log10_loss(pred_log10, target_log10, mask, mask_sum)
+        total = lambda_z * mse_norm + lambda_log10 * log10_loss
         return {
             "combined_loss": total,
             "mse_norm": mse_norm,
-            "mae_log10": mae_log10,
+            "log10_loss": log10_loss,
         }
 
-    return train_step, eval_step
+    return optimizer, train_step, eval_step
 
 
-def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
+def _mean_metrics(
+    metrics: list[dict[str, float]],
+    weights: list[float] | None = None,
+) -> dict[str, float]:
     """Average a list of scalar metric dictionaries by key.
+
+    When ``weights`` is provided, entries are averaged by weighted mean. Each
+    weight should equal the number of valid supervision targets that went into
+    the corresponding per-batch metric (i.e. ``valid_mask.sum()``). Without
+    weights, a plain arithmetic mean is returned — which biases the epoch
+    summary when the last batch is smaller than the rest.
 
     Parameters
     ----------
     metrics : list[dict[str, float]]
         Per-batch metric dictionaries with identical scalar keys.
+    weights : list[float] or None, optional
+        Per-batch weights matching ``metrics``. ``None`` falls back to
+        arithmetic mean.
 
     Returns
     -------
@@ -640,11 +478,24 @@ def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
         return {
             "combined_loss": float("nan"),
             "mse_norm": float("nan"),
-            "mae_log10": float("nan"),
+            "log10_loss": float("nan"),
         }
     keys = metrics[0].keys()
+    if weights is None:
+        return {
+            key: float(np.mean([metric[key] for metric in metrics]))
+            for key in keys
+        }
+    if len(weights) != len(metrics):
+        raise ValueError(
+            f"weights length {len(weights)} does not match metrics length {len(metrics)}"
+        )
+    w = np.asarray(weights, dtype=np.float64)
+    total_w = float(w.sum())
+    if total_w <= 0.0:
+        return {key: float("nan") for key in keys}
     return {
-        key: float(np.mean([metric[key] for metric in metrics]))
+        key: float(np.sum(w * np.asarray([metric[key] for metric in metrics], dtype=np.float64)) / total_w)
         for key in keys
     }
 
@@ -792,31 +643,58 @@ def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
     processed_root = resolve_path(config["paths"]["processed_root"], project_root)
     contract_path = processed_info_dir(processed_root) / "data_contract.json"
     if contract_path.exists():
+        contract: dict[str, Any] | None = None
         try:
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
-            version_ok = int(contract.get("processed_data_version", -1)) == PROCESSED_DATA_VERSION
-            chemistry_ok = str(contract.get("chemistry_type", "")).lower() == get_chemistry_type(config)
-            model_ok = str(contract.get("model_type", "")).lower() == get_model_type(config)
-            feature_order_ok = _feature_order_matches(contract, config)
-            required_files_ok = all(
-                (processed_root / split / "target_outputs.npy").exists()
-                for split in ("train", "val", "test")
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.warning(
+                "Processed contract %s could not be read (%s: %s); regenerating processed dataset.",
+                contract_path, type(exc).__name__, exc,
             )
-            if version_ok and chemistry_ok and model_ok and feature_order_ok and required_files_ok:
-                LOGGER.info("Using existing processed dataset at %s", processed_root)
-                return processed_root
-        except (OSError, ValueError, TypeError):
-            pass
+        if contract is not None:
+            try:
+                chemistry_ok = str(contract.get("chemistry_type", "")).lower() == get_chemistry_type(config)
+                model_ok = str(contract.get("model_type", "")).lower() == get_model_type(config)
+                feature_order_ok = _feature_order_matches(contract, config)
+                required_files_ok = all(
+                    (processed_root / split / "target_outputs.npy").exists()
+                    for split in ("train", "val", "test")
+                )
+            except (TypeError, ValueError) as exc:
+                LOGGER.warning(
+                    "Processed contract %s is malformed (%s: %s); regenerating processed dataset.",
+                    contract_path, type(exc).__name__, exc,
+                )
+            else:
+                if chemistry_ok and model_ok and feature_order_ok and required_files_ok:
+                    LOGGER.info("Using existing processed dataset at %s", processed_root)
+                    return processed_root
 
     raw_root = resolve_path(config["paths"]["raw_root"], project_root)
-    raw_runs_dir = raw_root / "runs"
-    consolidated_exists = (raw_root / "runs.h5").exists()
-    raw_run_files = sorted(raw_runs_dir.glob("run_*.h5")) if raw_runs_dir.exists() else []
-    if not raw_run_files and not consolidated_exists:
+    if not (raw_root / "runs.h5").exists():
         generate_raw_dataset(config, project_root=project_root)
 
     preprocess_raw_dataset(config, project_root=project_root)
     return processed_root
+
+
+def _strip_runtime_annotations(obj: Any) -> Any:
+    """Remove ``_project_root`` entries from every nested dict.
+
+    ``_project_root`` is a :class:`pathlib.Path` injected into configs at
+    CLI/tuning entry points to thread the repo root through the pipeline;
+    it is runtime-only state that must not leak into on-disk checkpoint
+    metadata.
+    """
+    if isinstance(obj, dict):
+        return {
+            key: _strip_runtime_annotations(value)
+            for key, value in obj.items()
+            if key != "_project_root"
+        }
+    if isinstance(obj, list):
+        return [_strip_runtime_annotations(value) for value in obj]
+    return obj
 
 
 def _checkpoint_payload(
@@ -831,32 +709,14 @@ def _checkpoint_payload(
 ) -> dict[str, Any]:
     """Package model state and training metadata into a checkpoint payload.
 
-    Parameters
-    ----------
-    params : Any
-        Current model parameter tree.
-    dims : Any
-        Model-dimension dataclass.
-    config : dict[str, Any]
-        Validated config to embed in the checkpoint.
-    normalization : dict[str, Any]
-        Normalization payload for downstream export and inference.
-    data_contract : dict[str, Any]
-        Processed-data contract describing tensor ordering.
-    metrics : dict[str, Any]
-        Current summary metrics to store alongside the checkpoint.
-    history : list[dict[str, Any]]
-        Full epoch history accumulated so far.
-
-    Returns
-    -------
-    dict[str, Any]
-        Pickle-serializable checkpoint dictionary.
+    Produces a dict with arrays under ``params`` and JSON-serializable
+    plain-Python values for the rest. ``_project_root`` is stripped
+    because it is a runtime-only Path annotation.
     """
     return {
         "params": jax.tree_util.tree_map(np.asarray, params),
         "model_dimensions": dims.to_dict(),
-        "config": dict(config),
+        "config": _strip_runtime_annotations(config),
         "normalization": normalization,
         "data_contract": data_contract,
         "metrics": metrics,
@@ -864,25 +724,50 @@ def _checkpoint_payload(
     }
 
 
+_METADATA_FILENAME = "metadata.json"
+_PARAMS_SUBDIR = "params"
+
+
 def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
-    """Serialize one training checkpoint payload to disk with pickle.
+    """Serialize one training checkpoint to an Orbax directory layout.
 
-    Parameters
-    ----------
-    path : Path
-        Output checkpoint path such as ``best.pt`` or ``last.pt``.
-    payload : dict[str, Any]
-        Checkpoint dictionary containing params, optimizer state, metrics,
-        normalization, and data-contract metadata.
+    ``path`` is the checkpoint *directory* (e.g. ``best/``). Layout:
 
-    Returns
-    -------
-    None
-        The checkpoint payload is written to ``path`` using the highest pickle
-        protocol.
+    - ``<path>/params/`` — param tree written by
+      :class:`orbax.checkpoint.StandardCheckpointer` (must be numeric-only).
+    - ``<path>/metadata.json`` — every other key (config, normalization,
+      data contract, history, metrics) as JSON-serializable plain Python.
+
+    The split is required because StandardCheckpointer's pytree leaves
+    must be numeric, and we need ``force=True`` overwrite semantics that
+    would wipe metadata if it sat inside the Orbax dir. Existing contents
+    are replaced so per-epoch saves are idempotent.
     """
-    with path.open("wb") as handle:
-        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    absolute = path.resolve()
+    absolute.mkdir(parents=True, exist_ok=True)
+    params = payload["params"]
+    metadata = {key: value for key, value in payload.items() if key != "params"}
+    params_dir = absolute / _PARAMS_SUBDIR
+    checkpointer = ocp.StandardCheckpointer()
+    checkpointer.save(params_dir, {"params": params}, force=True)
+    checkpointer.wait_until_finished()
+    checkpointer.close()
+    (absolute / _METADATA_FILENAME).write_text(
+        json.dumps(metadata, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _read_checkpoint(path: Path) -> dict[str, Any]:
+    """Load a checkpoint saved by :func:`_write_checkpoint`."""
+    resolved = path.resolve()
+    params_payload = ocp.StandardCheckpointer().restore(
+        resolved / _PARAMS_SUBDIR,
+    )
+    metadata = json.loads(
+        (resolved / _METADATA_FILENAME).read_text(encoding="utf-8")
+    )
+    return {"params": params_payload["params"], **metadata}
 
 
 def train_model(
@@ -925,7 +810,7 @@ def train_model(
 
     train_split = splits["train"]
     val_split = splits["val"]
-    test_split = splits.get("test", val_split)
+    test_split = splits["test"]
 
     dims, params = initialize_model(config, contract, seed=int(config["training"]["seed"]))
     LOGGER.info(
@@ -934,22 +819,24 @@ def train_model(
         get_model_type(config),
         count_parameters(params),
     )
-    opt_state = _init_adamw_state(params)
-
-    ema_cfg = dict(config["training"].get("ema", {"enabled": False, "decay": 0.0}))
+    # ``config["training"]["ema"]`` is populated (with an ``enabled=False``
+    # default if the user omitted the section) by the config validator, so
+    # this branch can assume the key exists with the canonical shape.
+    ema_cfg = config["training"]["ema"]
     ema_enabled = bool(ema_cfg["enabled"])
     ema_decay = float(ema_cfg["decay"])
     ema_params = jax.tree_util.tree_map(lambda x: x, params) if ema_enabled else None
     ema_decay_scalar = jnp.asarray(ema_decay, dtype=jnp.float32) if ema_enabled else None
     if ema_enabled:
         LOGGER.info("EMA enabled with decay=%.6f.", ema_decay)
-    train_step, eval_step = make_transformer_train_eval_functions(
+    optimizer, train_step, eval_step = make_transformer_train_eval_functions(
         dims=dims,
         normalization=normalization,
         loss_cfg=config["training"]["loss"],
         gradient_clip=float(config["training"]["gradient_clip"]),
         weight_decay=float(config["training"]["weight_decay"]),
     )
+    opt_state = optimizer.init(params)
 
     checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
     ensure_dir(checkpoints_root)
@@ -966,11 +853,13 @@ def train_model(
     early_stopping_patience = int(config["training"]["early_stopping_patience"])
     base_lr = float(config["training"]["learning_rate"])
     min_lr = float(config["training"]["min_lr"])
-    plateau_state = (
-        _init_reduce_on_plateau_state(base_lr)
-        if scheduler["name"] == "reduce_on_plateau"
-        else None
-    )
+    plateau_transform: optax.GradientTransformationExtraArgs | None = None
+    plateau_state: Any = None
+    if scheduler["name"] == "reduce_on_plateau":
+        plateau_transform = _build_plateau_transform(
+            scheduler, base_lr=base_lr, min_lr=min_lr,
+        )
+        plateau_state = plateau_transform.init(params)
 
     steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
     warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
@@ -995,8 +884,13 @@ def train_model(
         epoch_t0 = time.monotonic()
         train_batches = iter_batches(train_split, batch_size=batch_size, rng=rng)
         train_metrics_epoch: list[dict[str, float]] = []
+        train_weights_epoch: list[float] = []
         train_steps = 0
 
+        plateau_scale = (
+            float(plateau_state.scale) if plateau_state is not None else 1.0
+        )
+        plateau_scale_jax = jnp.asarray(plateau_scale, dtype=jnp.float32)
         for batch in train_batches:
             lr = _scheduled_learning_rate(
                 step=global_step,
@@ -1005,8 +899,8 @@ def train_model(
                 min_lr=min_lr,
                 warmup_steps=warmup_steps,
                 scheduler=scheduler,
-                plateau_state=plateau_state,
             )
+            batch_weight = float(np.asarray(batch["valid_mask"]).sum())
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
             dropout_rng, step_dropout_key = jax.random.split(dropout_rng)
             params, opt_state, metrics = train_step(
@@ -1014,38 +908,43 @@ def train_model(
                 opt_state,
                 device_batch,
                 jnp.asarray(lr, dtype=jnp.float32),
+                plateau_scale_jax,
                 step_dropout_key,
             )
             if ema_enabled:
                 ema_params = _ema_update(ema_params, params, ema_decay_scalar)
             train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            train_weights_epoch.append(batch_weight)
             global_step += 1
             train_steps += 1
 
         eval_params = ema_params if ema_enabled else params
         val_batches = iter_batches(val_split, batch_size=batch_size, rng=rng)
         val_metrics_epoch: list[dict[str, float]] = []
+        val_weights_epoch: list[float] = []
         val_steps = 0
         for batch in val_batches:
+            batch_weight = float(np.asarray(batch["valid_mask"]).sum())
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
             metrics = eval_step(eval_params, device_batch)
             val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            val_weights_epoch.append(batch_weight)
             val_steps += 1
 
         epoch_dt = time.monotonic() - epoch_t0
-        train_summary = _mean_metrics(train_metrics_epoch)
-        val_summary = _mean_metrics(val_metrics_epoch)
-        plateau_state = _maybe_update_plateau_scheduler(
-            scheduler=scheduler,
-            plateau_state=plateau_state,
-            metric=val_summary["combined_loss"],
-            global_step=global_step,
-            warmup_steps=warmup_steps,
-            min_lr=min_lr,
-        )
-        current_lr = float(
-            plateau_state.current_lr
-            if plateau_state is not None and scheduler["name"] == "reduce_on_plateau"
+        train_summary = _mean_metrics(train_metrics_epoch, train_weights_epoch)
+        val_summary = _mean_metrics(val_metrics_epoch, val_weights_epoch)
+        if plateau_transform is not None and global_step >= warmup_steps:
+            plateau_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
+            _, plateau_state = plateau_transform.update(
+                plateau_grads,
+                plateau_state,
+                params,
+                value=jnp.asarray(val_summary["combined_loss"], dtype=jnp.float32),
+            )
+        current_lr = (
+            lr * float(plateau_state.scale)
+            if plateau_state is not None
             else lr
         )
         record = {
@@ -1078,13 +977,13 @@ def train_model(
             metrics={"epoch": epoch + 1, "train": train_summary, "val": val_summary},
             history=history,
         )
-        _write_checkpoint(checkpoints_root / "last.pt", current_payload)
+        _write_checkpoint(checkpoints_root / "last", current_payload)
         if val_summary["combined_loss"] < best_val:
             best_val = val_summary["combined_loss"]
             best_epoch = epoch + 1
             no_improvement_epochs = 0
             best_payload = current_payload
-            _write_checkpoint(checkpoints_root / "best.pt", current_payload)
+            _write_checkpoint(checkpoints_root / "best", current_payload)
         else:
             no_improvement_epochs += 1
             if _should_early_stop(no_improvement_epochs, patience=early_stopping_patience):
@@ -1105,14 +1004,17 @@ def train_model(
     best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
     test_batches = iter_batches(test_split, batch_size=batch_size, rng=rng)
     test_metrics_epoch: list[dict[str, float]] = []
+    test_weights_epoch: list[float] = []
     for batch in test_batches:
+        batch_weight = float(np.asarray(batch["valid_mask"]).sum())
         device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
         metrics = eval_step(best_params, device_batch)
         test_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+        test_weights_epoch.append(batch_weight)
 
     final_metrics = {
         "best_val_combined_loss": float(best_val),
-        "test": _mean_metrics(test_metrics_epoch),
+        "test": _mean_metrics(test_metrics_epoch, test_weights_epoch),
         "num_train_runs": train_split.num_runs,
         "num_val_runs": val_split.num_runs,
         "num_test_runs": test_split.num_runs,
@@ -1125,7 +1027,7 @@ def train_model(
         json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8",
     )
     return TrainingArtifacts(
-        checkpoint_path=checkpoints_root / "best.pt",
+        checkpoint_path=checkpoints_root / "best",
         history_path=checkpoints_root / "history.json",
         metrics_path=checkpoints_root / "metrics.json",
     )

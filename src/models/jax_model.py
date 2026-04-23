@@ -1,24 +1,9 @@
-"""JAX model definitions for the FastChem and VULCAN emulators.
+"""Model construction helpers: build dims / init params / count params.
 
-Implements a FiLM-conditioned Transformer architecture:
-
-    1. Project global_inputs to per-layer FiLM parameters (gamma, beta).
-    2. Project per-level sequence to d_model + sinusoidal positional encoding.
-    3. Per block:
-       a. Pre-norm (ln1) -> multi-head self-attention -> dropout -> residual add
-       b. FiLM: x = x * (1 + gamma) + beta
-       c. Pre-norm (ln_ffn) -> FFN -> residual add
-          (FFN is dense ``act(W1 x) -> W2`` or gated SwiGLU
-          ``act(W1 x) * (Wg x) -> W2`` depending on ``ffn_type``)
-    4. Output head: norm -> act -> bottleneck -> final projection.
-
-Norms are LayerNorm or RMSNorm per ``TransformerDimensions.norm_type``;
-attention optionally applies QK-RMSNorm before the dot product when
-``use_qk_norm`` is set.  All operations are pure JAX and compatible with
-``jax.grad`` / ``jax.jvp``.
-
-This module is a convenience aggregation point.  The actual implementations
-live in :mod:`~.layers` and :mod:`~.transformer`.
+The Transformer architecture itself lives in :mod:`~.transformer`; the
+shared numeric primitives (linear, LayerNorm, RMSNorm, attention) live in
+:mod:`~.layers`. This module only wraps ``config + contract`` into a
+``TransformerDimensions`` dataclass and allocates its parameter tree.
 """
 
 from __future__ import annotations
@@ -27,21 +12,7 @@ from typing import Any
 
 import jax
 
-# Re-export shared layers so existing ``from .jax_model import ...`` keeps working.
-from .layers import (  # noqa: F401
-    _apply_dropout,
-    _init_layer_norm,
-    _init_linear,
-    _layer_norm,
-    _linear,
-    _multihead_attention,
-    _multihead_attention_qkv,
-    _resolve_activation,
-    sinusoidal_position_encoding,
-)
-
-# Re-export Transformer architecture.
-from .transformer import (  # noqa: F401
+from .transformer import (
     TransformerDimensions,
     apply_transformer_model,
     init_transformer_params,
@@ -94,12 +65,12 @@ def build_model_dimensions(
         conditioning_hidden_dim=int(model_cfg["conditioning_hidden_dim"]),
         film_clamp=float(model_cfg["film_clamp"]),
         output_head_divisor=int(model_cfg["output_head_divisor"]),
-        activation=str(model_cfg.get("activation", "gelu")).lower(),
-        dropout_rate=float(model_cfg.get("dropout_rate", 0.0)),
-        norm_type=str(model_cfg.get("norm_type", "layernorm")).lower(),
-        use_qk_norm=bool(model_cfg.get("use_qk_norm", False)),
-        ffn_type=str(model_cfg.get("ffn_type", "dense")).lower(),
-        zero_init_film=bool(model_cfg.get("zero_init_film", False)),
+        activation=str(model_cfg["activation"]).lower(),
+        dropout_rate=float(model_cfg["dropout_rate"]),
+        norm_type=str(model_cfg["norm_type"]).lower(),
+        use_qk_norm=bool(model_cfg["use_qk_norm"]),
+        ffn_type=str(model_cfg["ffn_type"]).lower(),
+        zero_init_film=bool(model_cfg["zero_init_film"]),
     )
 
 

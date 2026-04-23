@@ -1,4 +1,4 @@
-"""Optuna hyperparameter sweep for the VULCAN emulator Transformer.
+"""Optuna hyperparameter sweep for the chemistry emulator Transformer.
 
 Runs ``n_trials`` independent training runs, each for ``epochs_per_trial``
 epochs, and minimizes validation ``combined_loss``. The processed dataset is
@@ -14,7 +14,7 @@ kept fixed at the base-config values.
 
 Invocation::
 
-    python -m src.tuning --config config/vulcan_no_condensation.json \\
+    python -m src.tuning --config config/fastchem_no_condensation.json \\
         --trials 100 --epochs 100
 """
 
@@ -34,6 +34,14 @@ import jax
 
 import optuna
 
+from ..constants import (
+    TUNING_EARLY_STOP_MAX_PATIENCE,
+    TUNING_EARLY_STOP_MIN_PATIENCE,
+    TUNING_EARLY_STOP_PATIENCE_DIVISOR,
+    TUNING_EMA_DEFAULT_DECAY,
+    TUNING_TPE_SEED,
+    TUNING_WEIGHT_DECAY_RANGE,
+)
 from ..data_generation.data_loader import load_processed_dataset
 from ..training.trainer import _ensure_processed, train_model
 from ..utils.config import _validate_transformer_model_config, load_and_validate_config
@@ -43,7 +51,32 @@ LOGGER = get_logger(__name__)
 
 STUDY_NAME = "vulcan_emulator_arch_v2"
 
+_D_MODEL_CANDIDATES = (192, 256, 384)
 _NHEAD_CANDIDATES = (4, 6, 8, 12, 16)
+
+# Enumerate valid ``(d_model, nhead)`` pairs as a single categorical. Using one
+# parameter name across all trials (instead of ``f"nhead_for_d{d_model}"``)
+# keeps the Optuna dashboard and cross-trial analysis clean, and enforces the
+# ``d_model % nhead == 0`` constraint by construction.
+_ARCH_CHOICES: tuple[tuple[int, int], ...] = tuple(
+    (d, h)
+    for d in _D_MODEL_CANDIDATES
+    for h in _NHEAD_CANDIDATES
+    if d % h == 0
+)
+_ARCH_LABELS: tuple[str, ...] = tuple(f"d{d}_h{h}" for d, h in _ARCH_CHOICES)
+_ARCH_BY_LABEL: dict[str, tuple[int, int]] = dict(zip(_ARCH_LABELS, _ARCH_CHOICES))
+
+
+def _arch_label(d_model: int, nhead: int) -> str:
+    """Return the ``d{d_model}_h{nhead}`` categorical label for a valid pair."""
+    label = f"d{d_model}_h{nhead}"
+    if label not in _ARCH_BY_LABEL:
+        raise ValueError(
+            f"(d_model={d_model}, nhead={nhead}) is not in _ARCH_CHOICES."
+        )
+    return label
+
 
 # Formulation knobs held fixed in v2 (sweep v1 agreed these are neutral-or-good
 # across the top completed trials, so we spend budget on sizing + regularization
@@ -61,8 +94,7 @@ _FIXED_FORMULATION = {
 # "hybrid" arch (2026-04-16 sizing + 2026-04-17 sweep formulation wins); if
 # the hybrid run ships, its numbers become the bar any new trial has to clear.
 INCUMBENT_PARAMS = {
-    "d_model": 256,
-    "nhead_for_d256": 8,
+    "d_model_nhead": _arch_label(256, 8),
     "num_layers": 6,
     "dim_ff_mult": 4.0,
     "conditioning_hidden_dim": 256,
@@ -71,12 +103,8 @@ INCUMBENT_PARAMS = {
     "dropout_rate": 0.0,
     "weight_decay": 1e-4,
     "ema_enabled": True,
+    "loss_type": "mae",
 }
-
-
-def _valid_nheads(d_model: int) -> list[int]:
-    """Return the nhead options that evenly divide ``d_model``."""
-    return [h for h in _NHEAD_CANDIDATES if d_model % h == 0]
 
 
 def _sample_trial_overrides(trial: optuna.Trial) -> dict[str, Any]:
@@ -90,8 +118,8 @@ def _sample_trial_overrides(trial: optuna.Trial) -> dict[str, Any]:
     are enforced by construction here; the final config is also re-run
     through :func:`_validate_transformer_model_config` before training.
     """
-    d_model = trial.suggest_categorical("d_model", [192, 256, 384])
-    nhead = trial.suggest_categorical(f"nhead_for_d{d_model}", _valid_nheads(d_model))
+    arch_label = trial.suggest_categorical("d_model_nhead", list(_ARCH_LABELS))
+    d_model, nhead = _ARCH_BY_LABEL[arch_label]
     num_layers = trial.suggest_int("num_layers", 4, 8)
     dim_ff_mult = trial.suggest_float("dim_ff_mult", 2.5, 4.0)
     conditioning_hidden_dim = trial.suggest_categorical(
@@ -100,8 +128,21 @@ def _sample_trial_overrides(trial: optuna.Trial) -> dict[str, Any]:
     output_head_divisor = trial.suggest_categorical("output_head_divisor", [1, 2])
     norm_type = trial.suggest_categorical("norm_type", ["layernorm", "rmsnorm"])
     dropout_rate = trial.suggest_float("dropout_rate", 0.0, 0.1)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 5e-3, log=True)
+    weight_decay = trial.suggest_float(
+        "weight_decay",
+        TUNING_WEIGHT_DECAY_RANGE[0],
+        TUNING_WEIGHT_DECAY_RANGE[1],
+        log=True,
+    )
     ema_enabled = trial.suggest_categorical("ema_enabled", [True, False])
+
+    loss_type = trial.suggest_categorical("loss_type", ["mae", "huber"])
+    if loss_type == "huber":
+        huber_delta_log10 = trial.suggest_float(
+            "huber_delta_log10", 0.02, 0.3, log=True
+        )
+    else:
+        huber_delta_log10 = None
 
     dim_feedforward = int(round(d_model * dim_ff_mult))
     if dim_feedforward < d_model:
@@ -118,6 +159,10 @@ def _sample_trial_overrides(trial: optuna.Trial) -> dict[str, Any]:
         "dropout_rate": float(dropout_rate),
         "weight_decay": float(weight_decay),
         "ema_enabled": bool(ema_enabled),
+        "loss_type": loss_type,
+        "huber_delta_log10": (
+            float(huber_delta_log10) if huber_delta_log10 is not None else None
+        ),
     }
 
 
@@ -152,11 +197,37 @@ def _apply_overrides(
     training = cfg["training"]
     training["weight_decay"] = overrides["weight_decay"]
     training["epochs"] = int(epochs)
-    training["early_stopping_patience"] = max(5, min(20, int(epochs) // 5))
-    ema_cfg = dict(training.get("ema", {"enabled": False, "decay": 0.999}))
+    training["early_stopping_patience"] = max(
+        TUNING_EARLY_STOP_MIN_PATIENCE,
+        min(
+            TUNING_EARLY_STOP_MAX_PATIENCE,
+            int(epochs) // TUNING_EARLY_STOP_PATIENCE_DIVISOR,
+        ),
+    )
+    # The config validator guarantees ``training["ema"]`` exists with the
+    # canonical ``{"enabled": bool, "decay": float}`` shape. A trial that
+    # enables EMA on top of a base config that had it disabled inherits
+    # ``decay == 0.0`` (the validator's unset default), which is invalid once
+    # ``enabled`` flips to ``True`` — seed a sensible decay in that case.
+    ema_cfg = training["ema"]
     ema_cfg["enabled"] = bool(overrides["ema_enabled"])
-    ema_cfg.setdefault("decay", 0.999)
-    training["ema"] = ema_cfg
+    if ema_cfg["enabled"] and not (0.0 < ema_cfg["decay"] < 1.0):
+        ema_cfg["decay"] = TUNING_EMA_DEFAULT_DECAY
+
+    loss_cfg = training["loss"]
+    loss_cfg["type"] = overrides["loss_type"]
+    if overrides["loss_type"] == "huber":
+        loss_cfg["lambda_log10_huber"] = float(
+            loss_cfg.get("lambda_log10_huber", loss_cfg.get("lambda_log10_mae", 0.25))
+        )
+        loss_cfg["huber_delta_log10"] = float(overrides["huber_delta_log10"])
+        loss_cfg.pop("lambda_log10_mae", None)
+    else:  # mae
+        loss_cfg["lambda_log10_mae"] = float(
+            loss_cfg.get("lambda_log10_mae", loss_cfg.get("lambda_log10_huber", 0.25))
+        )
+        loss_cfg.pop("lambda_log10_huber", None)
+        loss_cfg.pop("huber_delta_log10", None)
 
     cfg["paths"]["checkpoints_root"] = str(checkpoints_root)
     return cfg
@@ -172,7 +243,7 @@ _CSV_FIELDS = (
     "epoch",
     "combined_loss",
     "mse_norm",
-    "mae_log10",
+    "log10_loss",
 )
 
 
@@ -256,29 +327,34 @@ def _make_objective(
 
 
 def _copy_best_checkpoint(study: optuna.Study, study_root: Path) -> Path | None:
-    """Copy the best trial's best.pt into ``<study_root>/best_overall/``."""
+    """Copy the best trial's best checkpoint into ``<study_root>/best_overall/``.
+
+    Checkpoints are now Orbax directories; copy the whole tree.
+    """
     try:
         best_number = int(study.best_trial.number)
     except (ValueError, RuntimeError):
         return None
-    src = study_root / f"trial_{best_number:04d}" / "best.pt"
+    src = study_root / f"trial_{best_number:04d}" / "best"
     if not src.exists():
-        LOGGER.warning("Best trial %d has no best.pt at %s", best_number, src)
+        LOGGER.warning("Best trial %d has no best checkpoint at %s", best_number, src)
         return None
     dst_dir = study_root / "best_overall"
     ensure_dir(dst_dir)
-    dst = dst_dir / "best.pt"
-    shutil.copy2(src, dst)
+    dst = dst_dir / "best"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
     return dst
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Optuna hyperparameter sweep for the VULCAN emulator.",
+        description="Optuna hyperparameter sweep for the chemistry emulator.",
     )
     parser.add_argument(
         "--config",
-        default="config/vulcan_no_condensation.json",
+        default="config/fastchem_no_condensation.json",
         help="Path to the base configuration JSON file.",
     )
     parser.add_argument("--trials", type=int, default=60, help="Number of Optuna trials.")
@@ -337,7 +413,9 @@ def main(argv: list[str] | None = None) -> int:
     storage = args.storage or f"sqlite:///{study_root / 'study.db'}"
     LOGGER.info("Optuna storage: %s | study: %s", storage, args.study_name)
 
-    sampler = optuna.samplers.TPESampler(seed=123, multivariate=True, group=True)
+    sampler = optuna.samplers.TPESampler(
+        seed=TUNING_TPE_SEED, multivariate=True, group=True
+    )
     # HyperbandPruner funnels compute to survivors so winners are evaluated at
     # real training length. MedianPruner (sweep v1) killed ~88% of trials before
     # epoch 30 and biased selection toward fast-early-learners.

@@ -32,7 +32,7 @@ def _write_config(tmp_path: Path, name: str, payload: dict) -> Path:
 @pytest.mark.parametrize(
     "filename",
     [
-        "vulcan_no_condensation.json",
+        "fastchem_no_condensation.json",
         "vulcan_condensation.json",
     ],
 )
@@ -54,7 +54,7 @@ def test_config_rejects_legacy_data_root_keys(tmp_path):
 def test_config_requires_run_root(tmp_path):
     payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
     payload["paths"].pop("run_root")
-    with pytest.raises(ConfigValidationError, match="Missing required keys in paths"):
+    with pytest.raises(ConfigValidationError, match="paths.run_root"):
         load_and_validate_config(_write_config(tmp_path, "missing_run_root.json", payload))
 
 
@@ -160,7 +160,7 @@ def test_vulcan_block_is_required_only_for_vulcan(tmp_path):
 
     vulcan = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
     vulcan.pop("vulcan")
-    with pytest.raises(ConfigValidationError, match="Missing required keys in root"):
+    with pytest.raises(ConfigValidationError, match=r"root\.vulcan"):
         load_and_validate_config(_write_config(tmp_path, "vulcan_missing.json", vulcan))
 
 
@@ -221,11 +221,84 @@ def test_invalid_early_stopping_patience_is_rejected(tmp_path):
         load_and_validate_config(_write_config(tmp_path, "invalid_patience.json", payload))
 
 
-def test_vulcan_requires_lambda_z_and_lambda_log10_mae_only(tmp_path):
+def test_vulcan_requires_loss_type(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
+    payload["training"]["loss"].pop("type")
+    with pytest.raises(ConfigValidationError, match="training.loss.type"):
+        load_and_validate_config(
+            _write_config(tmp_path, "vulcan_missing_loss_type.json", payload)
+        )
+
+
+def test_vulcan_rejects_unknown_loss_type(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
+    payload["training"]["loss"]["type"] = "l2"
+    with pytest.raises(ConfigValidationError, match="training.loss.type"):
+        load_and_validate_config(
+            _write_config(tmp_path, "vulcan_bad_loss_type.json", payload)
+        )
+
+
+def test_vulcan_mae_requires_lambda_log10_mae(tmp_path):
     payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
     payload["training"]["loss"].pop("lambda_log10_mae")
     with pytest.raises(ConfigValidationError, match="lambda_log10_mae"):
-        load_and_validate_config(_write_config(tmp_path, "vulcan_missing_lambda_log10_mae.json", payload))
+        load_and_validate_config(
+            _write_config(tmp_path, "vulcan_missing_lambda_log10_mae.json", payload)
+        )
+
+
+def test_vulcan_huber_loss_config_validates(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
+    payload["training"]["loss"] = {
+        "type": "huber",
+        "lambda_z": 1.0,
+        "lambda_log10_huber": 0.25,
+        "huber_delta_log10": 0.1,
+    }
+    load_and_validate_config(
+        _write_config(tmp_path, "vulcan_huber_loss.json", payload)
+    )
+
+
+def test_vulcan_huber_requires_lambda_log10_huber(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
+    payload["training"]["loss"] = {
+        "type": "huber",
+        "lambda_z": 1.0,
+        "huber_delta_log10": 0.1,
+    }
+    with pytest.raises(ConfigValidationError, match="lambda_log10_huber"):
+        load_and_validate_config(
+            _write_config(tmp_path, "vulcan_missing_lambda_log10_huber.json", payload)
+        )
+
+
+def test_vulcan_huber_requires_huber_delta(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
+    payload["training"]["loss"] = {
+        "type": "huber",
+        "lambda_z": 1.0,
+        "lambda_log10_huber": 0.25,
+    }
+    with pytest.raises(ConfigValidationError, match="huber_delta_log10"):
+        load_and_validate_config(
+            _write_config(tmp_path, "vulcan_missing_huber_delta.json", payload)
+        )
+
+
+def test_vulcan_huber_delta_must_be_positive(tmp_path):
+    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
+    payload["training"]["loss"] = {
+        "type": "huber",
+        "lambda_z": 1.0,
+        "lambda_log10_huber": 0.25,
+        "huber_delta_log10": 0.0,
+    }
+    with pytest.raises(ConfigValidationError, match="huber_delta_log10"):
+        load_and_validate_config(
+            _write_config(tmp_path, "vulcan_huber_delta_zero.json", payload)
+        )
 
 
 def test_vulcan_requires_planet_radius_sampling_range(tmp_path):
@@ -300,6 +373,24 @@ def test_explicit_cosine_scheduler_is_preserved(tmp_path):
 
 
 def test_run_pbs_defaults_to_no_condensation_config() -> None:
-    script_text = (ROOT / "run.pbs").read_text(encoding="utf-8")
-    assert 'CONFIG_PATH="${CONFIG_PATH:-config/vulcan_no_condensation.json}"' in script_text
+    script_text = (ROOT / "supercomputer_cmds" / "run.pbs").read_text(encoding="utf-8")
+    assert 'CONFIG_PATH="${CONFIG_PATH:-config/fastchem_no_condensation.json}"' in script_text
     assert "#PBS -N vulcan_emulator" in script_text
+
+
+def test_cli_and_tuning_defaults_point_to_fastchem_no_condensation_config() -> None:
+    cli_text = (ROOT / "src" / "utils" / "cli.py").read_text(encoding="utf-8")
+    tuning_text = (ROOT / "src" / "tuning" / "__main__.py").read_text(encoding="utf-8")
+
+    assert 'default="config/fastchem_no_condensation.json"' in cli_text
+    assert 'default="config/fastchem_no_condensation.json"' in tuning_text
+
+
+def test_public_docs_reference_fastchem_no_condensation_config() -> None:
+    for path in (
+        ROOT / "docs" / "README.md",
+        ROOT / "docs" / "config_guide.md",
+        ROOT / "spec.md",
+    ):
+        text = path.read_text(encoding="utf-8")
+        assert "config/fastchem_no_condensation.json" in text

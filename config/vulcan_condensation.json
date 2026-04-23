@@ -68,7 +68,6 @@
     }
   },
   "generation": {
-    "mode": "vulcan",
     "num_runs": 2000,
     "seed": 1,
     "overwrite": false,
@@ -140,6 +139,7 @@
     "weight_decay": 1e-05,
     "gradient_clip": 1.0,
     "loss": {
+      "type": "mae",
       "lambda_z": 1.0,
       "lambda_log10_mae": 0.25
     }

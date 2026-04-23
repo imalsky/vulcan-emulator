@@ -3,10 +3,6 @@
 All shared constants live here so every module imports from a single
 source of truth.  Module-private constants (used in exactly one file)
 stay in their respective modules.
-
-NOTE: ``standalone_inference.py`` is self-contained (embedded in NPZ
-bundles) and intentionally duplicates some values defined here.  Do
-not add imports from this file into ``standalone_inference.py``.
 """
 
 from __future__ import annotations
@@ -39,7 +35,9 @@ AU_CM = 1.495978707e13
 # NOT mass fractions, NOT molecular volume fractions. Matches VULCAN's
 # convention (see VULCAN build_atm.py: the {O,C,N,S,He}_H values satisfy
 # n_X = X_H * n_H in the equilibrium solver).
-# Used as the baseline for metallicity-scaled sampling.
+# Used as the solar anchor for the per-element X/H sampling ranges and as
+# the reference point for the ExoJAX ``global_inputs_from_metallicity``
+# helper (retrieval-side metallicity reparam, not a sampling step).
 SOLAR_ABUNDANCES: dict[str, float] = {
     "He_H": 7.84e-2,
     "C_H": 2.69e-4,
@@ -244,24 +242,6 @@ _INTERNAL_VULCAN_RUNTIME_DEFAULTS = {
 # Name of the default science preset when none is explicitly configured.
 _DEFAULT_SCIENCE_PRESET_NAME = "default"
 
-# =========================================================================
-# Export / data versioning
-# =========================================================================
-
-# Format identifier embedded in exported NPZ bundles.
-EXPORT_FORMAT = "jax_physical_bundle"
-
-# Bump when the export layout changes in a backwards-incompatible way.
-EXPORT_VERSION = 6
-
-# Bump when the processed tensor layout changes incompatibly.
-# v19: variable num_levels + variable pressure ranges. Adds per-run valid_mask
-# and position_coord (normalized log10(P) in [0, 1]) tensors alongside
-# sequence_inputs/target_outputs, and records (num_levels_range,
-# pressure_top_bar_range, pressure_bottom_bar_range,
-# log10_pressure_bar_union_range) in the data contract.
-PROCESSED_DATA_VERSION = 19
-
 # Subdirectory name for shared metadata within a processed dataset.
 PROCESSED_INFO_DIRNAME = "info"
 
@@ -294,6 +274,80 @@ _SINUSOIDAL_BASE_WAVELENGTH = 10_000.0
 # of magnitude as the historical fixed ``num_levels`` (~64) preserves
 # the frequency bands the model was tuned against.
 _POSITION_SCALE = 64.0
+
+# Large-negative logit used to mask out padded keys before softmax in
+# attention. Chosen so ``exp(-1e30)`` underflows to zero in float32 with
+# headroom to spare while still being finite (avoiding ``-jnp.inf`` so
+# downstream ``nan`` guards never trigger on fully-masked rows).
+ATTN_MASK_NEG_INF = -1.0e30
+
+# =========================================================================
+# Numerical floors and tolerances
+# =========================================================================
+
+# Floor below which a standard-deviation or span of a normalized feature
+# is treated as "effectively zero" and replaced by 1.0 to keep the
+# normalization invertible. Also used as the rtol when checking that a
+# per-layer column is vertically constant before reduction.
+NORM_STD_FLOOR = 1.0e-8
+
+# Floor used to stabilize divisions by a span-like quantity (gradient
+# norm, pressure coordinate span, position-coord normalization).
+NORM_SPAN_FLOOR = 1.0e-12
+
+# Cutoff on the fitted log-standard/standard std of a global input below
+# which the exporter treats the input as a fixed global and excises it
+# from the public ExoJAX surface. Also used as the atol when rechecking
+# that training data stayed within the fitted distribution.
+NEAR_CONSTANT_STD_THRESHOLD = 1.0e-6
+
+# Lower bound applied to eddy diffusivity before taking ``log10`` so
+# ``Kzz = 0`` samples do not blow up the log-standard normalizer.
+KZZ_LOG_FLOOR_CM2_S = 1.0e-30
+
+# Tolerance used when validating that a set of mixing fractions sums to
+# one (e.g., science-preset fractions in the generation config).
+FRACTION_SUM_TOLERANCE = 1.0e-6
+
+# =========================================================================
+# Stellar spectrum defaults — wavelength binning
+# =========================================================================
+
+# Short-wavelength bin width in nm for the stellar flux grid.
+DBIN1_NM_DEFAULT = 0.1
+
+# Long-wavelength bin width in nm for the stellar flux grid.
+DBIN2_NM_DEFAULT = 2.0
+
+# Transition wavelength (nm) where the stellar flux binning switches
+# from ``DBIN1_NM_DEFAULT`` to ``DBIN2_NM_DEFAULT``.
+DBIN_12TRANS_NM_DEFAULT = 240.0
+
+# =========================================================================
+# Hyperparameter-tuning defaults
+# =========================================================================
+
+# Seed fed to the Optuna TPE sampler so successive tuning invocations
+# explore the same trial sequence unless the user picks a different
+# config-level seed. Kept separate from the config ``seed`` because the
+# TPE proposer runs orthogonally to any per-trial training RNG.
+TUNING_TPE_SEED = 123
+
+# Early-stopping patience is computed from the trial epoch budget as
+# ``clip(epochs // DIVISOR, MIN, MAX)``. These bounds keep very short
+# trials from stopping too eagerly and very long trials from burning
+# most of the budget in a dead run.
+TUNING_EARLY_STOP_MIN_PATIENCE = 5
+TUNING_EARLY_STOP_MAX_PATIENCE = 20
+TUNING_EARLY_STOP_PATIENCE_DIVISOR = 5
+
+# Default EMA decay used when a tuning trial enables EMA but the base
+# config has no ``training.ema.decay`` value to inherit.
+TUNING_EMA_DEFAULT_DECAY = 0.999
+
+# Log-uniform sampling range for ``training.weight_decay`` inside a
+# tuning trial.
+TUNING_WEIGHT_DECAY_RANGE = (1.0e-6, 5.0e-3)
 
 # =========================================================================
 # ExoJAX-facing label lists

@@ -13,11 +13,29 @@ All generated HDF5 files follow a shared layout (see ``spec.md``,
 "Shared Data Contract") and are consumed downstream by
 ``preprocess.py``.  A generation manifest and sampling-coverage
 summary are persisted alongside the runs for provenance.
+
+Concurrency contract
+--------------------
+Worker runs execute on a ``ThreadPoolExecutor`` so the Python overhead
+between subprocess launches is minimal.  HDF5 is **not** thread-safe, so
+the design enforces the following invariants:
+
+* Each worker writes exclusively to its own per-run file in ``runs_dir``.
+  Two threads never hold the same ``h5py.File`` handle.
+* The per-chunk consolidation into ``chunks_dir`` runs on a separate,
+  single-worker executor so chunk writes are serial.
+* Orphan promotion on resume is protected by an ``fcntl`` lock on a
+  sentinel file inside ``runs_dir`` so two concurrent invocations of the
+  generation stage cannot promote the same orphan.
+
+Modifications that share an HDF5 writer across workers will violate
+these invariants and silently corrupt the dataset — preserve them.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import fcntl
 import json
 import os
 import pickle
@@ -40,7 +58,14 @@ from ..utils.config import (
     get_model_type,
     uses_fastchem,
 )
-from ..constants import ELEMENT_INPUT_ORDER, PUBLIC_PHYSICS_TOGGLES, SOLAR_ABUNDANCES, SUPPORTED_ATM_BASES
+from ..constants import (
+    ELEMENT_INPUT_ORDER,
+    KZZ_LOG_FLOOR_CM2_S,
+    NORM_SPAN_FLOOR,
+    PUBLIC_PHYSICS_TOGGLES,
+    SOLAR_ABUNDANCES,
+    SUPPORTED_ATM_BASES,
+)
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 from ..utils.provenance import manifest_for_files
 from .sampling import (
@@ -141,71 +166,56 @@ def _requested_run_count(config: dict[str, Any], num_runs: int | None) -> int:
     return int(config["generation"]["num_runs"] if num_runs is None else num_runs)
 
 
-def _read_run_hdf5_to_bytes(run_file: Path) -> tuple[str, bytes]:
-    """Read a per-run HDF5 file into memory as raw bytes.
-
-    Returns the run ID (file stem) and the full file contents.  Reading
-    into memory avoids holding the file handle open during the slow
-    sequential write phase of consolidation.
-    """
-    return run_file.stem, run_file.read_bytes()
-
-
-def consolidate_runs_to_single_hdf5(
+def merge_run_files_to_chunk(
     run_files: list[Path],
+    chunk_path: Path,
+    *,
+    delete_originals: bool = True,
+) -> Path:
+    """Merge per-run HDF5 files into one chunk HDF5, keyed by file stem.
+
+    Each per-run file's top-level datasets/groups (``inputs``, ``globals``,
+    ``final_state``, etc.) are copied into a group named after the source
+    file stem (the run ID) in ``chunk_path``. Used to collapse a generation
+    chunk's per-run staging files into a single HDF5 before they accumulate
+    on disk.
+    """
+    ensure_dir(chunk_path.parent)
+    with h5py.File(chunk_path, "w") as dest:
+        for run_file in sorted(run_files):
+            with h5py.File(run_file, "r") as src:
+                dest_group = dest.create_group(run_file.stem)
+                for key in src:
+                    src.copy(src[key], dest_group, name=key)
+    if delete_originals:
+        for run_file in run_files:
+            run_file.unlink()
+    LOGGER.info("Merged %d run files into %s", len(run_files), chunk_path)
+    return chunk_path
+
+
+def merge_chunks_to_runs_h5(
+    chunk_files: list[Path],
     output_path: Path,
     *,
     delete_originals: bool = True,
 ) -> Path:
-    """Merge per-run HDF5 files into a single file with one group per run.
+    """Merge per-chunk HDF5 files into the final ``runs.h5``.
 
-    On network filesystems the bottleneck is per-file metadata round-trips.
-    This reads all per-run files in parallel (thread pool), then writes the
-    consolidated output in a single sequential pass.
-
-    Parameters
-    ----------
-    run_files : list[Path]
-        Per-run HDF5 files to merge from a temporary staging directory.
-    output_path : Path
-        Destination consolidated HDF5 file, usually ``runs.h5``.
-    delete_originals : bool, default=True
-        When ``True``, remove the original per-run files after the consolidated
-        file has been written successfully.
-
-    Returns
-    -------
-    Path
-        Path to the consolidated HDF5 file where each original run is stored
-        as a top-level group named after the source file stem.
+    Each chunk file already stores one top-level group per run (produced by
+    :func:`merge_run_files_to_chunk`); those groups are copied across with
+    their names preserved.
     """
-    import io
-
     ensure_dir(output_path.parent)
-
-    # Parallel read: each thread opens one file on the network FS and reads
-    # it into memory.  This overlaps the per-file metadata latency.
-    max_workers = min(32, len(run_files))
-    LOGGER.info("Reading %d per-run files with %d threads", len(run_files), max_workers)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        buffers = dict(executor.map(_read_run_hdf5_to_bytes, sorted(run_files)))
-
-    # Sequential write: replay each in-memory buffer into the output file.
     with h5py.File(output_path, "w") as dest:
-        for run_id in sorted(buffers):
-            with h5py.File(io.BytesIO(buffers[run_id]), "r") as src:
-                dest_group = dest.create_group(run_id)
-                for key in src:
-                    src.copy(src[key], dest_group, name=key)
-    del buffers
-    LOGGER.info("Consolidated %d runs into %s", len(run_files), output_path)
+        for chunk_path in sorted(chunk_files):
+            with h5py.File(chunk_path, "r") as src:
+                for run_id in src:
+                    src.copy(src[run_id], dest, name=run_id)
     if delete_originals:
-        for run_file in run_files:
-            run_file.unlink()
-        parent = run_files[0].parent if run_files else None
-        if parent is not None and parent.exists() and not any(parent.iterdir()):
-            parent.rmdir()
-            LOGGER.info("Removed empty directory %s", parent)
+        for chunk_path in chunk_files:
+            chunk_path.unlink()
+    LOGGER.info("Merged %d chunk files into %s", len(chunk_files), output_path)
     return output_path
 
 
@@ -272,27 +282,27 @@ def _prepare_generation_directory(
     *,
     project_root: Path,
     num_runs: int | None,
-) -> tuple[Path, Path, Path, Path | None, Path | None]:
+) -> tuple[Path, Path, Path, Path | None, Path | None, Path | None]:
     """Prepare the raw-data output directory and resolve reuse semantics.
 
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Validated generation config containing raw-data paths and overwrite /
-        reuse settings.
-    project_root : Path
-        Repository root used to resolve config-relative paths.
-    num_runs : int or None
-        Optional override for the requested run count.
+    The raw-data layout during generation is::
+
+        raw_root/
+            runs/            per-run HDF5 staging (one file per in-flight run;
+                             cleared at the end of each chunk)
+            chunks/          consolidated chunk HDF5s produced by the chunk
+                             loop; cleared after the final merge
+            runs.h5          final merged dataset (only present once generation
+                             completes)
 
     Returns
     -------
-    tuple[Path, Path, Path, Path | None, Path | None]
-        Run root, raw-data root, metadata root, per-run staging directory
-        (``raw/runs/``) for new generation, and either ``None`` when new
-        generation should proceed or the reusable consolidated ``runs.h5``
-        path when reuse is allowed.  Per-run files are written under
-        ``raw/runs/`` so they survive a crash and can be resumed.
+    tuple[Path, Path, Path, Path | None, Path | None, Path | None]
+        Run root, raw-data root, metadata root, per-run staging directory,
+        per-chunk directory, and reusable ``runs.h5`` path. When reuse is
+        allowed the last entry is set and the two staging paths are
+        ``None``; otherwise the two staging paths point at freshly prepared
+        directories and the reuse entry is ``None``.
     """
     run_root = resolve_path(dataset_run_root(config), project_root)
     raw_root = resolve_path(dataset_raw_root(config), project_root)
@@ -302,20 +312,18 @@ def _prepare_generation_directory(
     ensure_dir(info_root)
     requested_runs = _requested_run_count(config, num_runs)
     consolidated_path = raw_root / "runs.h5"
-
-    # Per-run HDF5 staging lives under raw_root so completed runs survive
-    # a crash and can be resumed on the next invocation.
     runs_dir = raw_root / "runs"
+    chunks_dir = raw_root / "chunks"
 
-    # Count runs inside a consolidated file, if present.
     consolidated_count = 0
     if consolidated_path.exists():
         consolidated_count = len(list_run_ids_from_consolidated(consolidated_path))
     if bool(config["generation"]["overwrite"]):
         if consolidated_path.exists():
             consolidated_path.unlink()
-        if runs_dir.exists():
-            shutil.rmtree(runs_dir)
+        for staging in (runs_dir, chunks_dir):
+            if staging.exists():
+                shutil.rmtree(staging)
         for metadata_path in (
             info_root / "generation_manifest.json",
             info_root / "sampling_coverage.json",
@@ -324,8 +332,8 @@ def _prepare_generation_directory(
             if metadata_path.exists():
                 metadata_path.unlink()
         ensure_dir(runs_dir)
-        return run_root, raw_root, info_root, runs_dir, None
-    # Reuse only the canonical consolidated raw-data layout.
+        ensure_dir(chunks_dir)
+        return run_root, raw_root, info_root, runs_dir, chunks_dir, None
     if consolidated_count > 0:
         if bool(config["generation"]["reuse_raw_if_present"]) and consolidated_count == requested_runs:
             manifest_path = info_root / "generation_manifest.json"
@@ -335,22 +343,21 @@ def _prepare_generation_directory(
                     "Set generation.overwrite=true to regenerate them."
                 )
             manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest_mode = str(manifest_payload.get("mode", "")).lower()
             manifest_chemistry_type = str(manifest_payload.get("chemistry_type", "")).lower()
-            current_mode = str(config["generation"]["mode"]).lower()
             current_chemistry_type = get_chemistry_type(config)
-            if manifest_mode != current_mode or manifest_chemistry_type != current_chemistry_type:
+            if manifest_chemistry_type != current_chemistry_type:
                 raise RuntimeError(
-                    "Existing raw runs were generated with a different generation mode or chemistry_type. "
+                    "Existing raw runs were generated with a different chemistry_type. "
                     "Set generation.overwrite=true to regenerate a compatible dataset."
                 )
-            return run_root, raw_root, info_root, None, consolidated_path
+            return run_root, raw_root, info_root, None, None, consolidated_path
         raise RuntimeError(
             f"Found {consolidated_count} existing raw runs. "
             "Set generation.overwrite=true or align generation.num_runs with the existing dataset."
         )
     ensure_dir(runs_dir)
-    return run_root, raw_root, info_root, runs_dir, None
+    ensure_dir(chunks_dir)
+    return run_root, raw_root, info_root, runs_dir, chunks_dir, None
 
 
 def _coverage_fraction(low: float, high: float, observed_low: float, observed_high: float) -> float:
@@ -373,7 +380,7 @@ def _coverage_fraction(low: float, high: float, observed_low: float, observed_hi
         Fraction of the configured interval covered by the observed samples,
         clipped to ``[0, 1]``.
     """
-    span = max(high - low, 1.0e-12)
+    span = max(high - low, NORM_SPAN_FLOOR)
     return float(np.clip((observed_high - observed_low) / span, 0.0, 1.0))
 
 
@@ -382,7 +389,6 @@ def _sampling_coverage_payload(
     config: dict[str, Any],
     specs: list[RunSpecification],
     run_files: list[Path],
-    mode: str,
 ) -> dict[str, Any]:
     """Summarize the realized dataset coverage against the configured ranges.
 
@@ -395,9 +401,6 @@ def _sampling_coverage_payload(
     run_files : list[Path]
         Raw run files or consolidated files whose stored pressure and
         temperature profiles define the realized coverage.
-    mode : str
-        Generation mode label recorded in the output payload.
-
     Returns
     -------
     dict[str, Any]
@@ -480,8 +483,8 @@ def _sampling_coverage_payload(
         planet_radius_range = [float(x) for x in config["sampling"]["planet_radius_range_cm"]]
         kzz_lo, kzz_hi = (float(x) for x in config["sampling"]["kzz_range_cm2_s"])
         kzz_range = [
-            float(np.log10(max(kzz_lo, 1.0e-30))),
-            float(np.log10(max(kzz_hi, 1.0e-30))),
+            float(np.log10(max(kzz_lo, KZZ_LOG_FLOOR_CM2_S))),
+            float(np.log10(max(kzz_hi, KZZ_LOG_FLOOR_CM2_S))),
         ]
         configured_ranges.update({
             "gravity_cm_s2": gravity_range,
@@ -511,7 +514,6 @@ def _sampling_coverage_payload(
         })
 
     return {
-        "mode": mode,
         "chemistry_type": get_chemistry_type(config),
         "model_type": get_model_type(config),
         "num_runs": len(specs),
@@ -526,7 +528,6 @@ def _write_generation_metadata(
     run_files: list[Path],
     specs: list[RunSpecification],
     config: dict[str, Any],
-    mode: str,
 ) -> tuple[Path, Path]:
     """Persist raw-run provenance and sampling-coverage metadata.
 
@@ -540,9 +541,6 @@ def _write_generation_metadata(
         Successfully generated run specifications used to summarize coverage.
     config : dict[str, Any]
         Validated pipeline config.
-    mode : str
-        Generation mode label such as ``"synthetic"`` or ``"vulcan"``.
-
     Returns
     -------
     tuple[Path, Path]
@@ -552,14 +550,13 @@ def _write_generation_metadata(
     manifest_path = info_root / "generation_manifest.json"
     coverage_path = info_root / "sampling_coverage.json"
     manifest_payload = {
-        "mode": mode,
         "chemistry_type": get_chemistry_type(config),
         "run_files": manifest_for_files(run_files),
     }
     manifest_path.write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
     coverage_path.write_text(
         json.dumps(
-            _sampling_coverage_payload(config=config, specs=specs, run_files=run_files, mode=mode),
+            _sampling_coverage_payload(config=config, specs=specs, run_files=run_files),
             indent=2,
         )
         + "\n",
@@ -1384,10 +1381,18 @@ def convert_vulcan_output_to_hdf5(
         kzz_cm2_s = np.concatenate([[kzz_raw[0]], 0.5 * (kzz_raw[:-1] + kzz_raw[1:]), [kzz_raw[-1]]])
     else:
         kzz_cm2_s = np.asarray(kzz_raw, dtype=np.float64)
-    gravity_profile_runtime = None
+    # The layerwise runtime gravity lives at ``atm.g`` in current VULCAN
+    # builds, but it is not part of the VULCAN public contract and older
+    # or stripped outputs may omit it. Missing the attribute is expected;
+    # anything else is a legitimate failure and should surface. A debug
+    # line makes "not present" distinguishable from "broken" in logs.
     try:
         gravity_profile_runtime = np.asarray(_fetch(data, "atm", "g"), dtype=np.float64)
     except (AttributeError, KeyError):
+        LOGGER.debug(
+            "VULCAN output for run %s has no atm.g; falling back to the sampled scalar gravity.",
+            spec.run_id,
+        )
         gravity_profile_runtime = None
 
     # Extract the final converged mixing ratios from VULCAN output.
@@ -1398,9 +1403,19 @@ def convert_vulcan_output_to_hdf5(
             "required to derive the final raw-data contract."
         )
     ymix = np.asarray(_fetch(data, "variable", "ymix"), dtype=np.float64)
+    if not np.all(np.isfinite(ymix)):
+        raise ValueError(
+            "VULCAN output has non-finite values in variable.ymix "
+            "and cannot be converted into the raw-data contract."
+        )
     output_species = list(config["data_spec"]["output_species"])
     output_indices = [species.index(name) for name in output_species]
     final_ymix_output = ymix[:, output_indices]
+    if not np.all(np.isfinite(final_ymix_output)):
+        raise ValueError(
+            "VULCAN output has non-finite values in the selected final_ymix_output "
+            "and cannot be converted into the raw-data contract."
+        )
     converted_spec = RunSpecification(
         run_id=spec.run_id,
         pressure_bar=pressure_bar,
@@ -1675,7 +1690,7 @@ def run_vulcan_generation(
         Paths describing the generated raw dataset and its provenance files.
     """
     LOGGER.info("VULCAN generation starting (num_runs=%s)", num_runs or "config default")
-    run_root, raw_root, info_root, runs_dir, reusable_path = _prepare_generation_directory(
+    run_root, raw_root, info_root, runs_dir, chunks_dir, reusable_path = _prepare_generation_directory(
         config,
         project_root=project_root,
         num_runs=num_runs,
@@ -1693,8 +1708,8 @@ def run_vulcan_generation(
             manifest_path=manifest_path if manifest_path.exists() else None,
             coverage_path=coverage_path if coverage_path.exists() else None,
         )
-    if runs_dir is None:
-        raise RuntimeError("VULCAN generation requires a writable staging directory.")
+    if runs_dir is None or chunks_dir is None:
+        raise RuntimeError("VULCAN generation requires writable staging directories.")
     source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
     fastchem = uses_fastchem(config)
     worker_root_key = "vulcan_runtime" if "vulcan_runtime" in config else None
@@ -1831,22 +1846,63 @@ def run_vulcan_generation(
                         failures.append(run_id)
         return successes, failures
 
-    # Resume: detect per-run HDF5 files that survived from a previous
-    # interrupted run so we don't redo work.
-    existing_run_files = sorted(runs_dir.glob("run_*.h5"))
-    if existing_run_files:
+    # Resume: reuse chunk files already written by a previous invocation,
+    # and promote any orphan per-run files (from a crash mid-chunk) into a
+    # resume chunk so the in-flight ``runs/`` directory starts empty.
+    chunk_files: list[Path] = sorted(chunks_dir.glob("chunk_*.h5"))
+    completed_run_ids: set[str] = set()
+    for chunk_path in chunk_files:
+        completed_run_ids.update(list_run_ids_from_consolidated(chunk_path))
+    if chunk_files:
         LOGGER.info(
-            "Resuming: found %d completed per-run files from a previous run in %s",
-            len(existing_run_files),
-            runs_dir,
+            "Resuming: found %d existing chunk files covering %d runs in %s",
+            len(chunk_files), len(completed_run_ids), chunks_dir,
         )
 
-    # Initial batch, streamed in chunks so the first h5 appears within
-    # seconds instead of after the full ``target_count``-wide sampling loop.
+    # Lock the runs_dir before touching orphan per-run files so two
+    # concurrent invocations of the generation stage cannot both try to
+    # promote the same orphan into a resume chunk. A non-blocking flock
+    # is sufficient: if someone else holds it, we bail with a clear
+    # message instead of corrupting the shared state. The lock file lives
+    # next to ``runs_dir`` rather than inside it so the end-of-stage
+    # empty-directory cleanup does not trip over it.
+    ensure_dir(runs_dir)
+    _orphan_lock_path = runs_dir.parent / ".orphan_promotion.lock"
+    with open(_orphan_lock_path, "w") as _orphan_lock_handle:
+        try:
+            fcntl.flock(_orphan_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"Another generation process is resuming the same dataset "
+                f"(orphan-promotion lock held at {_orphan_lock_path}). Wait "
+                "for it to finish or remove the lock file if it is stale."
+            ) from exc
+        try:
+            orphan_run_files = sorted(runs_dir.glob("run_*.h5"))
+            if orphan_run_files:
+                resume_chunk = chunks_dir / "chunk_resume.h5"
+                # If a previous resume chunk survives, bump the suffix to avoid
+                # stomping its contents before we can merge them.
+                suffix = 0
+                while resume_chunk.exists():
+                    suffix += 1
+                    resume_chunk = chunks_dir / f"chunk_resume_{suffix:03d}.h5"
+                LOGGER.info(
+                    "Resuming: promoting %d orphan per-run files into %s",
+                    len(orphan_run_files), resume_chunk,
+                )
+                merge_run_files_to_chunk(orphan_run_files, resume_chunk)
+                chunk_files.append(resume_chunk)
+                completed_run_ids.update(list_run_ids_from_consolidated(resume_chunk))
+        finally:
+            # Unlink while we still hold the flock; the lock is released when
+            # the file handle closes at the end of the ``with`` block.
+            try:
+                _orphan_lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
     base_seed = int(config["generation"]["seed"])
-    next_run_index = 0
-    existing_stems = {p.stem for p in existing_run_files}
-    run_files: list[Path] = list(existing_run_files)
     all_failures: list[str] = []
     all_specs: list[RunSpecification] = []
 
@@ -1865,6 +1921,25 @@ def run_vulcan_generation(
         sample_chunk_size,
     )
 
+    # Chunk merges run on a dedicated background thread so the next chunk's
+    # generation starts immediately instead of waiting for the previous
+    # chunk's HDF5 consolidation. Single-worker to keep the merges serial
+    # (multiple h5py writers racing would contend on shared state).
+    merge_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="merge"
+    )
+    merge_futures: list[concurrent.futures.Future] = []
+
+    def _submit_merge(run_files: list[Path], chunk_path: Path) -> None:
+        merge_futures.append(
+            merge_executor.submit(merge_run_files_to_chunk, run_files, chunk_path)
+        )
+
+    def _await_merges() -> None:
+        for fut in merge_futures:
+            fut.result()
+        merge_futures.clear()
+
     skipped_total = 0
     for chunk_start in range(0, target_count, sample_chunk_size):
         chunk_end = min(chunk_start + sample_chunk_size, target_count)
@@ -1873,7 +1948,7 @@ def run_vulcan_generation(
         )
         chunk_specs = _attach_species_metadata(raw_chunk)
         all_specs.extend(chunk_specs)
-        chunk_remaining = [s for s in chunk_specs if s.run_id not in existing_stems]
+        chunk_remaining = [s for s in chunk_specs if s.run_id not in completed_run_ids]
         chunk_skipped = len(chunk_specs) - len(chunk_remaining)
         skipped_total += chunk_skipped
         if chunk_skipped:
@@ -1881,10 +1956,25 @@ def run_vulcan_generation(
                 "Chunk [%d, %d): skipping %d already-completed runs",
                 chunk_start, chunk_end, chunk_skipped,
             )
-        if chunk_remaining:
-            new_successes, new_failures = _run_batch(chunk_remaining)
-            run_files.extend(new_successes)
-            all_failures.extend(new_failures)
+        if not chunk_remaining:
+            continue
+        new_successes, new_failures = _run_batch(chunk_remaining)
+        all_failures.extend(new_failures)
+        if new_successes:
+            chunk_path = chunks_dir / f"chunk_{chunk_start:06d}_{chunk_end:06d}.h5"
+            # Pre-existing file would only appear if a previous crashed
+            # run wrote the chunk but failed to delete its per-run files;
+            # the promoted resume chunk already covers those. Use a unique
+            # suffix to be safe.
+            suffix = 0
+            while chunk_path.exists():
+                suffix += 1
+                chunk_path = chunks_dir / (
+                    f"chunk_{chunk_start:06d}_{chunk_end:06d}_{suffix:03d}.h5"
+                )
+            _submit_merge(new_successes, chunk_path)
+            chunk_files.append(chunk_path)
+            completed_run_ids.update(p.stem for p in new_successes)
 
     next_run_index = target_count
     if skipped_total:
@@ -1894,7 +1984,7 @@ def run_vulcan_generation(
     if backfill.get("enabled", True) and all_failures:
         max_retries = int(backfill.get("max_retries", 3))
         for attempt in range(1, max_retries + 1):
-            shortfall = target_count - len(run_files)
+            shortfall = target_count - len(completed_run_ids)
             if shortfall <= 0:
                 break
             LOGGER.info(
@@ -1909,30 +1999,49 @@ def run_vulcan_generation(
             )
             next_run_index += len(backfill_specs)
             new_successes, new_failures = _run_batch(backfill_specs)
-            run_files.extend(new_successes)
             all_failures.extend(new_failures)
             all_specs.extend(backfill_specs)
+            if new_successes:
+                chunk_path = chunks_dir / f"chunk_backfill_{attempt:02d}.h5"
+                _submit_merge(new_successes, chunk_path)
+                chunk_files.append(chunk_path)
+                completed_run_ids.update(p.stem for p in new_successes)
             if not new_failures:
                 break
+
+    # Drain background merges before scanning for stragglers so any files
+    # still queued for merging are removed from runs/ first.
+    _await_merges()
+    merge_executor.shutdown()
+
+    # Any straggler per-run files (e.g. from a worker that finished after
+    # its chunk merged) go into a final catch-all chunk.
+    straggler_run_files = sorted(runs_dir.glob("run_*.h5"))
+    if straggler_run_files:
+        final_chunk = chunks_dir / "chunk_stragglers.h5"
+        merge_run_files_to_chunk(straggler_run_files, final_chunk)
+        chunk_files.append(final_chunk)
+        completed_run_ids.update(list_run_ids_from_consolidated(final_chunk))
 
     if all_failures:
         failed_log = info_root / "failed_runs.json"
         failed_log.write_text(json.dumps(all_failures, indent=2), encoding="utf-8")
-        shortfall = target_count - len(run_files)
+        shortfall = target_count - len(completed_run_ids)
         if shortfall > 0:
             raise RuntimeError(
                 f"Generation finished {shortfall} successful runs short of the requested total. "
                 f"See {failed_log} for failed run IDs."
             )
 
-    run_files = sorted(run_files)
-    LOGGER.info("VULCAN generation complete: %d runs written to %s", len(run_files), runs_dir)
-    consolidated_path = consolidate_runs_to_single_hdf5(
-        run_files, raw_root / "runs.h5",
+    LOGGER.info(
+        "VULCAN generation complete: %d runs across %d chunk files",
+        len(completed_run_ids), len(chunk_files),
     )
-    # Per-run files are cleaned up by consolidate_runs_to_single_hdf5
-    # (delete_originals=True by default).  Remove the now-empty staging
-    # directory only after consolidation succeeds.
+    consolidated_path = merge_chunks_to_runs_h5(
+        chunk_files, raw_root / "runs.h5",
+    )
+    if chunks_dir.exists() and not any(chunks_dir.iterdir()):
+        chunks_dir.rmdir()
     if runs_dir.exists() and not any(runs_dir.iterdir()):
         runs_dir.rmdir()
     _cleanup_worker_base(worker_base)
@@ -1943,7 +2052,6 @@ def run_vulcan_generation(
         run_files=[consolidated_path],
         specs=successful_specs,
         config=config,
-        mode="vulcan",
     )
     return GeneratedRawDataset(
         run_root=run_root,
@@ -2032,7 +2140,7 @@ def generate_raw_dataset(
         Description of the generated or reused raw dataset.
     """
     _check_assets_availability(config, project_root)
-    mode = str(config["generation"]["mode"]).lower()
-    if mode == "vulcan":
+    chemistry_type = get_chemistry_type(config)
+    if chemistry_type in {"fastchem", "vulcan"}:
         return run_vulcan_generation(config, project_root=project_root, num_runs=num_runs)
-    raise ValueError(f"Unsupported generation mode: {mode}")
+    raise ValueError(f"Unsupported chemistry_type: {chemistry_type}")

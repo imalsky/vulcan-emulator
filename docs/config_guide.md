@@ -14,16 +14,16 @@ The two supported combinations are:
 - `vulcan + transformer`
 
 Shipped configs:
-- `config/vulcan_no_condensation.json` — VULCAN kinetic chemistry, gas-phase only
+- `config/fastchem_no_condensation.json` — FastChem equilibrium chemistry, gas-phase only
 - `config/vulcan_condensation.json` — VULCAN kinetic chemistry with H2O/S8 condensation
 
 CLI:
 
 ```bash
-python -m src.utils --config config/vulcan_no_condensation.json --stage generation
-python -m src.utils --config config/vulcan_no_condensation.json --stage normalization
-python -m src.utils --config config/vulcan_no_condensation.json --stage training
-python -m src.utils --config config/vulcan_no_condensation.json --stage export
+python -m src.utils --config config/fastchem_no_condensation.json --stage generation
+python -m src.utils --config config/fastchem_no_condensation.json --stage normalization
+python -m src.utils --config config/fastchem_no_condensation.json --stage training
+python -m src.utils --config config/fastchem_no_condensation.json --stage export
 ```
 
 ---
@@ -121,10 +121,15 @@ Output head: LayerNorm -> activation -> bottleneck -> dropout -> Linear(-> targe
 data/<run_name>/
   raw/
   info/
-  train/
-  val/
-  test/
+  processed/
+    train/
+    val/
+    test/
 ```
+
+`raw/`, `info/`, and `processed/` are auto-expanded by
+`load_and_validate_config()`; do not set `paths.raw_root` or
+`paths.processed_root` in the config.
 
 ### `data_spec`
 
@@ -137,9 +142,9 @@ data/<run_name>/
 
 | Key | Required for | Description |
 |-----|-------------|-------------|
-| `num_levels` | both | Number of vertical pressure levels |
-| `pressure_top_bar` | both | Top-of-atmosphere pressure (bar) |
-| `pressure_bottom_bar` | both | Bottom pressure (bar) |
+| `num_levels_range` | both | `[min, max]` number of vertical pressure levels (per-run count is sampled uniformly) |
+| `pressure_top_bar_range` | both | `[min, max]` top-of-atmosphere pressure (bar) |
+| `pressure_bottom_bar_range` | both | `[min, max]` bottom pressure (bar) |
 | `temperature_range_k` | both | [min, max] temperature bounds (K) |
 | `he_frac_range` | both | [min, max] He number fraction (n_He / n_H) |
 | `c_frac_range` | both | [min, max] C number fraction (n_C / n_H) |
@@ -154,6 +159,10 @@ data/<run_name>/
 | `diurnal_factor_range` | vulcan only | [min, max] diurnal averaging factor |
 | `kzz_range_cm2_s` | vulcan only | [min, max] per-run eddy diffusion coefficient (cm²/s). Log-sampled by default — override via `scales.kzz_cm2_s`. Kzz remains depth-constant within each run. |
 | `scales` | optional | Per-parameter sampling scale, `"linear"` (default) or `"log"`. Applies to any of `he_frac`, `c_frac`, `o_frac`, `n_frac`, `s_frac`, `kzz_cm2_s`. Use `log` when the range spans more than ~1 dex so samples are not biased toward the upper bound. |
+
+The scalar `num_levels`, `pressure_top_bar`, and `pressure_bottom_bar` keys
+are no longer accepted; config loading raises if they appear. Use the
+`_range` variants above.
 
 ### `temperature_profiles`
 
@@ -172,14 +181,17 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 
 | Key | Description |
 |-----|-------------|
-| `mode` | `"vulcan"` |
 | `num_runs` | Target number of successful runs |
 | `seed` | Sampling seed |
 | `overwrite` | Whether to overwrite existing raw data |
 | `reuse_raw_if_present` | Skip generation if raw data exists |
 | `parallel_workers` | Number of parallel generation workers (`0` = auto-detect from PBS/SLURM/OS) |
-| `sample_chunk_size` | Runs per streaming sample+execute chunk (default `1000`). Smaller chunks surface the first `run_*.h5` sooner and interleave progress logging; values `>= num_runs` collapse to the historical one-shot behavior. |
+| `sample_chunk_size` | Runs per streaming sample+execute chunk (default `1000`). Each chunk's per-run HDF5 files are merged into one `chunks/chunk_XXXXXX_YYYYYY.h5` immediately on completion and the originals deleted, so this also caps the peak per-run file count on disk. Lower values keep that peak smaller at the cost of more chunk files at the final merge step. |
 | `backfill` | `{enabled, max_retries}` for VULCAN failure recovery |
+
+`generation.mode` is a deprecated compatibility field. When present it must
+remain `"vulcan"`, but backend selection now comes from `chemistry_type` and
+the field is ignored by generation/preprocessing.
 
 ### `normalization`
 
@@ -216,10 +228,21 @@ Normalization methods:
 
 ### `training.loss`
 
+`type` selects the loss variant. Both variants combine a normalized-space
+MSE term (`lambda_z`) with a log10-space penalty on the physical residual
+`r = log10(pred_VMR / target_VMR)`.
+
 | Key | Required for | Description |
 |-----|-------------|-------------|
+| `type` | both | `"mae"` or `"huber"`. Picks the log10-space loss shape. |
 | `lambda_z` | both | Weight on MSE in normalized space (smoothness regularizer) |
-| `lambda_log10_mae` | both | Weight on MAE in log10 physical space (primary signal: `|log10(pred_VMR / target_VMR)|`) |
+| `lambda_log10_mae` | `mae` | Weight on mean `|r|` in log10 physical space. |
+| `lambda_log10_huber` | `huber` | Weight on Huber loss in log10 physical space (primary signal on `r`). |
+| `huber_delta_log10` | `huber` | Huber transition point in dex (must be `> 0`). Quadratic for `|r| <= delta`, linear otherwise. `0.1` is a sensible default (~26% fractional error at the transition). |
+
+MAE is the `delta -> 0` limit of Huber and is the current default in the
+shipped `config/fastchem_analytic_500k.json`. Huber is the preferred
+variant when outliers in the log-ratio tail dominate training signal.
 
 ### `model`
 
@@ -232,8 +255,12 @@ Normalization methods:
 | `conditioning_hidden_dim` | Hidden width of FiLM conditioning MLP |
 | `film_clamp` | Symmetric clamp on FiLM gamma/beta |
 | `output_head_divisor` | Output bottleneck: `d_model // output_head_divisor` |
-| `activation` | Optional. Activation function (default: `"leaky_relu"`) |
-| `dropout_rate` | Optional. Dropout probability (default: 0.05) |
+| `activation` | Optional. Activation function (default: `"gelu"`) |
+| `dropout_rate` | Optional. Dropout probability (default: `0.0`) |
+| `norm_type` | Optional. `"layernorm"` (default) or `"rmsnorm"`. RMSNorm drops mean subtraction and bias; ~10% faster and a modern default. |
+| `use_qk_norm` | Optional. `false` (default) or `true`. Applies RMSNorm to Q and K along `head_dim` before the attention dot product; stabilizes logits in deeper stacks. |
+| `ffn_type` | Optional. `"dense"` (default) or `"swiglu"`. SwiGLU gains a third projection; re-budget `dim_feedforward` to `~2/3 × dense` for param parity. |
+| `zero_init_film` | Optional. `false` (default) or `true`. Zero-initializes the final FiLM projection so γ=β=0 at step 0 (AdaLN-Zero). Combine with a wide `conditioning_hidden_dim`; starves the composition pathway otherwise. |
 
 Supported activations: `relu`, `gelu`, `silu`, `tanh`, `elu`, `selu`, `softplus`, `leaky_relu`.
 

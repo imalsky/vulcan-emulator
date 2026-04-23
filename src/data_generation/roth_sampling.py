@@ -30,8 +30,9 @@ from pathlib import Path
 from typing import Any, Dict, Tuple, Union
 
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
-from ..constants import ROTH_BOOLEAN_FILTER_KEYS, ROTH_FILTER_KEYS, ROTH_NUMERIC_FILTER_KEYS
+from ..constants import ROTH_NUMERIC_FILTER_KEYS
 
 RothFilterValue = Union[float, Tuple[float, float], bool]
 RothFilterConfig = Dict[str, RothFilterValue]
@@ -114,55 +115,6 @@ def _prepare_profile_coordinates(
     return log_pressure, temperature
 
 
-def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Return shape-preserving cubic Hermite slopes for strictly increasing ``x``.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        Strictly increasing sample coordinates.
-    y : np.ndarray
-        Sample values defined on ``x``.
-
-    Returns
-    -------
-    np.ndarray
-        Per-knot tangent slopes used by the monotone PCHIP interpolant.
-    """
-    if x.size == 2:
-        slope = (y[1] - y[0]) / (x[1] - x[0])
-        return np.array([slope, slope], dtype=np.float64)
-
-    h = np.diff(x)
-    delta = np.diff(y) / h
-    slopes = np.zeros_like(y, dtype=np.float64)
-
-    for idx in range(1, x.size - 1):
-        delta_left = delta[idx - 1]
-        delta_right = delta[idx]
-        if delta_left == 0.0 or delta_right == 0.0 or np.sign(delta_left) != np.sign(delta_right):
-            slopes[idx] = 0.0
-            continue
-        w1 = 2.0 * h[idx] + h[idx - 1]
-        w2 = h[idx] + 2.0 * h[idx - 1]
-        slopes[idx] = (w1 + w2) / ((w1 / delta_left) + (w2 / delta_right))
-
-    left = ((2.0 * h[0] + h[1]) * delta[0] - h[0] * delta[1]) / (h[0] + h[1])
-    if np.sign(left) != np.sign(delta[0]):
-        left = 0.0
-    elif np.sign(delta[0]) != np.sign(delta[1]) and abs(left) > abs(3.0 * delta[0]):
-        left = 3.0 * delta[0]
-    slopes[0] = left
-
-    right = ((2.0 * h[-1] + h[-2]) * delta[-1] - h[-1] * delta[-2]) / (h[-1] + h[-2])
-    if np.sign(right) != np.sign(delta[-1]):
-        right = 0.0
-    elif np.sign(delta[-1]) != np.sign(delta[-2]) and abs(right) > abs(3.0 * delta[-1]):
-        right = 3.0 * delta[-1]
-    slopes[-1] = right
-    return slopes
-
-
 def _pchip_interpolate(
     x_target: np.ndarray,
     x_source: np.ndarray,
@@ -170,50 +122,15 @@ def _pchip_interpolate(
 ) -> np.ndarray:
     """Evaluate a shape-preserving cubic Hermite interpolant with edge clamping.
 
-    Parameters
-    ----------
-    x_target : np.ndarray
-        Target coordinates where the interpolant should be evaluated.
-    x_source : np.ndarray
-        Strictly increasing source coordinates.
-    y_source : np.ndarray
-        Source values defined on ``x_source``.
-
-    Returns
-    -------
-    np.ndarray
-        Interpolated values on ``x_target`` with constant extrapolation
-        outside the source range.
+    Thin wrapper over :class:`scipy.interpolate.PchipInterpolator` (same
+    Fritsch-Carlson algorithm). Evaluation outside ``[x_source[0],
+    x_source[-1]]`` is replaced with the nearest endpoint value to avoid
+    cubic extrapolation artefacts.
     """
-    slopes = _pchip_slopes(x_source, y_source)
-    result = np.empty_like(x_target, dtype=np.float64)
-
-    left_mask = x_target <= x_source[0]
-    right_mask = x_target >= x_source[-1]
-    middle_mask = ~(left_mask | right_mask)
-    result[left_mask] = y_source[0]
-    result[right_mask] = y_source[-1]
-
-    if np.any(middle_mask):
-        x_mid = x_target[middle_mask]
-        interval_idx = np.searchsorted(x_source, x_mid, side="right") - 1
-        interval_idx = np.clip(interval_idx, 0, x_source.size - 2)
-        x0 = x_source[interval_idx]
-        x1 = x_source[interval_idx + 1]
-        y0 = y_source[interval_idx]
-        y1 = y_source[interval_idx + 1]
-        h = x1 - x0
-        t = (x_mid - x0) / h
-        h00 = (2.0 * t**3) - (3.0 * t**2) + 1.0
-        h10 = (t**3) - (2.0 * t**2) + t
-        h01 = (-2.0 * t**3) + (3.0 * t**2)
-        h11 = (t**3) - (t**2)
-        result[middle_mask] = (
-            h00 * y0
-            + h10 * h * slopes[interval_idx]
-            + h01 * y1
-            + h11 * h * slopes[interval_idx + 1]
-        )
+    pchip = PchipInterpolator(x_source, y_source, extrapolate=False)
+    result = pchip(x_target)
+    result = np.where(x_target <= x_source[0], y_source[0], result)
+    result = np.where(x_target >= x_source[-1], y_source[-1], result)
     return result
 
 

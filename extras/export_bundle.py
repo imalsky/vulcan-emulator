@@ -3,6 +3,15 @@
 Minimal CLI around ``src.models.export_bundle.export_checkpoint_to_npz`` that
 skips the config pipeline and takes the checkpoint path directly.
 
+The bundle is weights + JSON metadata only; the forward pass lives in
+``src/models/transformer.py`` and is reached via
+``src/models/standalone_inference.py``. Consumers must therefore have the
+``vulcan-emulator`` package on ``sys.path``. The project is organized so
+``src/`` sits alongside ``models/`` at the distribution root — that is,
+``<dist>/src`` and ``<dist>/models/<run>/best_exported.npz`` ship together
+as one tree, and consumers add ``<dist>`` to ``sys.path``. No per-bundle
+source copy is needed.
+
 Bundled in here is a NumPy 2.x → 1.x pickle compatibility shim: training
 usually runs with NumPy 2.x, but the local ``vulcan`` conda env is pinned to
 1.26 by exojax. A custom ``Unpickler.find_class`` rewrites the NumPy 2.x

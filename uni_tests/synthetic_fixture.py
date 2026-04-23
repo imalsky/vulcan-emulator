@@ -24,8 +24,8 @@ from src.data_generation.generation import (
     _generation_worker_count,
     _prepare_generation_directory,
     _write_generation_metadata,
-    consolidate_runs_to_single_hdf5,
     list_run_ids_from_consolidated,
+    merge_run_files_to_chunk,
     write_equilibrium_hdf5,
     write_raw_run_hdf5,
 )
@@ -338,7 +338,7 @@ def generate_synthetic_raw_runs(
         summary.
     """
     LOGGER.info("Synthetic generation starting (num_runs=%s)", num_runs or "config default")
-    run_root, raw_root, info_root, runs_dir, reusable_path = _prepare_generation_directory(
+    run_root, raw_root, info_root, runs_dir, chunks_dir, reusable_path = _prepare_generation_directory(
         config,
         project_root=project_root,
         num_runs=num_runs,
@@ -356,8 +356,8 @@ def generate_synthetic_raw_runs(
             manifest_path=manifest_path if manifest_path.exists() else None,
             coverage_path=coverage_path if coverage_path.exists() else None,
         )
-    if runs_dir is None:
-        raise RuntimeError("Synthetic generation requires a writable staging directory.")
+    if runs_dir is None or chunks_dir is None:
+        raise RuntimeError("Synthetic generation requires writable staging directories.")
     specs = sample_run_specifications(
         config=config,
         project_root=project_root,
@@ -411,18 +411,17 @@ def generate_synthetic_raw_runs(
                 run_files.append(future.result())
     run_files = sorted(run_files)
     LOGGER.info("Synthetic generation complete: %d runs written to %s", len(run_files), runs_dir)
-    consolidated_path = consolidate_runs_to_single_hdf5(
+    consolidated_path = merge_run_files_to_chunk(
         run_files, raw_root / "runs.h5",
     )
-    # Per-run files are cleaned up by consolidate_runs_to_single_hdf5.
-    if runs_dir.exists() and not any(runs_dir.iterdir()):
-        runs_dir.rmdir()
+    for staging in (runs_dir, chunks_dir):
+        if staging.exists() and not any(staging.iterdir()):
+            staging.rmdir()
     manifest_path, coverage_path = _write_generation_metadata(
         info_root=info_root,
         run_files=[consolidated_path],
         specs=prepared_specs,
         config=config,
-        mode=str(config["generation"]["mode"]).lower(),
     )
     return GeneratedRawDataset(
         run_root=run_root,

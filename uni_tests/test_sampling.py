@@ -339,7 +339,7 @@ def test_analytic_sampler_ranges_match_repo_config():
     import json
 
     root = Path(__file__).resolve().parents[1]
-    for cfg_name in ("vulcan_no_condensation.json", "vulcan_condensation.json"):
+    for cfg_name in ("fastchem_no_condensation.json", "vulcan_condensation.json"):
         cfg_path = root / "config" / cfg_name
         cfg = json.loads(cfg_path.read_text())
         sampler = cfg["temperature_profiles"]["analytic_sampler"]

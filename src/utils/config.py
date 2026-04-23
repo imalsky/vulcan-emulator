@@ -1,12 +1,12 @@
 """Configuration loading, validation, and normalization for emulator configs.
 
-This module is the single source of truth for config schema validation.  It:
+This module is the single source of truth for config schema validation. It:
 
 1. Loads a JSON config file from disk.
-2. Validates every field against its expected type, range, and chemistry/model
-   constraints.
-3. Derives internal aliases (``training.model``, ``roth_sampler``)
-   so downstream code can rely on a normalized, validated structure.
+2. Delegates schema validation to :mod:`src.utils.schemas` (Pydantic).
+3. Derives internal aliases (``training.model``, ``roth_sampler``,
+   ``data_spec`` feature orders) so downstream code can rely on a normalized,
+   validated structure.
 4. Returns a dict that is safe to pass to any pipeline stage.
 
 Validation is strict and fail-fast: any schema violation raises
@@ -20,13 +20,24 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
+from .schemas import (
+    ConfigAdapter,
+    ModelConfig,
+)
+
 from ..constants import (  # noqa: F401 — re-exported for downstream consumers
     CHEMISTRY_TYPES,
+    DBIN1_NM_DEFAULT,
+    DBIN2_NM_DEFAULT,
+    DBIN_12TRANS_NM_DEFAULT,
     DEFAULT_REQUIRED_GLOBAL_INPUTS,
     DEFAULT_STATE_SPECIES,
     ELEMENT_INPUT_ORDER,
     FASTCHEM_CONDITIONING_INPUT_ORDER,
     FASTCHEM_CORE_GLOBAL_INPUTS,
+    FRACTION_SUM_TOLERANCE,
     MODEL_TYPES,
     PUBLIC_PHYSICS_TOGGLES,
     SUPPORTED_ATM_BASES,
@@ -34,15 +45,6 @@ from ..constants import (  # noqa: F401 — re-exported for downstream consumers
     VULCAN_CORE_GLOBAL_INPUTS,
     VULCAN_OPTIONAL_GLOBAL_INPUTS,
     VULCAN_STELLAR_GLOBAL_INPUTS,
-    _ALLOWED_ACTIVATIONS,
-    _ALLOWED_LR_SCHEDULERS,
-    _ALLOWED_NORMALIZATION_METHODS,
-    _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS,
-    _ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS,
-    _ALLOWED_TEMPERATURE_PROFILE_NUMERIC_FILTER_KEYS,
-    _ALLOWED_TEMPERATURE_PROFILE_SOURCE_MODES,
-    _DEFAULT_SCIENCE_PRESET_NAME,
-    _INTERNAL_VULCAN_RUNTIME_DEFAULTS,
 )
 
 
@@ -50,339 +52,75 @@ class ConfigValidationError(ValueError):
     """Raised when a configuration file violates the required contract."""
 
 
-def _require_keys(mapping: dict[str, Any], keys: tuple[str, ...] | list[str], scope: str) -> None:
-    """Validate that a config subsection contains every required key.
+_DISCRIMINATOR_ERROR_TYPES = {"union_tag_not_found", "union_tag_invalid"}
+_TOP_LEVEL_DISCRIMINATORS = {"fastchem", "vulcan"}
 
-    Parameters
-    ----------
-    mapping : dict[str, Any]
-        Config subsection to validate.
-    keys : tuple[str, ...] or list[str]
-        Required keys that must appear in ``mapping``.
-    scope : str
-        Human-readable config scope used in validation errors.
 
-    Returns
-    -------
-    None
-        The function returns silently when all keys are present.
+def _format_pydantic_error(exc: ValidationError, scope: str) -> str:
+    """Render a Pydantic ``ValidationError`` as a ``<scope>.<field>: msg`` list.
 
-    Raises
-    ------
-    ConfigValidationError
-        If one or more required keys are missing.
+    Keeps the dotted field-path error-message shape that tests and logs
+    already rely on. Top-level discriminator tags (``fastchem`` /
+    ``vulcan``, used by the ``chemistry_type`` discriminated union) are
+    stripped from the leading position of the loc so users see paths
+    relative to the root. Discriminator errors (tag missing or unknown)
+    append the discriminator key to the loc so the error points at the
+    missing field rather than the enclosing union.
     """
-    missing = [key for key in keys if key not in mapping]
-    if missing:
-        raise ConfigValidationError(f"Missing required keys in {scope}: {missing}")
-
-
-
-
-def _as_bool(value: Any, field: str) -> bool:
-    """Validate and return one boolean config field.
-
-    Parameters
-    ----------
-    value : Any
-        Raw config value to validate.
-    field : str
-        Field name used in validation errors.
-
-    Returns
-    -------
-    bool
-        Validated boolean value.
-    """
-    if not isinstance(value, bool):
-        raise ConfigValidationError(f"{field} must be a boolean.")
-    return value
-
-
-def _as_int(value: Any, field: str) -> int:
-    """Validate and return one integer config field.
-
-    Parameters
-    ----------
-    value : Any
-        Raw config value to validate.
-    field : str
-        Field name used in validation errors.
-
-    Returns
-    -------
-    int
-        Validated integer value.
-    """
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigValidationError(f"{field} must be an integer.")
-    return int(value)
-
-
-def _as_float(value: Any, field: str) -> float:
-    """Validate and return one numeric config field as a float.
-
-    Parameters
-    ----------
-    value : Any
-        Raw config value to validate.
-    field : str
-        Field name used in validation errors.
-
-    Returns
-    -------
-    float
-        Validated numeric value converted to ``float``.
-    """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigValidationError(f"{field} must be numeric.")
-    return float(value)
-
-
-def _as_nonempty_str(value: Any, field: str) -> str:
-    """Validate and return one non-empty string config field.
-
-    Parameters
-    ----------
-    value : Any
-        Raw config value to validate.
-    field : str
-        Field name used in validation errors.
-
-    Returns
-    -------
-    str
-        Stripped non-empty string value.
-    """
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigValidationError(f"{field} must be a non-empty string.")
-    return value.strip()
-
-
-def _as_string_list(value: Any, field: str) -> list[str]:
-    """Validate and normalize a deduplicated list of non-empty strings.
-
-    Parameters
-    ----------
-    value : Any
-        Candidate list value from the config payload.
-    field : str
-        Fully qualified config field name used in validation errors.
-
-    Returns
-    -------
-    list[str]
-        Normalized string list with leading/trailing whitespace removed.
-    """
-    if not isinstance(value, list) or not value:
-        raise ConfigValidationError(f"{field} must be a non-empty list.")
-    result = [_as_nonempty_str(item, field) for item in value]
-    if len(set(result)) != len(result):
-        raise ConfigValidationError(f"{field} contains duplicate entries.")
-    return result
-
-
-def _normalized_method_name(
-    value: Any,
-    field: str,
-    *,
-    allowed: set[str] | None = None,
-) -> str:
-    """Validate and normalize a named method from the config payload.
-
-    Parameters
-    ----------
-    value : Any
-        Candidate method name from the config payload.
-    field : str
-        Fully qualified config field name used in validation errors.
-    allowed : set[str] or None, optional
-        Explicit method-name allow-list. When omitted, the shared
-        normalization-method set is used.
-
-    Returns
-    -------
-    str
-        Lower-cased validated method name.
-    """
-    method_name = _as_nonempty_str(value, field).lower()
-    allowed_methods = _ALLOWED_NORMALIZATION_METHODS if allowed is None else allowed
-    if method_name not in allowed_methods:
-        raise ConfigValidationError(
-            f"{field} must be one of {sorted(allowed_methods)}, got {method_name!r}."
-        )
-    return method_name
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = list(err["loc"])
+        if loc and loc[0] in _TOP_LEVEL_DISCRIMINATORS:
+            loc = loc[1:]
+        if err["type"] in _DISCRIMINATOR_ERROR_TYPES:
+            ctx = err.get("ctx") or {}
+            disc = str(ctx.get("discriminator", "type")).strip("'\"")
+            loc.append(disc)
+        tail = ".".join(str(x) for x in loc)
+        path = f"{scope}.{tail}" if tail else scope
+        parts.append(f"{path}: {err['msg']}")
+    return "; ".join(parts)
 
 
 def get_chemistry_type(config: dict[str, Any]) -> str:
-    """Return the validated chemistry target family from the config.
-
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Top-level config payload.
-
-    Returns
-    -------
-    str
-        Lower-cased chemistry type, either ``"fastchem"`` or ``"vulcan"``.
-    """
-    chemistry_type = _as_nonempty_str(
-        config.get("chemistry_type"),
-        "chemistry_type",
-    ).lower()
-    if chemistry_type not in CHEMISTRY_TYPES:
+    """Return the validated chemistry target family from the config."""
+    value = config.get("chemistry_type")
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigValidationError("chemistry_type: must be a non-empty string.")
+    normalized = value.strip().lower()
+    if normalized not in CHEMISTRY_TYPES:
         raise ConfigValidationError(
-            f"chemistry_type must be one of {CHEMISTRY_TYPES}, got {chemistry_type!r}."
+            f"chemistry_type must be one of {CHEMISTRY_TYPES}, got {normalized!r}."
         )
-    return chemistry_type
+    return normalized
 
 
 def get_model_type(config: dict[str, Any]) -> str:
-    """Return the validated prediction architecture family from the config.
-
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Top-level config payload.
-
-    Returns
-    -------
-    str
-        Lower-cased model type, either ``"mlp"`` or ``"transformer"``.
-    """
-    model_type = _as_nonempty_str(config.get("model_type"), "model_type").lower()
-    if model_type not in MODEL_TYPES:
+    """Return the validated prediction architecture family from the config."""
+    value = config.get("model_type")
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigValidationError("model_type: must be a non-empty string.")
+    normalized = value.strip().lower()
+    if normalized not in MODEL_TYPES:
         raise ConfigValidationError(
-            f"model_type must be one of {MODEL_TYPES}, got {model_type!r}."
+            f"model_type must be one of {MODEL_TYPES}, got {normalized!r}."
         )
-    return model_type
+    return normalized
 
 
 def uses_fastchem(config: dict[str, Any]) -> bool:
-    """Report whether the config targets FastChem equilibrium chemistry.
-
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Validated pipeline config.
-
-    Returns
-    -------
-    bool
-        ``True`` when ``chemistry_type`` resolves to ``"fastchem"``.
-    """
+    """Report whether the config targets FastChem equilibrium chemistry."""
     return get_chemistry_type(config) == "fastchem"
 
 
 def uses_vulcan_chemistry(config: dict[str, Any]) -> bool:
-    """Report whether the config targets converged VULCAN chemistry outputs.
-
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Validated pipeline config.
-
-    Returns
-    -------
-    bool
-        ``True`` when ``chemistry_type`` resolves to ``"vulcan"``.
-    """
+    """Report whether the config targets converged VULCAN chemistry outputs."""
     return get_chemistry_type(config) == "vulcan"
 
 
 def uses_transformer(config: dict[str, Any]) -> bool:
-    """Report whether the config selects the FiLM-conditioned Transformer.
-
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Validated pipeline config.
-
-    Returns
-    -------
-    bool
-        ``True`` when ``model_type`` resolves to ``"transformer"``.
-    """
+    """Report whether the config selects the FiLM-conditioned Transformer."""
     return get_model_type(config) == "transformer"
-
-
-def _validate_science_presets(
-    presets: Any,
-    *,
-    default_physics: dict[str, bool],
-    default_atm_base: str,
-    scope: str,
-) -> list[dict[str, Any]]:
-    """Validate curated full-VULCAN science presets.
-
-    Parameters
-    ----------
-    presets : Any
-        User-provided preset payload or ``None``.
-    default_physics : dict[str, bool]
-        Default public physics toggles used to backfill omitted presets.
-    default_atm_base : str
-        Default atmosphere base used to backfill omitted presets.
-    scope : str
-        Config scope label used in validation errors.
-
-    Returns
-    -------
-    list[dict[str, Any]]
-        Normalized preset dictionaries containing ``name``, ``atm_base``, and
-        ``physics_toggles``.
-    """
-    if presets is None:
-        return [
-            {
-                "name": _DEFAULT_SCIENCE_PRESET_NAME,
-                "atm_base": default_atm_base,
-                "physics_toggles": dict(default_physics),
-            }
-        ]
-    if not isinstance(presets, list) or not presets:
-        raise ConfigValidationError(f"{scope} must be a non-empty list when provided.")
-
-    normalized: list[dict[str, Any]] = []
-    seen_names: set[str] = set()
-    for idx, raw_preset in enumerate(presets):
-        preset_scope = f"{scope}[{idx}]"
-        if not isinstance(raw_preset, dict):
-            raise ConfigValidationError(f"{preset_scope} must be a mapping.")
-        name = _as_nonempty_str(raw_preset.get("name"), f"{preset_scope}.name")
-        if name in seen_names:
-            raise ConfigValidationError(f"{scope} contains duplicate preset name {name!r}.")
-        seen_names.add(name)
-        atm_base = _as_nonempty_str(
-            raw_preset.get("atm_base", default_atm_base),
-            f"{preset_scope}.atm_base",
-        )
-        if atm_base not in SUPPORTED_ATM_BASES:
-            raise ConfigValidationError(
-                f"{preset_scope}.atm_base must be one of {SUPPORTED_ATM_BASES}, got {atm_base!r}."
-            )
-        physics_overrides = raw_preset.get("physics_toggles", {})
-        if not isinstance(physics_overrides, dict):
-            raise ConfigValidationError(f"{preset_scope}.physics_toggles must be a mapping.")
-        physics = dict(default_physics)
-        for toggle_name, toggle_value in physics_overrides.items():
-            if toggle_name not in PUBLIC_PHYSICS_TOGGLES:
-                raise ConfigValidationError(
-                    f"{preset_scope}.physics_toggles.{toggle_name} is not a supported public toggle."
-                )
-            physics[toggle_name] = _as_bool(
-                toggle_value,
-                f"{preset_scope}.physics_toggles.{toggle_name}",
-            )
-        normalized.append(
-            {
-                "name": name,
-                "atm_base": atm_base,
-                "physics_toggles": physics,
-            }
-        )
-    return normalized
 
 
 def resolve_conditioning_inputs(
@@ -390,21 +128,7 @@ def resolve_conditioning_inputs(
     raw_global_inputs: dict[str, float],
     required_global_inputs: list[str],
 ) -> dict[str, float]:
-    """Resolve and validate the required per-run conditioning inputs.
-
-    Parameters
-    ----------
-    raw_global_inputs : dict[str, float]
-        Raw globals mapping loaded from a run file.
-    required_global_inputs : list[str]
-        Ordered conditioning-input names required by the active data contract.
-
-    Returns
-    -------
-    dict[str, float]
-        Reduced mapping containing exactly the required conditioning inputs in
-        Python float form.
-    """
+    """Resolve and validate the required per-run conditioning inputs."""
     resolved: dict[str, float] = {}
     for name in required_global_inputs:
         if name in raw_global_inputs:
@@ -417,37 +141,12 @@ def resolve_conditioning_inputs(
 
 
 def global_static_feature_order(config: dict[str, Any]) -> list[str]:
-    """Return the ordered list of global conditioning feature names.
-
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Validated pipeline config whose ``data_spec`` section defines the
-        required global inputs.
-
-    Returns
-    -------
-    list[str]
-        Ordered global feature names used by preprocessing and model I/O.
-    """
+    """Return the ordered list of global conditioning feature names."""
     return list(config["data_spec"]["required_global_inputs"])
 
 
 def global_feature_order(config: dict[str, Any]) -> list[str]:
-    """Return the full ordered global feature vector contract for the model.
-
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Validated pipeline config whose ``data_spec`` section defines the
-        required global inputs.
-
-    Returns
-    -------
-    list[str]
-        Ordered global feature names. In the current contract this matches
-        :func:`global_static_feature_order`.
-    """
+    """Return the full ordered global feature vector contract for the model."""
     return list(config["data_spec"]["required_global_inputs"])
 
 
@@ -466,507 +165,55 @@ def dataset_info_root(config: dict[str, Any]) -> str:
     return str(Path(config["paths"]["raw_root"]).parent / "info")
 
 
-def _validate_transformer_model_config(model: dict[str, Any], scope: str) -> dict[str, Any]:
-    """Validate and normalize the FiLM-Transformer config section.
+def _validate_transformer_model_config(
+    model: dict[str, Any], scope: str = "model"
+) -> dict[str, Any]:
+    """Validate a Transformer ``model`` dict against :class:`ModelConfig`.
 
-    Parameters
-    ----------
-    model : dict[str, Any]
-        Raw model config block for the Transformer architecture.
-    scope : str
-        Fully qualified config scope used in validation errors.
-
-    Returns
-    -------
-    dict[str, Any]
-        Normalized Transformer config with concrete numeric types and
-        defaults applied.
+    Retained as a public helper for :mod:`src.tuning` Optuna trials that
+    override a subset of hyperparameters on top of a validated base config.
     """
-    _require_keys(
-        model,
-        [
-            "d_model",
-            "nhead",
-            "num_layers",
-            "dim_feedforward",
-            "conditioning_hidden_dim",
-            "film_clamp",
-            "output_head_divisor",
-            "activation",
-            "dropout_rate",
-        ],
-        scope,
-    )
-    normalized = dict(model)
-    for key in (
-        "d_model",
-        "nhead",
-        "num_layers",
-        "dim_feedforward",
-        "conditioning_hidden_dim",
-        "output_head_divisor",
-    ):
-        normalized[key] = _as_int(normalized[key], f"{scope}.{key}")
-    normalized["film_clamp"] = _as_float(normalized["film_clamp"], f"{scope}.film_clamp")
-    normalized["activation"] = _as_nonempty_str(
-        normalized["activation"], f"{scope}.activation"
-    ).lower()
-    normalized["dropout_rate"] = _as_float(
-        normalized["dropout_rate"], f"{scope}.dropout_rate"
-    )
-    normalized["norm_type"] = _as_nonempty_str(
-        normalized.get("norm_type", "layernorm"), f"{scope}.norm_type"
-    ).lower()
-    normalized["ffn_type"] = _as_nonempty_str(
-        normalized.get("ffn_type", "dense"), f"{scope}.ffn_type"
-    ).lower()
-    normalized["use_qk_norm"] = bool(normalized.get("use_qk_norm", False))
-    normalized["zero_init_film"] = bool(normalized.get("zero_init_film", False))
-    if normalized["activation"] not in _ALLOWED_ACTIVATIONS:
-        raise ConfigValidationError(
-            f"{scope}.activation must be one of {_ALLOWED_ACTIVATIONS}."
-        )
-    if normalized["norm_type"] not in {"layernorm", "rmsnorm"}:
-        raise ConfigValidationError(
-            f"{scope}.norm_type must be one of 'layernorm' or 'rmsnorm'."
-        )
-    if normalized["ffn_type"] not in {"dense", "swiglu"}:
-        raise ConfigValidationError(
-            f"{scope}.ffn_type must be one of 'dense' or 'swiglu'."
-        )
-    if normalized["d_model"] < 8 or normalized["nhead"] < 1 or normalized["num_layers"] < 1:
-        raise ConfigValidationError(f"{scope} dimensions are too small.")
-    if normalized["conditioning_hidden_dim"] < 1:
-        raise ConfigValidationError(f"{scope}.conditioning_hidden_dim must be >= 1.")
-    if normalized["d_model"] % normalized["nhead"] != 0:
-        raise ConfigValidationError(f"{scope}.d_model must be divisible by nhead.")
-    if normalized["dim_feedforward"] < normalized["d_model"]:
-        raise ConfigValidationError(f"{scope}.dim_feedforward must be >= d_model.")
-    if normalized["output_head_divisor"] < 1:
-        raise ConfigValidationError(f"{scope}.output_head_divisor must be >= 1.")
-    if normalized["film_clamp"] <= 0.0:
-        raise ConfigValidationError(f"{scope}.film_clamp must be positive.")
-    if not 0.0 <= normalized["dropout_rate"] < 1.0:
-        raise ConfigValidationError(f"{scope}.dropout_rate must be in [0, 1).")
-    return normalized
-
-
-def _validate_training_scheduler(scheduler: Any, scope: str) -> dict[str, Any]:
-    """Validate and normalize the training-scheduler block.
-
-    Parameters
-    ----------
-    scheduler : Any
-        Raw scheduler payload from the config.
-    scope : str
-        Fully qualified config scope used in validation errors.
-
-    Returns
-    -------
-    dict[str, Any]
-        Normalized scheduler payload for either cosine decay or
-        reduce-on-plateau scheduling.
-    """
-    if not isinstance(scheduler, dict):
-        raise ConfigValidationError(f"{scope} must be a mapping.")
-    _require_keys(scheduler, ["name"], scope)
-    normalized = dict(scheduler)
-    normalized["name"] = _as_nonempty_str(normalized["name"], f"{scope}.name").lower()
-    if normalized["name"] not in _ALLOWED_LR_SCHEDULERS:
-        raise ConfigValidationError(
-            f"{scope}.name must be one of {_ALLOWED_LR_SCHEDULERS}."
-        )
-    if normalized["name"] == "cosine":
-        return {"name": "cosine"}
-
-    _require_keys(scheduler, ["factor", "patience", "threshold"], scope)
-    normalized["factor"] = _as_float(normalized["factor"], f"{scope}.factor")
-    normalized["patience"] = _as_int(normalized["patience"], f"{scope}.patience")
-    normalized["threshold"] = _as_float(normalized["threshold"], f"{scope}.threshold")
-    if not 0.0 < normalized["factor"] < 1.0:
-        raise ConfigValidationError(f"{scope}.factor must lie strictly between 0 and 1.")
-    if normalized["patience"] < 0:
-        raise ConfigValidationError(f"{scope}.patience must be >= 0.")
-    if normalized["threshold"] < 0.0:
-        raise ConfigValidationError(f"{scope}.threshold must be >= 0.")
-    return {
-        "name": "reduce_on_plateau",
-        "factor": normalized["factor"],
-        "patience": normalized["patience"],
-        "threshold": normalized["threshold"],
-    }
-
-
-def _validate_numeric_range(
-    value: Any,
-    field: str,
-    *,
-    allow_equal: bool = False,
-) -> list[float]:
-    """Validate a two-number range field and return normalized bounds.
-
-    Parameters
-    ----------
-    value : Any
-        Candidate two-element range payload.
-    field : str
-        Fully qualified config field name used in validation errors.
-    allow_equal : bool, default=False
-        Whether equal lower and upper bounds are permitted.
-
-    Returns
-    -------
-    list[float]
-        Normalized ``[lower, upper]`` bounds as floats.
-    """
-    if not isinstance(value, list) or len(value) != 2:
-        raise ConfigValidationError(f"{field} must be a length-2 list.")
-    lower = _as_float(value[0], f"{field}[0]")
-    upper = _as_float(value[1], f"{field}[1]")
-    if allow_equal:
-        if upper < lower:
-            raise ConfigValidationError(f"{field} must satisfy lower <= upper.")
-    elif upper <= lower:
-        raise ConfigValidationError(f"{field} must satisfy lower < upper.")
-    return [lower, upper]
-
-
-def _validate_temperature_profile_validation(
-    validation_config: Any,
-    scope: str,
-) -> dict[str, float]:
-    """Validate the shared temperature-profile bounds block.
-
-    Parameters
-    ----------
-    validation_config : Any
-        Candidate mapping containing minimum and maximum allowed
-        temperatures.
-    scope : str
-        Parent config scope used to construct error messages.
-
-    Returns
-    -------
-    dict[str, float]
-        Normalized validation block with ``min_temperature_k`` and
-        ``max_temperature_k``.
-    """
-    field = f"{scope}.validation"
-    if not isinstance(validation_config, dict):
-        raise ConfigValidationError(f"{field} must be a mapping.")
-    normalized = dict(validation_config)
-    _require_keys(normalized, ["min_temperature_k", "max_temperature_k"], field)
-    normalized["min_temperature_k"] = _as_float(
-        normalized["min_temperature_k"],
-        f"{field}.min_temperature_k",
-    )
-    normalized["max_temperature_k"] = _as_float(
-        normalized["max_temperature_k"],
-        f"{field}.max_temperature_k",
-    )
-    if normalized["min_temperature_k"] <= 0.0:
-        raise ConfigValidationError(f"{field}.min_temperature_k must be > 0.")
-    if normalized["max_temperature_k"] <= normalized["min_temperature_k"]:
-        raise ConfigValidationError(
-            f"{field}.max_temperature_k must be greater than min_temperature_k."
-        )
-    return normalized
-
-
-def _validate_analytic_temperature_sampler(sampler_config: Any) -> dict[str, Any]:
-    """Validate the Piette & Madhusudhan (2019) Guillot-based analytic PT sampler.
-
-    Parameters
-    ----------
-    sampler_config : Any
-        Raw config payload for ``temperature_profiles.analytic_sampler``.
-
-    Returns
-    -------
-    dict[str, Any]
-        Normalized analytic-sampler config with validated numeric ranges.
-    """
-    scope = "temperature_profiles.analytic_sampler"
-    if not isinstance(sampler_config, dict):
-        raise ConfigValidationError(f"{scope} must be a mapping.")
-    normalized = dict(sampler_config)
-    _require_keys(
-        normalized,
-        [
-            "t_int_k_range",
-            "t_eq_k_range",
-            "log10_delta_range",
-            "log10_gamma_range",
-            "alpha_range",
-            "log10_p_trans_bar_range",
-            "convection_probability",
-            "adiabatic_gradient_range",
-        ],
-        scope,
-    )
-
-    for key in (
-        "t_int_k_range",
-        "t_eq_k_range",
-        "log10_delta_range",
-        "log10_gamma_range",
-        "log10_p_trans_bar_range",
-        "adiabatic_gradient_range",
-    ):
-        normalized[key] = _validate_numeric_range(normalized[key], f"{scope}.{key}")
-
-    normalized["alpha_range"] = _validate_numeric_range(
-        normalized["alpha_range"],
-        f"{scope}.alpha_range",
-    )
-    if normalized["alpha_range"][0] < 0.0 or normalized["alpha_range"][1] >= 1.0:
-        raise ConfigValidationError(f"{scope}.alpha_range must lie within [0, 1).")
-    if normalized["t_int_k_range"][0] <= 0.0:
-        raise ConfigValidationError(f"{scope}.t_int_k_range[0] must be > 0.")
-    if normalized["t_eq_k_range"][0] <= 0.0:
-        raise ConfigValidationError(f"{scope}.t_eq_k_range[0] must be > 0.")
-    if normalized["adiabatic_gradient_range"][0] <= 0.0:
-        raise ConfigValidationError(f"{scope}.adiabatic_gradient_range[0] must be > 0.")
-
-    normalized["convection_probability"] = _as_float(
-        normalized["convection_probability"],
-        f"{scope}.convection_probability",
-    )
-    if not 0.0 <= normalized["convection_probability"] <= 1.0:
-        raise ConfigValidationError(
-            f"{scope}.convection_probability must lie in [0, 1]."
-        )
-
-    return normalized
-
-
-def _validate_temperature_profiles(profile_config: Any) -> dict[str, Any]:
-    """Validate shared temperature-profile sampling settings.
-
-    Parameters
-    ----------
-    profile_config : Any
-        Raw ``temperature_profiles`` config payload.
-
-    Returns
-    -------
-    dict[str, Any]
-        Normalized temperature-profile config containing validated source-mode,
-        filters, analytic sampler settings, and shared validity bounds.
-    """
-    if not isinstance(profile_config, dict):
-        raise ConfigValidationError("temperature_profiles must be a mapping.")
-    normalized = dict(profile_config)
-    _require_keys(normalized, ["source_mode", "validation"], "temperature_profiles")
-    normalized["source_mode"] = _as_nonempty_str(
-        normalized["source_mode"],
-        "temperature_profiles.source_mode",
-    ).lower()
-    if normalized["source_mode"] not in _ALLOWED_TEMPERATURE_PROFILE_SOURCE_MODES:
-        raise ConfigValidationError(
-            "temperature_profiles.source_mode must be one of "
-            f"{_ALLOWED_TEMPERATURE_PROFILE_SOURCE_MODES}."
-        )
-    normalized["validation"] = _validate_temperature_profile_validation(
-        normalized["validation"],
-        "temperature_profiles",
-    )
-
-    raw_filters = normalized.get("filters", {})
-    if not isinstance(raw_filters, dict):
-        raise ConfigValidationError("temperature_profiles.filters must be a mapping.")
-    filters: dict[str, float | tuple[float, float] | bool] = {}
-    for key, raw_value in raw_filters.items():
-        filter_key = _as_nonempty_str(key, "temperature_profiles.filters")
-        if filter_key not in _ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS:
-            raise ConfigValidationError(
-                f"temperature_profiles.filters.{filter_key} is not supported. "
-                f"Allowed keys are {sorted(_ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS)}."
-            )
-        field = f"temperature_profiles.filters.{filter_key}"
-        if filter_key in _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS:
-            filters[filter_key] = _as_bool(raw_value, field)
-            continue
-        if isinstance(raw_value, list):
-            if len(raw_value) != 2:
-                raise ConfigValidationError(
-                    f"{field} must be a numeric scalar or a two-number inclusive range."
-                )
-            lower = _as_float(raw_value[0], field)
-            upper = _as_float(raw_value[1], field)
-            if upper < lower:
-                raise ConfigValidationError(f"{field} range upper bound must be >= lower bound.")
-            filters[filter_key] = (lower, upper)
-            continue
-        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
-            raise ConfigValidationError(
-                f"{field} must be a numeric scalar or a two-number inclusive range."
-            )
-        filters[filter_key] = _as_float(raw_value, field)
-    normalized["filters"] = filters
-
-    source_mode = normalized["source_mode"]
-    analytic_sampler = normalized.get("analytic_sampler")
-    if source_mode in {"analytic", "mixed"}:
-        if analytic_sampler is None:
-            raise ConfigValidationError(
-                "temperature_profiles.analytic_sampler is required when "
-                "temperature_profiles.source_mode is 'analytic' or 'mixed'."
-            )
-        normalized["analytic_sampler"] = _validate_analytic_temperature_sampler(analytic_sampler)
-    elif analytic_sampler is not None:
-        normalized["analytic_sampler"] = _validate_analytic_temperature_sampler(analytic_sampler)
-    else:
-        normalized.pop("analytic_sampler", None)
-
-    if source_mode in {"pt_library", "mixed"}:
-        normalized["data_glob"] = _as_nonempty_str(
-            normalized.get("data_glob"),
-            "temperature_profiles.data_glob",
-        )
-    else:
-        normalized.pop("data_glob", None)
-
-    if source_mode == "mixed":
-        normalized["analytic_probability"] = _as_float(
-            normalized.get("analytic_probability", 0.5),
-            "temperature_profiles.analytic_probability",
-        )
-        if not 0.0 <= normalized["analytic_probability"] <= 1.0:
-            raise ConfigValidationError(
-                "temperature_profiles.analytic_probability must be between 0 and 1 "
-                "when temperature_profiles.source_mode='mixed'."
-            )
-    else:
-        normalized.pop("analytic_probability", None)
-    return normalized
-
-
-def _validate_split(split: Any) -> dict[str, Any]:
-    """Validate the train/val/test split policy under ``normalization``.
-
-    Parameters
-    ----------
-    split : Any
-        Candidate split mapping with fractions and RNG seed.
-
-    Returns
-    -------
-    dict[str, Any]
-        Normalized split payload with numeric fractions and integer seed.
-    """
-    if not isinstance(split, dict):
-        raise ConfigValidationError("normalization.split must be a mapping.")
-    _require_keys(
-        split,
-        ["train_fraction", "val_fraction", "test_fraction", "seed"],
-        "normalization.split",
-    )
-    normalized = dict(split)
-    for key in ("train_fraction", "val_fraction", "test_fraction"):
-        normalized[key] = _as_float(normalized[key], f"normalization.split.{key}")
-        if normalized[key] <= 0.0:
-            raise ConfigValidationError(f"normalization.split.{key} must be positive.")
-    total_fraction = (
-        normalized["train_fraction"]
-        + normalized["val_fraction"]
-        + normalized["test_fraction"]
-    )
-    if abs(total_fraction - 1.0) > 1.0e-6:
-        raise ConfigValidationError("normalization.split fractions must sum to 1.")
-    normalized["seed"] = _as_int(normalized["seed"], "normalization.split.seed")
-    return normalized
-
+    try:
+        return ModelConfig.model_validate(model).model_dump(mode="python")
+    except ValidationError as exc:
+        raise ConfigValidationError(_format_pydantic_error(exc, scope)) from exc
 
 
 def load_and_validate_config(path: str | Path) -> dict[str, Any]:
-    """Load a JSON config file, apply defaults, and validate its full contract.
+    """Load a JSON config file, validate against the schema, and derive aliases.
 
-    This is the primary entry point for config loading.  It reads the JSON
-    file, validates every section (paths, data_spec, sampling,
-    temperature_profiles, generation, normalization, training, model, and the
-    optional chemistry-specific block), derives internal aliases, and returns
-    a fully normalized dict.
+    Validation is delegated to :data:`src.utils.schemas.Config` (a
+    discriminated union over ``chemistry_type``). Derived aliases expected
+    by downstream pipeline stages are appended post-validation:
 
-    Parameters
-    ----------
-    path : str or Path
-        Filesystem path to the JSON config file.
-
-    Returns
-    -------
-    dict[str, Any]
-        Validated and normalized config.  Safe to pass to any pipeline stage.
-
-    Raises
-    ------
-    ConfigValidationError
-        If any field violates its type, range, or task-specific constraint.
+    - ``paths.raw_root`` / ``paths.processed_root`` (from ``run_root``)
+    - ``data_spec.element_input_order``, ``required_global_inputs``,
+      ``state_dim``, ``target_dim``, sequence/global feature orders
+    - ``training.model`` (shallow copy of ``model``)
+    - ``roth_sampler`` (extract from ``temperature_profiles``)
+    - ``physics_toggles``, ``science_presets``, ``default_science_preset``,
+      ``vulcan_runtime``, ``stellar_spectrum`` (VULCAN mirrors)
     """
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
-    required_root = [
-        "chemistry_type",
-        "model_type",
-        "paths",
-        "data_spec",
-        "sampling",
-        "temperature_profiles",
-        "generation",
-        "normalization",
-        "training",
-        "model",
-    ]
-    _require_keys(config, required_root, "root")
-    chemistry_type = get_chemistry_type(config)
-    model_type = get_model_type(config)
-    if "task" in config:
-        raise ConfigValidationError(
-            "task has been removed. Use top-level chemistry_type and model_type instead."
-        )
-    if chemistry_type == "fastchem" and "vulcan" in config:
-        raise ConfigValidationError(
-            "vulcan must not be defined when chemistry_type='fastchem'."
-        )
-    if chemistry_type == "vulcan":
-        _require_keys(config, ["vulcan"], "root")
-    config["chemistry_type"] = chemistry_type
-    config["model_type"] = model_type
+        raw = json.load(handle)
+
+    try:
+        validated = ConfigAdapter.validate_python(raw)
+    except ValidationError as exc:
+        raise ConfigValidationError(_format_pydantic_error(exc, "root")) from exc
+
+    config: dict[str, Any] = validated.model_dump(mode="python")
+    chemistry_type = config["chemistry_type"]
 
     paths = config["paths"]
-    if "raw_root" in paths or "processed_root" in paths:
-        raise ConfigValidationError(
-            "paths.raw_root and paths.processed_root are no longer supported. "
-            "Use run_root only (e.g. 'data/fastchem_mlp'). The validator auto-expands "
-            "it to run_root/raw and run_root/processed."
-        )
-    _require_keys(paths, ["run_root", "checkpoints_root", "vulcan_source_root"], "paths")
-    for key in paths:
-        paths[key] = _as_nonempty_str(paths[key], f"paths.{key}")
     run_root = paths.pop("run_root")
     paths["raw_root"] = str(Path(run_root) / "raw")
     paths["processed_root"] = str(Path(run_root) / "processed")
 
     data_spec = config["data_spec"]
-    if not isinstance(data_spec, dict):
-        raise ConfigValidationError("data_spec must be a mapping.")
-    state_species = _as_string_list(
-        data_spec.get("state_species", list(DEFAULT_STATE_SPECIES)),
-        "data_spec.state_species",
-    )
-    output_species = _as_string_list(
-        data_spec.get("output_species", list(state_species)),
-        "data_spec.output_species",
-    )
-    if "required_global_inputs" in data_spec:
-        raise ConfigValidationError(
-            "data_spec.required_global_inputs is derived internally and must not be set in the user config."
-        )
-    if "element_input_order" in data_spec:
-        raise ConfigValidationError(
-            "data_spec.element_input_order is derived internally and must not be set in the user config."
-        )
+    state_species = list(data_spec["state_species"])
+    output_species = list(data_spec.get("output_species") or state_species)
     derived_globals = (
         list(FASTCHEM_CORE_GLOBAL_INPUTS)
         if chemistry_type == "fastchem"
@@ -976,569 +223,37 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     data_spec["output_species"] = output_species
     data_spec["element_input_order"] = list(ELEMENT_INPUT_ORDER)
     data_spec["required_global_inputs"] = derived_globals
+    data_spec["state_dim"] = len(state_species)
+    data_spec["target_dim"] = len(output_species)
+    data_spec["sequence_static_feature_order"] = (
+        ["pressure_bar", "temperature_k"]
+        if chemistry_type == "fastchem"
+        else ["pressure_bar", "temperature_k", "kzz_cm2_s"]
+    )
+    data_spec["global_static_feature_order"] = list(derived_globals)
+    data_spec["global_feature_order"] = list(derived_globals)
 
-    sampling = config["sampling"]
-    required_sampling = [
-        "num_levels_range",
-        "pressure_top_bar_range",
-        "pressure_bottom_bar_range",
-        "temperature_range_k",
-        "he_frac_range",
-        "c_frac_range",
-        "o_frac_range",
-        "n_frac_range",
-        "s_frac_range",
-    ]
-    if chemistry_type == "vulcan":
-        required_sampling += [
-            "gravity_range_cm_s2",
-            "planet_radius_range_cm",
-            "stellar_radius_range_rsun",
-            "semi_major_axis_range_au",
-            "zenith_angle_range_deg",
-            "diurnal_factor_range",
-            "kzz_range_cm2_s",
-        ]
-    _require_keys(sampling, required_sampling, "sampling")
-    for legacy_key in ("num_levels", "pressure_top_bar", "pressure_bottom_bar"):
-        if legacy_key in sampling:
-            raise ConfigValidationError(
-                f"sampling.{legacy_key} is no longer supported. Use sampling.{legacy_key}_range "
-                "with a [lower, upper] pair instead."
-            )
-    if "kzz_cm2_s" in sampling:
-        raise ConfigValidationError(
-            "sampling.kzz_cm2_s (scalar) is no longer supported. Use "
-            "sampling.kzz_range_cm2_s with a [lower, upper] pair (log-sampled by default)."
-        )
-    if chemistry_type == "fastchem":
-        disallowed_sampling = [
-            key
-            for key in ("gravity_range_cm_s2", "planet_radius_range_cm", "kzz_range_cm2_s")
-            if key in sampling
-        ]
-        if disallowed_sampling:
-            raise ConfigValidationError(
-                "sampling contains VULCAN-only keys for chemistry_type='fastchem': "
-                f"{disallowed_sampling}"
-            )
+    config["training"]["model"] = dict(config["model"])
 
-    num_levels_range = sampling["num_levels_range"]
-    if not isinstance(num_levels_range, list) or len(num_levels_range) != 2:
-        raise ConfigValidationError("sampling.num_levels_range must be a length-2 list.")
-    nl_lo = _as_int(num_levels_range[0], "sampling.num_levels_range[0]")
-    nl_hi = _as_int(num_levels_range[1], "sampling.num_levels_range[1]")
-    if nl_lo < 4:
-        raise ConfigValidationError("sampling.num_levels_range[0] must be >= 4.")
-    if nl_lo > nl_hi:
-        raise ConfigValidationError("sampling.num_levels_range must satisfy lower <= upper.")
-    sampling["num_levels_range"] = [nl_lo, nl_hi]
-
-    for pkey in ("pressure_top_bar_range", "pressure_bottom_bar_range"):
-        values = sampling[pkey]
-        if not isinstance(values, list) or len(values) != 2:
-            raise ConfigValidationError(f"sampling.{pkey} must be a length-2 list.")
-        lo = _as_float(values[0], f"sampling.{pkey}[0]")
-        hi = _as_float(values[1], f"sampling.{pkey}[1]")
-        if lo <= 0.0 or hi <= 0.0:
-            raise ConfigValidationError(f"sampling.{pkey} bounds must be strictly positive (bar).")
-        if lo > hi:
-            raise ConfigValidationError(f"sampling.{pkey} must satisfy lower <= upper.")
-        sampling[pkey] = [lo, hi]
-
-    if sampling["pressure_top_bar_range"][1] >= sampling["pressure_bottom_bar_range"][0]:
-        raise ConfigValidationError(
-            "sampling.pressure_top_bar_range must lie strictly below sampling.pressure_bottom_bar_range "
-            "so every sampled column has p_top < p_bottom."
-        )
-    range_keys = [
-        "temperature_range_k",
-        "he_frac_range",
-        "c_frac_range",
-        "o_frac_range",
-        "n_frac_range",
-        "s_frac_range",
-    ]
-    if chemistry_type == "vulcan":
-        range_keys.extend(
-            [
-                "gravity_range_cm_s2",
-                "planet_radius_range_cm",
-                "stellar_radius_range_rsun",
-                "semi_major_axis_range_au",
-                "zenith_angle_range_deg",
-                "diurnal_factor_range",
-                "kzz_range_cm2_s",
-            ]
-        )
-    allow_equal_range_keys = {
-        "stellar_radius_range_rsun",
-        "semi_major_axis_range_au",
-        "zenith_angle_range_deg",
-        "diurnal_factor_range",
+    temperature_profiles = config["temperature_profiles"]
+    source_mode = temperature_profiles["source_mode"]
+    config["roth_sampler"] = {
+        "enabled": source_mode in {"pt_library", "mixed"},
+        "source_mode": "mixed" if source_mode == "mixed" else "roth",
+        "analytic_probability": temperature_profiles.get("analytic_probability"),
+        "data_glob": temperature_profiles.get("data_glob", ""),
+        "filters": dict(temperature_profiles["filters"]),
     }
-    for key in range_keys:
-        values = sampling[key]
-        if not isinstance(values, list) or len(values) != 2:
-            raise ConfigValidationError(f"sampling.{key} must be a length-2 list.")
-        low = _as_float(values[0], f"sampling.{key}[0]")
-        high = _as_float(values[1], f"sampling.{key}[1]")
-        if key in allow_equal_range_keys:
-            if low > high:
-                raise ConfigValidationError(f"sampling.{key} must be non-decreasing.")
-        elif not low < high:
-            raise ConfigValidationError(f"sampling.{key} must be strictly increasing.")
-        sampling[key] = [low, high]
-    _frac_range_keys = ("he_frac_range", "c_frac_range", "o_frac_range", "n_frac_range", "s_frac_range")
-    frac_upper_sum = sum(float(sampling[k][1]) for k in _frac_range_keys)
-    if frac_upper_sum >= 1.0:
-        raise ConfigValidationError(
-            f"The upper bounds of the elemental fraction ranges sum to {frac_upper_sum:.6f}, "
-            "which must be < 1.0 so that H_frac = 1 - sum remains positive."
-        )
-    if chemistry_type == "vulcan":
-        for key in (
-            "gravity_range_cm_s2",
-            "planet_radius_range_cm",
-            "stellar_radius_range_rsun",
-            "semi_major_axis_range_au",
-            "diurnal_factor_range",
-        ):
-            if sampling[key][0] <= 0.0:
-                raise ConfigValidationError(f"sampling.{key} must be strictly positive.")
-        if sampling["zenith_angle_range_deg"][0] < 0.0 or sampling["zenith_angle_range_deg"][1] >= 90.0:
-            raise ConfigValidationError(
-                "sampling.zenith_angle_range_deg must lie within [0, 90)."
-            )
-    if chemistry_type == "vulcan":
-        kzz_range = sampling["kzz_range_cm2_s"]
-        if kzz_range[0] <= 0.0:
-            raise ConfigValidationError("sampling.kzz_range_cm2_s must be strictly positive.")
-
-    config["temperature_profiles"] = _validate_temperature_profiles(config["temperature_profiles"])
-
-    generation = config["generation"]
-    _require_keys(
-        generation,
-        ["mode", "num_runs", "seed", "overwrite", "reuse_raw_if_present", "parallel_workers"],
-        "generation",
-    )
-    generation["mode"] = _as_nonempty_str(generation["mode"], "generation.mode").lower()
-    if generation["mode"] not in {"vulcan"}:
-        raise ConfigValidationError("generation.mode must be 'vulcan'.")
-    generation["num_runs"] = _as_int(generation["num_runs"], "generation.num_runs")
-    generation["seed"] = _as_int(generation["seed"], "generation.seed")
-    generation["overwrite"] = _as_bool(generation["overwrite"], "generation.overwrite")
-    generation["reuse_raw_if_present"] = _as_bool(
-        generation["reuse_raw_if_present"],
-        "generation.reuse_raw_if_present",
-    )
-    generation["parallel_workers"] = _as_int(
-        generation["parallel_workers"],
-        "generation.parallel_workers",
-    )
-    if generation["num_runs"] < 1:
-        raise ConfigValidationError("generation.num_runs must be >= 1.")
-    if generation["parallel_workers"] < 0:
-        raise ConfigValidationError("generation.parallel_workers must be >= 0 (0 = auto-detect).")
-    backfill = generation.get("backfill", {"enabled": True, "max_retries": 3})
-    if not isinstance(backfill, dict):
-        raise ConfigValidationError("generation.backfill must be a mapping.")
-    backfill["enabled"] = _as_bool(backfill.get("enabled", True), "generation.backfill.enabled")
-    backfill["max_retries"] = _as_int(
-        backfill.get("max_retries", 3), "generation.backfill.max_retries"
-    )
-    if backfill["max_retries"] < 0:
-        raise ConfigValidationError("generation.backfill.max_retries must be >= 0.")
-    generation["backfill"] = backfill
-    sample_chunk_size = generation.get("sample_chunk_size", 1000)
-    generation["sample_chunk_size"] = _as_int(
-        sample_chunk_size, "generation.sample_chunk_size",
-    )
-    if generation["sample_chunk_size"] < 1:
-        raise ConfigValidationError(
-            "generation.sample_chunk_size must be >= 1."
-        )
-
-
-    normalization = config["normalization"]
-    required_normalization_keys = [
-        "split",
-        "state_floor",
-        "sequence_methods",
-        "global_methods",
-        "target_method",
-    ]
-    _require_keys(normalization, required_normalization_keys, "normalization")
-    normalization["split"] = _validate_split(normalization["split"])
-    normalization["state_floor"] = _as_float(
-        normalization["state_floor"],
-        "normalization.state_floor",
-    )
-    if normalization["state_floor"] <= 0.0:
-        raise ConfigValidationError("normalization.state_floor must be positive.")
-    if not isinstance(normalization["sequence_methods"], dict):
-        raise ConfigValidationError("normalization.sequence_methods must be a mapping.")
-    if not isinstance(normalization["global_methods"], dict):
-        raise ConfigValidationError("normalization.global_methods must be a mapping.")
-    if chemistry_type == "fastchem":
-        expected_sequence_methods = {"pressure_bar", "temperature_k"}
-    else:
-        expected_sequence_methods = {"pressure_bar", "temperature_k", "kzz_cm2_s"}
-    if set(normalization["sequence_methods"].keys()) != expected_sequence_methods:
-        raise ConfigValidationError(
-            f"normalization.sequence_methods must define exactly {expected_sequence_methods}."
-        )
-    for key, method in normalization["sequence_methods"].items():
-        normalization["sequence_methods"][key] = _normalized_method_name(
-            method,
-            f"normalization.sequence_methods.{key}",
-        )
-    normalization["target_method"] = _normalized_method_name(
-        normalization["target_method"],
-        "normalization.target_method",
-    )
-    expected_global_methods = set(global_static_feature_order(config))
-    if set(normalization["global_methods"].keys()) != expected_global_methods:
-        raise ConfigValidationError(
-            f"normalization.global_methods must define exactly {expected_global_methods}."
-        )
-    for key, method in normalization["global_methods"].items():
-        normalization["global_methods"][key] = _normalized_method_name(
-            method,
-            f"normalization.global_methods.{key}",
-        )
-
-
-    training = config["training"]
-    _require_keys(
-        training,
-        [
-            "seed",
-            "batch_size",
-            "epochs",
-            "learning_rate",
-            "min_lr",
-            "warmup_epochs",
-            "early_stopping_patience",
-            "weight_decay",
-            "gradient_clip",
-            "scheduler",
-            "loss",
-        ],
-        "training",
-    )
-    for key in ("seed", "batch_size", "epochs", "warmup_epochs", "early_stopping_patience"):
-        training[key] = _as_int(training[key], f"training.{key}")
-    for key in ("learning_rate", "min_lr", "weight_decay", "gradient_clip"):
-        training[key] = _as_float(training[key], f"training.{key}")
-    training["scheduler"] = _validate_training_scheduler(
-        training["scheduler"],
-        "training.scheduler",
-    )
-    if training["batch_size"] < 1 or training["epochs"] < 1:
-        raise ConfigValidationError("training.batch_size and training.epochs must be >= 1.")
-    if training["early_stopping_patience"] < 1:
-        raise ConfigValidationError("training.early_stopping_patience must be >= 1.")
-    if training["learning_rate"] <= 0.0 or training["min_lr"] <= 0.0:
-        raise ConfigValidationError("Learning rates must be positive.")
-    if training["min_lr"] > training["learning_rate"]:
-        raise ConfigValidationError("training.min_lr cannot exceed training.learning_rate.")
-    if training["gradient_clip"] <= 0.0:
-        raise ConfigValidationError("training.gradient_clip must be positive.")
-    loss = training["loss"]
-    loss_required = ["lambda_z", "lambda_log10_mae"]
-    _require_keys(loss, loss_required, "training.loss")
-    for key in loss_required:
-        loss[key] = _as_float(loss[key], f"training.loss.{key}")
-        if loss[key] < 0.0:
-            raise ConfigValidationError(f"training.loss.{key} must be non-negative.")
-    ema = training.get("ema", {"enabled": False, "decay": 0.0})
-    if not isinstance(ema, dict):
-        raise ConfigValidationError("training.ema must be a mapping.")
-    ema["enabled"] = _as_bool(ema.get("enabled", False), "training.ema.enabled")
-    ema["decay"] = _as_float(ema.get("decay", 0.0), "training.ema.decay")
-    if ema["enabled"] and not (0.0 <= ema["decay"] < 1.0):
-        raise ConfigValidationError("training.ema.decay must be in [0, 1) when enabled.")
-    training["ema"] = ema
-    model = config["model"]
-
-    if not isinstance(model, dict):
-        raise ConfigValidationError("model must be a mapping.")
-    model = _validate_transformer_model_config(model, "model")
-    config["model"] = model
-    config["training"]["model"] = dict(model)
 
     if chemistry_type == "vulcan":
         section = config["vulcan"]
-        if not isinstance(section, dict):
-            raise ConfigValidationError("vulcan must be a mapping.")
-        _require_keys(
-            section,
-            [
-                "physics_toggles",
-                "runtime",
-            ],
-            "vulcan",
-        )
-        physics = section["physics_toggles"]
-        if not isinstance(physics, dict):
-            raise ConfigValidationError("vulcan.physics_toggles must be a mapping.")
-        for name in PUBLIC_PHYSICS_TOGGLES:
-            physics[name] = _as_bool(
-                physics.get(name, False),
-                f"vulcan.physics_toggles.{name}",
-            )
-        runtime = section["runtime"]
-        _require_keys(
-            runtime,
-            [
-                "chemistry_file",
-                "t_cross_sp",
-            ],
-            "vulcan.runtime",
-        )
-        runtime["chemistry_file"] = _as_nonempty_str(
-            runtime["chemistry_file"],
-            "vulcan.runtime.chemistry_file",
-        )
-        runtime["t_cross_sp"] = _as_string_list(
-            runtime["t_cross_sp"],
-            "vulcan.runtime.t_cross_sp",
-        )
-        runtime["python_executable"] = _as_nonempty_str(
-            runtime.get("python_executable", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["python_executable"]),
-            "vulcan.runtime.python_executable",
-        )
-        runtime["cfg_file"] = _as_nonempty_str(
-            runtime.get("cfg_file", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["cfg_file"]),
-            "vulcan.runtime.cfg_file",
-        )
-        runtime["worker_root"] = _as_nonempty_str(
-            runtime.get("worker_root", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["worker_root"]),
-            "vulcan.runtime.worker_root",
-        )
-        runtime["regenerate_chem_funs"] = _as_bool(
-            runtime.get(
-                "regenerate_chem_funs",
-                _INTERNAL_VULCAN_RUNTIME_DEFAULTS["regenerate_chem_funs"],
-            ),
-            "vulcan.runtime.regenerate_chem_funs",
-        )
-        cfg_assignments = runtime.get(
-            "cfg_assignments",
-            _INTERNAL_VULCAN_RUNTIME_DEFAULTS["cfg_assignments"],
-        )
-        if not isinstance(cfg_assignments, dict):
-            raise ConfigValidationError("vulcan.runtime.cfg_assignments must be a mapping.")
-        runtime["cfg_assignments"] = dict(cfg_assignments)
-        runtime["use_lowT_limit_rates"] = _as_bool(
-            runtime.get(
-                "use_lowT_limit_rates",
-                _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_lowT_limit_rates"],
-            ),
-            "vulcan.runtime.use_lowT_limit_rates",
-        )
-        runtime["use_adaptive_rtol"] = _as_bool(
-            runtime.get(
-                "use_adaptive_rtol",
-                _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_adaptive_rtol"],
-            ),
-            "vulcan.runtime.use_adaptive_rtol",
-        )
-        runtime["rocky"] = _as_bool(
-            runtime.get("rocky", _INTERNAL_VULCAN_RUNTIME_DEFAULTS["rocky"]),
-            "vulcan.runtime.rocky",
-        )
-        top_bc_flux_file = runtime.get(
-            "top_bc_flux_file",
-            _INTERNAL_VULCAN_RUNTIME_DEFAULTS["top_bc_flux_file"],
-        )
-        runtime["top_bc_flux_file"] = (
-            None
-            if top_bc_flux_file is None
-            else _as_nonempty_str(top_bc_flux_file, "vulcan.runtime.top_bc_flux_file")
-        )
-        bot_bc_flux_file = runtime.get(
-            "bot_bc_flux_file",
-            _INTERNAL_VULCAN_RUNTIME_DEFAULTS["bot_bc_flux_file"],
-        )
-        runtime["bot_bc_flux_file"] = (
-            None
-            if bot_bc_flux_file is None
-            else _as_nonempty_str(bot_bc_flux_file, "vulcan.runtime.bot_bc_flux_file")
-        )
-        default_atm_base = _as_nonempty_str(
-            runtime.get("atm_base", "H2"),
-            "vulcan.runtime.atm_base",
-        )
-        if default_atm_base not in SUPPORTED_ATM_BASES:
-            raise ConfigValidationError(
-                f"vulcan.runtime.atm_base must be one of {SUPPORTED_ATM_BASES}, got {default_atm_base!r}."
-            )
-        runtime["atm_base"] = default_atm_base
-        science_presets = _validate_science_presets(
-            section.get("science_presets"),
-            default_physics=dict(physics),
-            default_atm_base=default_atm_base,
-            scope="vulcan.science_presets",
-        )
+        physics = dict(section["physics_toggles"])
+        presets = list(section["science_presets"])
+        config["physics_toggles"] = physics
+        config["science_presets"] = presets
+        config["default_science_preset"] = dict(presets[0])
+        config["vulcan_runtime"] = dict(section["runtime"])
+        if section.get("stellar_spectrum") is not None:
+            config["stellar_spectrum"] = dict(section["stellar_spectrum"])
 
-        any_photochemistry_enabled = any(
-            bool(preset["physics_toggles"]["use_photochemistry"])
-            for preset in science_presets
-        )
-        if any_photochemistry_enabled:
-            raise ConfigValidationError(
-                "Photochemistry is not currently supported. All science presets must "
-                "have use_photochemistry=False (or 0). Support will be added in a future release."
-            )
-
-        # Validate stellar_spectrum section (used by data generation, not the model).
-        if "stellar_spectrum" in section:
-            spectrum = section["stellar_spectrum"]
-            _require_keys(
-                spectrum,
-                [
-                    "template_name",
-                    "max_tokens",
-                    "wavelength_min_nm",
-                    "wavelength_max_nm",
-                ],
-                "vulcan.stellar_spectrum",
-            )
-            spectrum["template_name"] = _as_nonempty_str(
-                spectrum["template_name"],
-                "vulcan.stellar_spectrum.template_name",
-            )
-            template_file = spectrum.get("template_file")
-            if template_file is None:
-                spectrum["template_file"] = None
-            else:
-                spectrum["template_file"] = _as_nonempty_str(
-                    template_file,
-                    "vulcan.stellar_spectrum.template_file",
-                )
-            library_glob = spectrum.get("library_glob")
-            if library_glob is None:
-                spectrum["library_glob"] = None
-            else:
-                spectrum["library_glob"] = _as_nonempty_str(
-                    library_glob,
-                    "vulcan.stellar_spectrum.library_glob",
-                )
-            spectrum["max_tokens"] = _as_int(
-                spectrum["max_tokens"],
-                "vulcan.stellar_spectrum.max_tokens",
-            )
-            if spectrum["max_tokens"] < 8:
-                raise ConfigValidationError("vulcan.stellar_spectrum.max_tokens must be >= 8.")
-            spectrum["wavelength_min_nm"] = _as_float(
-                spectrum["wavelength_min_nm"],
-                "vulcan.stellar_spectrum.wavelength_min_nm",
-            )
-            spectrum["wavelength_max_nm"] = _as_float(
-                spectrum["wavelength_max_nm"],
-                "vulcan.stellar_spectrum.wavelength_max_nm",
-            )
-            if spectrum["wavelength_min_nm"] >= spectrum["wavelength_max_nm"]:
-                raise ConfigValidationError(
-                    "vulcan.stellar_spectrum.wavelength_min_nm must be smaller than wavelength_max_nm."
-                )
-            spectrum.setdefault("dbin1_nm", 0.1)
-            spectrum["dbin1_nm"] = _as_float(
-                spectrum["dbin1_nm"],
-                "vulcan.stellar_spectrum.dbin1_nm",
-            )
-            spectrum.setdefault("dbin2_nm", 2.0)
-            spectrum["dbin2_nm"] = _as_float(
-                spectrum["dbin2_nm"],
-                "vulcan.stellar_spectrum.dbin2_nm",
-            )
-            spectrum.setdefault("dbin_12trans_nm", 240.0)
-            spectrum["dbin_12trans_nm"] = _as_float(
-                spectrum["dbin_12trans_nm"],
-                "vulcan.stellar_spectrum.dbin_12trans_nm",
-            )
-            if spectrum["dbin1_nm"] <= 0.0:
-                raise ConfigValidationError("vulcan.stellar_spectrum.dbin1_nm must be positive.")
-            if spectrum["dbin2_nm"] <= 0.0:
-                raise ConfigValidationError("vulcan.stellar_spectrum.dbin2_nm must be positive.")
-            if "teff_k" in spectrum and spectrum["teff_k"] is not None:
-                spectrum["teff_k"] = _as_float(
-                    spectrum["teff_k"],
-                    "vulcan.stellar_spectrum.teff_k",
-                )
-                if spectrum["teff_k"] <= 0.0:
-                    raise ConfigValidationError("vulcan.stellar_spectrum.teff_k must be positive.")
-            else:
-                spectrum["teff_k"] = None
-            if "radius_rsun" in spectrum:
-                spectrum["radius_rsun"] = _as_float(
-                    spectrum["radius_rsun"],
-                    "vulcan.stellar_spectrum.radius_rsun",
-                )
-                if spectrum["radius_rsun"] <= 0.0:
-                    raise ConfigValidationError("vulcan.stellar_spectrum.radius_rsun must be positive.")
-            if "semi_major_axis_au" in spectrum:
-                spectrum["semi_major_axis_au"] = _as_float(
-                    spectrum["semi_major_axis_au"],
-                    "vulcan.stellar_spectrum.semi_major_axis_au",
-                )
-                if spectrum["semi_major_axis_au"] <= 0.0:
-                    raise ConfigValidationError("vulcan.stellar_spectrum.semi_major_axis_au must be positive.")
-            section["stellar_spectrum"] = spectrum
-            config["stellar_spectrum"] = dict(spectrum)
-
-        section["physics_toggles"] = physics
-        section["science_presets"] = science_presets
-        section["runtime"] = runtime
-        config["vulcan"] = section
-        config["physics_toggles"] = dict(physics)
-        config["science_presets"] = list(science_presets)
-        config["default_science_preset"] = dict(science_presets[0])
-        config["vulcan_runtime"] = dict(runtime)
-
-    config["training"] = {
-        "seed": training["seed"],
-        "batch_size": training["batch_size"],
-        "epochs": training["epochs"],
-        "learning_rate": training["learning_rate"],
-        "min_lr": training["min_lr"],
-        "warmup_epochs": training["warmup_epochs"],
-        "early_stopping_patience": training["early_stopping_patience"],
-        "scheduler": training["scheduler"],
-        "weight_decay": training["weight_decay"],
-        "gradient_clip": training["gradient_clip"],
-        "model": training["model"],
-        "loss": training["loss"],
-        "ema": training["ema"],
-    }
-    config["roth_sampler"] = {
-        "enabled": config["temperature_profiles"]["source_mode"] in {"pt_library", "mixed"},
-        "source_mode": (
-            "mixed"
-            if config["temperature_profiles"]["source_mode"] == "mixed"
-            else "roth"
-        ),
-        "analytic_probability": config["temperature_profiles"].get("analytic_probability"),
-        "data_glob": config["temperature_profiles"].get("data_glob", ""),
-        "filters": dict(config["temperature_profiles"]["filters"]),
-    }
-
-    config["data_spec"]["state_dim"] = len(state_species)
-    config["data_spec"]["target_dim"] = len(output_species)
-    if chemistry_type == "fastchem":
-        config["data_spec"]["sequence_static_feature_order"] = [
-            "pressure_bar",
-            "temperature_k",
-        ]
-    else:
-        config["data_spec"]["sequence_static_feature_order"] = [
-            "pressure_bar",
-            "temperature_k",
-            "kzz_cm2_s",
-        ]
-    config["data_spec"]["global_static_feature_order"] = global_static_feature_order(config)
-    config["data_spec"]["global_feature_order"] = global_feature_order(config)
     return config

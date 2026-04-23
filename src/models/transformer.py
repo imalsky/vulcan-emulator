@@ -50,10 +50,6 @@ class TransformerDimensions:
     activations outside the float16 dynamic range (relevant if mixed-precision
     training is ever enabled).
 
-    Fields ``norm_type``, ``use_qk_norm``, ``ffn_type``, and ``zero_init_film``
-    default to the legacy configuration so pre-existing checkpoints and tests
-    keep working; opt in via the model config block.
-
     Attributes
     ----------
     norm_type : str
@@ -84,12 +80,12 @@ class TransformerDimensions:
     conditioning_hidden_dim: int
     film_clamp: float
     output_head_divisor: int
-    activation: str = "gelu"
-    dropout_rate: float = 0.0
-    norm_type: str = "layernorm"
-    use_qk_norm: bool = False
-    ffn_type: str = "dense"
-    zero_init_film: bool = False
+    activation: str
+    dropout_rate: float
+    norm_type: str
+    use_qk_norm: bool
+    ffn_type: str
+    zero_init_film: bool
 
     def to_dict(self: "TransformerDimensions") -> dict[str, Any]:
         """Serialize the dataclass fields into a plain Python mapping."""

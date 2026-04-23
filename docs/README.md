@@ -1,6 +1,6 @@
-# vulcan_emulator_photochem
+# vulcan_emulator
 
-JAX-first VULCAN emulator pipeline with one shared workflow and a configurable `chemistry_type × model_type` surface.
+JAX-first chemistry emulator pipeline with one shared workflow and a configurable `chemistry_type × model_type` surface.
 
 Supported chemistry targets:
 - `fastchem`: FastChem equilibrium chemistry from PT and profile-global `X/H`
@@ -10,16 +10,16 @@ Supported model families:
 - `transformer`
 
 Shipped configs:
-- `config/vulcan_no_condensation.json` — gas-phase only VULCAN
+- `config/fastchem_no_condensation.json` — gas-phase FastChem equilibrium
 - `config/vulcan_condensation.json` — condensation-enabled VULCAN
 
 CLI:
 
 ```bash
-python -m src.utils --config config/vulcan_no_condensation.json --stage generation
-python -m src.utils --config config/vulcan_no_condensation.json --stage normalization
-python -m src.utils --config config/vulcan_no_condensation.json --stage training
-python -m src.utils --config config/vulcan_no_condensation.json --stage export
+python -m src.utils --config config/fastchem_no_condensation.json --stage generation
+python -m src.utils --config config/fastchem_no_condensation.json --stage normalization
+python -m src.utils --config config/fastchem_no_condensation.json --stage training
+python -m src.utils --config config/fastchem_no_condensation.json --stage export
 ```
 
 `--stage normalization` performs the full raw-to-processed step: split creation, train-only normalization fitting, and processed tensor writing.
@@ -49,10 +49,10 @@ Shipped defaults:
 - `vulcan.runtime.rocky` defaults to `false`
 
 Data layout:
-- each config now uses a single dataset root under `data/<run_name>/`
+- each config uses a single dataset root under `data/<run_name>/`
 - raw files live in `data/<run_name>/raw`
 - shared metadata lives in `data/<run_name>/info`
-- processed split tensors live directly in `data/<run_name>/train`, `data/<run_name>/val`, and `data/<run_name>/test`
+- processed split tensors live in `data/<run_name>/processed/train`, `data/<run_name>/processed/val`, and `data/<run_name>/processed/test`
 - training artifacts stay under `models/`
 
 Contract notes:
@@ -62,12 +62,36 @@ Contract notes:
 
 Layout:
 - `assets/`: external PT libraries and stellar spectra
-- `config/`: canonical JSON configs and helper notes
-- `data/`: dataset runs with `raw/`, `info/`, `train/`, `val/`, `test/`, and derived spectrum libraries
+- `config/`: canonical JSON configs
+- `data/`: dataset runs with `raw/`, `info/`, `processed/{train,val,test}/`, and derived spectrum libraries
+- `docs/`: human-facing docs (`config_guide.md`, `training_diary.md`)
 - `models/`: checkpoints and exported bundles
 - `src/constants.py`: single source of truth for all shared constants
 - `src/models/`: architecture, inference, and export logic
 - `src/training/`: training loops and evaluation utilities
 - `src/data_generation/`: sampling, raw generation, preprocessing, and dataset I/O
 - `src/utils/`: config validation, CLI, logging, paths, and provenance helpers
+- `supercomputer_cmds/`: HPC submission scripts — submit from anywhere via `qsub supercomputer_cmds/run.pbs` or `sbatch supercomputer_cmds/run_gen.sh`
 - `uni_tests/`: minimal test suite (5 files — config, model, export, sampling, runner)
+
+## Inference surface
+
+- `ExportedJAXModel` in `src/models/export_bundle.py` is the single runtime
+  class for loaded bundles. It exposes both the canonical
+  `predict_fastchem_profile` / `predict_vulcan_profile` (keyword-only,
+  profile-level) methods and short positional aliases `predict_fastchem` /
+  `predict_vulcan` / `make_compiled_fastchem_predictor` for callers that
+  prefer the older names.
+- `src/models/standalone_inference.py` is a thin backward-compat shim that
+  re-exports `load_model`, `ExportedModel`, and the ExoJAX wrapper
+  factories. New code should import from `export_bundle` or `exojax_api`
+  directly.
+- The ExoJAX-facing factories `make_fastchem_vmr_fn` / `make_vulcan_vmr_fn`
+  live in `src/models/exojax_api.py`.
+
+## Running the demos
+
+The notebooks under `exojax_demo/` and `extras/` expect an exported bundle
+at `models/<run_name>/best_exported.npz`. No bundle is checked in; produce
+one first with `python -m src.utils --config config/<cfg>.json --stage export`
+and point the notebook's `BUNDLE_PATH` at the result.

@@ -18,7 +18,9 @@ from src.data_generation.generation import (
     generate_raw_dataset,
     run_vulcan_generation,
     write_equilibrium_hdf5,
+    write_raw_run_hdf5,
 )
+from src.data_generation.preprocess import load_raw_run
 from synthetic_fixture import generate_synthetic_raw_runs
 from src.data_generation.sampling import sample_run_specifications
 from src.data_generation.spectrum import (
@@ -43,7 +45,6 @@ def _make_equilibrium_config(tmp_path: Path) -> dict:
     config["paths"]["processed_root"] = str(tmp_path / "dataset" / "processed")
     config["paths"]["checkpoints_root"] = str(tmp_path / "checkpoints")
     config["paths"]["vulcan_source_root"] = str(tmp_path / "VULCAN")
-    config["generation"]["mode"] = "vulcan"
     config["generation"]["num_runs"] = 1
     config["generation"]["parallel_workers"] = 1
     config["temperature_profiles"]["source_mode"] = "analytic"
@@ -93,11 +94,22 @@ def test_generate_synthetic_raw_runs_writes_final_state_only(tiny_config):
 
 
 def test_generate_synthetic_raw_runs_reuse_keeps_consolidated_format(tiny_config):
-    artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
-
-    artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
+    config = copy.deepcopy(tiny_config)
+    artifact = generate_synthetic_raw_runs(config, project_root=config["_project_root"])
+    artifact = generate_synthetic_raw_runs(config, project_root=config["_project_root"])
 
     assert artifact.consolidated_path.exists()
+
+
+def test_generate_synthetic_raw_runs_manifest_omits_generation_mode(tiny_config):
+    artifact = generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    coverage = json.loads(artifact.coverage_path.read_text(encoding="utf-8"))
+
+    assert manifest["chemistry_type"] == tiny_config["chemistry_type"]
+    assert coverage["chemistry_type"] == tiny_config["chemistry_type"]
+    assert "mode" not in manifest
+    assert "mode" not in coverage
 
 
 def test_generate_synthetic_raw_runs_requires_configured_spectrum_template(tiny_config):
@@ -126,9 +138,26 @@ def test_generate_synthetic_raw_runs_can_synthesize_template_without_asset(tiny_
 
 def test_vulcan_generation_requires_configured_checkout(tiny_config):
     config = copy.deepcopy(tiny_config)
-    config["generation"]["mode"] = "vulcan"
     with pytest.raises(FileNotFoundError):
         generate_raw_dataset(config, project_root=config["_project_root"])
+
+
+def test_generate_raw_dataset_uses_chemistry_type(tmp_path, monkeypatch):
+    config = _make_equilibrium_config(tmp_path)
+    sentinel = object()
+
+    def _fake_check_assets_availability(config, project_root):
+        del config, project_root
+
+    def _fake_run_vulcan_generation(config, *, project_root, num_runs=None):
+        del project_root, num_runs
+        assert config["chemistry_type"] == "fastchem"
+        return sentinel
+
+    monkeypatch.setattr(generation_module, "_check_assets_availability", _fake_check_assets_availability)
+    monkeypatch.setattr(generation_module, "run_vulcan_generation", _fake_run_vulcan_generation)
+
+    assert generate_raw_dataset(config, project_root=config["_project_root"]) is sentinel
 
 
 def test_patch_vulcan_cfg_uses_profile_kzz_and_cross_sections(tmp_path, tiny_config):
@@ -272,6 +301,99 @@ def test_convert_fake_vulcan_output_to_hdf5_writes_final_state_only(tmp_path, ti
         np.testing.assert_allclose(final_state, reference, atol=1.0e-12)
         assert np.asarray(handle["inputs/kzz_cm2_s"]).shape == (nz,)
         np.testing.assert_allclose(np.asarray(handle["inputs/gravity_cm_s2"]), runtime_gravity, atol=1.0e-12)
+
+
+def test_convert_fake_vulcan_output_to_hdf5_rejects_nonfinite_ymix(tmp_path, tiny_config):
+    specs = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=1,
+        seed=9,
+    )
+    spec = specs[0]
+    species = list(tiny_config["data_spec"]["state_species"])
+    nz = spec.pressure_bar.size
+    reference = np.full((nz, len(species)), 1.0e-8, dtype=np.float64)
+    reference[:, species.index("H2")] = 0.84
+    reference[:, species.index("He")] = 0.15
+    reference[:, species.index("H2O")] = 1.0e-3
+    reference /= np.sum(reference, axis=1, keepdims=True)
+    reference[0, 0] = np.nan
+    fake = {
+        "variable": {
+            "species": species,
+            "ymix": reference,
+        },
+        "atm": {
+            "pco": spec.pressure_bar * 1.0e6,
+            "Tco": spec.temperature_k,
+            "Kzz": spec.kzz_cm2_s[:-1],
+        },
+    }
+    vul_path = tmp_path / "fake_nonfinite.vul"
+    with vul_path.open("wb") as handle:
+        pickle.dump(fake, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    out_h5 = tmp_path / "converted_bad.h5"
+    converted_spec = type(spec)(
+        run_id=spec.run_id,
+        pressure_bar=spec.pressure_bar,
+        temperature_k=spec.temperature_k,
+        kzz_cm2_s=spec.kzz_cm2_s,
+        globals=spec.globals,
+        spectrum=spec.spectrum,
+        metadata={**spec.metadata, "state_species": species, "output_species": species},
+        elemental_abundances_frac=spec.elemental_abundances_frac,
+        gravity_cm_s2=spec.gravity_cm_s2,
+    )
+
+    with pytest.raises(ValueError, match="variable\\.ymix"):
+        convert_vulcan_output_to_hdf5(
+            vul_path,
+            output_h5_path=out_h5,
+            spec=converted_spec,
+            config=tiny_config,
+        )
+
+
+def test_load_raw_run_rejects_nonfinite_final_state(tmp_path, tiny_config):
+    specs = sample_run_specifications(
+        config=tiny_config,
+        project_root=tiny_config["_project_root"],
+        num_runs=1,
+        seed=13,
+    )
+    spec = specs[0]
+    species = list(tiny_config["data_spec"]["output_species"])
+    nz = spec.pressure_bar.size
+    final_ymix_output = np.full((nz, len(species)), 1.0e-8, dtype=np.float64)
+    final_ymix_output[:, species.index("H2")] = 0.84
+    final_ymix_output[:, species.index("He")] = 0.15
+    final_ymix_output[:, species.index("H2O")] = 1.0e-3
+    final_ymix_output /= np.sum(final_ymix_output, axis=1, keepdims=True)
+    final_ymix_output[0, 0] = np.inf
+
+    output_path = tmp_path / "nonfinite_raw.h5"
+    converted_spec = type(spec)(
+        run_id=spec.run_id,
+        pressure_bar=spec.pressure_bar,
+        temperature_k=spec.temperature_k,
+        kzz_cm2_s=spec.kzz_cm2_s,
+        globals=spec.globals,
+        spectrum=spec.spectrum,
+        metadata={**spec.metadata, "state_species": species, "output_species": species},
+        elemental_abundances_frac=spec.elemental_abundances_frac,
+        gravity_cm_s2=spec.gravity_cm_s2,
+    )
+    write_raw_run_hdf5(
+        output_path,
+        spec=converted_spec,
+        final_ymix_output=final_ymix_output,
+        output_species=species,
+    )
+
+    with h5py.File(output_path, "r") as handle:
+        with pytest.raises(ValueError, match="non-finite final-state abundance values"):
+            load_raw_run(handle, config=tiny_config, run_id=spec.run_id)
 
 
 
@@ -454,7 +576,6 @@ def test_run_vulcan_generation_backfill_assigns_unique_run_ids(tmp_path, monkeyp
 
 def test_run_vulcan_generation_hard_fails_on_shortfall(tmp_path, tiny_config, monkeypatch):
     config = copy.deepcopy(tiny_config)
-    config["generation"]["mode"] = "vulcan"
     config["generation"]["num_runs"] = 2
     config["generation"]["parallel_workers"] = 1
     config["generation"]["backfill"] = {"enabled": True, "max_retries": 1}

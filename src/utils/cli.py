@@ -72,10 +72,10 @@ def main(argv: list[str] | None = None) -> int:
     int
         Process-style exit code for the selected stage.
     """
-    parser = argparse.ArgumentParser(description="Photochemical VULCAN surrogate pipeline.")
+    parser = argparse.ArgumentParser(description="FastChem/VULCAN chemistry emulator pipeline.")
     parser.add_argument(
         "--config",
-        default="config/vulcan_no_condensation.json",
+        default="config/fastchem_no_condensation.json",
         help="Path to a configuration JSON file relative to the project root.",
     )
     parser.add_argument(
@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         checkpoints_root = Path(config["paths"]["checkpoints_root"])
         if not checkpoints_root.is_absolute():
             checkpoints_root = project_root / checkpoints_root
-        best_checkpoint = checkpoints_root / "best.pt"
+        best_checkpoint = checkpoints_root / "best"
         if not best_checkpoint.exists():
             LOGGER.error("No best checkpoint found at %s", best_checkpoint)
             return 1

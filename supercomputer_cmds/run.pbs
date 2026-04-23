@@ -10,30 +10,31 @@
 # =============================================================================
 # VULCAN Emulator Pipeline — PBS Submission Script
 #
-# Full VULCAN kinetic-chemistry pipeline:
+# Full chemistry-emulator pipeline:
 # generation → normalization → training → export
 #
-# Usage:
-#   qsub run.pbs                                                    # no condensation (default)
-#   qsub -v CONFIG_PATH=config/vulcan_condensation.json run.pbs     # with condensation
-#   qsub -v DATA_ONLY=1 run_cpu.pbs                                # data only (CPU)
+# Usage (submit from anywhere; the script self-locates the project root):
+#   qsub supercomputer_cmds/run.pbs                                                    # no condensation (default)
+#   qsub -v CONFIG_PATH=config/vulcan_condensation.json supercomputer_cmds/run.pbs     # with condensation
+#   qsub -v DATA_ONLY=1 supercomputer_cmds/run_cpu.pbs                                 # data only (CPU)
 #
 # To run ONLY data generation and normalization on a CPU node (no GPU hours
-# consumed), copy this script to run_cpu.pbs and change the PBS directives:
+# consumed), copy this script to supercomputer_cmds/run_cpu.pbs and change the
+# PBS directives:
 #
 #   #PBS -q long
 #   #PBS -l select=1:ncpus=72:mem=400gb
 #
 # Then submit with:
-#   qsub -v DATA_ONLY=1 run_cpu.pbs
+#   qsub -v DATA_ONLY=1 supercomputer_cmds/run_cpu.pbs
 #
 # This runs generation + normalization only, skipping training and export.
 # Once the data is ready, submit the GPU job with:
-#   qsub -v SKIP_GEN=1 run.pbs
+#   qsub -v SKIP_GEN=1 supercomputer_cmds/run.pbs
 #
 # Environment Variables:
 #   CONFIG_PATH     — config file path
-#                     (default: config/vulcan_no_condensation.json)
+#                     (default: config/fastchem_no_condensation.json)
 #   DATA_ONLY       — set to 1 to run only generation + normalization (no GPU needed)
 #   SKIP_GEN        — set to 1 to skip generation (data already exists)
 #   SKIP_NORM       — set to 1 to skip normalization (processed data exists)
@@ -43,7 +44,8 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd -P)}"
 cd -P "${PROJECT_ROOT}"
 PROJECT_ROOT="$(pwd -P)"
 export VULCAN_PROJECT_ROOT="${PROJECT_ROOT}"
@@ -76,7 +78,7 @@ if [[ "$(basename "${CONDA_PREFIX:-}")" != "${CONDA_ENV}" ]]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/vulcan_no_condensation.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/fastchem_no_condensation.json}"
 if [[ "${CONFIG_PATH}" != /* ]]; then
   CONFIG_PATH="${PROJECT_ROOT}/${CONFIG_PATH}"
 fi
@@ -149,7 +151,7 @@ if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ] && [ "${CONFIG_CHEMISTRY_TYPE}" !=
   exit 1
 fi
 if [ "${CONFIG_MODEL_TYPE}" != "transformer" ]; then
-  echo "ERROR: run.pbs is for the VULCAN transformer pipeline, but model_type=${CONFIG_MODEL_TYPE}."
+  echo "ERROR: run.pbs is for the chemistry emulator transformer pipeline, but model_type=${CONFIG_MODEL_TYPE}."
   exit 1
 fi
 
@@ -209,7 +211,7 @@ fi
 if [ "${SKIP_GEN}" != "1" ]; then
   echo ""
   echo "========== Stage: generation =========="
-  # Check if raw data already exists before regenerating.
+  # Check if the consolidated raw dataset already exists.
   DATA_CFG_RAW="$(python - "${CONFIG_PATH}" <<'PY'
 from pathlib import Path
 import json
@@ -224,7 +226,6 @@ run_root = Path(str(cfg["paths"]["run_root"]))
 if not run_root.is_absolute():
     run_root = (project_root / run_root).resolve()
 raw_root = run_root / "raw"
-print(raw_root / "runs")
 print(int(cfg["generation"]["num_runs"]))
 consolidated_path = raw_root / "runs.h5"
 print(consolidated_path)
@@ -239,29 +240,17 @@ PY
     exit 1
   }
   mapfile -t DATA_CFG <<<"${DATA_CFG_RAW}"
-  if [ "${#DATA_CFG[@]}" -lt 4 ]; then
-    echo "ERROR: config inspection did not return raw_root, num_runs, and consolidated metadata."
+  if [ "${#DATA_CFG[@]}" -lt 3 ]; then
+    echo "ERROR: config inspection did not return num_runs and consolidated metadata."
     exit 1
   fi
-  RAW_RUN_DIR="${DATA_CFG[0]}"
-  EXPECTED_RUNS="${DATA_CFG[1]}"
-  CONSOLIDATED_PATH="${DATA_CFG[2]}"
-  CONSOLIDATED_COUNT="${DATA_CFG[3]}"
-  RUN_COUNT=0
-  if [ -d "${RAW_RUN_DIR}" ]; then
-    RUN_COUNT="$(find "${RAW_RUN_DIR}" -maxdepth 1 -type f -name 'run_*.h5' | wc -l | tr -d ' ')"
-  fi
+  EXPECTED_RUNS="${DATA_CFG[0]}"
+  CONSOLIDATED_PATH="${DATA_CFG[1]}"
+  CONSOLIDATED_COUNT="${DATA_CFG[2]}"
   if [ "${CONSOLIDATED_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
     echo "Raw dataset already present in consolidated file (${CONSOLIDATED_COUNT} runs), skipping generation."
-  elif [ "${RUN_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
-    echo "Raw dataset already present (${RUN_COUNT} per-run files), consolidation needed."
-    python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
   elif [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
-    if [ "${RUN_COUNT}" -gt 0 ]; then
-      echo "Resuming generation: ${RUN_COUNT}/${EXPECTED_RUNS} per-run files found, continuing..."
-    else
-      echo "Generating raw runs..."
-    fi
+    echo "Generating raw runs (generation handles its own resume from orphan chunk/per-run files)..."
     python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
   else
     echo "ERROR: consolidated file has ${CONSOLIDATED_COUNT} runs but expected ${EXPECTED_RUNS}."
@@ -290,7 +279,7 @@ if [ "${DATA_ONLY}" = "1" ]; then
   echo ""
   echo "========== DATA_ONLY=1: stopping after data processing =========="
   echo "Data generation and normalization complete."
-  echo "Submit the GPU job with: qsub -v SKIP_GEN=1 run.pbs"
+  echo "Submit the GPU job with: qsub -v SKIP_GEN=1 supercomputer_cmds/run.pbs"
   exit 0
 fi
 

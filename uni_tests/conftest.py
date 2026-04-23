@@ -109,7 +109,6 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     },
                 },
                 "generation": {
-                    "mode": "vulcan",
                     "num_runs": 128,
                     "seed": 7,
                     "overwrite": False,
@@ -176,6 +175,7 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                         "threshold": 1.0e-4,
                     },
                     "loss": {
+                        "type": "mae",
                         "lambda_z": 1.0,
                         "lambda_log10_mae": 0.1,
                     },
@@ -190,6 +190,10 @@ def _write_vulcan_transformer_test_config(config_path: Path) -> None:
                     "output_head_divisor": 2,
                     "activation": "leaky_relu",
                     "dropout_rate": 0.05,
+                    "norm_type": "layernorm",
+                    "use_qk_norm": False,
+                    "ffn_type": "dense",
+                    "zero_init_film": False,
                 },
                 "vulcan": {
                     "physics_toggles": {
@@ -291,7 +295,6 @@ def tiny_config(tmp_path):
     config["stellar_spectrum"]["library_glob"] = str(spectrum_dir / "*.txt")
 
     config["_project_root"] = ROOT
-    config["generation"]["mode"] = "vulcan"
     config["generation"]["num_runs"] = 4
     config["generation"]["seed"] = 11
     config["generation"]["parallel_workers"] = 1

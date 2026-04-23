@@ -8,20 +8,20 @@
 #PBS -m abe
 
 # =============================================================================
-# VULCAN Emulator — Optuna hyperparameter sweep
+# Chemistry Emulator — Optuna hyperparameter sweep
 #
 # Runs: (optional) generation → (optional) normalization → tuning
 # Defaults assume the dataset is already generated + normalized on disk.
 # Training and export are NOT run; each trial trains for TRIALS_EPOCHS epochs
 # subject to the MedianPruner configured in src/tuning/__main__.py.
 #
-# Usage:
-#   qsub run_tune.pbs
-#   qsub -v TRIALS=200,TRIALS_EPOCHS=120 run_tune.pbs
-#   qsub -v SKIP_GEN=0,SKIP_NORM=0 run_tune.pbs                          # force a data pass
+# Usage (submit from anywhere; the script self-locates the project root):
+#   qsub supercomputer_cmds/run_tune.pbs
+#   qsub -v TRIALS=200,TRIALS_EPOCHS=120 supercomputer_cmds/run_tune.pbs
+#   qsub -v SKIP_GEN=0,SKIP_NORM=0 supercomputer_cmds/run_tune.pbs                          # force a data pass
 #
 # Environment Variables:
-#   CONFIG_PATH     — config file path (default: config/vulcan_no_condensation.json)
+#   CONFIG_PATH     — config file path (default: config/fastchem_no_condensation.json)
 #   TRIALS          — number of Optuna trials (default: 100)
 #   TRIALS_EPOCHS   — max epochs per trial (default: 100)
 #   SKIP_GEN        — skip generation (default: 1, data is already on disk)
@@ -32,7 +32,8 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd -P)}"
 cd -P "${PROJECT_ROOT}"
 PROJECT_ROOT="$(pwd -P)"
 export VULCAN_PROJECT_ROOT="${PROJECT_ROOT}"
@@ -65,7 +66,7 @@ if [[ "$(basename "${CONDA_PREFIX:-}")" != "${CONDA_ENV}" ]]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/vulcan_no_condensation.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/fastchem_no_condensation.json}"
 if [[ "${CONFIG_PATH}" != /* ]]; then
   CONFIG_PATH="${PROJECT_ROOT}/${CONFIG_PATH}"
 fi
@@ -133,7 +134,7 @@ if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ] && [ "${CONFIG_CHEMISTRY_TYPE}" !=
   exit 1
 fi
 if [ "${CONFIG_MODEL_TYPE}" != "transformer" ]; then
-  echo "ERROR: run_tune.pbs is for the VULCAN transformer pipeline, but model_type=${CONFIG_MODEL_TYPE}."
+  echo "ERROR: run_tune.pbs is for the chemistry emulator transformer pipeline, but model_type=${CONFIG_MODEL_TYPE}."
   exit 1
 fi
 
@@ -207,7 +208,6 @@ run_root = Path(str(cfg["paths"]["run_root"]))
 if not run_root.is_absolute():
     run_root = (project_root / run_root).resolve()
 raw_root = run_root / "raw"
-print(raw_root / "runs")
 print(int(cfg["generation"]["num_runs"]))
 consolidated_path = raw_root / "runs.h5"
 print(consolidated_path)
@@ -222,29 +222,17 @@ PY
     exit 1
   }
   mapfile -t DATA_CFG <<<"${DATA_CFG_RAW}"
-  if [ "${#DATA_CFG[@]}" -lt 4 ]; then
-    echo "ERROR: config inspection did not return raw_root, num_runs, and consolidated metadata."
+  if [ "${#DATA_CFG[@]}" -lt 3 ]; then
+    echo "ERROR: config inspection did not return num_runs and consolidated metadata."
     exit 1
   fi
-  RAW_RUN_DIR="${DATA_CFG[0]}"
-  EXPECTED_RUNS="${DATA_CFG[1]}"
-  CONSOLIDATED_PATH="${DATA_CFG[2]}"
-  CONSOLIDATED_COUNT="${DATA_CFG[3]}"
-  RUN_COUNT=0
-  if [ -d "${RAW_RUN_DIR}" ]; then
-    RUN_COUNT="$(find "${RAW_RUN_DIR}" -maxdepth 1 -type f -name 'run_*.h5' | wc -l | tr -d ' ')"
-  fi
+  EXPECTED_RUNS="${DATA_CFG[0]}"
+  CONSOLIDATED_PATH="${DATA_CFG[1]}"
+  CONSOLIDATED_COUNT="${DATA_CFG[2]}"
   if [ "${CONSOLIDATED_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
     echo "Raw dataset already present in consolidated file (${CONSOLIDATED_COUNT} runs), skipping generation."
-  elif [ "${RUN_COUNT}" -eq "${EXPECTED_RUNS}" ]; then
-    echo "Raw dataset already present (${RUN_COUNT} per-run files), consolidation needed."
-    python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
   elif [ "${CONSOLIDATED_COUNT}" -eq 0 ]; then
-    if [ "${RUN_COUNT}" -gt 0 ]; then
-      echo "Resuming generation: ${RUN_COUNT}/${EXPECTED_RUNS} per-run files found, continuing..."
-    else
-      echo "Generating raw runs..."
-    fi
+    echo "Generating raw runs (generation handles its own resume from orphan chunk/per-run files)..."
     python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
   else
     echo "ERROR: consolidated file has ${CONSOLIDATED_COUNT} runs but expected ${EXPECTED_RUNS}."

@@ -14,7 +14,7 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 
-from ..constants import _POSITION_SCALE, _SINUSOIDAL_BASE_WAVELENGTH
+from ..constants import ATTN_MASK_NEG_INF, _POSITION_SCALE, _SINUSOIDAL_BASE_WAVELENGTH
 
 
 # ---------------------------------------------------------------------------
@@ -187,37 +187,6 @@ def _apply_norm(
     raise ValueError(f"Unsupported norm_type: {norm_type}")
 
 
-def sinusoidal_position_encoding(length: int, dim: int, dtype: jnp.dtype = jnp.float32) -> jax.Array:
-    """Compute fixed sinusoidal positional encoding (Vaswani et al., 2017).
-
-    Even indices use sin, odd indices use cos:
-        PE(pos, 2i)   = sin(pos / 10000^(2i/dim))
-        PE(pos, 2i+1) = cos(pos / 10000^(2i/dim))
-
-    Parameters
-    ----------
-    length : int
-        Number of positions (atmospheric levels).
-    dim : int
-        Encoding dimension (should equal ``d_model``).
-    dtype : jnp.dtype
-        Output dtype.
-
-    Returns
-    -------
-    jax.Array
-        Positional encoding matrix of shape ``(length, dim)``.
-    """
-    position = jnp.arange(length, dtype=dtype)[:, None]
-    index = jnp.arange(dim, dtype=dtype)[None, :]
-    angle_rate = 1.0 / jnp.power(
-        _SINUSOIDAL_BASE_WAVELENGTH,
-        (2.0 * jnp.floor(index / 2.0)) / float(dim),
-    )
-    angle = position * angle_rate
-    return jnp.where((jnp.arange(dim) % 2)[None, :] == 0, jnp.sin(angle), jnp.cos(angle))
-
-
 def sinusoidal_position_encoding_continuous(
     position: jax.Array,
     dim: int,
@@ -226,10 +195,10 @@ def sinusoidal_position_encoding_continuous(
     """Continuous sinusoidal positional encoding over a real-valued coordinate.
 
     Accepts any real-valued ``position`` array (e.g. normalized
-    log10-pressure) and returns the same Vaswani-style sin/cos bands as
-    :func:`sinusoidal_position_encoding`, but evaluated at the provided
-    positions rather than integer indices. This is the PE used for the
-    variable-grid emulator: two columns with different ``nz`` but the
+    log10-pressure) and returns the same Vaswani-style sin/cos bands as the
+    legacy fixed-index helper, but evaluated at the provided positions rather
+    than integer indices.
+    This is the PE used for the variable-grid emulator: two columns with different ``nz`` but the
     same physical pressures produce identical PE at those pressures.
 
     The raw position is multiplied by ``_POSITION_SCALE`` so that the
@@ -338,7 +307,7 @@ def _multihead_attention_qkv(
     logits = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
     if source_mask is not None:
         expanded_mask = source_mask[:, None, None, :]
-        logits = jnp.where(expanded_mask, logits, jnp.full_like(logits, -1.0e30))
+        logits = jnp.where(expanded_mask, logits, jnp.full_like(logits, ATTN_MASK_NEG_INF))
     weights = jax.nn.softmax(logits, axis=-1)
     if source_mask is not None:
         expanded_mask = source_mask[:, None, None, :].astype(weights.dtype)

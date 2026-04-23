@@ -21,9 +21,9 @@ temperature-profile sources, selected by ``temperature_profiles.source_mode``:
   GCM-derived profiles.
 
 The module also handles Latin-hypercube sampling of the global conditioning
-scalars (metallicity, C/O, S/O, and for VULCAN also surface gravity, planet
-radius, and irradiation geometry) plus stellar-spectrum selection for VULCAN
-chemistry runs.
+scalars (the hydrogen-normalized elemental fractions ``He_H, C_H, O_H, N_H,
+S_H``, and for VULCAN also surface gravity, planet radius, and irradiation
+geometry) plus stellar-spectrum selection for VULCAN chemistry runs.
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.ndimage import uniform_filter1d
+from scipy.stats import qmc
 
 from ..constants import (
     ANALYTIC_SAMPLER_GRAVITY_CM_S2,
@@ -371,10 +373,7 @@ def _apply_upper_atmosphere_modification(
     if window <= 1:
         return modified
 
-    pad = window // 2
-    padded = np.pad(modified, pad, mode="edge")
-    kernel = np.ones(window) / window
-    return np.convolve(padded, kernel, mode="valid")[:nz]
+    return uniform_filter1d(modified, size=window, mode="nearest")
 
 
 def _apply_convective_adjustment(
@@ -930,35 +929,15 @@ def _latin_hypercube_unit_samples(
 ) -> np.ndarray:
     """Generate a Latin-hypercube design matrix in the unit hypercube [0, 1]^d.
 
-    Latin-hypercube sampling (LHS) ensures that each dimension is stratified
-    into ``num_samples`` equal-probability bins, with exactly one sample per
-    bin.  This provides better coverage of the parameter space than pure
-    random sampling, especially at moderate sample counts.
-
-    Parameters
-    ----------
-    num_samples : int
-        Number of samples (rows) in the design matrix.  Must be >= 1.
-    num_dimensions : int
-        Number of dimensions (columns).
-    rng : np.random.Generator
-        Random number generator for reproducible designs.
-
-    Returns
-    -------
-    np.ndarray
-        Design matrix of shape ``(num_samples, num_dimensions)`` with values
-        in [0, 1].
+    Thin wrapper over :class:`scipy.stats.qmc.LatinHypercube`: each dimension
+    is stratified into ``num_samples`` equal-probability bins with exactly one
+    sample per bin. The supplied ``rng`` threads determinism through scipy's
+    QMC engine.
     """
     if num_samples < 1:
         raise ValueError("num_samples must be >= 1.")
-    cutpoints = np.linspace(0.0, 1.0, num_samples + 1, dtype=np.float64)
-    samples = np.empty((num_samples, num_dimensions), dtype=np.float64)
-    for dim in range(num_dimensions):
-        offsets = rng.uniform(0.0, 1.0, size=num_samples)
-        coords = cutpoints[:-1] + offsets * (cutpoints[1:] - cutpoints[:-1])
-        samples[:, dim] = coords[rng.permutation(num_samples)]
-    return samples
+    sampler = qmc.LatinHypercube(d=num_dimensions, seed=rng)
+    return sampler.random(num_samples)
 
 
 def _scale_unit_interval(
@@ -1452,6 +1431,10 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
             float(gravity),
             dtype=np.float64,
         )
+    # SeedSequence.generate_state derives a reproducible uint32 from the
+    # per-run seed material (parent seed + spawn path), giving every run a
+    # stable numeric seed that survives retries with different chunk seeding.
+    rng_seed = int(plan.child_seeds[run_idx].generate_state(1, dtype=np.uint32)[0])
     if fastchem:
         globals_map = {**base_globals, **element_fractions}
         return RunSpecification(
@@ -1459,7 +1442,7 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
             pressure_bar=pressure_bar,
             temperature_k=temperature_k,
             globals=globals_map,
-            metadata=temperature_metadata,
+            metadata={**temperature_metadata, "rng_seed": rng_seed},
             elemental_abundances_frac=None,
             gravity_cm_s2=gravity_profile,
         )
@@ -1493,6 +1476,7 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
             **temperature_metadata,
             "spectrum_name": spectrum.name,
             "science_preset_name": str(preset["name"]),
+            "rng_seed": rng_seed,
         },
         kzz_cm2_s=kzz,
         spectrum=spectrum,
@@ -1546,11 +1530,11 @@ def sample_run_specifications(
     """Sample the full set of atmospheric configurations used to generate raw runs.
 
     Uses Latin-hypercube sampling (LHC) to stratify the global conditioning
-    scalars (metallicity, C/O, S/O, and for VULCAN also surface gravity,
-    planet radius, stellar radius, orbital separation, zenith angle, and
-    diurnal factor) over the configured ranges. For each run, a temperature
-    profile is independently drawn from the configured source (analytic,
-    PT-library, or mixed).
+    scalars (the hydrogen-normalized elemental fractions ``He_H, C_H, O_H,
+    N_H, S_H``, and for VULCAN also surface gravity, planet radius, stellar
+    radius, orbital separation, zenith angle, and diurnal factor) over the
+    configured ranges. For each run, a temperature profile is independently
+    drawn from the configured source (analytic, PT-library, or mixed).
 
     Parameters
     ----------

@@ -2,10 +2,12 @@
 
 This module provides two main capabilities:
 
-1. **Checkpoint export**: Convert a training checkpoint (pickle) into a
-   portable NPZ bundle (``jax_physical_bundle`` format, version 1).  The
-   bundle embeds model parameters, dimensions, normalization metadata,
-   data contract, and config — everything needed for standalone inference.
+1. **Checkpoint export**: Convert a training checkpoint (Orbax directory)
+   into a portable NPZ bundle that embeds model parameters, dimensions,
+   normalization metadata, data contract, and config — everything needed
+   for inference. Bundles are identified by their structural metadata;
+   stale bundles whose structure no longer matches the current loader
+   fail with a ``KeyError`` on missing metadata and must be re-exported.
 
 2. **Physical-unit inference**: ``ExportedJAXModel`` wraps the exported
    bundle and provides ``predict_fastchem_profile()`` and
@@ -21,7 +23,6 @@ The NPZ layout uses ``params/<dotted.key>`` for model weight arrays and
 from __future__ import annotations
 
 import json
-import pickle
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -30,8 +31,12 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 
-from ..constants import EXPORT_FORMAT, EXPORT_VERSION
+from ..constants import (
+    NEAR_CONSTANT_STD_THRESHOLD,
+    NORM_SPAN_FLOOR,
+)
 from .jax_model import (
     TransformerDimensions,
     apply_transformer_model,
@@ -39,21 +44,7 @@ from .jax_model import (
 
 
 def _flatten_params(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
-    """Flatten a nested parameter tree into dotted-key arrays.
-
-    Parameters
-    ----------
-    tree : Any
-        Nested dict/list/array parameter structure.
-    prefix : str, default=""
-        Dotted-key prefix accumulated during recursion.
-
-    Returns
-    -------
-    dict[str, np.ndarray]
-        Flat mapping from dotted parameter names to NumPy arrays suitable for
-        NPZ serialization.
-    """
+    """Flatten a nested parameter tree into dotted-key arrays."""
     flat: dict[str, np.ndarray] = {}
     if isinstance(tree, dict):
         for key, value in tree.items():
@@ -68,19 +59,7 @@ def _flatten_params(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
 
 
 def _convert_numeric_dicts(node: Any) -> Any:
-    """Convert integer-keyed dict nodes back into Python lists.
-
-    Parameters
-    ----------
-    node : Any
-        Nested structure produced while rebuilding a flattened parameter tree.
-
-    Returns
-    -------
-    Any
-        Structure with contiguous ``{"0": ..., "1": ...}`` mappings restored
-        to list form.
-    """
+    """Restore contiguous ``{"0": ..., "1": ...}`` mappings to list form."""
     if isinstance(node, dict):
         converted = {key: _convert_numeric_dicts(value) for key, value in node.items()}
         if converted and all(key.isdigit() for key in converted):
@@ -92,18 +71,7 @@ def _convert_numeric_dicts(node: Any) -> Any:
 
 
 def _unflatten_params(flat_params: dict[str, np.ndarray]) -> Any:
-    """Reconstruct the nested parameter tree from dotted NPZ keys.
-
-    Parameters
-    ----------
-    flat_params : dict[str, np.ndarray]
-        Flat mapping produced by ``_flatten_params``.
-
-    Returns
-    -------
-    Any
-        Nested parameter tree matching the original dict/list structure.
-    """
+    """Reconstruct the nested parameter tree from dotted NPZ keys."""
     root: dict[str, Any] = {}
     for key, value in flat_params.items():
         cursor = root
@@ -147,40 +115,6 @@ def _restore_block_transform_space_jax(
     std = jnp.asarray(block["std"], dtype=arr.dtype)
     if method in {"standard", "log-standard"}:
         return arr * std + mean
-    raise ValueError(f"Unsupported normalization method: {method}")
-
-
-def apply_block_jax(x: jax.Array | np.ndarray, block: dict[str, Any]) -> jax.Array:
-    """Apply one normalization block using JAX arrays.
-
-    Parameters
-    ----------
-    x : jax.Array or np.ndarray
-        Input values whose last dimension matches the normalization block.
-    block : dict[str, Any]
-        Normalization block with method metadata and fitted statistics.
-
-    Returns
-    -------
-    jax.Array
-        Normalized values in model space.
-    """
-    arr = jnp.asarray(x, dtype=jnp.float32)
-    method = str(block["method"]).lower()
-    if method == "none":
-        return arr
-    if method == "log-minmax":
-        floor = jnp.asarray(float(block["floor"]), dtype=arr.dtype)
-        log10_min = jnp.asarray(block["log10_min"], dtype=arr.dtype)
-        span = jnp.asarray(block["span"], dtype=arr.dtype)
-        return (jnp.log10(jnp.maximum(arr, floor)) - log10_min) / span
-    mean = jnp.asarray(block["mean"], dtype=arr.dtype)
-    std = jnp.asarray(block["std"], dtype=arr.dtype)
-    if method == "standard":
-        return (arr - mean) / std
-    if method == "log-standard":
-        floor = jnp.asarray(float(block["floor"]), dtype=arr.dtype)
-        return (jnp.log10(jnp.maximum(arr, floor)) - mean) / std
     raise ValueError(f"Unsupported normalization method: {method}")
 
 
@@ -362,8 +296,8 @@ def _validate_near_constant_standard_globals(
     normalization_block: dict[str, Any],
     *,
     field_name: str,
-    std_threshold: float = 1.0e-6,
-    atol: float = 1.0e-6,
+    std_threshold: float = NEAR_CONSTANT_STD_THRESHOLD,
+    atol: float = NEAR_CONSTANT_STD_THRESHOLD,
 ) -> None:
     """Reject eager inputs that change fixed training-time global features."""
     methods = list(normalization_block.get("methods", []))
@@ -457,7 +391,7 @@ def _position_coord_from_pressure_jax(
 ) -> jax.Array:
     """Build a normalized log10(P) position coordinate for the continuous PE."""
     lo, hi = _log10_pressure_union_bounds(data_contract)
-    span = jnp.asarray(max(hi - lo, 1.0e-12), dtype=jnp.float32)
+    span = jnp.asarray(max(hi - lo, NORM_SPAN_FLOOR), dtype=jnp.float32)
     log_p = jnp.log10(jnp.asarray(pressure_bar, dtype=jnp.float32))
     return (log_p - jnp.asarray(lo, dtype=jnp.float32)) / span
 
@@ -634,8 +568,6 @@ def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) 
     destination.parent.mkdir(parents=True, exist_ok=True)
     flat_params = _flatten_params(payload["params"])
     metadata = {
-        "export_format": EXPORT_FORMAT,
-        "export_version": str(EXPORT_VERSION),
         "chemistry_type": str(payload["config"]["chemistry_type"]),
         "model_type": str(payload["config"]["model_type"]),
         "model_dimensions": json.dumps(payload["model_dimensions"], default=str),
@@ -643,12 +575,10 @@ def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) 
         "data_contract": json.dumps(payload["data_contract"], default=str),
         "config": json.dumps(payload["config"], default=str),
     }
-    standalone_src = (Path(__file__).parent / "standalone_inference.py").read_text(encoding="utf-8")
     np.savez(
         destination,
         **{f"params/{key}": value for key, value in flat_params.items()},
         **{f"meta/{key}": np.array(value) for key, value in metadata.items()},
-        **{"meta/vulcan_emulator_src": np.frombuffer(standalone_src.encode("utf-8"), dtype=np.uint8)},
     )
     return destination
 
@@ -667,7 +597,7 @@ def export_checkpoint_to_npz(
     Parameters
     ----------
     checkpoint_path : str or Path
-        Path to the pickle checkpoint (``best.pt`` or ``last.pt``).
+        Path to the Orbax checkpoint directory (``best/`` or ``last/``).
     output_path : str, Path, or None
         Destination path for the NPZ file.  If None, defaults to
         ``<checkpoint_stem>_exported.npz`` in the same directory.
@@ -677,9 +607,12 @@ def export_checkpoint_to_npz(
     Path
         Path to the written NPZ bundle.
     """
-    checkpoint = Path(checkpoint_path)
-    with checkpoint.open("rb") as handle:
-        payload = pickle.load(handle)
+    checkpoint = Path(checkpoint_path).resolve()
+    params_payload = ocp.StandardCheckpointer().restore(checkpoint / "params")
+    metadata = json.loads(
+        (checkpoint / "metadata.json").read_text(encoding="utf-8")
+    )
+    payload = {"params": params_payload["params"], **metadata}
     destination = Path(output_path) if output_path is not None else checkpoint.with_name(
         f"{checkpoint.stem}_exported.npz"
     )
@@ -710,22 +643,8 @@ def _resolve_device(device: str | jax.Device | None) -> jax.Device | None:
 
 def _parse_export_metadata(
     arrays: np.lib.npyio.NpzFile,
-) -> tuple[str, int, str, str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Parse bundle metadata from an exported NPZ file handle.
-
-    Parameters
-    ----------
-    arrays : np.lib.npyio.NpzFile
-        Open NPZ bundle containing ``meta/*`` JSON payloads.
-
-    Returns
-    -------
-    tuple[str, int, str, str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]
-        Export format name, export version, chemistry type, model type, model
-        dimensions, normalization payload, data contract, and config.
-    """
-    export_format = str(arrays["meta/export_format"].item())
-    export_version = int(str(arrays["meta/export_version"].item()))
+) -> tuple[str, str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Parse bundle metadata from an exported NPZ file handle."""
     chemistry_type = str(arrays["meta/chemistry_type"].item())
     model_type = str(arrays["meta/model_type"].item())
     model_dimensions = json.loads(str(arrays["meta/model_dimensions"].item()))
@@ -733,8 +652,6 @@ def _parse_export_metadata(
     data_contract = json.loads(str(arrays["meta/data_contract"].item()))
     config = json.loads(str(arrays["meta/config"].item()))
     return (
-        export_format,
-        export_version,
         chemistry_type,
         model_type,
         model_dimensions,
@@ -753,8 +670,6 @@ class ExportedJAXModel:
     normalization: dict[str, Any]
     data_contract: dict[str, Any]
     config: dict[str, Any]
-    export_format: str
-    export_version: int
     chemistry_type: str
     model_type: str
 
@@ -802,8 +717,8 @@ class ExportedJAXModel:
 
         Returns a dict mapping feature names to their required constant
         values.  Features whose training-set standard deviation fell below
-        ``1e-6`` are considered fixed; passing a different value will raise
-        ``ValueError`` at prediction time.
+        ``NEAR_CONSTANT_STD_THRESHOLD`` are considered fixed; passing a
+        different value will raise ``ValueError`` at prediction time.
         """
         feature_order = list(self.data_contract.get("global_static_feature_order", []))
         norm = self.normalization.get("global_static", {})
@@ -814,7 +729,10 @@ class ExportedJAXModel:
         for idx, name in enumerate(feature_order):
             if idx >= len(methods):
                 break
-            if str(methods[idx]).lower() == "standard" and float(stds[idx]) < 1.0e-6:
+            if (
+                str(methods[idx]).lower() == "standard"
+                and float(stds[idx]) < NEAR_CONSTANT_STD_THRESHOLD
+            ):
                 result[name] = float(means[idx])
         return result
 
@@ -1000,6 +918,53 @@ class ExportedJAXModel:
             return_log10=return_log10,
         )
 
+    # ------------------------------------------------------------------
+    # Short-name aliases kept for backward compatibility with callers that
+    # used the pre-consolidation ``standalone_inference.ExportedModel`` API.
+    # ------------------------------------------------------------------
+
+    def predict_fastchem(
+        self: "ExportedJAXModel",
+        pressure_bar: jax.Array | np.ndarray,
+        temperature_k: jax.Array | np.ndarray,
+        global_inputs: dict[str, float] | jax.Array | np.ndarray,
+        *,
+        return_log10: bool = False,
+    ) -> jax.Array:
+        """Alias for :meth:`predict_fastchem_profile` with positional inputs."""
+        return self.predict_fastchem_profile(
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            global_inputs=global_inputs,
+            return_log10=return_log10,
+        )
+
+    def predict_vulcan(
+        self: "ExportedJAXModel",
+        pressure_bar: jax.Array | np.ndarray,
+        temperature_k: jax.Array | np.ndarray,
+        kzz_cm2_s: jax.Array | np.ndarray,
+        global_inputs: dict[str, float] | jax.Array | np.ndarray,
+        *,
+        return_log10: bool = False,
+    ) -> jax.Array:
+        """Alias for :meth:`predict_vulcan_profile` with positional inputs."""
+        return self.predict_vulcan_profile(
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            kzz_cm2_s=kzz_cm2_s,
+            global_inputs=global_inputs,
+            return_log10=return_log10,
+        )
+
+    def make_compiled_fastchem_predictor(
+        self: "ExportedJAXModel",
+        *,
+        return_log10: bool = False,
+    ) -> Callable[[Any, Any, Any], jax.Array]:
+        """Alias for :meth:`make_compiled_fastchem_profile_predictor`."""
+        return self.make_compiled_fastchem_profile_predictor(return_log10=return_log10)
+
 
 def load_exported_model(
     bundle_path: str | Path,
@@ -1028,8 +993,6 @@ def load_exported_model(
     bundle = Path(bundle_path)
     with np.load(bundle, allow_pickle=False) as arrays:
         (
-            export_format,
-            export_version,
             chemistry_type,
             model_type,
             model_dimensions,
@@ -1060,8 +1023,6 @@ def load_exported_model(
         normalization=normalization,
         data_contract=data_contract,
         config=config,
-        export_format=export_format,
-        export_version=export_version,
         chemistry_type=chemistry_type,
         model_type=model_type,
     )

@@ -11,10 +11,9 @@ externally by VULCAN's ``r_star / orbit_radius`` configuration.
 from __future__ import annotations
 
 import glob as glob_module
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 
@@ -141,57 +140,6 @@ def read_vulcan_spectrum_txt(path: str | Path, *, name: str | None = None) -> Sp
     )
     record.validate()
     return record
-
-
-def save_spectrum_manifest(records: Iterable[SpectrumRecord], output_dir: str | Path) -> Path:
-    """Persist a spectrum library and its manifest under one directory."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    manifest: dict[str, Any] = {"records": []}
-    for record in records:
-        record.validate()
-        npz_name = f"{record.name}.npz"
-        npz_path = output_path / npz_name
-        np.savez(
-            npz_path,
-            wavelength_nm=record.wavelength_nm.astype(np.float64),
-            flux_erg_cm2_s_nm=record.flux_erg_cm2_s_nm.astype(np.float64),
-            metadata=json.dumps(record.metadata, sort_keys=True),
-        )
-        manifest["records"].append(
-            {
-                "name": record.name,
-                "file": npz_name,
-                "metadata": record.metadata,
-            }
-        )
-    manifest_path = output_path / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return manifest_path
-
-
-def load_spectrum_manifest(manifest_path: str | Path) -> dict[str, SpectrumRecord]:
-    """Load a saved spectrum manifest into validated in-memory records."""
-    manifest_file = Path(manifest_path)
-    payload = json.loads(manifest_file.read_text(encoding="utf-8"))
-    result: dict[str, SpectrumRecord] = {}
-    for entry in payload.get("records", []):
-        arrays = np.load(manifest_file.parent / entry["file"])
-        metadata_text = (
-            arrays["metadata"].item() if arrays["metadata"].shape == () else str(arrays["metadata"])
-        )
-        record = SpectrumRecord(
-            name=str(entry["name"]),
-            wavelength_nm=np.asarray(arrays["wavelength_nm"], dtype=np.float64),
-            flux_erg_cm2_s_nm=np.asarray(arrays["flux_erg_cm2_s_nm"], dtype=np.float64),
-            metadata=json.loads(metadata_text),
-        )
-        record.validate()
-        result[record.name] = record
-    return result
 
 
 def load_spectrum_records_from_glob(pattern: str) -> dict[str, SpectrumRecord]:

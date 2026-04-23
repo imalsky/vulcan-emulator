@@ -1,4 +1,4 @@
-# VULCAN emulator — developer notes for Claude
+# VULCAN emulator — developer notes for Codex
 
 ## Conda environment
 
@@ -16,15 +16,17 @@ install into `base`.
 
 ## Quick bundle sanity check
 
+The NPZ bundle holds only weights + metadata; the forward pass lives in
+`src/models/transformer.py` and is loaded via `src/models/standalone_inference.py`,
+so the `vulcan-emulator` package must be on `sys.path`. No bundle is checked
+into the repo — produce one first with
+`python -m src.utils --config config/<cfg>.json --stage export`, which writes
+to `models/<run_name>/best_exported.npz`. Then:
+
 ```bash
-cd exojax_demo
 python -c "
-import sys, types, numpy as np
-with np.load('best_exported.npz', allow_pickle=False) as f:
-    src = bytes(f['meta/vulcan_emulator_src']).decode()
-m = types.ModuleType('_e'); sys.modules['_e'] = m
-exec(compile(src, '<e>', 'exec'), m.__dict__)
-b = m.load_model('best_exported.npz')
+from src.models.standalone_inference import load_model
+b = load_model('models/<run_name>/best_exported.npz')
 print(b.chemistry_type, b.data_contract['global_static_feature_order'], b.fixed_globals)
 "
 ```
