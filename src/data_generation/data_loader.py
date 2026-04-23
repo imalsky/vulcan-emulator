@@ -109,10 +109,20 @@ def iter_batches(
     *,
     batch_size: int,
     rng: np.random.Generator,
+    drop_last: bool = False,
 ) -> Iterator[dict[str, np.ndarray]]:
-    """Yield one shuffled epoch of mini-batches for a split."""
+    """Yield one shuffled epoch of mini-batches for a split.
+
+    ``drop_last=True`` drops the final partial batch so every yielded batch
+    shares the same leading dim. Use it for the training loop to keep the
+    JIT compile cache to a single shape — the partial-batch shape otherwise
+    triggers a second compiled program (and a second CUDA-graph capture)
+    every epoch, which has been observed to interact badly with XLA's
+    command-buffer path on long runs.
+    """
     indices = np.arange(split.num_runs, dtype=np.int32)
     rng.shuffle(indices)
     step = int(batch_size)
-    for start in range(0, indices.size, step):
+    end = (indices.size // step) * step if drop_last else indices.size
+    for start in range(0, end, step):
         yield build_batch(split, indices[start : start + step])

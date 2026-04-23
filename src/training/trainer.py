@@ -861,7 +861,10 @@ def train_model(
         )
         plateau_state = plateau_transform.init(params)
 
-    steps_per_epoch = max(1, (train_split.num_runs + batch_size - 1) // batch_size)
+    # Training drops the partial last batch (see ``iter_batches`` call below)
+    # so ``steps_per_epoch`` is a floor division, not a ceil. This must match
+    # the actual loop or warmup/cosine schedules drift.
+    steps_per_epoch = max(1, train_split.num_runs // batch_size)
     warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
     total_steps = epochs * steps_per_epoch
     LOGGER.info(
@@ -882,8 +885,10 @@ def train_model(
 
     for epoch in range(epochs):
         epoch_t0 = time.monotonic()
-        train_batches = iter_batches(train_split, batch_size=batch_size, rng=rng)
-        train_metrics_epoch: list[dict[str, float]] = []
+        train_batches = iter_batches(
+            train_split, batch_size=batch_size, rng=rng, drop_last=True,
+        )
+        train_metrics_device: list[dict[str, jax.Array]] = []
         train_weights_epoch: list[float] = []
         train_steps = 0
 
@@ -913,23 +918,35 @@ def train_model(
             )
             if ema_enabled:
                 ema_params = _ema_update(ema_params, params, ema_decay_scalar)
-            train_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            train_metrics_device.append(metrics)
             train_weights_epoch.append(batch_weight)
             global_step += 1
             train_steps += 1
+        # One host sync per epoch instead of per step. Per-step ``float()``
+        # serializes training and turns any deferred GPU error (e.g. a
+        # CUDA_ERROR_STREAM_CAPTURE_INVALIDATED in the captured graph) into
+        # a useless traceback inside the ``float()`` call.
+        train_metrics_epoch: list[dict[str, float]] = [
+            {k: float(v) for k, v in m.items()}
+            for m in jax.device_get(train_metrics_device)
+        ]
 
         eval_params = ema_params if ema_enabled else params
         val_batches = iter_batches(val_split, batch_size=batch_size, rng=rng)
-        val_metrics_epoch: list[dict[str, float]] = []
+        val_metrics_device: list[dict[str, jax.Array]] = []
         val_weights_epoch: list[float] = []
         val_steps = 0
         for batch in val_batches:
             batch_weight = float(np.asarray(batch["valid_mask"]).sum())
             device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
             metrics = eval_step(eval_params, device_batch)
-            val_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+            val_metrics_device.append(metrics)
             val_weights_epoch.append(batch_weight)
             val_steps += 1
+        val_metrics_epoch: list[dict[str, float]] = [
+            {k: float(v) for k, v in m.items()}
+            for m in jax.device_get(val_metrics_device)
+        ]
 
         epoch_dt = time.monotonic() - epoch_t0
         train_summary = _mean_metrics(train_metrics_epoch, train_weights_epoch)
@@ -1003,14 +1020,18 @@ def train_model(
 
     best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
     test_batches = iter_batches(test_split, batch_size=batch_size, rng=rng)
-    test_metrics_epoch: list[dict[str, float]] = []
+    test_metrics_device: list[dict[str, jax.Array]] = []
     test_weights_epoch: list[float] = []
     for batch in test_batches:
         batch_weight = float(np.asarray(batch["valid_mask"]).sum())
         device_batch = {key: jnp.asarray(value) for key, value in batch.items()}
         metrics = eval_step(best_params, device_batch)
-        test_metrics_epoch.append({key: float(value) for key, value in metrics.items()})
+        test_metrics_device.append(metrics)
         test_weights_epoch.append(batch_weight)
+    test_metrics_epoch: list[dict[str, float]] = [
+        {k: float(v) for k, v in m.items()}
+        for m in jax.device_get(test_metrics_device)
+    ]
 
     final_metrics = {
         "best_val_combined_loss": float(best_val),

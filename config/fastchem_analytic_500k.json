@@ -111,11 +111,11 @@
     }
   },
   "model": {
-    "d_model": 256,
+    "d_model": 192,
     "nhead": 8,
-    "num_layers": 6,
-    "dim_feedforward": 1024,
-    "conditioning_hidden_dim": 256,
+    "num_layers": 4,
+    "dim_feedforward": 768,
+    "conditioning_hidden_dim": 192,
     "film_clamp": 100.0,
     "output_head_divisor": 2,
     "activation": "silu",
