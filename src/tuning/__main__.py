@@ -43,8 +43,8 @@ from ..constants import (
     TUNING_WEIGHT_DECAY_RANGE,
 )
 from ..data_generation.data_loader import load_processed_dataset
-from ..training.trainer import _ensure_processed, train_model
-from ..utils.config import _validate_transformer_model_config, load_and_validate_config
+from ..training.trainer import ensure_processed, train_model
+from ..utils.config import validate_transformer_model_config, load_and_validate_config
 from ..utils.helpers import ensure_dir, get_logger, resolve_path, resolve_project_root
 
 LOGGER = get_logger(__name__)
@@ -116,7 +116,7 @@ def _sample_trial_overrides(trial: optuna.Trial) -> dict[str, Any]:
 
     Constraints (``d_model % nhead == 0``, ``dim_feedforward >= d_model``)
     are enforced by construction here; the final config is also re-run
-    through :func:`_validate_transformer_model_config` before training.
+    through :func:`validate_transformer_model_config` before training.
     """
     arch_label = trial.suggest_categorical("d_model_nhead", list(_ARCH_LABELS))
     d_model, nhead = _ARCH_BY_LABEL[arch_label]
@@ -191,8 +191,7 @@ def _apply_overrides(
     for key, value in _FIXED_FORMULATION.items():
         model[key] = value
 
-    cfg["model"] = _validate_transformer_model_config(model, "model")
-    cfg["training"]["model"] = dict(cfg["model"])
+    cfg["model"] = validate_transformer_model_config(model, "model")
 
     training = cfg["training"]
     training["weight_decay"] = overrides["weight_decay"]
@@ -215,17 +214,22 @@ def _apply_overrides(
         ema_cfg["decay"] = TUNING_EMA_DEFAULT_DECAY
 
     loss_cfg = training["loss"]
+    # The validated base config has exactly one of lambda_log10_mae /
+    # lambda_log10_huber set (mutually exclusive in the loss schema). When
+    # a trial flips the loss type, carry the existing weight over so the
+    # sweep compares shapes of the same weighted loss.
+    existing_weight = float(
+        loss_cfg["lambda_log10_huber"]
+        if "lambda_log10_huber" in loss_cfg
+        else loss_cfg["lambda_log10_mae"]
+    )
     loss_cfg["type"] = overrides["loss_type"]
     if overrides["loss_type"] == "huber":
-        loss_cfg["lambda_log10_huber"] = float(
-            loss_cfg.get("lambda_log10_huber", loss_cfg.get("lambda_log10_mae", 0.25))
-        )
+        loss_cfg["lambda_log10_huber"] = existing_weight
         loss_cfg["huber_delta_log10"] = float(overrides["huber_delta_log10"])
         loss_cfg.pop("lambda_log10_mae", None)
     else:  # mae
-        loss_cfg["lambda_log10_mae"] = float(
-            loss_cfg.get("lambda_log10_mae", loss_cfg.get("lambda_log10_huber", 0.25))
-        )
+        loss_cfg["lambda_log10_mae"] = existing_weight
         loss_cfg.pop("lambda_log10_huber", None)
         loss_cfg.pop("huber_delta_log10", None)
 
@@ -406,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     study_root = _study_root(base_config, project_root)
     ensure_dir(study_root)
 
-    processed_root = _ensure_processed(base_config, project_root=project_root)
+    processed_root = ensure_processed(base_config, project_root=project_root)
     LOGGER.info("Loading processed dataset once from %s", processed_root)
     splits, normalization, contract = load_processed_dataset(processed_root)
 

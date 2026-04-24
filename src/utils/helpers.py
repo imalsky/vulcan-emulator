@@ -25,14 +25,14 @@ _NOISY_LOGGER_NAMES = (
     "jax._src.xla_bridge",
     "jaxlib",
 )
-_LIVE_LOG_ENV = "VULCAN_LIVE_LOG_PATH"
+LIVE_LOG_ENV = "VULCAN_LIVE_LOG_PATH"
 _PROJECT_ROOT_ENV = "VULCAN_PROJECT_ROOT"
 _LOGGING_CONFIGURED = False
 
 
 def _resolve_live_log_path() -> Path | None:
     """Return the resolved live-log path when the launcher requested one."""
-    live_log_path = os.environ.get(_LIVE_LOG_ENV, "").strip()
+    live_log_path = os.environ.get(LIVE_LOG_ENV, "").strip()
     if not live_log_path:
         return None
     resolved_path = Path(live_log_path).expanduser().resolve()

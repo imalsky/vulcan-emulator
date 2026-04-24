@@ -266,7 +266,7 @@ def tiny_config(tmp_path):
             num_points=64,
             wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
             wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
-            teff_k=float(config["stellar_spectrum"].get("teff_k", 5485.0)),
+            teff_k=float(config["stellar_spectrum"]["teff_k"]),
             name="test_surface_flux",
         ),
         spectrum_file,
@@ -276,7 +276,7 @@ def tiny_config(tmp_path):
             num_points=64,
             wavelength_min_nm=float(config["stellar_spectrum"]["wavelength_min_nm"]),
             wavelength_max_nm=float(config["stellar_spectrum"]["wavelength_max_nm"]),
-            teff_k=float(config["stellar_spectrum"].get("teff_k", 5485.0)) + 250.0,
+            teff_k=float(config["stellar_spectrum"]["teff_k"]) + 250.0,
             name="test_surface_flux_alt",
         ),
         spectrum_file_alt,
@@ -305,11 +305,6 @@ def tiny_config(tmp_path):
 
     config["training"]["batch_size"] = 4
     config["training"]["epochs"] = 1
-    config["training"]["model"]["d_model"] = 16
-    config["training"]["model"]["nhead"] = 4
-    config["training"]["model"]["num_layers"] = 1
-    config["training"]["model"]["dim_feedforward"] = 32
-    config["training"]["model"]["conditioning_hidden_dim"] = 32
 
     config["model"]["d_model"] = 16
     config["model"]["nhead"] = 4

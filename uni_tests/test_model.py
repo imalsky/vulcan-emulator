@@ -112,7 +112,6 @@ def test_training_checkpoint_smoke_with_cosine_scheduler(tiny_config):
 
 def test_dropout_is_stochastic_only_in_training_mode(tiny_config):
     config = copy.deepcopy(tiny_config)
-    config["training"]["model"]["dropout_rate"] = 0.5
     config["model"]["dropout_rate"] = 0.5
     batch, _, contract = _prepare_batch(config)
     dims, params = initialize_model(config, contract, seed=3)
@@ -159,7 +158,6 @@ def test_dropout_is_stochastic_only_in_training_mode(tiny_config):
 )
 def test_supported_activations_run_forward_passes(tiny_config, activation: str):
     config = copy.deepcopy(tiny_config)
-    config["training"]["model"]["activation"] = activation
     config["model"]["activation"] = activation
     batch, _, contract = _prepare_batch(config)
     dims, params = initialize_model(config, contract, seed=3)

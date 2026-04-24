@@ -61,7 +61,7 @@ from ..models.jax_model import (
     initialize_model,
 )
 from ..utils.config import get_chemistry_type, get_model_type
-from ..utils.helpers import ensure_dir, get_logger, resolve_path
+from ..utils.helpers import LIVE_LOG_ENV, ensure_dir, get_logger, resolve_path
 
 LOGGER = get_logger(__name__)
 
@@ -616,7 +616,7 @@ def _emit_epoch_table_line(line: str) -> None:
         Fully formatted line to emit.
     """
     print(line, flush=True)
-    live_log_path = os.environ.get("VULCAN_LIVE_LOG_PATH", "").strip()
+    live_log_path = os.environ.get(LIVE_LOG_ENV, "").strip()
     if not live_log_path:
         return
     with Path(live_log_path).expanduser().resolve().open("a", encoding="utf-8") as handle:
@@ -624,7 +624,7 @@ def _emit_epoch_table_line(line: str) -> None:
         handle.flush()
 
 
-def _ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
+def ensure_processed(config: dict[str, Any], *, project_root: Path) -> Path:
     """Ensure the processed dataset exists and matches the active config.
 
     Parameters
@@ -802,7 +802,7 @@ def train_model(
         Paths to the best checkpoint, epoch history, and final metrics files.
     """
     if preloaded is None:
-        processed_root = _ensure_processed(config, project_root=project_root)
+        processed_root = ensure_processed(config, project_root=project_root)
         splits, normalization, contract = load_processed_dataset(processed_root)
     else:
         processed_root = Path("<preloaded>")

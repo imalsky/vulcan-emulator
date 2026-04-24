@@ -28,30 +28,18 @@ def build_model_dimensions(
     config: dict, contract: dict
 ) -> TransformerDimensions:
     """Build the dimension dataclass for the active chemistry/model contract."""
-    try:
-        model_cfg = config["training"]["model"]
-    except KeyError as exc:
-        raise KeyError(
-            "config['training']['model'] is missing; ensure the config was passed "
-            "through load_and_validate_config(), which materializes this alias."
-        ) from exc
+    model_cfg = config["model"]
+    # Current preprocess.py writes sequence_dim, global_dim, and target_dim
+    # directly. The len-of-order-list fallback lets this function still load
+    # older bundles whose data_contract predates those explicit keys.
     sequence_dim = int(
-        contract.get(
-            "sequence_dim",
-            len(contract.get("sequence_static_feature_order", [])),
-        )
+        contract.get("sequence_dim", len(contract["sequence_static_feature_order"]))
     )
     global_dim = int(
-        contract.get(
-            "global_dim",
-            len(contract.get("global_static_feature_order", [])),
-        )
+        contract.get("global_dim", len(contract["global_static_feature_order"]))
     )
     target_dim = int(
-        contract.get(
-            "target_dim",
-            len(contract.get("output_species_order", [])),
-        )
+        contract.get("target_dim", len(contract["output_species_order"]))
     )
 
     return TransformerDimensions(

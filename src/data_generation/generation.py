@@ -711,7 +711,12 @@ def _gravity_profile_from_spec(spec: RunSpecification) -> np.ndarray:
         if profile.ndim != 1:
             raise ValueError("RunSpecification.gravity_cm_s2 must be a 1-D array.")
         return profile
-    gravity_value = float(spec.globals.get("gravity_cm_s2", 0.0))
+    if "gravity_cm_s2" not in spec.globals:
+        raise ValueError(
+            "RunSpecification has neither a gravity_cm_s2 profile nor a "
+            "gravity_cm_s2 entry in globals; cannot materialize a gravity profile."
+        )
+    gravity_value = float(spec.globals["gravity_cm_s2"])
     return np.full(int(spec.pressure_bar.size), gravity_value, dtype=np.float64)
 
 
@@ -1712,15 +1717,14 @@ def run_vulcan_generation(
         raise RuntimeError("VULCAN generation requires writable staging directories.")
     source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
     fastchem = uses_fastchem(config)
-    worker_root_key = "vulcan_runtime" if "vulcan_runtime" in config else None
-    worker_base = resolve_path(
-        config["vulcan_runtime"]["worker_root"]
-        if worker_root_key
-        else "data/vulcan_workers",
-        project_root,
-    )
+    # vulcan_runtime is only derived for VULCAN configs; FastChem configs
+    # use the canonical worker-root default (per constants.py runtime defaults).
+    if "vulcan_runtime" in config:
+        worker_base = resolve_path(config["vulcan_runtime"]["worker_root"], project_root)
+    else:
+        worker_base = resolve_path("data/vulcan_workers", project_root)
     run_single = _run_single_fastchem_spec if fastchem else _run_single_vulcan_spec
-    backfill = config["generation"].get("backfill", {"enabled": True, "max_retries": 3})
+    backfill = config["generation"]["backfill"]
     target_count = num_runs or int(config["generation"]["num_runs"])
 
     def _attach_species_metadata(
@@ -1906,7 +1910,7 @@ def run_vulcan_generation(
     all_failures: list[str] = []
     all_specs: list[RunSpecification] = []
 
-    configured_chunk = int(config["generation"].get("sample_chunk_size", 1000))
+    configured_chunk = int(config["generation"]["sample_chunk_size"])
     sample_chunk_size = max(1, min(configured_chunk, target_count))
 
     plan = build_sampling_plan(
@@ -1981,8 +1985,8 @@ def run_vulcan_generation(
         LOGGER.info("Resumed %d already-completed runs across all chunks", skipped_total)
 
     # Backfill rounds.
-    if backfill.get("enabled", True) and all_failures:
-        max_retries = int(backfill.get("max_retries", 3))
+    if bool(backfill["enabled"]) and all_failures:
+        max_retries = int(backfill["max_retries"])
         for attempt in range(1, max_retries + 1):
             shortfall = target_count - len(completed_run_ids)
             if shortfall <= 0:
@@ -2084,11 +2088,11 @@ def _check_assets_availability(config: dict[str, Any], project_root: Path) -> No
     if assets_dir.exists():
         return
 
-    needs_roth = bool(config.get("roth_sampler", {}).get("enabled", False))
+    needs_roth = bool(config["roth_sampler"]["enabled"])
 
     needs_spectra_from_assets = False
     if not uses_fastchem(config):
-        spectrum_cfg = config.get("stellar_spectrum", {}) or {}
+        spectrum_cfg = config.get("stellar_spectrum") or {}
         for key in ("template_file", "library_glob"):
             ref = spectrum_cfg.get(key)
             if not ref:

@@ -10,10 +10,9 @@ jax_model
     Model construction helpers (``build_model_dimensions``,
     ``initialize_model``, ``count_parameters``).
 standalone_inference
-    Backward-compatibility shim that re-exports ``load_model``,
-    ``ExportedModel``, and the ExoJAX wrapper factories under their
-    pre-consolidation names. New code should import from ``export_bundle``
-    or ``exojax_api`` directly.
+    Public inference API — the single module notebooks and external
+    consumers (ExoJAX, retrieval frameworks) should import from. Thin
+    re-export surface over ``export_bundle`` and ``exojax_api``.
 export_bundle
     Bundle export utilities and physical-units inference wrapper.
 exojax_api

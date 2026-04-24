@@ -150,7 +150,9 @@ Supported PT-library filter keys:
 
 ### `model`
 
-Valid keys:
+All keys are required. Recommended values are annotated where applicable;
+the schema has no defaults so every config must set each key explicitly.
+
 - `d_model`
 - `nhead`
 - `num_layers`
@@ -158,19 +160,19 @@ Valid keys:
 - `conditioning_hidden_dim`
 - `film_clamp`
 - `output_head_divisor`
-- optional `activation`
-- optional `dropout_rate`
-- optional `norm_type` — `"layernorm"` (default) or `"rmsnorm"`
+- `activation`
+- `dropout_rate`
+- `norm_type` — `"layernorm"` (conventional) or `"rmsnorm"`
   (drops mean subtraction and bias; ~10% faster).
-- optional `ffn_type` — `"dense"` (default) or `"swiglu"`
+- `ffn_type` — `"dense"` or `"swiglu"`
   (gated FFN: `act(W1 x) * (W_gate x) → W2`; re-budget
   `dim_feedforward` to `~2/3 × dense` for param parity).
-- optional `use_qk_norm` — `false` (default) or `true`.  Applies
-  RMSNorm to Q and K along `head_dim` before the attention dot
-  product (stabilizes logits, essential past ~12 layers).
-- optional `zero_init_film` — `false` (default) or `true`.  Zeroes
-  the final FiLM projection (`context_out`) so γ=β=0 at step 0,
-  matching DiT's AdaLN-Zero; improves early-training stability.
+- `use_qk_norm` — when `true`, applies RMSNorm to Q and K along
+  `head_dim` before the attention dot product (stabilizes logits,
+  essential past ~12 layers).
+- `zero_init_film` — when `true`, zeroes the final FiLM projection
+  (`context_out`) so γ=β=0 at step 0, matching DiT's AdaLN-Zero;
+  improves early-training stability.
 
 ### `vulcan`
 
@@ -223,9 +225,9 @@ When present, it supports:
 - optional `dbin1_nm` — short-wavelength bin width in nm (default 0.1)
 - optional `dbin2_nm` — long-wavelength bin width in nm (default 2.0)
 - optional `dbin_12trans_nm` — transition wavelength between bin regimes in nm (default 240.0)
-- optional `teff_k` — effective temperature for blackbody template generation (defaults to 5485 K)
-- optional `radius_rsun` — provenance metadata only (per-run values come from `sampling`)
-- optional `semi_major_axis_au` — provenance metadata only (per-run values come from `sampling`)
+- optional `teff_k` — effective temperature (K) for blackbody template generation; schema default 5485.0
+- optional `radius_rsun` — provenance metadata only (per-run values come from `sampling`); schema default 0.939
+- optional `semi_major_axis_au` — provenance metadata only (per-run values come from `sampling`); schema default 0.04858
 
 Per-run stellar irradiation geometry now lives under `sampling`:
 - `stellar_radius_range_rsun`
@@ -265,7 +267,9 @@ Worker runtime scratch directories use `tempfile.mkdtemp()` for staging and
 - `inputs/pressure_bar` `(nz,)`
 - `inputs/temperature_k` `(nz,)`
 - `inputs/element_input_order` `(n_elements,)`
-- `inputs/elemental_abundances_x_h` `(nz, n_elements)`
+- `inputs/elemental_abundances_frac` `(nz, n_elements)` — hydrogen-normalized
+  `n_X / n_H` per level (column-constant across the profile), in the order
+  given by `inputs/element_input_order`
 - `inputs/gravity_cm_s2` `(nz,)`
 - `inputs/state_species` `(n_state,)`
 - `inputs/output_species` `(n_output,)`
@@ -281,7 +285,9 @@ learned FastChem contract does not consume gravity or Kzz.
 - `inputs/temperature_k` `(nz,)`
 - `inputs/kzz_cm2_s` `(nz,)`
 - `inputs/element_input_order` `(n_elements,)`
-- `inputs/elemental_abundances_x_h` `(nz, n_elements)`
+- `inputs/elemental_abundances_frac` `(nz, n_elements)` — hydrogen-normalized
+  `n_X / n_H` per level (column-constant across the profile), in the order
+  given by `inputs/element_input_order`
 - `inputs/gravity_cm_s2` `(nz,)`, storing the layerwise gravity profile from
   the VULCAN runtime (`atm.g`) when available
 - `inputs/state_species` `(n_state,)`
@@ -310,20 +316,30 @@ All processed datasets write:
   - `info/sampling_coverage.json`
   - optional `info/failed_runs.json`
 
+All per-run arrays are padded to `max_num_levels` (upper bound of
+`sampling.num_levels_range`); the companion `valid_mask.npy` and
+`position_coord.npy` capture the true level count and the physical
+pressure coordinate for each run. See the "Variable-grid contract"
+section below for the full contract.
+
 ### FastChem processed split
 
-- `sequence_inputs.npy` `(N, nz, 2)` for `[pressure_bar, temperature_k]`
-- `target_outputs.npy` `(N, nz, target_dim)`
+- `sequence_inputs.npy` `(N, max_num_levels, 2)` for `[pressure_bar, temperature_k]`
+- `target_outputs.npy` `(N, max_num_levels, target_dim)`
 - `global_inputs.npy` `(N, 5)` for `[He_H, C_H, O_H, N_H, S_H]`
+- `valid_mask.npy` `(N, max_num_levels)` bool — true for real levels, false for padding
+- `position_coord.npy` `(N, max_num_levels)` float32 in `[0, 1]`
 
 ### VULCAN processed split
 
-- `sequence_inputs.npy` `(N, nz, 3)` for `[pressure_bar, temperature_k, kzz_cm2_s]`
-- `target_outputs.npy` `(N, nz, target_dim)`
+- `sequence_inputs.npy` `(N, max_num_levels, 3)` for `[pressure_bar, temperature_k, kzz_cm2_s]`
+- `target_outputs.npy` `(N, max_num_levels, target_dim)`
 - `global_inputs.npy` `(N, global_dim)` for
   `[gravity_cm_s2, planet_radius_cm, He_H, C_H, O_H, N_H, S_H,
     r_star_rsun, semi_major_axis_au, zenith_angle_deg, diurnal_factor,
     <physics toggles>, <atm_base one-hots>]`
+- `valid_mask.npy` `(N, max_num_levels)` bool
+- `position_coord.npy` `(N, max_num_levels)` float32 in `[0, 1]`
 
 `metadata.json` and `info/data_contract.json` store explicit:
 - `chemistry_type`
@@ -399,10 +415,17 @@ contains (in order):
 | Group                | Fields                                                          | Normalization     |
 |----------------------|-----------------------------------------------------------------|-------------------|
 | Planetary            | `gravity_cm_s2`, `planet_radius_cm`                             | log-standard      |
-| Elemental abundances | `He_H`, `C_H`, `O_H`, `N_H`, `S_H`                            | standard or log-standard |
+| Elemental abundances | `He_H`, `C_H`, `O_H`, `N_H`, `S_H`                            | log-standard      |
 | Irradiation geometry | `r_star_rsun`, `semi_major_axis_au`, `zenith_angle_deg`, `diurnal_factor` | `log-standard`, `log-standard`, `standard`, `standard` |
 | Physics toggles      | `use_photochemistry`, `use_ion_chemistry`, ...                  | none (binary)     |
 | Atmosphere base      | `atm_base_H2`, `atm_base_N2`, `atm_base_O2`, `atm_base_CO2`, `atm_base_H2O` | none (one-hot) |
+
+Every elemental-abundance channel (including `He_H`) uses `log-standard`
+normalization so the training distribution of `X/H` matches the
+log-scale priors used by downstream retrieval frameworks (ExoJAX and
+compatible samplers). Using `standard` on `He_H` while the other
+elements use `log-standard` biases the retrieval likelihood surface and
+is therefore not supported.
 
 The irradiation-geometry globals (`r_star_rsun`, `semi_major_axis_au`,
 `zenith_angle_deg`, `diurnal_factor`) are sampled per run from the VULCAN
@@ -433,12 +456,15 @@ Input:    Linear(sequence_dim → d_model) + sinusoidal positional encoding
 Per block:
   a. Pre-norm (ln1) → multi-head self-attention [+ optional QK-Norm]
      → dropout → residual add
-  b. FiLM: x = x * (1 + gamma) + beta
+  b. FiLM: x = x * (1 + clip(gamma)) + clip(beta)
+     (clip bounds are [-film_clamp, film_clamp])
   c. Pre-norm (ln_ffn) → FFN → residual add
-     (FFN is dense `act(W1 x) → W2` or gated SwiGLU
-      `act(W1 x) * (W_gate x) → W2`, per `ffn_type`)
+     (FFN is dense `act(W1 x) → dropout → W2` or gated SwiGLU
+      `(act(W1 x) * (W_gate x)) → dropout → W2`, per `ffn_type`;
+      dropout is interior, applied between the hidden activation and W2)
 
-Output head: norm → activation → Linear(d_model → d_model // output_head_divisor) → dropout → Linear(→ target_dim)
+Output head: norm → Linear(d_model → d_model // output_head_divisor)
+           → activation → dropout → Linear(→ target_dim)
 ```
 
 Norms are LayerNorm or RMSNorm per `model.norm_type`.
@@ -466,7 +492,11 @@ Norms are LayerNorm or RMSNorm per `model.norm_type`.
 Target outputs use `log-standard` normalization: `(log10(ymix) - mean) / std`.
 
 Sequence features are normalized per-feature:
-- `pressure_bar`: log-standard
+- `pressure_bar`: log-minmax — `log10(p)` mapped to `[0, 1]` over the
+  training-set log-pressure span. This matches the `[0, 1]` range of
+  `position_coord.npy` (the continuous positional-encoding input) so
+  the sequence-feature column and the positional encoding share the
+  same numerical character.
 - `temperature_k`: standard
 - `kzz_cm2_s`: log-standard
 
@@ -519,6 +549,138 @@ through the predict methods.
 PT-library metadata and analytic-sampler reference gravity remain PT-shape-only
 inputs and are intentionally allowed to differ from the VULCAN runtime surface
 gravity and radius.
+
+## Classical References (Notebook Contract)
+
+`extras/` and `exojax_demo/` ship six notebooks that compare the exported
+emulator against two classical equilibrium chemistry backends:
+
+- **Live FastChem** — subprocess rerun using the exact same runtime and
+  input-writing logic as data generation
+  (`src/data_generation/generation.py` mirrored in
+  `src/models/classical_reference.py::run_fastchem_online`). This is the
+  oracle the emulator was trained against.
+- **ExoGibbs** — `exogibbs.presets.fastchem.chemsetup()` Gibbs-free-energy
+  minimizer. It is an *independent* classical reference; matching it
+  exactly is not a contract the emulator claims.
+
+### Apples-to-apples abundance contract
+
+Every notebook that drives the emulator and either classical backend uses
+the same (He, C, O, N, S)/H anchors — the training values in
+`src/constants.py::SOLAR_ABUNDANCES`. Any notebook that constructs solar
+globals from another source (e.g. `exojax.utils.zsol.nsol()` AAG21 ratios
+or hard-coded numeric dicts) is off-contract and will feed the emulator a
+reference point the training distribution was not centered on.
+
+`src/models/classical_reference.py::build_exogibbs_element_vector(...,
+mode="fastchem_proxy")` is the single source of truth for turning a
+5-element `{He_H, C_H, O_H, N_H, S_H}` dict into the 28-element vector
+ExoGibbs expects. It mirrors exactly what FastChem wrote to its input
+file during data generation:
+
+1. **Refractory background**: Lodders (2009) values from FastChem's
+   shipped `input/solar_element_abundances.dat`, captured as
+   `src/constants.py::FASTCHEM_LODDERS_SOLAR_ABUNDANCES` (16 elements:
+   He, C, O, N, S, P, Si, Ti, V, Cl, K, Na, Mg, F, Ca, Fe). These are
+   n_X/n_H number-ratios in the astronomical log_eps convention.
+2. **Hidden-metallicity proxy**: the 11 refractory metals in
+   `FASTCHEM_METALLICITY_SCALED_ELEMENTS` (P, Si, Ti, V, Cl, K, Na, Mg,
+   F, Ca, Fe) are multiplied by `10 ** offset_dex`, where the offset is
+   the same volatile-weighted [alpha/H] proxy the trainer applies
+   (`compute_fastchem_metallicity_offset_dex`, weights 0.48·C + 0.31·O +
+   0.21·S, divided by `1 − ALPHA_FE_SLOPE = 0.85`). The proxy is
+   referenced against `SOLAR_ABUNDANCES`, so at pure solar the factor is
+   exactly 1.
+3. **Free globals**: He, C, O, N, S slots are overwritten with the
+   sampled `*_H` globals.
+4. **Untracked elements zeroed**: ExoGibbs' 28-element setup includes
+   Al, Ar, Co, Cr, Cu, Ge, Mn, Ne, Ni, Zn, which FastChem never tracked
+   during training. They are set to zero so the classical reference
+   operates on the same chemistry the emulator learned.
+5. **Convention normalization**: FastChem's abundance file is n_X/n_H
+   (H implicitly 1). ExoGibbs expects n_X/n_total mole fractions, so
+   the final step divides by the sum of the 27-element vector (H
+   included as 1.0 during the pre-sum stage) before appending 0 for
+   the electron slot.
+
+`src/constants.py::FASTCHEM_TRACKED_ELEMENTS` is the frozenset of the 16
+elements FastChem's solar file actually lists; it is derived directly from
+`FASTCHEM_LODDERS_SOLAR_ABUNDANCES` so the two cannot drift.
+
+Notebooks that build an ExoGibbs element vector inside a JAX-traced
+function (rather than calling `build_exogibbs_element_vector` directly —
+e.g. `exojax_demo/comparison.ipynb` for retrieval gradients) must
+reproduce the same five steps with the same `FASTCHEM_LODDERS_*`,
+`FASTCHEM_METALLICITY_SCALED_ELEMENTS`, and `SOLAR_ABUNDANCES` constants.
+
+### ExoGibbs chemistry setup
+
+Notebooks must build the ExoGibbs `ChemicalSetup` via
+`src/models/classical_reference.py::chemsetup_matched_to_fastchem(
+fastchem_source_root)` rather than calling
+`exogibbs.presets.fastchem.chemsetup()` directly. The helper pins the
+classical reference to VULCAN-FastChem's shipped
+`fastchem_vulcan/input/logK_wo_ions.dat` — the same 5-term-logK thermo
+file tree FastChem itself reads — so:
+
+- **Species sets are aligned**. ExoGibbs runs on the same ~369-species
+  gas list VULCAN ships; ions are absent on both sides (FastChem uses
+  `parameters_wo_ion.dat`; the helper uses the `_wo_ions` thermo file).
+- **Thermodynamic coefficients agree for every species common to both
+  codes**. The 5-term-logK fits in `logK_wo_ions.dat` are the FastChem
+  project's own fits, re-used inside ExoGibbs verbatim.
+
+FastChem still executes against `nasa9_logK_SNCHOPTi.dat` (NASA-9
+polynomial form), because the currently trained emulator was fit against
+the YMIX output of that file. A full thermodynamic-form match —
+switching FastChem data generation to the 5-term logK fits in
+`logK_wo_ions.dat` — requires regenerating training data and retraining
+the emulator. Until that happens, a residual ~0.05–0.2 dex FC↔EG
+disagreement on major species at T extremes is expected and is not an
+emulator defect.
+
+### FastChem non-convergence handling
+
+FastChem's internal solver can converge in its outer loop while failing
+per-element mass-balance on individual levels (the `"fail"` entries in
+`output/monitor_output.dat`). Those levels produce numerically unreliable
+VMRs — typically NaN or state-floor placeholders — that corrupt
+FastChem↔ExoGibbs comparison metrics.
+
+`run_fastchem_online(...)` exposes two switches that give notebooks
+explicit control over this:
+
+- `return_fail_mask=True` adds a boolean `(nz,)` mask alongside the VMR
+  output; notebooks should exclude flagged levels from any dex-error
+  summary they publish.
+- `raise_on_fail=True` turns the same condition into a hard error so
+  science-grade comparisons can't silently include non-converged points.
+
+`read_fastchem_monitor_fail_mask(...)` is the standalone parser backing
+both flags.
+
+### Known irreducible residual
+
+Even with matched backgrounds, matched element basis, matched species
+via `logK_wo_ions.dat`, and fail-mask filtering, a ~0.1–0.3 dex FC↔EG
+floor remains on sulfur-chain and several O-bearing species. Sources:
+
+1. **Polynomial-form mismatch** — FastChem still fits thermochemistry
+   via NASA-9 polynomials while ExoGibbs uses the 5-term logK form,
+   both targeting the same JANAF/Burcat data. Closing this requires
+   retraining on `logK_wo_ions.dat`-generated FastChem output.
+2. **Residual species-network differences** — ExoGibbs' Gibbs
+   minimization can place S into polymers (S5, S6, S7) and rare oxide
+   species that FastChem's NASA-9 table omits. See project memory
+   "don't worry about S5/S6/S7" — this floor is accepted.
+3. **Solver-algorithm drift** — Newton mass-action vs Gibbs
+   free-energy minimization can land on different metastable minima in
+   poorly conditioned corners of the PT grid.
+
+The `"aas_fixed"` mode of `build_exogibbs_element_vector` is kept as a
+legacy AAG21-background comparison path. It is **not** training-matched
+and should not be used when benchmarking ML vs classical equivalence.
 
 ## Testing
 

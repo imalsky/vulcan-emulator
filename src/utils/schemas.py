@@ -793,9 +793,9 @@ class StellarSpectrumConfig(_StrictModel):
     dbin1_nm: PositiveFloat = DBIN1_NM_DEFAULT
     dbin2_nm: PositiveFloat = DBIN2_NM_DEFAULT
     dbin_12trans_nm: float = DBIN_12TRANS_NM_DEFAULT
-    teff_k: float | None = None
-    radius_rsun: float | None = None
-    semi_major_axis_au: float | None = None
+    teff_k: PositiveFloat = 5485.0
+    radius_rsun: PositiveFloat = 0.939
+    semi_major_axis_au: PositiveFloat = 0.04858
 
     @field_validator("template_file", "library_glob", mode="after")
     @classmethod
@@ -812,15 +812,6 @@ class StellarSpectrumConfig(_StrictModel):
         if value < 8:
             raise ValueError("max_tokens must be >= 8.")
         return value
-
-    @field_validator("teff_k", "radius_rsun", "semi_major_axis_au", mode="after")
-    @classmethod
-    def _positive_or_none(cls, value: float | None, info) -> float | None:
-        if value is None:
-            return None
-        if value <= 0.0:
-            raise ValueError(f"{info.field_name} must be positive.")
-        return float(value)
 
     @model_validator(mode="after")
     def _check_wavelengths(self) -> "StellarSpectrumConfig":

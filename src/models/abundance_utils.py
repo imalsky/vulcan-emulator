@@ -17,13 +17,20 @@ from ..constants import SOLAR_ABUNDANCES, SPECIES_MOLAR_MASS
 
 
 def solar_abundances() -> dict[str, float]:
-    """Return the solar reference abundances used during model training.
+    """Return the solar reference abundances used as the sampling anchor.
+
+    All five elemental channels (``He_H``, ``C_H``, ``O_H``, ``N_H``,
+    ``S_H``) are sampled per run during training; the values returned
+    here are the Asplund et al. (2009) solar anchors that the sampling
+    ranges bracket.  ``global_inputs_from_metallicity`` pins ``He_H``
+    to the solar value because a single metallicity scalar cannot
+    meaningfully scale helium — that is a convention of the metallicity
+    helper, not a restriction of the model.
 
     Returns
     -------
     dict[str, float]
         Mapping from element key (e.g. ``"C_H"``) to number fraction.
-        ``He_H`` is fixed in the current model and cannot be varied.
     """
     return dict(SOLAR_ABUNDANCES)
 
@@ -91,7 +98,7 @@ def global_inputs_from_metallicity(
     -------
     dict[str, jax.Array]
         Global inputs dict with keys ``He_H``, ``C_H``, ``O_H``, ``N_H``,
-        ``S_H`` ready to pass to ``bundle.predict_fastchem()``.
+        ``S_H`` ready to pass to ``bundle.predict_fastchem_profile()``.
     """
     solar = SOLAR_ABUNDANCES
     met = jnp.asarray(log_metallicity, dtype=jnp.float32)

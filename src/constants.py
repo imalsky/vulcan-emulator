@@ -46,6 +46,43 @@ SOLAR_ABUNDANCES: dict[str, float] = {
     "S_H": 1.32e-5,
 }
 
+# Lodders (2009) solar abundances shipped with the FastChem runtime at
+# ``VULCAN-master/fastchem_vulcan/input/solar_element_abundances.dat``.
+# FastChem reads these at every training run and overrides only He/C/O/N/S
+# from the sampled globals, so any classical reference that claims to mirror
+# the FastChem training contract must use *these* values as the background
+# for refractories (P, Si, Ti, V, Cl, K, Na, Mg, F, Ca, Fe) — not the AAG21
+# background that ExoGibbs defaults to.
+# Values are n_X/n_H, converted from log_eps = log10(n_X/n_H) + 12 entries in
+# the FastChem file.
+FASTCHEM_LODDERS_SOLAR_ABUNDANCES: dict[str, float] = {
+    "He": 10.0 ** (10.9864 - 12.0),
+    "C": 10.0 ** (8.4434 - 12.0),
+    "N": 10.0 ** (7.9130 - 12.0),
+    "O": 10.0 ** (8.7826 - 12.0),
+    "S": 10.0 ** (7.12 - 12.0),
+    "P": 10.0 ** (5.5058 - 12.0),
+    "Si": 10.0 ** (7.5867 - 12.0),
+    "Ti": 10.0 ** (4.9794 - 12.0),
+    "V": 10.0 ** (4.0437 - 12.0),
+    "Cl": 10.0 ** (5.3002 - 12.0),
+    "K": 10.0 ** (5.1619 - 12.0),
+    "Na": 10.0 ** (6.3479 - 12.0),
+    "Mg": 10.0 ** (7.5995 - 12.0),
+    "F": 10.0 ** (4.49196 - 12.0),
+    "Ca": 10.0 ** (6.3677 - 12.0),
+    "Fe": 10.0 ** (7.5151 - 12.0),
+}
+
+# The 16 elements FastChem tracks via its solar file (H is implicit — the
+# abundances are n_X/n_H). Elements in a broader classical-chemistry setup
+# (e.g. Al/Ar/Co/Cr/Cu/Ge/Mn/Ne/Ni/Zn in ExoGibbs' 28-element setup) that
+# are NOT in this set were never tracked during FastChem training and must
+# be zeroed when mirroring the training contract.
+FASTCHEM_TRACKED_ELEMENTS: frozenset[str] = frozenset(
+    FASTCHEM_LODDERS_SOLAR_ABUNDANCES.keys()
+)
+
 # =========================================================================
 # Analytic PT sampler constants
 # =========================================================================

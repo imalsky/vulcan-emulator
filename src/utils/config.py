@@ -4,7 +4,7 @@ This module is the single source of truth for config schema validation. It:
 
 1. Loads a JSON config file from disk.
 2. Delegates schema validation to :mod:`src.utils.schemas` (Pydantic).
-3. Derives internal aliases (``training.model``, ``roth_sampler``,
+3. Derives internal aliases (``roth_sampler``,
    ``data_spec`` feature orders) so downstream code can rely on a normalized,
    validated structure.
 4. Returns a dict that is safe to pass to any pipeline stage.
@@ -165,13 +165,13 @@ def dataset_info_root(config: dict[str, Any]) -> str:
     return str(Path(config["paths"]["raw_root"]).parent / "info")
 
 
-def _validate_transformer_model_config(
+def validate_transformer_model_config(
     model: dict[str, Any], scope: str = "model"
 ) -> dict[str, Any]:
     """Validate a Transformer ``model`` dict against :class:`ModelConfig`.
 
-    Retained as a public helper for :mod:`src.tuning` Optuna trials that
-    override a subset of hyperparameters on top of a validated base config.
+    Used by :mod:`src.tuning` Optuna trials to re-validate per-trial
+    hyperparameter overrides on top of a validated base config.
     """
     try:
         return ModelConfig.model_validate(model).model_dump(mode="python")
@@ -189,7 +189,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     - ``paths.raw_root`` / ``paths.processed_root`` (from ``run_root``)
     - ``data_spec.element_input_order``, ``required_global_inputs``,
       ``state_dim``, ``target_dim``, sequence/global feature orders
-    - ``training.model`` (shallow copy of ``model``)
     - ``roth_sampler`` (extract from ``temperature_profiles``)
     - ``physics_toggles``, ``science_presets``, ``default_science_preset``,
       ``vulcan_runtime``, ``stellar_spectrum`` (VULCAN mirrors)
@@ -213,7 +212,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
 
     data_spec = config["data_spec"]
     state_species = list(data_spec["state_species"])
-    output_species = list(data_spec.get("output_species") or state_species)
+    output_species = list(data_spec["output_species"])
     derived_globals = (
         list(FASTCHEM_CORE_GLOBAL_INPUTS)
         if chemistry_type == "fastchem"
@@ -232,8 +231,6 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     )
     data_spec["global_static_feature_order"] = list(derived_globals)
     data_spec["global_feature_order"] = list(derived_globals)
-
-    config["training"]["model"] = dict(config["model"])
 
     temperature_profiles = config["temperature_profiles"]
     source_mode = temperature_profiles["source_mode"]

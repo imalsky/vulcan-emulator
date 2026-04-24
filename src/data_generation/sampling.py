@@ -832,7 +832,7 @@ def _sample_temperature_profile_record(
         Temperature profile in Kelvin with shape ``(nz,)`` plus a flat
         metadata dictionary describing the sampled source and parameters.
     """
-    roth_cfg = config.get("roth_sampler", {"enabled": False})
+    roth_cfg = config["roth_sampler"]
     chosen_source = source if source is not None else _decide_temperature_profile_source(roth_cfg, rng=rng)
 
     if chosen_source == "roth":
@@ -983,7 +983,7 @@ def _sampling_scale(config: dict[str, Any], key: str, default: str = "linear") -
     Sampling scales live under ``sampling.scales`` in the config. Missing
     entries fall back to linear so existing configs keep their old behavior.
     """
-    scales = config.get("sampling", {}).get("scales", {}) or {}
+    scales = config["sampling"].get("scales") or {}
     mode = str(scales.get(key, default)).lower()
     if mode not in ("linear", "log"):
         raise ValueError(
@@ -1018,9 +1018,9 @@ def _ensure_stellar_template(
         return generate_blackbody_template(
             wavelength_min_nm=float(spectrum_cfg["wavelength_min_nm"]),
             wavelength_max_nm=float(spectrum_cfg["wavelength_max_nm"]),
-            teff_k=float(spectrum_cfg.get("teff_k") or 5485.0),
-            radius_rsun=float(spectrum_cfg.get("radius_rsun") or 0.939),
-            semi_major_axis_au=float(spectrum_cfg.get("semi_major_axis_au") or 0.04858),
+            teff_k=float(spectrum_cfg["teff_k"]),
+            radius_rsun=float(spectrum_cfg["radius_rsun"]),
+            semi_major_axis_au=float(spectrum_cfg["semi_major_axis_au"]),
             name=str(spectrum_cfg["template_name"]),
         )
     template_path = (project_root / str(template_file)).resolve()
@@ -1271,7 +1271,7 @@ def build_sampling_plan(
         int(config["generation"]["seed"] if seed is None else seed)
     ).spawn(total_runs)
 
-    roth_cfg = config.get("roth_sampler", {"enabled": False})
+    roth_cfg = config["roth_sampler"]
 
     return SamplingPlan(
         config=config,

@@ -190,7 +190,7 @@ def test_supported_activations_validate(tmp_path, activation: str):
     payload = copy.deepcopy(payload)
     payload["model"]["activation"] = activation
     config = load_and_validate_config(_write_config(tmp_path, "fastchem_transformer_config.json", payload))
-    assert config["training"]["model"]["activation"] == activation
+    assert config["model"]["activation"] == activation
 
 
 def test_invalid_activation_is_rejected(tmp_path):

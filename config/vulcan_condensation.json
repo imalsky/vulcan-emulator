@@ -96,7 +96,7 @@
     "global_methods": {
       "gravity_cm_s2": "log-standard",
       "planet_radius_cm": "log-standard",
-      "He_H": "standard",
+      "He_H": "log-standard",
       "C_H": "log-standard",
       "O_H": "log-standard",
       "N_H": "log-standard",

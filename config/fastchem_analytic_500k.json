@@ -18,14 +18,14 @@
   },
   "sampling": {
     "num_levels_range": [40, 60],
-    "pressure_top_bar_range": [1e-07, 1e-06],
+    "pressure_top_bar_range": [1.0e-06, 1.0e-05],
     "pressure_bottom_bar_range": [100.0, 200.0],
-    "temperature_range_k": [100.0, 3500.0],
-    "he_frac_range":  [7.6e-03, 7.6e-01],
-    "c_frac_range":   [2.7e-05, 2.7e-03],
-    "o_frac_range":   [4.5e-05, 4.5e-03],
-    "n_frac_range":   [6.2e-06, 6.2e-04],
-    "s_frac_range":   [1.2e-06, 1.2e-04],
+    "temperature_range_k": [100.0, 3000.0],
+    "he_frac_range":  [5e-02, 3e-01],
+    "c_frac_range":   [4.22e-05, 1.68e-03],
+    "o_frac_range":   [7.17e-05, 2.85e-03],
+    "n_frac_range":   [9.89e-06, 3.94e-04],
+    "s_frac_range":   [1.93e-06, 7.68e-05],
     "scales": {
       "he_frac": "log",
       "c_frac":  "log",
@@ -35,19 +35,25 @@
     }
   },
   "temperature_profiles": {
-    "source_mode": "analytic",
+    "source_mode": "mixed",
+    "analytic_probability": 0.7,
+    "data_glob": "assets/PTprofiles/*.dat",
+    "filters": {
+      "Teq": [600.0, 2800.0],
+      "LogMet": [-0.5, 1.5]
+    },
     "validation": {
-      "min_temperature_k": 100.0,
-      "max_temperature_k": 3500.0
+      "min_temperature_k": 1.0,
+      "max_temperature_k": 3000.0
     },
     "analytic_sampler": {
-      "t_int_k_range": [50.0, 1000.0],
-      "t_eq_k_range": [300.0, 3500.0],
-      "log10_delta_range": [-3.0, 1.0],
-      "log10_gamma_range": [-1.0, 1.0],
-      "alpha_range": [0.0, 0.9],
-      "log10_p_trans_bar_range": [-2.0, 2.0],
-      "convection_probability": 0.2,
+      "t_int_k_range": [1.0, 1000.0],
+      "t_eq_k_range": [1.0, 3000.0],
+      "log10_delta_range": [-6, 2],
+      "log10_gamma_range": [-4.0, 4.0],
+      "alpha_range": [0.0, 0.999],
+      "log10_p_trans_bar_range": [-9.0, 3.0],
+      "convection_probability": 0.1,
       "adiabatic_gradient_range": [0.25, 0.35]
     }
   },
@@ -60,7 +66,7 @@
     "sample_chunk_size": 1000,
     "backfill": {
       "enabled": true,
-      "max_retries": 3
+      "max_retries": 5
     }
   },
   "normalization": {
@@ -86,16 +92,16 @@
   },
   "training": {
     "seed": 123,
-    "batch_size": 512,
-    "epochs": 400,
+    "batch_size": 256,
+    "epochs": 200,
     "learning_rate": 0.0003,
     "min_lr": 1e-06,
     "warmup_epochs": 20,
-    "early_stopping_patience": 40,
+    "early_stopping_patience": 20,
     "scheduler": {
       "name": "reduce_on_plateau",
       "factor": 0.5,
-      "patience": 15,
+      "patience": 10,
       "threshold": 0.0001
     },
     "weight_decay": 1e-04,
@@ -111,11 +117,11 @@
     }
   },
   "model": {
-    "d_model": 192,
-    "nhead": 8,
-    "num_layers": 4,
-    "dim_feedforward": 768,
-    "conditioning_hidden_dim": 192,
+    "d_model": 256,
+    "nhead": 4,
+    "num_layers": 6,
+    "dim_feedforward": 1024,
+    "conditioning_hidden_dim": 256,
     "film_clamp": 100.0,
     "output_head_divisor": 2,
     "activation": "silu",

@@ -1,0 +1,1926 @@
+{
+  "generated_utc": "2026-04-24T18:29:12Z",
+  "bundle_path": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/models/fastchem_analytic_500k/best_exported.npz",
+  "model": "fastchem_analytic_500k",
+  "exogibbs_element_mode": "fastchem_proxy",
+  "state_floor": 1e-30,
+  "globals_map": {
+    "He_H": 0.0784,
+    "C_H": 0.000269,
+    "O_H": 0.00049,
+    "N_H": 6.76e-05,
+    "S_H": 1.32e-05
+  },
+  "species_labels": [
+    "H2",
+    "He",
+    "H",
+    "O",
+    "OH",
+    "H2O",
+    "CO",
+    "CO2",
+    "CH4",
+    "N2",
+    "NH3",
+    "H2S",
+    "SH",
+    "S",
+    "SO",
+    "SO2",
+    "S2"
+  ],
+  "profiles": {
+    "Hot Power-Law": {
+      "timings_ms": {
+        "ml": 10.290145874023438,
+        "fastchem": 169.77524757385254,
+        "exogibbs": 242.02990531921387
+      },
+      "fastchem_debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/fastchem_runtime/hot_power_law",
+      "pairwise_mean_abs_dex": {
+        "ml_vs_fastchem": 0.16304165613411678,
+        "fastchem_vs_exogibbs": 0.20455491423452557,
+        "ml_vs_exogibbs": 0.2913459119818252
+      },
+      "pairwise_per_species": {
+        "ml_vs_fastchem": {
+          "H2": {
+            "max_abs_dex": 0.0026336555603305306,
+            "median_abs_dex": 0.0010982268460555805
+          },
+          "He": {
+            "max_abs_dex": 0.01912350005017316,
+            "median_abs_dex": 0.004891316701344073
+          },
+          "H": {
+            "max_abs_dex": 1.715045378105585,
+            "median_abs_dex": 0.06262092908309058
+          },
+          "O": {
+            "max_abs_dex": 3.899030394683823,
+            "median_abs_dex": 0.1396170173489475
+          },
+          "OH": {
+            "max_abs_dex": 2.244819994276863,
+            "median_abs_dex": 0.07918237912749682
+          },
+          "H2O": {
+            "max_abs_dex": 0.020670903217812064,
+            "median_abs_dex": 0.013962941617610802
+          },
+          "CO": {
+            "max_abs_dex": 0.0427401294049532,
+            "median_abs_dex": 0.005542953292959396
+          },
+          "CO2": {
+            "max_abs_dex": 0.32912250708749635,
+            "median_abs_dex": 0.028710684680694598
+          },
+          "CH4": {
+            "max_abs_dex": 1.2562026427545128,
+            "median_abs_dex": 0.04090573054716007
+          },
+          "N2": {
+            "max_abs_dex": 0.02134078089980651,
+            "median_abs_dex": 0.0015215698861585913
+          },
+          "NH3": {
+            "max_abs_dex": 0.1448803230104545,
+            "median_abs_dex": 0.02414914442396343
+          },
+          "H2S": {
+            "max_abs_dex": 0.022471463521086754,
+            "median_abs_dex": 0.0021504757049850554
+          },
+          "SH": {
+            "max_abs_dex": 1.238244324876141,
+            "median_abs_dex": 0.044845707507960686
+          },
+          "S": {
+            "max_abs_dex": 2.5684992659787262,
+            "median_abs_dex": 0.0924158081984281
+          },
+          "SO": {
+            "max_abs_dex": 1.9357292224168123,
+            "median_abs_dex": 0.04749784625868081
+          },
+          "SO2": {
+            "max_abs_dex": 1.5053358949069224,
+            "median_abs_dex": 0.025034929517285143
+          },
+          "S2": {
+            "max_abs_dex": 1.1113772957126908,
+            "median_abs_dex": 0.02456833837734873
+          }
+        },
+        "fastchem_vs_exogibbs": {
+          "H2": {
+            "max_abs_dex": 5.904434597464592e-05,
+            "median_abs_dex": 5.8892107576737074e-05
+          },
+          "He": {
+            "max_abs_dex": 1.4852010400634441e-05,
+            "median_abs_dex": 1.4291535202382022e-05
+          },
+          "H": {
+            "max_abs_dex": 0.0006291793611863383,
+            "median_abs_dex": 0.00021278378855882352
+          },
+          "O": {
+            "max_abs_dex": 0.20419724532300876,
+            "median_abs_dex": 0.19821340750958072
+          },
+          "OH": {
+            "max_abs_dex": 0.14909434711071157,
+            "median_abs_dex": 0.1340010571516812
+          },
+          "H2O": {
+            "max_abs_dex": 0.20668814643119138,
+            "median_abs_dex": 0.2008646835534782
+          },
+          "CO": {
+            "max_abs_dex": 0.01556788644214091,
+            "median_abs_dex": 8.976118246284415e-05
+          },
+          "CO2": {
+            "max_abs_dex": 0.2113630583507522,
+            "median_abs_dex": 0.20244017668042114
+          },
+          "CH4": {
+            "max_abs_dex": 0.2596731453494492,
+            "median_abs_dex": 0.2128051167717917
+          },
+          "N2": {
+            "max_abs_dex": 0.0012675783292417364,
+            "median_abs_dex": 4.44890680530996e-05
+          },
+          "NH3": {
+            "max_abs_dex": 0.007594217978063256,
+            "median_abs_dex": 0.006283215049352808
+          },
+          "H2S": {
+            "max_abs_dex": 0.2484589528249188,
+            "median_abs_dex": 0.12389494588687677
+          },
+          "SH": {
+            "max_abs_dex": 0.3139536476904681,
+            "median_abs_dex": 0.1622140787754187
+          },
+          "S": {
+            "max_abs_dex": 2.3598696625224136,
+            "median_abs_dex": 1.5781166904033403
+          },
+          "SO": {
+            "max_abs_dex": 0.11384941323440323,
+            "median_abs_dex": 0.0745533586354794
+          },
+          "SO2": {
+            "max_abs_dex": 0.3183748966700257,
+            "median_abs_dex": 0.2797989120973403
+          },
+          "S2": {
+            "max_abs_dex": 0.48112665740578286,
+            "median_abs_dex": 0.23328923413455538
+          }
+        },
+        "ml_vs_exogibbs": {
+          "H2": {
+            "max_abs_dex": 0.0026926984363715573,
+            "median_abs_dex": 0.001156873755584105
+          },
+          "He": {
+            "max_abs_dex": 0.01910912802550213,
+            "median_abs_dex": 0.004877132522787431
+          },
+          "H": {
+            "max_abs_dex": 1.715171042652523,
+            "median_abs_dex": 0.06299139030627887
+          },
+          "O": {
+            "max_abs_dex": 3.6948331493608144,
+            "median_abs_dex": 0.10607024815861976
+          },
+          "OH": {
+            "max_abs_dex": 2.1410168749053167,
+            "median_abs_dex": 0.09266179207258185
+          },
+          "H2O": {
+            "max_abs_dex": 0.2139116053572998,
+            "median_abs_dex": 0.19997093339873895
+          },
+          "CO": {
+            "max_abs_dex": 0.042539910771770995,
+            "median_abs_dex": 0.005029137028474295
+          },
+          "CO2": {
+            "max_abs_dex": 0.5404855654382485,
+            "median_abs_dex": 0.22027692627529794
+          },
+          "CH4": {
+            "max_abs_dex": 1.0639436882645192,
+            "median_abs_dex": 0.27993188497960864
+          },
+          "N2": {
+            "max_abs_dex": 0.02138578455872686,
+            "median_abs_dex": 0.0013781257080442977
+          },
+          "NH3": {
+            "max_abs_dex": 0.14766657489798618,
+            "median_abs_dex": 0.018559893363542468
+          },
+          "H2S": {
+            "max_abs_dex": 0.22598748930383206,
+            "median_abs_dex": 0.12661562676537397
+          },
+          "SH": {
+            "max_abs_dex": 1.552197972566609,
+            "median_abs_dex": 0.1572416834734458
+          },
+          "S": {
+            "max_abs_dex": 2.4586401965065585,
+            "median_abs_dex": 1.3269669648823461
+          },
+          "SO": {
+            "max_abs_dex": 1.9837279486677861,
+            "median_abs_dex": 0.08772897480666675
+          },
+          "SO2": {
+            "max_abs_dex": 1.3265732500712701,
+            "median_abs_dex": 0.3212177287117859
+          },
+          "S2": {
+            "max_abs_dex": 1.5925039531184737,
+            "median_abs_dex": 0.19414027665423372
+          }
+        }
+      },
+      "worst_species": {
+        "ml_vs_fastchem": [
+          {
+            "species": "O",
+            "max_abs_dex": 3.899030394683823,
+            "median_abs_dex": 0.1396170173489475,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "S",
+            "max_abs_dex": 2.5684992659787262,
+            "median_abs_dex": 0.0924158081984281,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "OH",
+            "max_abs_dex": 2.244819994276863,
+            "median_abs_dex": 0.07918237912749682,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "SO",
+            "max_abs_dex": 1.9357292224168123,
+            "median_abs_dex": 0.04749784625868081,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "H",
+            "max_abs_dex": 1.715045378105585,
+            "median_abs_dex": 0.06262092908309058,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          }
+        ],
+        "fastchem_vs_exogibbs": [
+          {
+            "species": "S",
+            "max_abs_dex": 2.3598696625224136,
+            "median_abs_dex": 1.5781166904033403,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "S2",
+            "max_abs_dex": 0.48112665740578286,
+            "median_abs_dex": 0.23328923413455538,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "SO2",
+            "max_abs_dex": 0.3183748966700257,
+            "median_abs_dex": 0.2797989120973403,
+            "worst_pressure_bar": 0.9540954763499934,
+            "worst_temperature_k": 1995.3063629382286
+          },
+          {
+            "species": "SH",
+            "max_abs_dex": 0.3139536476904681,
+            "median_abs_dex": 0.1622140787754187,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "CH4",
+            "max_abs_dex": 0.2596731453494492,
+            "median_abs_dex": 0.2128051167717917,
+            "worst_pressure_bar": 7.906043210907698,
+            "worst_temperature_k": 2217.828473508209
+          }
+        ],
+        "ml_vs_exogibbs": [
+          {
+            "species": "O",
+            "max_abs_dex": 3.6948331493608144,
+            "median_abs_dex": 0.10607024815861976,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "S",
+            "max_abs_dex": 2.4586401965065585,
+            "median_abs_dex": 1.3269669648823461,
+            "worst_pressure_bar": 5.689866029018293e-05,
+            "worst_temperature_k": 1226.8320066445474
+          },
+          {
+            "species": "OH",
+            "max_abs_dex": 2.1410168749053167,
+            "median_abs_dex": 0.09266179207258185,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "SO",
+            "max_abs_dex": 1.9837279486677861,
+            "median_abs_dex": 0.08772897480666675,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          },
+          {
+            "species": "H",
+            "max_abs_dex": 1.715171042652523,
+            "median_abs_dex": 0.06299139030627887,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 893.3671843019262
+          }
+        ]
+      },
+      "below_floor_counts": {
+        "ml": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          }
+        },
+        "fastchem": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          }
+        },
+        "exogibbs": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          }
+        }
+      }
+    },
+    "Warm Power-Law": {
+      "timings_ms": {
+        "ml": 8.749008178710938,
+        "fastchem": 233.0949306488037,
+        "exogibbs": 809.528112411499
+      },
+      "fastchem_debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/fastchem_runtime/warm_power_law",
+      "pairwise_mean_abs_dex": {
+        "ml_vs_fastchem": 1.3746108429934953,
+        "fastchem_vs_exogibbs": 1.2745638368712304,
+        "ml_vs_exogibbs": 0.48041259304612205
+      },
+      "pairwise_per_species": {
+        "ml_vs_fastchem": {
+          "H2": {
+            "max_abs_dex": 0.012441056457664745,
+            "median_abs_dex": 0.0024501393338392657
+          },
+          "He": {
+            "max_abs_dex": 0.011321150795930879,
+            "median_abs_dex": 0.0016363311447929463
+          },
+          "H": {
+            "max_abs_dex": 2.675463155390638,
+            "median_abs_dex": 0.18565783037157235
+          },
+          "O": {
+            "max_abs_dex": 0.5075984192093337,
+            "median_abs_dex": 0.005228650236311694
+          },
+          "OH": {
+            "max_abs_dex": 2.2169311188919743,
+            "median_abs_dex": 0.1274698568171475
+          },
+          "H2O": {
+            "max_abs_dex": 0.15205658360592977,
+            "median_abs_dex": 0.003762248328372353
+          },
+          "CO": {
+            "max_abs_dex": 17.59300422668457,
+            "median_abs_dex": 0.0845116119808389
+          },
+          "CO2": {
+            "max_abs_dex": 17.574042320251465,
+            "median_abs_dex": 0.040389149343950326
+          },
+          "CH4": {
+            "max_abs_dex": 26.674954414367676,
+            "median_abs_dex": 0.019744562609090188
+          },
+          "N2": {
+            "max_abs_dex": 0.26698850836852106,
+            "median_abs_dex": 0.005482279569224868
+          },
+          "NH3": {
+            "max_abs_dex": 1.8436860117371046,
+            "median_abs_dex": 0.04142040176848516
+          },
+          "H2S": {
+            "max_abs_dex": 25.313235759735107,
+            "median_abs_dex": 0.0041564404155587376
+          },
+          "SH": {
+            "max_abs_dex": 5.283748555649787,
+            "median_abs_dex": 0.1313558562541628
+          },
+          "S": {
+            "max_abs_dex": 1.2109352882397637,
+            "median_abs_dex": 0.06164073944091797
+          },
+          "SO": {
+            "max_abs_dex": 2.0441211476452104,
+            "median_abs_dex": 0.08095826313074728
+          },
+          "SO2": {
+            "max_abs_dex": 2.0698954810245027,
+            "median_abs_dex": 0.09048991254778826
+          },
+          "S2": {
+            "max_abs_dex": 4.296751022338867,
+            "median_abs_dex": 0.09356881191298605
+          }
+        },
+        "fastchem_vs_exogibbs": {
+          "H2": {
+            "max_abs_dex": 6.443241824155566e-05,
+            "median_abs_dex": 3.976478573171349e-05
+          },
+          "He": {
+            "max_abs_dex": 0.0005293173965423836,
+            "median_abs_dex": 7.101956379113039e-05
+          },
+          "H": {
+            "max_abs_dex": 0.002752434409966753,
+            "median_abs_dex": 0.0004192349892226943
+          },
+          "O": {
+            "max_abs_dex": 0.09565548242985855,
+            "median_abs_dex": 0.0
+          },
+          "OH": {
+            "max_abs_dex": 0.2847722026335866,
+            "median_abs_dex": 0.026185188341923293
+          },
+          "H2O": {
+            "max_abs_dex": 0.09726059648222041,
+            "median_abs_dex": 0.09063892366457127
+          },
+          "CO": {
+            "max_abs_dex": 19.639234884469314,
+            "median_abs_dex": 0.09485606126760748
+          },
+          "CO2": {
+            "max_abs_dex": 19.012240173485843,
+            "median_abs_dex": 0.1932468618307075
+          },
+          "CH4": {
+            "max_abs_dex": 26.667705445868094,
+            "median_abs_dex": 0.05623552353916006
+          },
+          "N2": {
+            "max_abs_dex": 0.012739474364905412,
+            "median_abs_dex": 0.00013101110251190207
+          },
+          "NH3": {
+            "max_abs_dex": 0.031428672250426004,
+            "median_abs_dex": 0.007262935044368479
+          },
+          "H2S": {
+            "max_abs_dex": 24.81422026266625,
+            "median_abs_dex": 0.27935531488243326
+          },
+          "SH": {
+            "max_abs_dex": 1.4869673763580167,
+            "median_abs_dex": 0.2879105448995718
+          },
+          "S": {
+            "max_abs_dex": 3.7138772660380575,
+            "median_abs_dex": 1.7057373083400087
+          },
+          "SO": {
+            "max_abs_dex": 0.6497691023690386,
+            "median_abs_dex": 0.03028791353281335
+          },
+          "SO2": {
+            "max_abs_dex": 0.815239659393356,
+            "median_abs_dex": 0.10035900847591606
+          },
+          "S2": {
+            "max_abs_dex": 2.2358154990027295,
+            "median_abs_dex": 0.37404997586808
+          }
+        },
+        "ml_vs_exogibbs": {
+          "H2": {
+            "max_abs_dex": 0.01241200709377635,
+            "median_abs_dex": 0.0025047134837255097
+          },
+          "He": {
+            "max_abs_dex": 0.010798456173248594,
+            "median_abs_dex": 0.0017832285305444673
+          },
+          "H": {
+            "max_abs_dex": 2.6727308367591327,
+            "median_abs_dex": 0.1849588403360034
+          },
+          "O": {
+            "max_abs_dex": 0.4577716797563802,
+            "median_abs_dex": 0.02386951446533203
+          },
+          "OH": {
+            "max_abs_dex": 1.9395399394986796,
+            "median_abs_dex": 0.06648759931247206
+          },
+          "H2O": {
+            "max_abs_dex": 0.10791023697186075,
+            "median_abs_dex": 0.0905563634570663
+          },
+          "CO": {
+            "max_abs_dex": 8.9626465913528,
+            "median_abs_dex": 0.06115723829043107
+          },
+          "CO2": {
+            "max_abs_dex": 6.438751153162581,
+            "median_abs_dex": 0.15734140126709395
+          },
+          "CH4": {
+            "max_abs_dex": 0.07739698382390348,
+            "median_abs_dex": 0.019136179747364146
+          },
+          "N2": {
+            "max_abs_dex": 0.25424903400361565,
+            "median_abs_dex": 0.00560319637012352
+          },
+          "NH3": {
+            "max_abs_dex": 1.8751146839875306,
+            "median_abs_dex": 0.043019233734215234
+          },
+          "H2S": {
+            "max_abs_dex": 1.3148017079482823,
+            "median_abs_dex": 0.2846344963329548
+          },
+          "SH": {
+            "max_abs_dex": 5.871358871459961,
+            "median_abs_dex": 0.17986486088774178
+          },
+          "S": {
+            "max_abs_dex": 4.799615904583138,
+            "median_abs_dex": 1.7411650970359807
+          },
+          "SO": {
+            "max_abs_dex": 1.4379177370090055,
+            "median_abs_dex": 0.026276807087142195
+          },
+          "SO2": {
+            "max_abs_dex": 1.3048103667016981,
+            "median_abs_dex": 0.12814145151386924
+          },
+          "S2": {
+            "max_abs_dex": 4.47027587890625,
+            "median_abs_dex": 0.312997835130278
+          }
+        }
+      },
+      "worst_species": {
+        "ml_vs_fastchem": [
+          {
+            "species": "CH4",
+            "max_abs_dex": 26.674954414367676,
+            "median_abs_dex": 0.019744562609090188,
+            "worst_pressure_bar": 5.689866029018293e-05,
+            "worst_temperature_k": 451.5350317582462
+          },
+          {
+            "species": "H2S",
+            "max_abs_dex": 25.313235759735107,
+            "median_abs_dex": 0.0041564404155587376,
+            "worst_pressure_bar": 1.5264179671752304e-07,
+            "worst_temperature_k": 249.77478452425876
+          },
+          {
+            "species": "CO",
+            "max_abs_dex": 17.59300422668457,
+            "median_abs_dex": 0.0845116119808389,
+            "worst_pressure_bar": 5.689866029018293e-05,
+            "worst_temperature_k": 451.5350317582462
+          },
+          {
+            "species": "CO2",
+            "max_abs_dex": 17.574042320251465,
+            "median_abs_dex": 0.040389149343950326,
+            "worst_pressure_bar": 5.689866029018293e-05,
+            "worst_temperature_k": 451.5350317582462
+          },
+          {
+            "species": "SH",
+            "max_abs_dex": 5.283748555649787,
+            "median_abs_dex": 0.1313558562541628,
+            "worst_pressure_bar": 3.5564803062231213e-07,
+            "worst_temperature_k": 271.8211758769124
+          }
+        ],
+        "fastchem_vs_exogibbs": [
+          {
+            "species": "CH4",
+            "max_abs_dex": 26.667705445868094,
+            "median_abs_dex": 0.05623552353916006,
+            "worst_pressure_bar": 2.329951810515372e-07,
+            "worst_temperature_k": 260.56491635250217
+          },
+          {
+            "species": "H2S",
+            "max_abs_dex": 24.81422026266625,
+            "median_abs_dex": 0.27935531488243326,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 239.43147779626554
+          },
+          {
+            "species": "CO",
+            "max_abs_dex": 19.639234884469314,
+            "median_abs_dex": 0.09485606126760748,
+            "worst_pressure_bar": 5.689866029018293e-05,
+            "worst_temperature_k": 451.5350317582462
+          },
+          {
+            "species": "CO2",
+            "max_abs_dex": 19.012240173485843,
+            "median_abs_dex": 0.1932468618307075,
+            "worst_pressure_bar": 5.689866029018293e-05,
+            "worst_temperature_k": 451.5350317582462
+          },
+          {
+            "species": "S",
+            "max_abs_dex": 3.7138772660380575,
+            "median_abs_dex": 1.7057373083400087,
+            "worst_pressure_bar": 0.0003088843596477479,
+            "worst_temperature_k": 534.7623681833527
+          }
+        ],
+        "ml_vs_exogibbs": [
+          {
+            "species": "CO",
+            "max_abs_dex": 8.9626465913528,
+            "median_abs_dex": 0.06115723829043107,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 239.43147779626554
+          },
+          {
+            "species": "CO2",
+            "max_abs_dex": 6.438751153162581,
+            "median_abs_dex": 0.15734140126709395,
+            "worst_pressure_bar": 1e-07,
+            "worst_temperature_k": 239.43147779626554
+          },
+          {
+            "species": "SH",
+            "max_abs_dex": 5.871358871459961,
+            "median_abs_dex": 0.17986486088774178,
+            "worst_pressure_bar": 5.428675439323859e-07,
+            "worst_temperature_k": 283.5636995548186
+          },
+          {
+            "species": "S",
+            "max_abs_dex": 4.799615904583138,
+            "median_abs_dex": 1.7411650970359807,
+            "worst_pressure_bar": 0.000471486636345739,
+            "worst_temperature_k": 557.8638051857799
+          },
+          {
+            "species": "S2",
+            "max_abs_dex": 4.47027587890625,
+            "median_abs_dex": 0.312997835130278,
+            "worst_pressure_bar": 1.2648552168552959e-06,
+            "worst_temperature_k": 308.59247219773783
+          }
+        ]
+      },
+      "below_floor_counts": {
+        "ml": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 23,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 5,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 1,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 8,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 8,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          }
+        },
+        "fastchem": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 7,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 27,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 16,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 16,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 16,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 14,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 2,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 3,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 19,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 15,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 13,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 5,
+            "exact_zero": 0
+          }
+        },
+        "exogibbs": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 7,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 27,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 16,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 5,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 16,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 16,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 14,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 7,
+            "exact_zero": 0
+          }
+        }
+      },
+      "coverage_audit": {
+        "sampled_test_runs": 2000,
+        "cold_top_count": 33,
+        "cold_top_solar_log_rms_dex_le_0p3": 1,
+        "warmshape_like_count": 4,
+        "warmshape_like_solar_log_rms_dex_le_0p2": 0,
+        "nearest_examples": [
+          {
+            "run_id": "run_65241",
+            "score": 0.6864811178919583,
+            "globals_log_rms_dex": 0.6604579914265443,
+            "bottom_temperature_k": 1963.446061773917,
+            "top_temperature_k": 329.65078379231403,
+            "top_pressure_bar": 2.0147925526352227e-07,
+            "temperature_grid_k": [
+              1869.248094059961,
+              1323.5931516921369,
+              748.6384824463673,
+              330.74460845123974
+            ]
+          },
+          {
+            "run_id": "run_176292",
+            "score": 0.7913589084878979,
+            "globals_log_rms_dex": 0.607589225471254,
+            "bottom_temperature_k": 2079.327256977167,
+            "top_temperature_k": 515.9326981785852,
+            "top_pressure_bar": 1.5219370905875007e-07,
+            "temperature_grid_k": [
+              1967.4667201129814,
+              1177.5090862599495,
+              784.805798277179,
+              516.5728893173747
+            ]
+          },
+          {
+            "run_id": "run_297847",
+            "score": 0.8932055607355779,
+            "globals_log_rms_dex": 0.36460020533303455,
+            "bottom_temperature_k": 1761.9586745347074,
+            "top_temperature_k": 504.5604681924712,
+            "top_pressure_bar": 4.5232997389910613e-07,
+            "temperature_grid_k": [
+              1657.960103357739,
+              1254.2501240814245,
+              675.2406877523498,
+              504.784591445304
+            ]
+          },
+          {
+            "run_id": "run_19497",
+            "score": 0.9167737888394126,
+            "globals_log_rms_dex": 0.6253738002538483,
+            "bottom_temperature_k": 2080.0213900868243,
+            "top_temperature_k": 328.9512937616729,
+            "top_pressure_bar": 1.2003297973356407e-07,
+            "temperature_grid_k": [
+              2079.186127794687,
+              1361.2694380032929,
+              690.6992802900112,
+              329.67962556646626
+            ]
+          },
+          {
+            "run_id": "run_204826",
+            "score": 0.9606688077300329,
+            "globals_log_rms_dex": 0.4175370250979885,
+            "bottom_temperature_k": 1704.9663192543794,
+            "top_temperature_k": 411.15749108248815,
+            "top_pressure_bar": 3.0486689980352e-07,
+            "temperature_grid_k": [
+              1691.316071624156,
+              1100.880078811572,
+              588.7022140154992,
+              411.42702321946206
+            ]
+          }
+        ]
+      }
+    },
+    "Cool Isothermal": {
+      "timings_ms": {
+        "ml": 8.83936882019043,
+        "fastchem": 189.42594528198242,
+        "exogibbs": 300.321102142334
+      },
+      "fastchem_debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/fastchem_runtime/cool_isothermal",
+      "pairwise_mean_abs_dex": {
+        "ml_vs_fastchem": 0.0023447395233702553,
+        "fastchem_vs_exogibbs": 0.2738923152238025,
+        "ml_vs_exogibbs": 0.27457244271923004
+      },
+      "pairwise_per_species": {
+        "ml_vs_fastchem": {
+          "H2": {
+            "max_abs_dex": 0.002545992469687633,
+            "median_abs_dex": 0.00033132187848240735
+          },
+          "He": {
+            "max_abs_dex": 0.0012621788915181398,
+            "median_abs_dex": 0.00027054900451983777
+          },
+          "H": {
+            "max_abs_dex": 0.00874523315471798,
+            "median_abs_dex": 0.0014504847750140826
+          },
+          "O": {
+            "max_abs_dex": 0.08307647705078125,
+            "median_abs_dex": 0.005888273564268687
+          },
+          "OH": {
+            "max_abs_dex": 0.016863455923113335,
+            "median_abs_dex": 0.0026671995139384563
+          },
+          "H2O": {
+            "max_abs_dex": 0.006570631797369941,
+            "median_abs_dex": 0.000884284112118161
+          },
+          "CO": {
+            "max_abs_dex": 0.03259601320376149,
+            "median_abs_dex": 0.0018635502017503303
+          },
+          "CO2": {
+            "max_abs_dex": 0.027240961166032918,
+            "median_abs_dex": 0.0016046653853862836
+          },
+          "CH4": {
+            "max_abs_dex": 0.011218836129632592,
+            "median_abs_dex": 0.0009458937847925952
+          },
+          "N2": {
+            "max_abs_dex": 0.03596482022674685,
+            "median_abs_dex": 0.0004908577326205865
+          },
+          "NH3": {
+            "max_abs_dex": 0.010051808162872433,
+            "median_abs_dex": 0.0010459483054159335
+          },
+          "H2S": {
+            "max_abs_dex": 0.0020265829589067863,
+            "median_abs_dex": 0.000572926207274449
+          },
+          "SH": {
+            "max_abs_dex": 0.011649163205664337,
+            "median_abs_dex": 0.0012383267590223568
+          },
+          "S": {
+            "max_abs_dex": 0.028086976540070197,
+            "median_abs_dex": 0.0030765902868079564
+          },
+          "SO": {
+            "max_abs_dex": 0.023562820570496967,
+            "median_abs_dex": 0.0034587212057601846
+          },
+          "SO2": {
+            "max_abs_dex": 0.020567590054902496,
+            "median_abs_dex": 0.0022238063459880664
+          },
+          "S2": {
+            "max_abs_dex": 0.024524307780243504,
+            "median_abs_dex": 0.001658809174371001
+          }
+        },
+        "fastchem_vs_exogibbs": {
+          "H2": {
+            "max_abs_dex": 6.165047617257002e-05,
+            "median_abs_dex": 5.3604708220397757e-05
+          },
+          "He": {
+            "max_abs_dex": 0.00012940023426111225,
+            "median_abs_dex": 5.0353054610596804e-05
+          },
+          "H": {
+            "max_abs_dex": 0.0004514213551889412,
+            "median_abs_dex": 0.0004215154472220206
+          },
+          "O": {
+            "max_abs_dex": 0.20051320977399456,
+            "median_abs_dex": 0.1000132410593384
+          },
+          "OH": {
+            "max_abs_dex": 0.21250212494388876,
+            "median_abs_dex": 0.12610531684659065
+          },
+          "H2O": {
+            "max_abs_dex": 0.20223621007951387,
+            "median_abs_dex": 0.098172332867132
+          },
+          "CO": {
+            "max_abs_dex": 0.11067901195281316,
+            "median_abs_dex": 0.011195405388815471
+          },
+          "CO2": {
+            "max_abs_dex": 0.20628008332331849,
+            "median_abs_dex": 0.1924837929281229
+          },
+          "CH4": {
+            "max_abs_dex": 0.19081687171812511,
+            "median_abs_dex": 0.02120203804639953
+          },
+          "N2": {
+            "max_abs_dex": 0.0008830709916827217,
+            "median_abs_dex": 8.057029237562574e-05
+          },
+          "NH3": {
+            "max_abs_dex": 0.00037937876652627267,
+            "median_abs_dex": 0.00027238518744443496
+          },
+          "H2S": {
+            "max_abs_dex": 0.31755269568220257,
+            "median_abs_dex": 0.27488605160115753
+          },
+          "SH": {
+            "max_abs_dex": 0.3883824421105295,
+            "median_abs_dex": 0.3457322937803111
+          },
+          "S": {
+            "max_abs_dex": 2.8734226132524547,
+            "median_abs_dex": 2.599361063446196
+          },
+          "SO": {
+            "max_abs_dex": 0.310670572127723,
+            "median_abs_dex": 0.15079635784215384
+          },
+          "SO2": {
+            "max_abs_dex": 0.3884714255663084,
+            "median_abs_dex": 0.12397856750817837
+          },
+          "S2": {
+            "max_abs_dex": 0.6143670183118495,
+            "median_abs_dex": 0.5290997130893098
+          }
+        },
+        "ml_vs_exogibbs": {
+          "H2": {
+            "max_abs_dex": 0.002568016433818432,
+            "median_abs_dex": 0.0003358757685307176
+          },
+          "He": {
+            "max_abs_dex": 0.0011327786572570275,
+            "median_abs_dex": 0.00026821492616019293
+          },
+          "H": {
+            "max_abs_dex": 0.009157329687973004,
+            "median_abs_dex": 0.0018116945653208205
+          },
+          "O": {
+            "max_abs_dex": 0.2076954644244715,
+            "median_abs_dex": 0.10453562522745585
+          },
+          "OH": {
+            "max_abs_dex": 0.21618055621392784,
+            "median_abs_dex": 0.1268232515101957
+          },
+          "H2O": {
+            "max_abs_dex": 0.19817642116071355,
+            "median_abs_dex": 0.09779751055861174
+          },
+          "CO": {
+            "max_abs_dex": 0.1136045390402165,
+            "median_abs_dex": 0.014654121628688621
+          },
+          "CO2": {
+            "max_abs_dex": 0.20571516282605096,
+            "median_abs_dex": 0.19427755279874237
+          },
+          "CH4": {
+            "max_abs_dex": 0.2020357078477577,
+            "median_abs_dex": 0.021004381593872745
+          },
+          "N2": {
+            "max_abs_dex": 0.03508174923506413,
+            "median_abs_dex": 0.0005122221021847118
+          },
+          "NH3": {
+            "max_abs_dex": 0.010431186929398706,
+            "median_abs_dex": 0.0010830005361710526
+          },
+          "H2S": {
+            "max_abs_dex": 0.31729266420820856,
+            "median_abs_dex": 0.2757039735923641
+          },
+          "SH": {
+            "max_abs_dex": 0.3874423605892048,
+            "median_abs_dex": 0.34625420164459886
+          },
+          "S": {
+            "max_abs_dex": 2.8650039555118383,
+            "median_abs_dex": 2.5970136521950904
+          },
+          "SO": {
+            "max_abs_dex": 0.31478239602416025,
+            "median_abs_dex": 0.1508039030531627
+          },
+          "SO2": {
+            "max_abs_dex": 0.38806925622171207,
+            "median_abs_dex": 0.12070329742963093
+          },
+          "S2": {
+            "max_abs_dex": 0.6175369080666329,
+            "median_abs_dex": 0.5304016641362237
+          }
+        }
+      },
+      "worst_species": {
+        "ml_vs_fastchem": [
+          {
+            "species": "O",
+            "max_abs_dex": 0.08307647705078125,
+            "median_abs_dex": 0.005888273564268687,
+            "worst_pressure_bar": 3.393221771895328,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "N2",
+            "max_abs_dex": 0.03596482022674685,
+            "median_abs_dex": 0.0004908577326205865,
+            "worst_pressure_bar": 100.0,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "CO",
+            "max_abs_dex": 0.03259601320376149,
+            "median_abs_dex": 0.0018635502017503303,
+            "worst_pressure_bar": 100.0,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "S",
+            "max_abs_dex": 0.028086976540070197,
+            "median_abs_dex": 0.0030765902868079564,
+            "worst_pressure_bar": 100.0,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "CO2",
+            "max_abs_dex": 0.027240961166032918,
+            "median_abs_dex": 0.0016046653853862836,
+            "worst_pressure_bar": 100.0,
+            "worst_temperature_k": 800.0
+          }
+        ],
+        "fastchem_vs_exogibbs": [
+          {
+            "species": "S",
+            "max_abs_dex": 2.8734226132524547,
+            "median_abs_dex": 2.599361063446196,
+            "worst_pressure_bar": 100.0,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "S2",
+            "max_abs_dex": 0.6143670183118495,
+            "median_abs_dex": 0.5290997130893098,
+            "worst_pressure_bar": 0.0007196856730011514,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "SO2",
+            "max_abs_dex": 0.3884714255663084,
+            "median_abs_dex": 0.12397856750817837,
+            "worst_pressure_bar": 0.4094915062380423,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "SH",
+            "max_abs_dex": 0.3883824421105295,
+            "median_abs_dex": 0.3457322937803111,
+            "worst_pressure_bar": 0.0007196856730011514,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "H2S",
+            "max_abs_dex": 0.31755269568220257,
+            "median_abs_dex": 0.27488605160115753,
+            "worst_pressure_bar": 0.0007196856730011514,
+            "worst_temperature_k": 800.0
+          }
+        ],
+        "ml_vs_exogibbs": [
+          {
+            "species": "S",
+            "max_abs_dex": 2.8650039555118383,
+            "median_abs_dex": 2.5970136521950904,
+            "worst_pressure_bar": 65.51285568595509,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "S2",
+            "max_abs_dex": 0.6175369080666329,
+            "median_abs_dex": 0.5304016641362237,
+            "worst_pressure_bar": 0.0007196856730011514,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "SO2",
+            "max_abs_dex": 0.38806925622171207,
+            "median_abs_dex": 0.12070329742963093,
+            "worst_pressure_bar": 0.2682695795279725,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "SH",
+            "max_abs_dex": 0.3874423605892048,
+            "median_abs_dex": 0.34625420164459886,
+            "worst_pressure_bar": 0.0007196856730011514,
+            "worst_temperature_k": 800.0
+          },
+          {
+            "species": "H2S",
+            "max_abs_dex": 0.31729266420820856,
+            "median_abs_dex": 0.2757039735923641,
+            "worst_pressure_bar": 0.0007196856730011514,
+            "worst_temperature_k": 800.0
+          }
+        ]
+      },
+      "below_floor_counts": {
+        "ml": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 3,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          }
+        },
+        "fastchem": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 9,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          }
+        },
+        "exogibbs": {
+          "H2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "He": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "O": {
+            "below_state_floor": 9,
+            "exact_zero": 0
+          },
+          "OH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2O": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "CH4": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "N2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "NH3": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "H2S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SH": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "SO2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          },
+          "S2": {
+            "below_state_floor": 0,
+            "exact_zero": 0
+          }
+        }
+      }
+    }
+  },
+  "live_fastchem_reproducibility_audit": {
+    "sampled_test_runs": 20,
+    "count_mean_abs_dex_gt_0p1": 5,
+    "count_monitor_fail_rows_gt_0": 5,
+    "worst_runs": [
+      {
+        "run_id": "run_322749",
+        "bucket": "analytic_radiative",
+        "mean_abs_dex": 3.1011775195992155,
+        "fail_row_count": 25,
+        "fail_rows_head": [
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35
+        ],
+        "top_pressure_bar": 4.768723976316522e-07,
+        "top_temperature_k": 159.62225076067085,
+        "debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/repro_sample/run_322749"
+      },
+      {
+        "run_id": "run_31225",
+        "bucket": "analytic_radiative",
+        "mean_abs_dex": 3.0594398292718483,
+        "fail_row_count": 55,
+        "fail_rows_head": [
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22
+        ],
+        "top_pressure_bar": 1.1246825283564525e-07,
+        "top_temperature_k": 190.71692792492092,
+        "debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/repro_sample/run_31225"
+      },
+      {
+        "run_id": "run_171103",
+        "bucket": "analytic_radiative",
+        "mean_abs_dex": 1.9226246180419269,
+        "fail_row_count": 44,
+        "fail_rows_head": [
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29
+        ],
+        "top_pressure_bar": 2.820909603332744e-07,
+        "top_temperature_k": 283.1629237776101,
+        "debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/repro_sample/run_171103"
+      },
+      {
+        "run_id": "run_450542",
+        "bucket": "analytic_radiative",
+        "mean_abs_dex": 1.514522491437414,
+        "fail_row_count": 34,
+        "fail_rows_head": [
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33
+        ],
+        "top_pressure_bar": 1.1139495581609518e-07,
+        "top_temperature_k": 228.00833300679935,
+        "debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/repro_sample/run_450542"
+      },
+      {
+        "run_id": "run_332576",
+        "bucket": "analytic_radiative",
+        "mean_abs_dex": 1.0610045460775894,
+        "fail_row_count": 23,
+        "fail_rows_head": [
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45
+        ],
+        "top_pressure_bar": 7.340275985596923e-07,
+        "top_temperature_k": 228.06614277492577,
+        "debug_dir": "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan-emulator/exojax_demo/diagnostics/exogibbs_vs_emulator_20260424T182905Z/repro_sample/run_332576"
+      }
+    ]
+  }
+}

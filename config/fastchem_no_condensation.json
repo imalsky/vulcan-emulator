@@ -85,7 +85,7 @@
       "temperature_k": "standard"
     },
     "global_methods": {
-      "He_H": "standard",
+      "He_H": "log-standard",
       "C_H": "log-standard",
       "O_H": "log-standard",
       "N_H": "log-standard",

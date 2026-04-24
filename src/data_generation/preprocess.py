@@ -958,25 +958,23 @@ def _equilibrium_normalization_payload(
     }
 
 
-def _discover_raw_runs(raw_root: Path) -> tuple[Path | None, list[str]]:
-    """Auto-detect consolidated vs per-file raw run layout.
+def _consolidated_raw_runs(raw_root: Path) -> tuple[Path, list[str]]:
+    """Return the consolidated ``runs.h5`` path plus its sorted run IDs.
 
-    Parameters
-    ----------
-    raw_root : Path
-        Raw dataset root directory.
-
-    Returns
-    -------
-    tuple[Path | None, list[str]]
-        Consolidated file path plus sorted run IDs when ``runs.h5`` exists,
-        otherwise ``(None, [])``.
+    Raises
+    ------
+    FileNotFoundError
+        If ``runs.h5`` does not exist under ``raw_root``. Preprocessing
+        requires the merged raw dataset produced by data generation.
     """
     consolidated = raw_root / "runs.h5"
-    if consolidated.exists():
-        with h5py.File(consolidated, "r") as f:
-            return consolidated, sorted(f.keys())
-    return None, []
+    if not consolidated.exists():
+        raise FileNotFoundError(
+            f"No consolidated runs.h5 found under {raw_root}. Run data generation "
+            "first; preprocessing requires the merged raw dataset."
+        )
+    with h5py.File(consolidated, "r") as f:
+        return consolidated, sorted(f.keys())
 
 
 def _write_processed_info_dir(
@@ -1023,12 +1021,7 @@ def _load_raw_runs(
     load_run_fn: Callable[..., Any],
 ) -> tuple[list[Any], list[Path]]:
     """Load raw runs from the consolidated ``runs.h5`` file."""
-    consolidated_path, consolidated_ids = _discover_raw_runs(raw_root)
-    if consolidated_path is None:
-        raise FileNotFoundError(
-            f"No consolidated runs.h5 found under {raw_root}. Run data generation "
-            "first; preprocessing requires the merged raw dataset."
-        )
+    consolidated_path, consolidated_ids = _consolidated_raw_runs(raw_root)
     LOGGER.info(
         "Reading %d runs from consolidated %s", len(consolidated_ids), consolidated_path,
     )
@@ -1337,6 +1330,7 @@ def preprocess_raw_dataset(
         "global_static_feature_order": list(config["data_spec"]["global_static_feature_order"]),
         "sequence_dim": 3,
         "target_dim": len(config["data_spec"]["output_species"]),
+        "global_dim": len(global_static_order),
         "max_num_levels": max_num_levels,
         "num_levels_range": num_levels_range,
         "pressure_top_bar_range": [
