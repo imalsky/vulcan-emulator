@@ -9,17 +9,16 @@ Supported chemistry targets:
 Supported model families:
 - `transformer`
 
-Shipped configs:
-- `config/fastchem_no_condensation.json` — gas-phase FastChem equilibrium
-- `config/vulcan_condensation.json` — condensation-enabled VULCAN
+Shipped config:
+- `config/fastchem.json` — gas-phase FastChem equilibrium
 
 CLI:
 
 ```bash
-python -m src.utils --config config/fastchem_no_condensation.json --stage generation
-python -m src.utils --config config/fastchem_no_condensation.json --stage normalization
-python -m src.utils --config config/fastchem_no_condensation.json --stage training
-python -m src.utils --config config/fastchem_no_condensation.json --stage export
+python -m src.utils --config config/fastchem.json --stage generation
+python -m src.utils --config config/fastchem.json --stage normalization
+python -m src.utils --config config/fastchem.json --stage training
+python -m src.utils --config config/fastchem.json --stage export
 ```
 
 `--stage normalization` performs the full raw-to-processed step: split creation, train-only normalization fitting, and processed tensor writing.
@@ -72,7 +71,7 @@ Layout:
 - `src/data_generation/`: sampling, raw generation, preprocessing, and dataset I/O
 - `src/utils/`: config validation, CLI, logging, paths, and provenance helpers
 - `supercomputer_cmds/`: HPC submission scripts — submit from anywhere via `qsub supercomputer_cmds/run.pbs` or `sbatch supercomputer_cmds/run_gen.sh`
-- `uni_tests/`: minimal test suite (5 files — config, model, export, sampling, runner)
+- `uni_tests/`: minimal test suite (4 files — config, model, export, sampling)
 
 ## Inference surface
 

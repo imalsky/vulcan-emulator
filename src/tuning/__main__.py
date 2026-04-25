@@ -14,7 +14,7 @@ kept fixed at the base-config values.
 
 Invocation::
 
-    python -m src.tuning --config config/fastchem_no_condensation.json \\
+    python -m src.tuning --config config/fastchem.json \\
         --trials 100 --epochs 100
 """
 
@@ -358,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--config",
-        default="config/fastchem_no_condensation.json",
+        default="config/fastchem.json",
         help="Path to the base configuration JSON file.",
     )
     parser.add_argument("--trials", type=int, default=60, help="Number of Optuna trials.")

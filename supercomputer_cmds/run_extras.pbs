@@ -14,7 +14,7 @@
 #
 # Usage (submit from anywhere; the script self-locates the project root):
 #   qsub supercomputer_cmds/run_extras.pbs
-#   qsub -v MODEL=fastchem_no_condensation supercomputer_cmds/run_extras.pbs
+#   qsub -v MODEL=fastchem supercomputer_cmds/run_extras.pbs
 # =============================================================================
 
 set -euo pipefail
@@ -37,7 +37,7 @@ source "${CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV:-pyt2_8_gh}"
 
 # --- Configuration ---
-MODEL="${MODEL:-fastchem_no_condensation}"
+MODEL="${MODEL:-fastchem}"
 
 # --- Environment ---
 export HDF5_USE_FILE_LOCKING=FALSE

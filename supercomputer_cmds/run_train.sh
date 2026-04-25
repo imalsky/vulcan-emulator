@@ -16,7 +16,7 @@
 set -euo pipefail
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/fastchem_analytic_500k.json}
+CONFIG_PATH=${CONFIG_PATH:-config/fastchem.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
 SKIP_EXPORT=${SKIP_EXPORT:-0}
 

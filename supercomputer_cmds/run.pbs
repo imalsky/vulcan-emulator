@@ -14,8 +14,8 @@
 # generation → normalization → training → export
 #
 # Usage (submit from anywhere; the script self-locates the project root):
-#   qsub supercomputer_cmds/run.pbs                                                    # no condensation (default)
-#   qsub -v CONFIG_PATH=config/vulcan_condensation.json supercomputer_cmds/run.pbs     # with condensation
+#   qsub supercomputer_cmds/run.pbs                                                    # default fastchem
+#   qsub -v CONFIG_PATH=path/to/other.json supercomputer_cmds/run.pbs                  # custom config
 #   qsub -v DATA_ONLY=1 supercomputer_cmds/run_cpu.pbs                                 # data only (CPU)
 #
 # To run ONLY data generation and normalization on a CPU node (no GPU hours
@@ -34,7 +34,7 @@
 #
 # Environment Variables:
 #   CONFIG_PATH     — config file path
-#                     (default: config/fastchem_no_condensation.json)
+#                     (default: config/fastchem.json)
 #   DATA_ONLY       — set to 1 to run only generation + normalization (no GPU needed)
 #   SKIP_GEN        — set to 1 to skip generation (data already exists)
 #   SKIP_NORM       — set to 1 to skip normalization (processed data exists)
@@ -78,7 +78,7 @@ if [[ "$(basename "${CONDA_PREFIX:-}")" != "${CONDA_ENV}" ]]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/fastchem_no_condensation.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/fastchem.json}"
 if [[ "${CONFIG_PATH}" != /* ]]; then
   CONFIG_PATH="${PROJECT_ROOT}/${CONFIG_PATH}"
 fi

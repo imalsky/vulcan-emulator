@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FastChem/VULCAN chemistry emulator pipeline.")
     parser.add_argument(
         "--config",
-        default="config/fastchem_no_condensation.json",
+        default="config/fastchem.json",
         help="Path to a configuration JSON file relative to the project root.",
     )
     parser.add_argument(

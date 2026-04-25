@@ -1657,7 +1657,12 @@ def _run_single_fastchem_spec(
         config=config,
     )
     _write_fastchem_tp_profile(fastchem_root, spec)
-    subprocess.run(["./fastchem", "input/config.input"], cwd=fastchem_root, check=True)
+    subprocess.run(
+        ["./fastchem", "input/config.input"],
+        cwd=fastchem_root,
+        check=True,
+        timeout=120,
+    )
     fastchem_output = fastchem_root / "output" / "vulcan_EQ.dat"
     if not fastchem_output.exists():
         raise FileNotFoundError(

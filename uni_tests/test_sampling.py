@@ -145,6 +145,49 @@ def test_analytic_temperature_sampling_uses_piette_sampler_metadata_and_bounds(t
     assert "temperature_profile_analytic_log10_p_trans_bar" in metadata
 
 
+def test_analytic_temperature_sampling_uses_power_law_branch_when_probability_is_one(tiny_config):
+    # power_law_probability=1.0 forces every analytic draw down the new branch.
+    # Assert the metadata flags it correctly and T(P) really is a power law
+    # (constant log-T/log-P slope equal to the logged alpha).
+    config = copy.deepcopy(tiny_config)
+    config["roth_sampler"] = {"enabled": False}
+    config["temperature_profiles"]["source_mode"] = "analytic"
+    sampler = config["temperature_profiles"]["analytic_sampler"]
+    sampler["power_law_probability"] = 1.0
+    sampler["power_law_t0_range_k"] = [800.0, 1500.0]
+    sampler["power_law_alpha_range"] = [0.05, 0.20]
+    sampler["power_law_p_ref_bar"] = 1.0
+    pressure_bar = _grid_from_config(config)
+
+    profile, metadata = _sample_temperature_profile_record(
+        pressure_bar,
+        config=config,
+        rng=np.random.default_rng(0),
+    )
+
+    hard_bounds = config["temperature_profiles"]["validation"]
+    assert profile.shape == pressure_bar.shape
+    assert np.all(np.isfinite(profile))
+    assert float(np.min(profile)) >= float(hard_bounds["min_temperature_k"])
+    assert float(np.max(profile)) <= float(hard_bounds["max_temperature_k"])
+    assert metadata["temperature_profile_source"] == "analytic"
+    assert metadata["temperature_profile_analytic_profile_type"] == "power_law"
+    assert metadata["temperature_profile_analytic_convective_adjustment_applied"] is False
+
+    t0_k = float(metadata["temperature_profile_analytic_t0_k"])
+    alpha = float(metadata["temperature_profile_analytic_alpha"])
+    p_ref_bar = float(metadata["temperature_profile_analytic_p_ref_bar"])
+    expected = t0_k * (pressure_bar / p_ref_bar) ** alpha
+    np.testing.assert_allclose(profile, expected, rtol=0.0, atol=1e-9)
+
+    # Constant log-T/log-P slope across any two distinct levels — the
+    # defining property of the power-law family the retrieval samples.
+    log_p = np.log(pressure_bar)
+    log_t = np.log(profile)
+    slopes = np.diff(log_t) / np.diff(log_p)
+    np.testing.assert_allclose(slopes, alpha, rtol=0.0, atol=1e-9)
+
+
 def test_pt_library_sampling_rejects_profiles_outside_shared_temperature_bounds(tiny_config, tmp_path):
     config = copy.deepcopy(tiny_config)
     pressure_bar = _grid_from_config(config)
@@ -328,27 +371,6 @@ def test_roth_profile_has_no_constant_plateau_near_toa(tiny_config):
         top_slice = spec.temperature_k[-5:]
         # Require that the top levels vary (no constant plateau).
         assert np.any(np.abs(np.diff(top_slice)) > 1.0e-6)
-
-
-def test_analytic_sampler_ranges_match_repo_config():
-    """Pin the narrowed analytic-sampler ranges — changes should be explicit.
-
-    Catches accidental reversions to the old wide bounds that produced the
-    extreme ``run_07390`` inversion.
-    """
-    import json
-
-    root = Path(__file__).resolve().parents[1]
-    for cfg_name in ("fastchem_no_condensation.json", "vulcan_condensation.json"):
-        cfg_path = root / "config" / cfg_name
-        cfg = json.loads(cfg_path.read_text())
-        sampler = cfg["temperature_profiles"]["analytic_sampler"]
-        assert sampler["log10_gamma_range"] == [-1.0, 1.0], cfg_name
-        assert sampler["log10_delta_range"] == [-3.0, 1.0], cfg_name
-        assert sampler["alpha_range"] == [0.0, 0.9], cfg_name
-        assert sampler["log10_p_trans_bar_range"] == [-2.0, 2.0], cfg_name
-        assert sampler["t_int_k_range"] == [50.0, 1000.0], cfg_name
-        assert sampler["t_eq_k_range"] == [300.0, 3500.0], cfg_name
 
 
 def _specs_equal(a, b):

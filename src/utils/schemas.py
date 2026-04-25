@@ -357,7 +357,22 @@ class VulcanSamplingConfig(_SamplingBase):
 
 
 class AnalyticSamplerConfig(_StrictModel):
-    """Piette & Madhusudhan (2019) Guillot-based analytic PT sampler."""
+    """Analytic PT sampler.
+
+    Each analytic draw is one of two shapes, gated by ``power_law_probability``:
+
+    * Modified Guillot (Piette & Madhusudhan 2019, default) — driven by the
+      six ``t_int_k_range`` … ``log10_p_trans_bar_range`` fields plus the
+      optional convective adjustment.
+    * Pure power-law ``T(P) = T0 * (P / power_law_p_ref_bar) ** alpha`` —
+      driven by ``power_law_t0_range_k`` and ``power_law_alpha_range``.
+      Mirrors the ExoJAX ``art.powerlaw_temperature(T0, alpha)`` family
+      used by retrieval consumers, so the training distribution covers the
+      power-law prior tails NUTS walks through.
+
+    Power-law fields are optional but required together when
+    ``power_law_probability > 0``.
+    """
 
     t_int_k_range: list[float]
     t_eq_k_range: list[float]
@@ -367,6 +382,10 @@ class AnalyticSamplerConfig(_StrictModel):
     log10_p_trans_bar_range: list[float]
     convection_probability: float
     adiabatic_gradient_range: list[float]
+    power_law_probability: float = 0.0
+    power_law_t0_range_k: list[float] | None = None
+    power_law_alpha_range: list[float] | None = None
+    power_law_p_ref_bar: float = 1.0
 
     @field_validator(
         "t_int_k_range",
@@ -389,6 +408,24 @@ class AnalyticSamplerConfig(_StrictModel):
             raise ValueError("alpha_range must lie within [0, 1)")
         return bounds
 
+    @field_validator("power_law_t0_range_k", mode="after")
+    @classmethod
+    def _power_law_t0(cls, value: list[float] | None) -> list[float] | None:
+        if value is None:
+            return value
+        bounds = _strict_range(value)
+        if bounds[0] <= 0.0:
+            raise ValueError("power_law_t0_range_k[0] must be > 0")
+        return bounds
+
+    @field_validator("power_law_alpha_range", mode="after")
+    @classmethod
+    def _power_law_alpha(cls, value: list[float] | None) -> list[float] | None:
+        # Alpha may be negative (weak inversion) so no positivity floor here.
+        if value is None:
+            return value
+        return _strict_range(value)
+
     @model_validator(mode="after")
     def _positive_floors(self) -> "AnalyticSamplerConfig":
         if self.t_int_k_range[0] <= 0.0:
@@ -399,6 +436,18 @@ class AnalyticSamplerConfig(_StrictModel):
             raise ValueError("adiabatic_gradient_range[0] must be > 0")
         if not 0.0 <= self.convection_probability <= 1.0:
             raise ValueError("convection_probability must lie in [0, 1]")
+        if not 0.0 <= self.power_law_probability <= 1.0:
+            raise ValueError("power_law_probability must lie in [0, 1]")
+        if self.power_law_p_ref_bar <= 0.0:
+            raise ValueError("power_law_p_ref_bar must be > 0")
+        if self.power_law_probability > 0.0 and (
+            self.power_law_t0_range_k is None
+            or self.power_law_alpha_range is None
+        ):
+            raise ValueError(
+                "power_law_probability > 0 requires both power_law_t0_range_k "
+                "and power_law_alpha_range to be set."
+            )
         return self
 
 

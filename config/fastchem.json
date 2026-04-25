@@ -2,8 +2,8 @@
   "chemistry_type": "fastchem",
   "model_type": "transformer",
   "paths": {
-    "run_root": "data/fastchem_analytic_500k",
-    "checkpoints_root": "models/fastchem_analytic_500k",
+    "run_root": "data/fastchem",
+    "checkpoints_root": "models/fastchem",
     "vulcan_source_root": "../VULCAN-master"
   },
   "data_spec": {
@@ -21,17 +21,17 @@
     "pressure_top_bar_range": [1.0e-06, 1.0e-05],
     "pressure_bottom_bar_range": [100.0, 200.0],
     "temperature_range_k": [100.0, 3000.0],
-    "he_frac_range":  [5e-02, 3e-01],
-    "c_frac_range":   [4.22e-05, 1.68e-03],
-    "o_frac_range":   [7.17e-05, 2.85e-03],
-    "n_frac_range":   [9.89e-06, 3.94e-04],
-    "s_frac_range":   [1.93e-06, 7.68e-05],
+    "he_frac_range": [5e-02, 3e-01],
+    "c_frac_range": [4.22e-05, 1.68e-03],
+    "o_frac_range": [7.17e-05, 2.85e-03],
+    "n_frac_range": [9.89e-06, 3.94e-04],
+    "s_frac_range": [1.93e-06, 7.68e-05],
     "scales": {
       "he_frac": "log",
-      "c_frac":  "log",
-      "o_frac":  "log",
-      "n_frac":  "log",
-      "s_frac":  "log"
+      "c_frac": "log",
+      "o_frac": "log",
+      "n_frac": "log",
+      "s_frac": "log"
     }
   },
   "temperature_profiles": {
@@ -54,7 +54,11 @@
       "alpha_range": [0.0, 0.999],
       "log10_p_trans_bar_range": [-9.0, 3.0],
       "convection_probability": 0.1,
-      "adiabatic_gradient_range": [0.25, 0.35]
+      "adiabatic_gradient_range": [0.25, 0.35],
+      "power_law_probability": 0.143,
+      "power_law_t0_range_k": [800.0, 2200.0],
+      "power_law_alpha_range": [0.0, 0.25],
+      "power_law_p_ref_bar": 1.0
     }
   },
   "generation": {
@@ -62,7 +66,7 @@
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
-    "parallel_workers": 0,
+    "parallel_workers": 64,
     "sample_chunk_size": 1000,
     "backfill": {
       "enabled": true,
@@ -126,7 +130,7 @@
     "output_head_divisor": 2,
     "activation": "silu",
     "dropout_rate": 0.0,
-    "norm_type": "rmsnorm",
+    "norm_type": "layernorm",
     "use_qk_norm": false,
     "ffn_type": "dense",
     "zero_init_film": false

@@ -15,7 +15,7 @@
 set -euo pipefail
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/fastchem_analytic_500k.json}
+CONFIG_PATH=${CONFIG_PATH:-config/fastchem.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
 SKIP_NORM=${SKIP_NORM:-0}
 
@@ -49,6 +49,20 @@ export PYTHONPATH="$(pwd)/src:$(pwd):${PYTHONPATH:-}"
 export MPLBACKEND=Agg
 export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
 
+# Pin BLAS/OpenMP to one thread per process. With 64 parallel workers each
+# calling numpy/scipy, unbounded OpenMP fans out to 64 threads per call and
+# the resulting thousands of contending threads can stall progress entirely.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export BLIS_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-64}}}
+export SRUN_CPUS_PER_TASK
+
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel
   python -m pip install -U jax numpy scipy h5py optuna optax orbax-checkpoint pydantic
@@ -65,8 +79,27 @@ print(f"[preflight] raw_root={cfg['paths']['raw_root']}")
 print(f"[preflight] processed_root={cfg['paths']['processed_root']}")
 PY
 
-srun python -u -m src.utils --config "$CONFIG_PATH" --stage generation
+python - <<'PY'
+import os
+
+affinity = "unavailable"
+if hasattr(os, "sched_getaffinity"):
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except OSError:
+        affinity = "error"
+print(
+    "[preflight] "
+    f"SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'unset')} "
+    f"SLURM_CPUS_ON_NODE={os.environ.get('SLURM_CPUS_ON_NODE', 'unset')} "
+    f"SRUN_CPUS_PER_TASK={os.environ.get('SRUN_CPUS_PER_TASK', 'unset')} "
+    f"os_cpu_count={os.cpu_count()} "
+    f"affinity_cpus={affinity}"
+)
+PY
+
+srun --ntasks=1 --cpus-per-task="$SRUN_CPUS_PER_TASK" --cpu-bind=cores python -u -m src.utils --config "$CONFIG_PATH" --stage generation
 
 if [ "$SKIP_NORM" != "1" ]; then
-  srun python -u -m src.utils --config "$CONFIG_PATH" --stage normalization
+  srun --ntasks=1 --cpus-per-task="$SRUN_CPUS_PER_TASK" --cpu-bind=cores python -u -m src.utils --config "$CONFIG_PATH" --stage normalization
 fi

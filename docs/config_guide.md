@@ -13,17 +13,16 @@ The two supported combinations are:
 - `fastchem + transformer`
 - `vulcan + transformer`
 
-Shipped configs:
-- `config/fastchem_no_condensation.json` — FastChem equilibrium chemistry, gas-phase only
-- `config/vulcan_condensation.json` — VULCAN kinetic chemistry with H2O/S8 condensation
+Shipped config:
+- `config/fastchem.json` — FastChem equilibrium chemistry, gas-phase only
 
 CLI:
 
 ```bash
-python -m src.utils --config config/fastchem_no_condensation.json --stage generation
-python -m src.utils --config config/fastchem_no_condensation.json --stage normalization
-python -m src.utils --config config/fastchem_no_condensation.json --stage training
-python -m src.utils --config config/fastchem_no_condensation.json --stage export
+python -m src.utils --config config/fastchem.json --stage generation
+python -m src.utils --config config/fastchem.json --stage normalization
+python -m src.utils --config config/fastchem.json --stage training
+python -m src.utils --config config/fastchem.json --stage export
 ```
 
 ---
@@ -241,7 +240,7 @@ MSE term (`lambda_z`) with a log10-space penalty on the physical residual
 | `huber_delta_log10` | `huber` | Huber transition point in dex (must be `> 0`). Quadratic for `|r| <= delta`, linear otherwise. `0.1` is a sensible default (~26% fractional error at the transition). |
 
 MAE is the `delta -> 0` limit of Huber and is the current default in the
-shipped `config/fastchem_analytic_500k.json`. Huber is the preferred
+shipped `config/fastchem.json`. Huber is the preferred
 variant when outliers in the log-ratio tail dominate training signal.
 
 ### `model`

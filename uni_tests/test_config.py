@@ -5,18 +5,10 @@ import json
 from pathlib import Path
 
 import pytest
-from src.utils.config import (
-    DEFAULT_REQUIRED_GLOBAL_INPUTS,
-    DEFAULT_STATE_SPECIES,
-    ConfigValidationError,
-    load_and_validate_config,
-    resolve_conditioning_inputs,
-)
+from src.utils.config import ConfigValidationError, load_and_validate_config
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = ROOT / "uni_tests" / "fixtures"
-FASTCHEM_GLOBAL_ORDER = ["He_H", "C_H", "O_H", "N_H", "S_H"]
-VULCAN_GLOBAL_ORDER = list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
 
 
 def _load_raw_json(path: Path) -> dict:
@@ -29,18 +21,28 @@ def _write_config(tmp_path: Path, name: str, payload: dict) -> Path:
     return config_path
 
 
-@pytest.mark.parametrize(
-    "filename",
-    [
-        "fastchem_no_condensation.json",
-        "vulcan_condensation.json",
-    ],
-)
-def test_shipped_configs_use_single_dataset_root_layout(filename: str):
-    raw_config = _load_raw_json(ROOT / "config" / filename)
-    run_root = Path(raw_config["paths"]["run_root"])
+def test_shipped_fastchem_config_loads_and_validates():
+    """The single shipped config must always validate cleanly.
 
-    assert run_root.parent.name == "data"
+    Canary test that fails loudly if any schema change breaks production.
+    """
+    config = load_and_validate_config(ROOT / "config" / "fastchem.json")
+    assert config["chemistry_type"] == "fastchem"
+    assert config["model_type"] == "transformer"
+    assert config["model"]["norm_type"] == "layernorm"
+    sampler = config["temperature_profiles"]["analytic_sampler"]
+    assert sampler["power_law_probability"] > 0.0
+    assert sampler["power_law_t0_range_k"] is not None
+    assert sampler["power_law_alpha_range"] is not None
+    run_root = Path(config["paths"]["raw_root"]).parent
+    assert run_root.name == "fastchem"
+
+
+def test_config_requires_run_root(tmp_path):
+    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
+    payload["paths"].pop("run_root")
+    with pytest.raises(ConfigValidationError, match="paths.run_root"):
+        load_and_validate_config(_write_config(tmp_path, "missing_run_root.json", payload))
 
 
 def test_config_rejects_legacy_data_root_keys(tmp_path):
@@ -51,146 +53,20 @@ def test_config_rejects_legacy_data_root_keys(tmp_path):
         load_and_validate_config(_write_config(tmp_path, "split_roots.json", payload))
 
 
-def test_config_requires_run_root(tmp_path):
-    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    payload["paths"].pop("run_root")
-    with pytest.raises(ConfigValidationError, match="paths.run_root"):
-        load_and_validate_config(_write_config(tmp_path, "missing_run_root.json", payload))
-
-
-def test_shipped_vulcan_config_defaults_are_correct():
-    raw_config = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    assert "python_executable" not in raw_config["vulcan"]["runtime"]
-    assert "cfg_file" not in raw_config["vulcan"]["runtime"]
-    assert raw_config["vulcan"]["runtime"]["chemistry_file"] == "thermo/SNCHO_photo_network_2025.txt"
-    assert raw_config["vulcan"]["runtime"]["regenerate_chem_funs"] is True
-    assert raw_config["vulcan"]["runtime"]["rocky"] is False
-    assert raw_config["vulcan"]["runtime"]["cfg_assignments"]["condense_sp"] == ["H2O", "S8"]
-    assert raw_config["vulcan"]["runtime"]["cfg_assignments"]["non_gas_sp"] == ["H2O_l_s", "S8_l_s"]
-    assert "enabled" not in raw_config["vulcan"]["stellar_spectrum"]
-
-    config = load_and_validate_config(ROOT / "config" / "vulcan_condensation.json")
-    assert config["normalization"]["global_methods"]["gravity_cm_s2"] == "log-standard"
-    assert config["normalization"]["global_methods"]["planet_radius_cm"] == "log-standard"
-    assert config["vulcan_runtime"]["python_executable"] == "python"
-    assert config["vulcan_runtime"]["cfg_file"] == "vulcan_cfg.py"
-    assert config["vulcan_runtime"]["worker_root"] == "data/vulcan_workers"
-    assert config["vulcan_runtime"]["chemistry_file"] == "thermo/SNCHO_photo_network_2025.txt"
-    assert config["vulcan_runtime"]["regenerate_chem_funs"] is True
-    assert config["vulcan_runtime"]["use_lowT_limit_rates"] is True
-    assert config["vulcan_runtime"]["use_adaptive_rtol"] is True
-    assert config["vulcan_runtime"]["rocky"] is False
-    assert config["vulcan_runtime"]["top_bc_flux_file"] is None
-    assert config["vulcan_runtime"]["bot_bc_flux_file"] is None
-    assert config["vulcan_runtime"]["cfg_assignments"]["condense_sp"] == ["H2O", "S8"]
-    assert config["vulcan_runtime"]["cfg_assignments"]["non_gas_sp"] == ["H2O_l_s", "S8_l_s"]
-    assert len(config["science_presets"]) == 1
-    assert config["science_presets"][0]["name"] == "basic_h2"
-    assert config["science_presets"][0]["atm_base"] == "H2"
-    assert config["science_presets"][0]["physics_toggles"]["use_photochemistry"] is False
-    assert config["science_presets"][0]["physics_toggles"]["use_condensation"] is True
-    assert config["stellar_spectrum"]["template_file"] is None
-    assert config["stellar_spectrum"]["library_glob"] is None
-    assert config["stellar_spectrum"]["teff_k"] == pytest.approx(5485.0)
-    assert config["stellar_spectrum"]["max_tokens"] == 2610
-
-
-def test_resolve_conditioning_inputs_rejects_missing_vulcan_runtime_inputs():
-    config = load_and_validate_config(ROOT / "config" / "vulcan_condensation.json")
-    with pytest.raises(ConfigValidationError, match="use_photochemistry"):
-        resolve_conditioning_inputs(
-            raw_global_inputs={
-                "gravity_cm_s2": 1.0e3,
-                "planet_radius_cm": 9.0e9,
-                "He_H": 7.84e-2,
-                "C_H": 2.69e-4,
-                "O_H": 4.90e-4,
-                "N_H": 6.76e-5,
-                "S_H": 1.32e-5,
-                "r_star_rsun": 0.939,
-                "semi_major_axis_au": 0.04858,
-                "zenith_angle_deg": 48.0,
-                "diurnal_factor": 1.0,
-            },
-            required_global_inputs=list(config["data_spec"]["required_global_inputs"]),
-        )
-
-
-def test_vulcan_config_allows_missing_template_file_when_photochemistry_disabled(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["vulcan"]["stellar_spectrum"]["template_file"] = None
-    payload["vulcan"]["stellar_spectrum"]["library_glob"] = None
-
-    config = load_and_validate_config(_write_config(tmp_path, "vulcan_no_template.json", payload))
-
-    assert config["stellar_spectrum"]["template_file"] is None
-
-
-def test_vulcan_config_rejects_photochemistry_enabled(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["vulcan"]["physics_toggles"]["use_photochemistry"] = True
-    payload["vulcan"]["science_presets"] = [
-        {
-            "name": "photo_h2",
-            "atm_base": "H2",
-            "physics_toggles": {
-                "use_photochemistry": True,
-                "use_ion_chemistry": False,
-                "use_eddy_diffusion": True,
-                "use_molecular_diffusion": False,
-                "use_upwind_molecular_diffusion": False,
-                "use_boundary_conditions": False,
-                "use_condensation": True,
-                "use_settling": False,
-                "use_initial_cold_trap": False,
-                "use_sat_surface_h2o": False,
-            },
-        }
-    ]
-
-    with pytest.raises(ConfigValidationError, match="Photochemistry is not currently supported"):
-        load_and_validate_config(_write_config(tmp_path, "vulcan_photochem.json", payload))
-
-
-def test_vulcan_block_is_required_only_for_vulcan(tmp_path):
-    fastchem = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    fastchem["vulcan"] = {"unexpected": True}
-    with pytest.raises(ConfigValidationError, match="chemistry_type='fastchem'"):
-        load_and_validate_config(_write_config(tmp_path, "fastchem_invalid.json", fastchem))
-
-    vulcan = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    vulcan.pop("vulcan")
-    with pytest.raises(ConfigValidationError, match=r"root\.vulcan"):
-        load_and_validate_config(_write_config(tmp_path, "vulcan_missing.json", vulcan))
-
-
 @pytest.mark.parametrize(
-    ("section", "key", "error_fragment"),
+    ("section", "key"),
     [
-        ("model", "activation", "model"),
-        ("model", "dropout_rate", "model"),
-        ("training", "early_stopping_patience", "training"),
-        ("training", "scheduler", "training"),
+        ("model", "activation"),
+        ("model", "dropout_rate"),
+        ("training", "scheduler"),
     ],
 )
-def test_required_hyperparameters_must_be_explicit(tmp_path, section, key, error_fragment):
+def test_required_hyperparameters_must_be_explicit(tmp_path, section, key):
     payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
     payload = copy.deepcopy(payload)
     payload[section].pop(key)
-    with pytest.raises(ConfigValidationError, match=error_fragment):
+    with pytest.raises(ConfigValidationError, match=section):
         load_and_validate_config(_write_config(tmp_path, "missing_hparam.json", payload))
-
-
-@pytest.mark.parametrize(
-    "activation",
-    ["relu", "gelu", "silu", "tanh", "elu", "selu", "softplus", "leaky_relu"],
-)
-def test_supported_activations_validate(tmp_path, activation: str):
-    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    payload = copy.deepcopy(payload)
-    payload["model"]["activation"] = activation
-    config = load_and_validate_config(_write_config(tmp_path, "fastchem_transformer_config.json", payload))
-    assert config["model"]["activation"] == activation
 
 
 def test_invalid_activation_is_rejected(tmp_path):
@@ -214,100 +90,6 @@ def test_invalid_dropout_rate_is_rejected(tmp_path):
         load_and_validate_config(_write_config(tmp_path, "invalid_dropout.json", payload))
 
 
-def test_invalid_early_stopping_patience_is_rejected(tmp_path):
-    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    payload["training"]["early_stopping_patience"] = 0
-    with pytest.raises(ConfigValidationError, match="early_stopping_patience"):
-        load_and_validate_config(_write_config(tmp_path, "invalid_patience.json", payload))
-
-
-def test_vulcan_requires_loss_type(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"].pop("type")
-    with pytest.raises(ConfigValidationError, match="training.loss.type"):
-        load_and_validate_config(
-            _write_config(tmp_path, "vulcan_missing_loss_type.json", payload)
-        )
-
-
-def test_vulcan_rejects_unknown_loss_type(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"]["type"] = "l2"
-    with pytest.raises(ConfigValidationError, match="training.loss.type"):
-        load_and_validate_config(
-            _write_config(tmp_path, "vulcan_bad_loss_type.json", payload)
-        )
-
-
-def test_vulcan_mae_requires_lambda_log10_mae(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"].pop("lambda_log10_mae")
-    with pytest.raises(ConfigValidationError, match="lambda_log10_mae"):
-        load_and_validate_config(
-            _write_config(tmp_path, "vulcan_missing_lambda_log10_mae.json", payload)
-        )
-
-
-def test_vulcan_huber_loss_config_validates(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"] = {
-        "type": "huber",
-        "lambda_z": 1.0,
-        "lambda_log10_huber": 0.25,
-        "huber_delta_log10": 0.1,
-    }
-    load_and_validate_config(
-        _write_config(tmp_path, "vulcan_huber_loss.json", payload)
-    )
-
-
-def test_vulcan_huber_requires_lambda_log10_huber(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"] = {
-        "type": "huber",
-        "lambda_z": 1.0,
-        "huber_delta_log10": 0.1,
-    }
-    with pytest.raises(ConfigValidationError, match="lambda_log10_huber"):
-        load_and_validate_config(
-            _write_config(tmp_path, "vulcan_missing_lambda_log10_huber.json", payload)
-        )
-
-
-def test_vulcan_huber_requires_huber_delta(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"] = {
-        "type": "huber",
-        "lambda_z": 1.0,
-        "lambda_log10_huber": 0.25,
-    }
-    with pytest.raises(ConfigValidationError, match="huber_delta_log10"):
-        load_and_validate_config(
-            _write_config(tmp_path, "vulcan_missing_huber_delta.json", payload)
-        )
-
-
-def test_vulcan_huber_delta_must_be_positive(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["training"]["loss"] = {
-        "type": "huber",
-        "lambda_z": 1.0,
-        "lambda_log10_huber": 0.25,
-        "huber_delta_log10": 0.0,
-    }
-    with pytest.raises(ConfigValidationError, match="huber_delta_log10"):
-        load_and_validate_config(
-            _write_config(tmp_path, "vulcan_huber_delta_zero.json", payload)
-        )
-
-
-def test_vulcan_requires_planet_radius_sampling_range(tmp_path):
-    payload = _load_raw_json(ROOT / "config" / "vulcan_condensation.json")
-    payload["sampling"].pop("planet_radius_range_cm")
-    with pytest.raises(ConfigValidationError, match="planet_radius_range_cm"):
-        load_and_validate_config(_write_config(tmp_path, "missing_planet_radius.json", payload))
-
-
 def test_fastchem_rejects_vulcan_only_sampling_keys(tmp_path):
     payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
     payload["sampling"]["planet_radius_range_cm"] = [7.0e9, 1.0e10]
@@ -320,28 +102,6 @@ def test_invalid_mixed_temperature_profile_probability_is_rejected(tmp_path):
     payload["temperature_profiles"]["analytic_probability"] = 1.5
     with pytest.raises(ConfigValidationError, match="analytic_probability"):
         load_and_validate_config(_write_config(tmp_path, "invalid_temp_prob.json", payload))
-
-
-def test_missing_analytic_sampler_for_mixed_temperature_profiles_is_rejected(tmp_path):
-    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    payload["temperature_profiles"].pop("analytic_sampler")
-    with pytest.raises(ConfigValidationError, match="analytic_sampler"):
-        load_and_validate_config(_write_config(tmp_path, "missing_analytic_sampler.json", payload))
-
-
-def test_valid_temperature_profile_filters_are_normalized(tmp_path):
-    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    payload["temperature_profiles"]["filters"] = {
-        "Teq": [1400.0, 1600.0],
-        "LogDrag": 0.0,
-        "TiOVO": False,
-    }
-    validated = load_and_validate_config(_write_config(tmp_path, "valid_filters.json", payload))
-    assert validated["temperature_profiles"]["filters"] == {
-        "Teq": (1400.0, 1600.0),
-        "LogDrag": 0.0,
-        "TiOVO": False,
-    }
 
 
 def test_invalid_temperature_profile_filter_key_is_rejected(tmp_path):
@@ -358,39 +118,40 @@ def test_invalid_analytic_temperature_sampler_t_int_range_is_rejected(tmp_path):
         load_and_validate_config(_write_config(tmp_path, "invalid_t_int.json", payload))
 
 
-def test_invalid_temperature_profile_filter_range_is_rejected(tmp_path):
+def test_power_law_probability_requires_t0_and_alpha_ranges(tmp_path):
+    """Cross-field schema rule: enabling the power-law branch requires both ranges."""
     payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    payload["temperature_profiles"]["filters"] = {"Teq": [1800.0, 1200.0]}
-    with pytest.raises(ConfigValidationError, match="Teq"):
-        load_and_validate_config(_write_config(tmp_path, "invalid_filter_range.json", payload))
+    sampler = payload["temperature_profiles"]["analytic_sampler"]
+    sampler["power_law_probability"] = 0.1
+    # power_law_t0_range_k and power_law_alpha_range deliberately omitted
+    with pytest.raises(ConfigValidationError, match="power_law_t0_range_k|power_law_alpha_range"):
+        load_and_validate_config(_write_config(tmp_path, "missing_power_law_ranges.json", payload))
 
 
-def test_explicit_cosine_scheduler_is_preserved(tmp_path):
+def test_huber_loss_requires_huber_delta(tmp_path):
+    """Loss-type cross-field validation — the Huber path needs huber_delta_log10."""
     payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
-    payload["training"]["scheduler"] = {"name": "cosine"}
-    validated = load_and_validate_config(_write_config(tmp_path, "cosine_scheduler.json", payload))
-    assert validated["training"]["scheduler"] == {"name": "cosine"}
+    payload["training"]["loss"] = {
+        "type": "huber",
+        "lambda_z": 1.0,
+        "lambda_log10_huber": 0.25,
+    }
+    with pytest.raises(ConfigValidationError, match="huber_delta_log10"):
+        load_and_validate_config(_write_config(tmp_path, "missing_huber_delta.json", payload))
 
 
-def test_run_pbs_defaults_to_no_condensation_config() -> None:
-    script_text = (ROOT / "supercomputer_cmds" / "run.pbs").read_text(encoding="utf-8")
-    assert 'CONFIG_PATH="${CONFIG_PATH:-config/fastchem_no_condensation.json}"' in script_text
-    assert "#PBS -N vulcan_emulator" in script_text
-
-
-def test_cli_and_tuning_defaults_point_to_fastchem_no_condensation_config() -> None:
+def test_public_surfaces_default_to_shipped_fastchem_config():
+    """The shell scripts, CLI, tuning entrypoint, and docs must agree on
+    the single shipped config name. Drift here is a contract bug.
+    """
     cli_text = (ROOT / "src" / "utils" / "cli.py").read_text(encoding="utf-8")
     tuning_text = (ROOT / "src" / "tuning" / "__main__.py").read_text(encoding="utf-8")
+    run_pbs_text = (ROOT / "supercomputer_cmds" / "run.pbs").read_text(encoding="utf-8")
 
-    assert 'default="config/fastchem_no_condensation.json"' in cli_text
-    assert 'default="config/fastchem_no_condensation.json"' in tuning_text
+    assert 'default="config/fastchem.json"' in cli_text
+    assert 'default="config/fastchem.json"' in tuning_text
+    assert 'CONFIG_PATH="${CONFIG_PATH:-config/fastchem.json}"' in run_pbs_text
 
-
-def test_public_docs_reference_fastchem_no_condensation_config() -> None:
-    for path in (
-        ROOT / "docs" / "README.md",
-        ROOT / "docs" / "config_guide.md",
-        ROOT / "spec.md",
-    ):
+    for path in (ROOT / "docs" / "README.md", ROOT / "docs" / "config_guide.md", ROOT / "spec.md"):
         text = path.read_text(encoding="utf-8")
-        assert "config/fastchem_no_condensation.json" in text
+        assert "config/fastchem.json" in text

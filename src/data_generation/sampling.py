@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,6 +77,7 @@ _ROTH_PROFILE_CACHE: dict[tuple, list[RothProfile]] = {}
 # Native pressure bounds (min_bar, max_bar) paired with each cached profile
 # list. Computed once per cache entry so per-run grid clipping is O(1).
 _ROTH_BOUNDS_CACHE: dict[tuple, tuple[float, float]] = {}
+_ROTH_CACHE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,28 @@ class RunSpecification:
     spectrum: SpectrumRecord | None = None
     elemental_abundances_frac: np.ndarray | None = None
     gravity_cm_s2: np.ndarray | None = None
+
+
+def _detect_available_cpus() -> int:
+    """Return the number of CPUs available to this process."""
+    for env_var in ("NCPUS", "SLURM_CPUS_ON_NODE", "SLURM_CPUS_PER_TASK"):
+        value = os.environ.get(env_var)
+        if value is not None:
+            try:
+                n_cpus = int(value)
+                if n_cpus >= 1:
+                    return n_cpus
+            except ValueError:
+                pass
+    return os.cpu_count() or 1
+
+
+def _sampling_worker_count(config: dict[str, Any], total_specs: int) -> int:
+    """Return the effective number of parallel sampling workers to launch."""
+    configured = int(config["generation"]["parallel_workers"])
+    if configured <= 0:
+        configured = _detect_available_cpus()
+    return max(1, min(configured, total_specs))
 
 
 def _element_fractions_from_sampled_globals(globals_map: dict[str, float]) -> dict[str, float]:
@@ -454,6 +478,87 @@ def _validate_temperature_profile(
     return True, ""
 
 
+def _power_law_temperature(
+    pressure_bar: np.ndarray,
+    *,
+    t0_k: float,
+    alpha: float,
+    p_ref_bar: float,
+) -> np.ndarray:
+    """Compute the pure power-law temperature profile ``T = T0 * (P/P_ref)**alpha``.
+
+    Mirrors ExoJAX's ``art.powerlaw_temperature(T0, alpha)`` family — the
+    parameterization driving NUTS in ``exojax_demo/comparison.ipynb``. Adding
+    this shape to training keeps the emulator in-distribution under that
+    retrieval prior. See spec.md "Analytic profile shapes".
+    """
+    pressure_bar = np.asarray(pressure_bar, dtype=np.float64)
+    return t0_k * (pressure_bar / p_ref_bar) ** alpha
+
+
+def _sample_power_law_temperature_profile_record(
+    pressure_bar: np.ndarray,
+    *,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Sample a valid power-law PT profile via rejection sampling.
+
+    Mirrors :func:`_sample_analytic_temperature_profile_record` for the
+    Guillot path: draw ``(T0, alpha)`` uniformly from the configured ranges,
+    evaluate the power-law form, and accept iff the profile is finite and
+    inside the shared ``temperature_profiles.validation`` bounds. The
+    Piette upper-atmosphere modification and the convective adjustment do
+    not apply to power-law draws — the whole point is to expose the pure
+    constant-log-slope shape ExoJAX retrieval consumers sample over.
+    """
+    sampler = config["temperature_profiles"]["analytic_sampler"]
+    validation = config["temperature_profiles"]["validation"]
+    t0_range = sampler["power_law_t0_range_k"]
+    alpha_range = sampler["power_law_alpha_range"]
+    p_ref_bar = float(sampler["power_law_p_ref_bar"])
+
+    for attempt in range(_MAX_PROFILE_ATTEMPTS):
+        t0_k = _sample_range_value(t0_range, rng=rng)
+        alpha = _sample_range_value(alpha_range, rng=rng)
+
+        profile_k = _power_law_temperature(
+            pressure_bar,
+            t0_k=t0_k,
+            alpha=alpha,
+            p_ref_bar=p_ref_bar,
+        )
+
+        if not np.all(np.isfinite(profile_k)):
+            continue
+
+        is_valid, reason = _validate_temperature_profile(
+            profile_k, validation=validation,
+        )
+        if not is_valid:
+            LOGGER.debug(
+                "Power-law profile attempt %d rejected: %s", attempt + 1, reason,
+            )
+            continue
+
+        metadata: dict[str, Any] = {
+            "source": "analytic",
+            "analytic_profile_type": "power_law",
+            "analytic_t0_k": t0_k,
+            "analytic_alpha": alpha,
+            "analytic_p_ref_bar": p_ref_bar,
+            "analytic_convective_adjustment_applied": False,
+        }
+        return np.asarray(profile_k, dtype=np.float64), metadata
+
+    raise RuntimeError(
+        f"Failed to generate a valid power-law profile after {_MAX_PROFILE_ATTEMPTS} attempts. "
+        "Consider widening the validation bounds or tightening "
+        "power_law_t0_range_k / power_law_alpha_range to keep T(P_bottom) "
+        "below max_temperature_k."
+    )
+
+
 def _sample_analytic_temperature_profile_record(
     pressure_bar: np.ndarray,
     *,
@@ -462,13 +567,14 @@ def _sample_analytic_temperature_profile_record(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Sample a valid analytic PT profile via rejection sampling.
 
-    Draws parameters from uniform distributions, computes the Piette &
-    Madhusudhan (2019) modified Guillot (2010) radiative-equilibrium
-    profile, optionally applies convective adjustment, then validates.
-    If the profile fails validation it is discarded and a fresh draw is
-    attempted (up to ``_MAX_PROFILE_ATTEMPTS``).
+    Each call coin-flips on ``power_law_probability`` (default 0.0). Tails
+    delegate to :func:`_sample_power_law_temperature_profile_record`; the
+    rest follow the Piette & Madhusudhan (2019) modified Guillot (2010)
+    radiative-equilibrium path with optional convective adjustment, then
+    validate. If a profile fails validation it is discarded and a fresh
+    draw is attempted (up to ``_MAX_PROFILE_ATTEMPTS``).
 
-    The profile equations are (Piette & Madhusudhan 2019, Eqs. 15-16):
+    The Guillot profile equations are (Piette & Madhusudhan 2019, Eqs. 15-16):
 
         T_G^4(P) = (3/4)*T_int^4*(2/3 + delta*P)
                  + (3/4)*T_eq^4*[2/3 + 1/(gamma*sqrt(3))
@@ -494,6 +600,11 @@ def _sample_analytic_temperature_profile_record(
     """
     sampler = config["temperature_profiles"]["analytic_sampler"]
     validation = config["temperature_profiles"]["validation"]
+
+    if float(rng.random()) < float(sampler.get("power_law_probability", 0.0)):
+        return _sample_power_law_temperature_profile_record(
+            pressure_bar, config=config, rng=rng,
+        )
 
     for attempt in range(_MAX_PROFILE_ATTEMPTS):
         # --- Draw parameters ---
@@ -625,42 +736,53 @@ def _load_configured_roth_profiles(
     cache_key = (data_glob, filter_items, validation_items)
     profiles = _ROTH_PROFILE_CACHE.get(cache_key)
     if profiles is None:
-        loaded_profiles = load_roth_profiles_native(
-            data_glob,
-            filters=roth_cfg.get("filters", {}),
-        )
-        validation = config["temperature_profiles"]["validation"]
-        profiles = []
-        rejected_profiles = 0
-        for profile in loaded_profiles:
-            temperature_k = np.asarray(profile.temperature_k, dtype=np.float64)
-            is_valid, reason = _validate_temperature_profile(
-                temperature_k,
-                validation=validation,
-            )
-            if is_valid:
-                profiles.append(profile)
-                continue
-            rejected_profiles += 1
-            LOGGER.debug(
-                "Rejected PT-library profile %s: %s",
-                profile.metadata.get("source_file", "<unknown>"),
-                reason,
-            )
-        if rejected_profiles:
-            LOGGER.debug(
-                "Rejected %d PT-library profiles outside shared temperature bounds.",
-                rejected_profiles,
-            )
-        _ROTH_PROFILE_CACHE[cache_key] = profiles
-        if profiles:
-            _ROTH_BOUNDS_CACHE[cache_key] = roth_library_pressure_bounds(profiles)
+        with _ROTH_CACHE_LOCK:
+            profiles = _ROTH_PROFILE_CACHE.get(cache_key)
+            if profiles is None:
+                LOGGER.info("Loading PT-library profiles from %s", data_glob)
+                loaded_profiles = load_roth_profiles_native(
+                    data_glob,
+                    filters=roth_cfg.get("filters", {}),
+                )
+                validation = config["temperature_profiles"]["validation"]
+                profiles = []
+                rejected_profiles = 0
+                for profile in loaded_profiles:
+                    temperature_k = np.asarray(profile.temperature_k, dtype=np.float64)
+                    is_valid, reason = _validate_temperature_profile(
+                        temperature_k,
+                        validation=validation,
+                    )
+                    if is_valid:
+                        profiles.append(profile)
+                        continue
+                    rejected_profiles += 1
+                    LOGGER.debug(
+                        "Rejected PT-library profile %s: %s",
+                        profile.metadata.get("source_file", "<unknown>"),
+                        reason,
+                    )
+                if rejected_profiles:
+                    LOGGER.debug(
+                        "Rejected %d PT-library profiles outside shared temperature bounds.",
+                        rejected_profiles,
+                    )
+                _ROTH_PROFILE_CACHE[cache_key] = profiles
+                if profiles:
+                    _ROTH_BOUNDS_CACHE[cache_key] = roth_library_pressure_bounds(profiles)
+                LOGGER.info("Loaded %d PT-library profiles from %s", len(profiles), data_glob)
     if not profiles:
         raise FileNotFoundError(
             "roth_sampler.enabled=true but no temperature profiles matched "
             f"{data_glob!r} after applying filters and shared temperature validation."
         )
     return profiles
+
+
+def _prime_sampling_caches(plan: SamplingPlan) -> None:
+    """Warm expensive shared sampling caches before threaded sampling begins."""
+    if plan.roth_cfg.get("enabled", False):
+        _load_configured_roth_profiles(config=plan.config, roth_cfg=plan.roth_cfg)
 
 
 def _roth_library_native_bounds(
@@ -1504,8 +1626,9 @@ def sample_run_specifications_slice(
     count = end - start
     if count == 0:
         return []
+    _prime_sampling_caches(plan)
     indices = range(start, end)
-    max_workers = max(1, min(os.cpu_count() or 1, 16))
+    max_workers = _sampling_worker_count(plan.config, count)
     if count == 1 or max_workers == 1:
         specs = [_sample_one_from_plan(plan, i) for i in indices]
     else:

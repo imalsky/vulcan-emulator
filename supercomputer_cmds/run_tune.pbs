@@ -21,7 +21,7 @@
 #   qsub -v SKIP_GEN=0,SKIP_NORM=0 supercomputer_cmds/run_tune.pbs                          # force a data pass
 #
 # Environment Variables:
-#   CONFIG_PATH     — config file path (default: config/fastchem_no_condensation.json)
+#   CONFIG_PATH     — config file path (default: config/fastchem.json)
 #   TRIALS          — number of Optuna trials (default: 100)
 #   TRIALS_EPOCHS   — max epochs per trial (default: 100)
 #   SKIP_GEN        — skip generation (default: 1, data is already on disk)
@@ -66,7 +66,7 @@ if [[ "$(basename "${CONDA_PREFIX:-}")" != "${CONDA_ENV}" ]]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/fastchem_no_condensation.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/fastchem.json}"
 if [[ "${CONFIG_PATH}" != /* ]]; then
   CONFIG_PATH="${PROJECT_ROOT}/${CONFIG_PATH}"
 fi
