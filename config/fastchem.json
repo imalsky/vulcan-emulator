@@ -55,14 +55,14 @@
       "log10_p_trans_bar_range": [-9.0, 3.0],
       "convection_probability": 0.1,
       "adiabatic_gradient_range": [0.25, 0.35],
-      "power_law_probability": 0.40,
+      "power_law_probability": 0.25,
       "power_law_t0_range_k": [600.0, 2400.0],
       "power_law_alpha_range": [0.0, 0.25],
       "power_law_p_ref_bar": 1.0
     }
   },
   "generation": {
-    "num_runs": 500000,
+    "num_runs": 1000000,
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
@@ -70,7 +70,7 @@
     "sample_chunk_size": 1000,
     "backfill": {
       "enabled": true,
-      "max_retries": 5
+      "max_retries": 20
     }
   },
   "normalization": {
@@ -98,7 +98,7 @@
     "seed": 123,
     "batch_size": 256,
     "epochs": 200,
-    "learning_rate": 0.0003,
+    "learning_rate": 0.0001,
     "min_lr": 1e-06,
     "warmup_epochs": 20,
     "early_stopping_patience": 20,
@@ -127,7 +127,7 @@
     "dim_feedforward": 1024,
     "conditioning_hidden_dim": 256,
     "film_clamp": 100.0,
-    "output_head_divisor": 2,
+    "output_head_divisor": 1,
     "activation": "silu",
     "dropout_rate": 0.0,
     "norm_type": "layernorm",
