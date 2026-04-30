@@ -1,1 +1,0 @@
-Equilibrium calculation (Fastchem) finished. 

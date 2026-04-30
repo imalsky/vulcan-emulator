@@ -108,12 +108,20 @@ def _detect_available_cpus() -> int:
     return os.cpu_count() or 1
 
 
+# Sampling work is dominated by GIL-bound Python on tiny per-run arrays
+# (PCHIP interpolation, validation, dict construction, RNG draws). Past
+# ~32 threads the GIL contention and context-switch overhead overwhelm any
+# further parallelism, so we cap independent of `parallel_workers` (which
+# is sized for the GIL-releasing fastchem subprocess phase).
+_SAMPLING_WORKER_CAP = 32
+
+
 def _sampling_worker_count(config: dict[str, Any], total_specs: int) -> int:
     """Return the effective number of parallel sampling workers to launch."""
     configured = int(config["generation"]["parallel_workers"])
     if configured <= 0:
         configured = _detect_available_cpus()
-    return max(1, min(configured, total_specs))
+    return max(1, min(configured, total_specs, _SAMPLING_WORKER_CAP))
 
 
 def _element_fractions_from_sampled_globals(globals_map: dict[str, float]) -> dict[str, float]:
@@ -488,8 +496,9 @@ def _power_law_temperature(
     """Compute the pure power-law temperature profile ``T = T0 * (P/P_ref)**alpha``.
 
     Mirrors ExoJAX's ``art.powerlaw_temperature(T0, alpha)`` family — the
-    parameterization driving NUTS in ``exojax_demo/comparison.ipynb``. Adding
-    this shape to training keeps the emulator in-distribution under that
+    parameterization driving NUTS in
+    ``exojax_demo/06_classical_vs_emulator_retrieval.ipynb``. Adding this
+    shape to training keeps the emulator in-distribution under that
     retrieval prior. See spec.md "Analytic profile shapes".
     """
     pressure_bar = np.asarray(pressure_bar, dtype=np.float64)

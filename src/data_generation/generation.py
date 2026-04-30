@@ -1800,6 +1800,25 @@ def run_vulcan_generation(
         )
         return _attach_species_metadata(specs, start_index=start_index)
 
+    # Pool size is fixed for the whole generation so the same threads (and
+    # therefore the same worker_root directories under worker_base) are reused
+    # across every chunk. Recreating the pool per chunk forced fresh
+    # threading.get_ident() values, which made _ensure_fastchem_worker_tree
+    # do a full source-tree copy for every new thread and dominated wall time
+    # on shared filesystems.
+    generation_worker_count = _generation_worker_count(config, target_count)
+    generation_executor = (
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=generation_worker_count, thread_name_prefix="gen"
+        )
+        if generation_worker_count > 1
+        else None
+    )
+    LOGGER.info(
+        "Generation pool: %d workers (reused across all chunks)",
+        generation_worker_count,
+    )
+
     def _run_batch(specs: list[RunSpecification]) -> tuple[list[Path], list[str]]:
         """Execute one batch of run specifications through the active backend.
 
@@ -1814,11 +1833,9 @@ def run_vulcan_generation(
             Successfully written raw-run files and failed run IDs that may be
             backfilled later.
         """
-        worker_count = _generation_worker_count(config, len(specs))
-        LOGGER.info("Running %d specs with %d parallel workers", len(specs), worker_count)
         successes: list[Path] = []
         failures: list[str] = []
-        if worker_count == 1:
+        if generation_executor is None:
             for spec in specs:
                 try:
                     successes.append(
@@ -1834,25 +1851,24 @@ def run_vulcan_generation(
                     LOGGER.warning("Run %s failed, will backfill", spec.run_id, exc_info=True)
                     failures.append(spec.run_id)
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                future_to_id = {
-                    executor.submit(
-                        run_single,
-                        spec,
-                        source_root=source_root,
-                        worker_base=worker_base,
-                        runs_dir=runs_dir,
-                        config=config,
-                    ): spec.run_id
-                    for spec in specs
-                }
-                for future in concurrent.futures.as_completed(future_to_id):
-                    run_id = future_to_id[future]
-                    try:
-                        successes.append(future.result())
-                    except Exception:
-                        LOGGER.warning("Run %s failed, will backfill", run_id, exc_info=True)
-                        failures.append(run_id)
+            future_to_id = {
+                generation_executor.submit(
+                    run_single,
+                    spec,
+                    source_root=source_root,
+                    worker_base=worker_base,
+                    runs_dir=runs_dir,
+                    config=config,
+                ): spec.run_id
+                for spec in specs
+            }
+            for future in concurrent.futures.as_completed(future_to_id):
+                run_id = future_to_id[future]
+                try:
+                    successes.append(future.result())
+                except Exception:
+                    LOGGER.warning("Run %s failed, will backfill", run_id, exc_info=True)
+                    failures.append(run_id)
         return successes, failures
 
     # Resume: reuse chunk files already written by a previous invocation,
@@ -2022,6 +2038,8 @@ def run_vulcan_generation(
     # still queued for merging are removed from runs/ first.
     _await_merges()
     merge_executor.shutdown()
+    if generation_executor is not None:
+        generation_executor.shutdown()
 
     # Any straggler per-run files (e.g. from a worker that finished after
     # its chunk merged) go into a final catch-all chunk.

@@ -584,8 +584,9 @@ gravity and radius.
 
 ## Classical References (Notebook Contract)
 
-`extras/` and `exojax_demo/` ship six notebooks that compare the exported
-emulator against two classical equilibrium chemistry backends:
+`exojax_demo/` ships six numbered notebooks (`01_..` through `06_..`) that
+compare the exported emulator against two classical equilibrium chemistry
+backends:
 
 - **Live FastChem** — subprocess rerun using the exact same runtime and
   input-writing logic as data generation
@@ -642,9 +643,10 @@ elements FastChem's solar file actually lists; it is derived directly from
 
 Notebooks that build an ExoGibbs element vector inside a JAX-traced
 function (rather than calling `build_exogibbs_element_vector` directly —
-e.g. `exojax_demo/comparison.ipynb` for retrieval gradients) must
-reproduce the same five steps with the same `FASTCHEM_LODDERS_*`,
-`FASTCHEM_METALLICITY_SCALED_ELEMENTS`, and `SOLAR_ABUNDANCES` constants.
+e.g. `exojax_demo/06_classical_vs_emulator_retrieval.ipynb` for retrieval
+gradients) must reproduce the same five steps with the same
+`FASTCHEM_LODDERS_*`, `FASTCHEM_METALLICITY_SCALED_ELEMENTS`, and
+`SOLAR_ABUNDANCES` constants.
 
 ### ExoGibbs chemistry setup
 

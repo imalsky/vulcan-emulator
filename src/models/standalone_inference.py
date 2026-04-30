@@ -32,6 +32,7 @@ from .export_bundle import ExportedJAXModel as ExportedModel
 from .export_bundle import load_exported_model as load_model
 from .exojax_api import make_fastchem_vmr_fn, make_vulcan_vmr_fn
 from .jax_model import TransformerDimensions, apply_transformer_model
+from .pt_profiles import guillot_temperature
 
 __all__ = [
     "ExportedModel",
@@ -39,6 +40,7 @@ __all__ = [
     "TransformerDimensions",
     "VULCAN_GLOBAL_LABELS",
     "apply_transformer_model",
+    "guillot_temperature",
     "load_model",
     "make_fastchem_vmr_fn",
     "make_vulcan_vmr_fn",
