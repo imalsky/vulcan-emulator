@@ -5,13 +5,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from src.data_generation import sampling as sampling_module
+from src.data_generation.generation import _element_profile_from_spec
 from src.data_generation.roth_sampling import (
     _interpolate_profile,
     load_roth_profiles,
     load_roth_profiles_native,
     roth_library_pressure_bounds,
 )
-from src.data_generation.generation import _element_profile_from_spec
 from src.data_generation.sampling import (
     _decide_temperature_profile_source,
     _sample_column_pressure_grid,
@@ -31,6 +32,32 @@ def _grid_from_config(config, seed=0):
     return _sample_column_pressure_grid(
         config["sampling"], rng=np.random.default_rng(seed),
     )
+
+
+def _fastchem_sampling_config():
+    config = load_and_validate_config(
+        Path(__file__).resolve().parents[1]
+        / "uni_tests"
+        / "fixtures"
+        / "fastchem_transformer_config.json"
+    )
+    config["_project_root"] = Path(__file__).resolve().parents[1]
+    config["roth_sampler"] = {"enabled": False}
+    config["temperature_profiles"]["source_mode"] = "analytic"
+    config["generation"]["parallel_workers"] = 1
+    config["sampling"]["num_levels_range"] = [12, 12]
+    return config
+
+
+def _enable_corner_coverage(config, *, fraction=0.4):
+    config["sampling"]["corner_coverage"] = {
+        "enabled": True,
+        "fraction": fraction,
+        "abundance_quantile_width": 0.2,
+        "hot_tmax_k": 2500.0,
+        "large_trange_k": 800.0,
+        "max_profile_resample_attempts": 3,
+    }
 
 FIXTURE_PT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -417,3 +444,136 @@ def test_chunked_slice_matches_one_shot_sampling(tiny_config):
         assert len(streamed) == len(baseline)
         for a, b in zip(baseline, streamed):
             _specs_equal(a, b)
+
+
+def test_fastchem_default_sampling_has_no_corner_labels():
+    config = _fastchem_sampling_config()
+
+    plan = build_sampling_plan(
+        config=config,
+        project_root=config["_project_root"],
+        num_runs=16,
+        seed=5,
+    )
+
+    assert all(label is None for label in plan.corner_coverage_labels)
+
+
+def test_fastchem_corner_coverage_labels_and_abundance_strata(monkeypatch):
+    config = _fastchem_sampling_config()
+    _enable_corner_coverage(config, fraction=1.0)
+
+    def fake_temperature_profile(pressure_bar, *, config, rng, source=None):
+        del config, rng, source
+        return (
+            np.linspace(1200.0, 2600.0, pressure_bar.size, dtype=np.float64),
+            {"temperature_profile_source": "analytic"},
+        )
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_sample_temperature_profile_record",
+        fake_temperature_profile,
+    )
+
+    specs = sample_run_specifications(
+        config=config,
+        project_root=config["_project_root"],
+        num_runs=16,
+        seed=5,
+    )
+    labels = [spec.metadata["corner_coverage_label"] for spec in specs]
+    assert set(labels) == {
+        "carbon_rich_hot",
+        "oxygen_rich_hot",
+        "high_metallicity_hot",
+        "near_unity_c_o_hot",
+    }
+    for label in set(labels):
+        assert labels.count(label) == 4
+
+    for spec in specs:
+        c_to_o = spec.globals["C_H"] / spec.globals["O_H"]
+        label = spec.metadata["corner_coverage_label"]
+        if label == "carbon_rich_hot":
+            assert c_to_o > 2.0
+        elif label == "oxygen_rich_hot":
+            assert c_to_o < 0.5
+        elif label == "near_unity_c_o_hot":
+            assert 0.5 <= c_to_o <= 2.0
+        assert spec.temperature_k.max() <= config["temperature_profiles"]["validation"]["max_temperature_k"]
+        assert spec.metadata["corner_coverage_profile_satisfied"] is True
+
+
+def test_fastchem_corner_coverage_chunked_slice_matches_one_shot(monkeypatch):
+    config = _fastchem_sampling_config()
+    _enable_corner_coverage(config, fraction=0.5)
+
+    def fake_temperature_profile(pressure_bar, *, config, rng, source=None):
+        del config, rng, source
+        return (
+            np.linspace(1000.0, 2600.0, pressure_bar.size, dtype=np.float64),
+            {"temperature_profile_source": "analytic"},
+        )
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_sample_temperature_profile_record",
+        fake_temperature_profile,
+    )
+
+    total_runs = 16
+    baseline = sample_run_specifications(
+        config=config,
+        project_root=config["_project_root"],
+        num_runs=total_runs,
+        seed=11,
+    )
+    plan = build_sampling_plan(
+        config=config,
+        project_root=config["_project_root"],
+        num_runs=total_runs,
+        seed=11,
+    )
+    streamed = []
+    for lo, hi in zip([0, 3, 9], [3, 9, total_runs]):
+        streamed.extend(sample_run_specifications_slice(plan, start=lo, end=hi))
+
+    assert len(streamed) == len(baseline)
+    for a, b in zip(baseline, streamed):
+        _specs_equal(a, b)
+
+
+def test_fastchem_corner_temperature_profile_resampling(monkeypatch):
+    config = _fastchem_sampling_config()
+    _enable_corner_coverage(config, fraction=1.0)
+    calls = {"count": 0}
+
+    def alternating_temperature_profile(pressure_bar, *, config, rng, source=None):
+        del config, rng, source
+        calls["count"] += 1
+        if calls["count"] % 2 == 1:
+            profile = np.full(pressure_bar.shape, 1200.0, dtype=np.float64)
+        else:
+            profile = np.linspace(1200.0, 2600.0, pressure_bar.size, dtype=np.float64)
+        return profile, {"temperature_profile_source": "analytic"}
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_sample_temperature_profile_record",
+        alternating_temperature_profile,
+    )
+
+    specs = sample_run_specifications(
+        config=config,
+        project_root=config["_project_root"],
+        num_runs=8,
+        seed=3,
+    )
+
+    assert calls["count"] == 16
+    for spec in specs:
+        assert spec.temperature_k.max() >= config["sampling"]["corner_coverage"]["hot_tmax_k"]
+        assert np.ptp(spec.temperature_k) >= config["sampling"]["corner_coverage"]["large_trange_k"]
+        assert spec.metadata["corner_coverage_profile_attempts"] == 2
+        assert spec.metadata["corner_coverage_profile_satisfied"] is True

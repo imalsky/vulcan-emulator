@@ -75,6 +75,11 @@ logs/
 *.npz
 *.vul
 
+# ExoJAX-managed external opacity tables (HITRAN CIA, ExoMol line lists,
+# partition functions). Auto-downloaded by MdbExomol / CdbCIA on first
+# use — never commit them. Matches `.database/` at any depth.
+.database/
+
 # Images / plot outputs
 *.png
 *.jpg

@@ -183,6 +183,27 @@ _FRAC_RANGE_KEYS = (
 )
 
 
+class CornerCoverageConfig(_StrictModel):
+    """Optional targeted sampling for high-sensitivity chemistry corners."""
+
+    enabled: bool = False
+    fraction: float = 0.2
+    abundance_quantile_width: float = 0.2
+    hot_tmax_k: PositiveFloat = 2500.0
+    large_trange_k: PositiveFloat = 800.0
+    max_profile_resample_attempts: PositiveInt = 50
+
+    @model_validator(mode="after")
+    def _check_corner_coverage(self) -> "CornerCoverageConfig":
+        if not 0.0 <= self.fraction <= 1.0:
+            raise ValueError("corner_coverage.fraction must lie in [0, 1]")
+        if not 0.0 < self.abundance_quantile_width <= 0.5:
+            raise ValueError(
+                "corner_coverage.abundance_quantile_width must lie in (0, 0.5]"
+            )
+        return self
+
+
 class _SamplingBase(_StrictModel):
     """Shared sampling fields used by both FastChem and VULCAN configs."""
 
@@ -196,6 +217,7 @@ class _SamplingBase(_StrictModel):
     n_frac_range: list[float]
     s_frac_range: list[float]
     scales: dict[str, Literal["log", "linear"]] | None = None
+    corner_coverage: CornerCoverageConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -575,6 +597,7 @@ class GenerationConfig(_StrictModel):
     reuse_raw_if_present: bool
     parallel_workers: NonNegativeInt
     sample_chunk_size: PositiveInt = 1000
+    fastchem_timeout_seconds: PositiveFloat = 30.0
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
 
 
@@ -964,6 +987,10 @@ class FastChemConfig(_ConfigBase):
     @model_validator(mode="after")
     def _check_normalization_keys(self) -> "FastChemConfig":
         _check_fastchem_normalization_keys(self.normalization, self.data_spec)
+        _check_fastchem_temperature_floor(self.sampling, self.temperature_profiles)
+        _check_corner_coverage_temperature_thresholds(
+            self.sampling, self.temperature_profiles,
+        )
         return self
 
 
@@ -984,6 +1011,9 @@ class VulcanConfig(_ConfigBase):
     @model_validator(mode="after")
     def _check_normalization_keys(self) -> "VulcanConfig":
         _check_vulcan_normalization_keys(self.normalization, self.data_spec)
+        _check_corner_coverage_temperature_thresholds(
+            self.sampling, self.temperature_profiles,
+        )
         return self
 
 
@@ -1012,6 +1042,49 @@ def _check_fastchem_normalization_keys(
     if set(normalization.global_methods.keys()) != expected_globals:
         raise ValueError(
             f"normalization.global_methods must define exactly {expected_globals}."
+        )
+
+
+def _check_fastchem_temperature_floor(
+    sampling: FastChemSamplingConfig,
+    temperature_profiles: TemperatureProfilesConfig,
+) -> None:
+    min_sampling_temperature = float(sampling.temperature_range_k[0])
+    min_validation_temperature = float(temperature_profiles.validation.min_temperature_k)
+    if min_sampling_temperature < 100.0:
+        raise ValueError(
+            "FastChem sampling.temperature_range_k[0] must be >= 100.0 K."
+        )
+    if min_validation_temperature < 100.0:
+        raise ValueError(
+            "FastChem temperature_profiles.validation.min_temperature_k must be >= 100.0 K."
+        )
+
+
+def _check_corner_coverage_temperature_thresholds(
+    sampling: _SamplingBase,
+    temperature_profiles: TemperatureProfilesConfig,
+) -> None:
+    corner = sampling.corner_coverage
+    if corner is None or not corner.enabled:
+        return
+    validation = temperature_profiles.validation
+    t_min = float(validation.min_temperature_k)
+    t_max = float(validation.max_temperature_k)
+    if float(corner.hot_tmax_k) > t_max:
+        raise ValueError(
+            "corner_coverage.hot_tmax_k must be <= "
+            "temperature_profiles.validation.max_temperature_k."
+        )
+    if float(corner.hot_tmax_k) < t_min:
+        raise ValueError(
+            "corner_coverage.hot_tmax_k must be >= "
+            "temperature_profiles.validation.min_temperature_k."
+        )
+    if float(corner.large_trange_k) > (t_max - t_min):
+        raise ValueError(
+            "corner_coverage.large_trange_k must be <= the validation "
+            "temperature span."
         )
 
 

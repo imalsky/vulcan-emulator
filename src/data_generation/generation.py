@@ -1049,6 +1049,49 @@ def _reset_fastchem_worker_between_runs(fastchem_root: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
+def read_fastchem_monitor_fail_mask(monitor_path: Path) -> np.ndarray | None:
+    """Parse FastChem monitor output into a per-level failure mask.
+
+    Parameters
+    ----------
+    monitor_path : Path
+        Path to ``output/monitor_output.dat`` emitted by FastChem.
+
+    Returns
+    -------
+    np.ndarray or None
+        Boolean array with shape ``(nz,)``. A row is ``True`` when any
+        per-element status field is ``"fail"``. Returns ``None`` when the
+        monitor file is absent or contains no parseable rows.
+    """
+    if not monitor_path.exists():
+        return None
+    lines = monitor_path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return None
+    flags: list[bool] = []
+    for line in lines[1:]:
+        parts = line.split()
+        if not parts:
+            continue
+        flags.append(any(status == "fail" for status in parts[8:]))
+    if not flags:
+        return None
+    return np.asarray(flags, dtype=bool)
+
+
+def _raise_on_fastchem_monitor_failures(monitor_path: Path, *, run_id: str) -> None:
+    """Raise when FastChem reports per-level monitor failures."""
+    fail_mask = read_fastchem_monitor_fail_mask(monitor_path)
+    if fail_mask is None or not bool(fail_mask.any()):
+        return
+    n_failed = int(fail_mask.sum())
+    raise RuntimeError(
+        f"FastChem monitor reports non-converged levels for run {run_id}: "
+        f"{n_failed}/{fail_mask.size} levels failed."
+    )
+
+
 def _ensure_vulcan_chem_funs(worker_root: Path, python_executable: str) -> None:
     """Run ``make_chem_funs.py`` once per worker tree; the network is constant."""
     marker = worker_root / _VULCAN_CHEM_FUNS_MARKER
@@ -1657,11 +1700,16 @@ def _run_single_fastchem_spec(
         config=config,
     )
     _write_fastchem_tp_profile(fastchem_root, spec)
+    timeout_seconds = float(config["generation"].get("fastchem_timeout_seconds", 30.0))
     subprocess.run(
         ["./fastchem", "input/config.input"],
         cwd=fastchem_root,
         check=True,
-        timeout=120,
+        timeout=timeout_seconds,
+    )
+    _raise_on_fastchem_monitor_failures(
+        fastchem_root / "output" / "monitor_output.dat",
+        run_id=spec.run_id,
     )
     fastchem_output = fastchem_root / "output" / "vulcan_EQ.dat"
     if not fastchem_output.exists():

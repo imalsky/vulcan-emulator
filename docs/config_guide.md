@@ -158,6 +158,7 @@ data/<run_name>/
 | `diurnal_factor_range` | vulcan only | [min, max] diurnal averaging factor |
 | `kzz_range_cm2_s` | vulcan only | [min, max] per-run eddy diffusion coefficient (cm²/s). Log-sampled by default — override via `scales.kzz_cm2_s`. Kzz remains depth-constant within each run. |
 | `scales` | optional | Per-parameter sampling scale, `"linear"` (default) or `"log"`. Applies to any of `he_frac`, `c_frac`, `o_frac`, `n_frac`, `s_frac`, `kzz_cm2_s`. Use `log` when the range spans more than ~1 dex so samples are not biased toward the upper bound. |
+| `corner_coverage` | optional | FastChem-only targeted joint sampling for retrieval-sensitive chemistry corners. When enabled, a configured fraction of runs remaps C/O unit coordinates into carbon-rich, oxygen-rich, high-C+O, and near-unity C/O strata and resamples PT profiles toward hot or large-temperature-range columns. VULCAN configs may include the block, but it is currently ignored. |
 
 The scalar `num_levels`, `pressure_top_bar`, and `pressure_bottom_bar` keys
 are no longer accepted; config loading raises if they appear. Use the
@@ -186,6 +187,7 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 | `reuse_raw_if_present` | Skip generation if raw data exists |
 | `parallel_workers` | Number of parallel generation workers (`0` = auto-detect from PBS/SLURM/OS) |
 | `sample_chunk_size` | Runs per streaming sample+execute chunk (default `1000`). Each chunk's per-run HDF5 files are merged into one `chunks/chunk_XXXXXX_YYYYYY.h5` immediately on completion and the originals deleted, so this also caps the peak per-run file count on disk. Lower values keep that peak smaller at the cost of more chunk files at the final merge step. |
+| `fastchem_timeout_seconds` | FastChem subprocess timeout in seconds (default `30.0`) |
 | `backfill` | `{enabled, max_retries}` for VULCAN failure recovery |
 
 `generation.mode` is a deprecated compatibility field. When present it must

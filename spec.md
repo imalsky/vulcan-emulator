@@ -85,6 +85,13 @@ Stages:
 
 ## Config Surface
 
+Configs are stored as `.json` files but are loaded as **JSONC**: the
+`load_and_validate_config()` loader strips `//` line comments and
+`/* … */` block comments before `json.loads`, so configs may carry inline
+documentation (units, design rationale) without breaking schema validation.
+A strict JSON parser will reject commented configs — always go through the
+loader. Comments inside string literals are preserved.
+
 Every config contains:
 - `chemistry_type`
 - `model_type`
@@ -126,10 +133,15 @@ These are hydrogen-normalized absolute abundances `n_X / n_H`.
 The generation sampler draws these `X/H` channels directly via Latin-hypercube
 sampling over the per-element ranges in `sampling.{he,c,o,n,s}_frac_range`
 (each scale configured under `sampling.scales`, typically `"log"` so the
-ranges bracket the solar anchor in `SOLAR_ABUNDANCES`).  No `[M/H]` / `C/O` /
-`S/O` reparameterization or conversion happens anywhere in the pipeline —
-the same `X/H` values flow through generation, preprocessing, training, and
-the exported inference wrappers.
+ranges bracket the solar anchor in `SOLAR_ABUNDANCES`).  FastChem configs may
+optionally enable `sampling.corner_coverage`, which reserves a deterministic
+fraction of runs for retrieval-sensitive joint strata in derived C/O space
+(carbon-rich, oxygen-rich, high-C+O, and near-unity C/O) and resamples those
+profiles toward hot or large-temperature-range PT columns.  This remaps only
+the sampled unit-cube coordinates before converting back to absolute `X/H`;
+no `[M/H]` / `C/O` / `S/O` values are stored in the generated dataset. The same
+absolute `X/H` values flow through generation, preprocessing, training, and the
+exported inference wrappers.
 
 Retrieval-side consumers that prefer a metallicity / ratio parameterization
 can use the `global_inputs_from_metallicity(...)` helper in
@@ -171,6 +183,7 @@ disables the branch and reproduces the historical Guillot-only behavior.
 
 Both shapes are rejection-sampled against
 `temperature_profiles.validation.{min,max}_temperature_k`. The shipped
+FastChem config enforces `min_temperature_k >= 100 K`, and the shipped
 `max_temperature_k = 3000 K` cap is intentional and **not** a placeholder:
 VULCAN's shipped reaction networks (`NCHO_photo_network.txt`,
 `SNCHO_photo_network_2025.txt`) are documented as validated only over

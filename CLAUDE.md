@@ -118,6 +118,8 @@ Notebooks under `exojax_demo/` compare the emulator against live FastChem (subpr
 
 Solar anchors must come from `SOLAR_ABUNDANCES` in `src/constants.py` — not from `exojax.utils.zsol.nsol()` AAG21 ratios — or the emulator gets fed a reference point its training distribution wasn't centered on. A residual ~0.1–0.3 dex FC↔EG floor on sulfur polymers (S5/S6/S7) and several O-bearing species is expected and accepted; it is not an emulator defect (NASA-9 vs 5-term-logK polynomial mismatch + species-network differences).
 
+**H₂O is the dominant FC↔EG gap species in retrievals, not sulfur.** Near the CO/H₂O chemical transition (C/O ≈ 0.8), H₂O diverges by ~1.3 dex between FastChem (NASA-9) and ExoGibbs (5-term logK) because H₂O abundance equals total oxygen minus CO-locked oxygen — a small difference in CO thermodynamics amplifies into a large residual H₂O difference. At solar C/O the gap is ~0.19 dex; at C/O = 0.8 it reaches ~1.3 dex. CO itself is negligible (~0.01 dex). This means notebook 06's classical vs emulator corner plots will diverge significantly — the classical retrieval is fitting a fundamentally different forward model. **Notebook 07 (emulator vs FastChem, same mock) is the correct apples-to-apples recovery test.**
+
 ## HPC entry points
 
 PBS and SLURM submission scripts live in `supercomputer_cmds/` and self-locate the project root, so submit from anywhere:

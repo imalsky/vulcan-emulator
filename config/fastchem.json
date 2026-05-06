@@ -1,3 +1,21 @@
+// FastChem surrogate training config.
+//
+// File format: JSONC (JSON with // line and /* block */ comments). The
+// loader at src/utils/config.py strips comments before json.load, so a
+// strict JSON parser will reject this file directly — always go through
+// load_and_validate_config().
+//
+// Units convention used throughout this file:
+//   - Pressure values:    bar (literal pressures) or log10(bar) for keys
+//                         prefixed with "log10_..._bar".
+//   - Temperatures:       K (kelvin), in any "_k" suffixed key.
+//   - Times:              seconds, in any "_seconds" suffixed key.
+//   - Elemental abundances: dimensionless number ratios n_X / n_H,
+//                         hydrogen-normalized (NOT mole fractions, NOT
+//                         mass fractions). Solar anchors live in
+//                         src/constants.py:SOLAR_ABUNDANCES.
+//   - Probabilities & fractions: dimensionless, in [0, 1].
+//   - Log10 quantities:   dex (always log base 10 unless stated otherwise).
 {
   "chemistry_type": "fastchem",
   "model_type": "transformer",
@@ -17,21 +35,57 @@
     ]
   },
   "sampling": {
+    // Per-run vertical level count (drawn uniformly).
     "num_levels_range": [40, 60],
-    "pressure_top_bar_range": [1.0e-06, 1.0e-05],
-    "pressure_bottom_bar_range": [100.0, 200.0],
+    // Pressure grid, top and bottom edges, in bar (linear).
+    "pressure_top_bar_range":    [1.0e-06, 1.0e-05],
+    "pressure_bottom_bar_range": [100.0,   200.0],
+    // Per-level temperature validation envelope, in K (rejection sampling).
     "temperature_range_k": [100.0, 3000.0],
+    // Elemental abundances are sampled as n_X / n_H (dimensionless number
+    // ratios). Round-number ranges chosen slightly wider than the literal
+    // [0.1x, 100x] solar interval (Asplund 2009 anchors in src/constants.py)
+    // so the LHC stratification is on clean log10 grids and a 0.1 dex
+    // truncation margin in retrieval priors stays inside the box.
+    //   He solar = 7.84e-2  -> range [5e-2,    3e-1]    = 0.64x .. 3.83x
+    //   C  solar = 2.69e-4  -> range [2e-5,    3e-2]    = 0.074x .. 111x
+    //   O  solar = 4.90e-4  -> range [4e-5,    5e-2]    = 0.082x .. 102x
+    //   N  solar = 6.76e-5  -> range [5e-6,    7e-3]    = 0.074x .. 104x
+    //   S  solar = 1.32e-5  -> range [1e-6,    2e-3]    = 0.076x .. 152x
+    // He is intentionally narrower than the metals: it is not scaled with
+    // metallicity in src/models/abundance_utils.py and 100x solar He is
+    // unphysical (~7.8 number ratio).
     "he_frac_range": [5e-02, 3e-01],
-    "c_frac_range": [4.22e-05, 3.0e-03],
-    "o_frac_range": [7.17e-05, 5.5e-03],
-    "n_frac_range": [9.89e-06, 7.5e-04],
-    "s_frac_range": [1.93e-06, 1.5e-04],
+    "c_frac_range": [2e-05,  3e-02],
+    "o_frac_range": [4e-05,  5e-02],
+    "n_frac_range": [5e-06,  7e-03],
+    "s_frac_range": [1e-06,  2e-03],
+    // LHC scale per element. "log" means each axis is uniform in
+    // log10(n_X/n_H) over the corresponding _frac_range; "linear" would
+    // be uniform in n_X/n_H. Keep all five at "log" so retrieval priors
+    // (Gaussian / TruncatedNormal in log10 space) match training density.
     "scales": {
       "he_frac": "log",
       "c_frac": "log",
       "o_frac": "log",
       "n_frac": "log",
       "s_frac": "log"
+    },
+    // Reserves a fraction of runs for retrieval-sensitive corner strata
+    // (carbon-rich, oxygen-rich, high-Z, near-unity C/O). See
+    // src/data_generation/sampling.py for the strata definitions.
+    "corner_coverage": {
+      "enabled": true,
+      // Fraction of total runs allocated to corner strata (dimensionless).
+      "fraction": 0.30,
+      // Quantile width within the LHC unit cube used to define each corner
+      // (e.g. 0.15 = top/bottom 15% of the rank distribution).
+      "abundance_quantile_width": 0.15,
+      // Corner profiles must additionally satisfy "hot" or "wide-T" PT
+      // characteristics (in K).
+      "hot_tmax_k": 2500.0,
+      "large_trange_k": 800.0,
+      "max_profile_resample_attempts": 50
     }
   },
   "temperature_profiles": {
@@ -39,26 +93,28 @@
     "analytic_probability": 0.7,
     "data_glob": "assets/PTprofiles/*.dat",
     "filters": {
-      "Teq": [600.0, 2800.0],
-      "LogMet": [-0.5, 1.5]
+      "Teq": [600.0, 2800.0],   // K
+      "LogMet": [-0.5, 1.5]     // dex (log10 metallicity)
     },
     "validation": {
-      "min_temperature_k": 1.0,
+      "min_temperature_k": 100.0,
       "max_temperature_k": 3000.0
     },
     "analytic_sampler": {
-      "t_int_k_range": [1.0, 1000.0],
-      "t_eq_k_range": [1.0, 3000.0],
-      "log10_delta_range": [-6, 2],
-      "log10_gamma_range": [-4.0, 4.0],
-      "alpha_range": [0.0, 0.999],
-      "log10_p_trans_bar_range": [-9.0, 3.0],
-      "convection_probability": 0.1,
-      "adiabatic_gradient_range": [0.25, 0.35],
-      "power_law_probability": 0.25,
-      "power_law_t0_range_k": [600.0, 2400.0],
-      "power_law_alpha_range": [0.0, 0.25],
-      "power_law_p_ref_bar": 1.0
+      // Modified-Guillot parameters (Piette & Madhusudhan 2019).
+      "t_int_k_range":          [1.0, 1000.0],   // K  (internal heat)
+      "t_eq_k_range":           [1.0, 3000.0],   // K  (equilibrium temp)
+      "log10_delta_range":      [-6, 2],         // log10 dimensionless
+      "log10_gamma_range":      [-4.0, 4.0],     // log10 dimensionless
+      "alpha_range":            [0.0, 0.999],    // dimensionless
+      "log10_p_trans_bar_range":[-9.0, 3.0],     // log10(bar)
+      "convection_probability": 0.1,             // dimensionless [0, 1]
+      "adiabatic_gradient_range":[0.25, 0.35],   // dimensionless dT/dT_eff
+      // Pure-power-law branch (mirrors ExoJAX's art.powerlaw_temperature).
+      "power_law_probability":  0.25,            // dimensionless [0, 1]
+      "power_law_t0_range_k":   [600.0, 2400.0], // K
+      "power_law_alpha_range":  [0.0, 0.25],     // dimensionless slope
+      "power_law_p_ref_bar":    1.0              // bar
     }
   },
   "generation": {
@@ -66,8 +122,9 @@
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,
-    "parallel_workers": 64,
+    "parallel_workers": 24,
     "sample_chunk_size": 1000,
+    "fastchem_timeout_seconds": 30.0,
     "backfill": {
       "enabled": true,
       "max_retries": 20
@@ -80,6 +137,7 @@
       "test_fraction": 0.1,
       "seed": 123
     },
+    // Smallest VMR retained before log; values below this are clipped.
     "state_floor": 1e-30,
     "target_method": "log-standard",
     "sequence_methods": {
@@ -88,10 +146,10 @@
     },
     "global_methods": {
       "He_H": "log-standard",
-      "C_H": "log-standard",
-      "O_H": "log-standard",
-      "N_H": "log-standard",
-      "S_H": "log-standard"
+      "C_H":  "log-standard",
+      "O_H":  "log-standard",
+      "N_H":  "log-standard",
+      "S_H":  "log-standard"
     }
   },
   "training": {
@@ -112,7 +170,9 @@
     "gradient_clip": 1.0,
     "loss": {
       "type": "mae",
+      // lambda_z weights MSE in normalized target space (dimensionless).
       "lambda_z": 1.0,
+      // lambda_log10_mae weights MAE in log10(VMR) space (dex^-1 weight).
       "lambda_log10_mae": 0.25
     },
     "ema": {

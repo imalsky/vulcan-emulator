@@ -376,6 +376,38 @@ def roth_library_pressure_bounds(
     return min(mins), max(maxs)
 
 
+def _load_pt_bundle(path: Path) -> list[RothProfile]:
+    """Load a prebaked single-file PT-library bundle.
+
+    The bundle layout is the one produced by ``scripts/prebake_pt_profiles.py``:
+    concatenated ``pressure_bar`` and ``temperature_k`` arrays, an integer
+    ``offsets`` index of length ``N_profiles + 1``, and an object array of
+    JSON-encoded per-profile metadata. Reading the bundle is a single
+    ``np.load`` plus N slices, in contrast to per-file globs.
+    """
+    with np.load(path, allow_pickle=True) as archive:
+        pressure_concat = np.asarray(archive["pressure_bar"], dtype=np.float64)
+        temperature_concat = np.asarray(archive["temperature_k"], dtype=np.float64)
+        offsets = np.asarray(archive["offsets"], dtype=np.int64)
+        metadata_array = np.asarray(archive["metadata"])
+    profiles: list[RothProfile] = []
+    for i in range(metadata_array.size):
+        start = int(offsets[i])
+        stop = int(offsets[i + 1])
+        metadata_payload = metadata_array[i]
+        if isinstance(metadata_payload, bytes):
+            metadata_payload = metadata_payload.decode("utf-8")
+        metadata = json.loads(str(metadata_payload))
+        profiles.append(
+            RothProfile(
+                pressure_bar=pressure_concat[start:stop].copy(),
+                temperature_k=temperature_concat[start:stop].copy(),
+                metadata=metadata,
+            )
+        )
+    return profiles
+
+
 def load_roth_profiles_native(
     data_glob: str,
     *,
@@ -383,11 +415,19 @@ def load_roth_profiles_native(
 ) -> list[RothProfile]:
     """Load and filter PT-library profiles at their native pressure grid.
 
+    Accepts either a glob (``*.dat`` / ``*.npz`` / ``*.json`` / ``*.csv``)
+    or a single prebaked bundle path (``*.bundle.npz``). The bundle path
+    short-circuits the per-file dispatch to a single ``np.load``.
+
     No interpolation is done here — interpolation onto a per-run pressure
     grid is the caller's responsibility. This split exists so the library
     can be loaded from disk once and reused across many runs with
     different pressure grids (see ``_load_configured_roth_profiles``).
     """
+    candidate = Path(data_glob)
+    if candidate.is_file() and candidate.name.endswith(".bundle.npz"):
+        bundle_profiles = _load_pt_bundle(candidate)
+        return [profile for profile in bundle_profiles if _matches_filters(profile.metadata, filters)]
     result: list[RothProfile] = []
     for path_str in sorted(glob.glob(data_glob)):
         path = Path(path_str)

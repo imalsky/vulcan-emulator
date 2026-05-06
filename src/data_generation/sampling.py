@@ -114,6 +114,13 @@ def _detect_available_cpus() -> int:
 # further parallelism, so we cap independent of `parallel_workers` (which
 # is sized for the GIL-releasing fastchem subprocess phase).
 _SAMPLING_WORKER_CAP = 32
+_CORNER_COVERAGE_LABELS = (
+    "carbon_rich_hot",
+    "oxygen_rich_hot",
+    "high_metallicity_hot",
+    "near_unity_c_o_hot",
+)
+_NEAR_UNITY_C_TO_O_RANGE = (0.5, 2.0)
 
 
 def _sampling_worker_count(config: dict[str, Any], total_specs: int) -> int:
@@ -707,15 +714,23 @@ def _resolve_roth_data_glob(config: dict[str, Any], roth_cfg: dict[str, Any]) ->
     -------
     str
         Absolute or unchanged glob string ready for filesystem expansion.
+
+    Notes
+    -----
+    Prefers a prebaked sibling ``<dir>.bundle.npz`` file when present, since
+    parsing the original ``.dat`` library is the dominant startup cost on a
+    fresh process. The original glob is the fallback when no bundle exists.
+    Bake one with ``python scripts/prebake_pt_profiles.py``.
     """
     data_glob = str(roth_cfg["data_glob"])
     project_root = config.get("_project_root")
-    if project_root is None:
-        return data_glob
     glob_path = Path(data_glob)
-    if glob_path.is_absolute():
-        return data_glob
-    return str((project_root / glob_path).resolve())
+    if not glob_path.is_absolute() and project_root is not None:
+        glob_path = (project_root / glob_path).resolve()
+    bundle_path = glob_path.parent.with_suffix(".bundle.npz")
+    if bundle_path.is_file():
+        return str(bundle_path)
+    return str(glob_path)
 
 
 def _load_configured_roth_profiles(
@@ -1108,6 +1123,30 @@ def _scale_unit_interval(
     return float(lower + value * (upper - lower))
 
 
+def _unit_interval_from_scaled_value(
+    value: float,
+    lower: float,
+    upper: float,
+    scale: str = "linear",
+) -> float:
+    """Map a physical value back to the unit interval for one sampled range."""
+    clipped = float(np.clip(value, lower, upper))
+    if scale == "log":
+        if lower <= 0.0 or upper <= 0.0:
+            raise ValueError(
+                f"log-scale sampling requires positive bounds; got [{lower}, {upper}]"
+            )
+        log_lower = math.log10(lower)
+        log_upper = math.log10(upper)
+        return float((math.log10(clipped) - log_lower) / (log_upper - log_lower))
+    return float((clipped - lower) / (upper - lower))
+
+
+def _unit_band(value: float, lower: float, upper: float) -> float:
+    """Remap a unit sample into a closed unit-interval sub-band."""
+    return float(lower + value * (upper - lower))
+
+
 def _sampling_scale(config: dict[str, Any], key: str, default: str = "linear") -> str:
     """Return the sampling scale (``"linear"`` or ``"log"``) for a given key.
 
@@ -1279,6 +1318,8 @@ class SamplingPlan:
     total_runs: int
     design: np.ndarray
     child_seeds: list[np.random.SeedSequence]
+    corner_coverage_cfg: dict[str, Any] | None
+    corner_coverage_labels: list[str | None]
     sampling_cfg: dict[str, Any]
     roth_cfg: dict[str, Any]
     # Pre-resolved fraction ranges/scales, shared across all runs.
@@ -1308,6 +1349,117 @@ class SamplingPlan:
     spectra: dict[str, SpectrumRecord] | None
     spectrum_names: list[str] | None
     science_presets: list[dict[str, Any]] | None
+
+
+def _build_corner_coverage_labels(
+    *,
+    total_runs: int,
+    corner_cfg: dict[str, Any] | None,
+    rng: np.random.Generator,
+) -> list[str | None]:
+    """Assign deterministic corner-coverage labels to selected run indices."""
+    labels: list[str | None] = [None] * int(total_runs)
+    if not corner_cfg or not bool(corner_cfg.get("enabled", False)):
+        return labels
+    target_count = int(round(float(corner_cfg["fraction"]) * int(total_runs)))
+    target_count = max(0, min(int(total_runs), target_count))
+    if target_count == 0:
+        return labels
+
+    order = rng.permutation(int(total_runs))
+    base_count, remainder = divmod(target_count, len(_CORNER_COVERAGE_LABELS))
+    counts = [
+        base_count + (1 if i < remainder else 0)
+        for i in range(len(_CORNER_COVERAGE_LABELS))
+    ]
+    offset = 0
+    for label, count in zip(_CORNER_COVERAGE_LABELS, counts):
+        for run_idx in order[offset: offset + count]:
+            labels[int(run_idx)] = label
+        offset += count
+    return labels
+
+
+def _apply_corner_abundance_units(
+    plan: SamplingPlan,
+    *,
+    label: str | None,
+    c_unit: float,
+    o_unit: float,
+) -> tuple[float, float]:
+    """Remap C/O coordinates into the configured corner-coverage stratum."""
+    if label is None or plan.corner_coverage_cfg is None:
+        return c_unit, o_unit
+
+    q = float(plan.corner_coverage_cfg["abundance_quantile_width"])
+    if label == "carbon_rich_hot":
+        return _unit_band(c_unit, 1.0 - q, 1.0), _unit_band(o_unit, 0.0, q)
+    if label == "oxygen_rich_hot":
+        return _unit_band(c_unit, 0.0, q), _unit_band(o_unit, 1.0 - q, 1.0)
+    if label == "high_metallicity_hot":
+        return _unit_band(c_unit, 1.0 - q, 1.0), _unit_band(o_unit, 1.0 - q, 1.0)
+    if label != "near_unity_c_o_hot":
+        raise ValueError(f"Unknown corner coverage label {label!r}.")
+
+    o_unit = _unit_band(o_unit, q, 1.0 - q)
+    o_frac = _scale_unit_interval(o_unit, *plan.o_frac_range, plan.o_frac_scale)
+    c_min, c_max = plan.c_frac_range
+    ratio_lo = max(_NEAR_UNITY_C_TO_O_RANGE[0], c_min / o_frac)
+    ratio_hi = min(_NEAR_UNITY_C_TO_O_RANGE[1], c_max / o_frac)
+    if ratio_lo > ratio_hi:
+        ratio_lo = c_min / o_frac
+        ratio_hi = c_max / o_frac
+    ratio = _scale_unit_interval(c_unit, ratio_lo, ratio_hi, "log")
+    c_frac = o_frac * ratio
+    c_unit = _unit_interval_from_scaled_value(
+        c_frac, *plan.c_frac_range, plan.c_frac_scale,
+    )
+    return c_unit, o_unit
+
+
+def _corner_temperature_satisfied(
+    profile_k: np.ndarray,
+    corner_cfg: dict[str, Any],
+) -> bool:
+    """Return whether one PT profile reaches the configured corner threshold."""
+    profile = np.asarray(profile_k, dtype=np.float64)
+    return (
+        float(np.max(profile)) >= float(corner_cfg["hot_tmax_k"])
+        or float(np.ptp(profile)) >= float(corner_cfg["large_trange_k"])
+    )
+
+
+def _sample_corner_temperature_profile_record(
+    pressure_bar: np.ndarray,
+    *,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+    source: str,
+    corner_cfg: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Sample a valid PT profile, preferring hot or large-range corner profiles."""
+    max_attempts = int(corner_cfg["max_profile_resample_attempts"])
+    last_profile: np.ndarray | None = None
+    last_metadata: dict[str, Any] | None = None
+    for attempt in range(1, max_attempts + 1):
+        profile, metadata = _sample_temperature_profile_record(
+            pressure_bar, config=config, rng=rng, source=source,
+        )
+        if _corner_temperature_satisfied(profile, corner_cfg):
+            return profile, {
+                **metadata,
+                "corner_coverage_profile_attempts": attempt,
+                "corner_coverage_profile_satisfied": True,
+            }
+        last_profile = profile
+        last_metadata = metadata
+
+    assert last_profile is not None and last_metadata is not None
+    return last_profile, {
+        **last_metadata,
+        "corner_coverage_profile_attempts": max_attempts,
+        "corner_coverage_profile_satisfied": False,
+    }
 
 
 def build_sampling_plan(
@@ -1402,6 +1554,15 @@ def build_sampling_plan(
         int(config["generation"]["seed"] if seed is None else seed)
     ).spawn(total_runs)
 
+    corner_coverage_cfg = sampling_cfg.get("corner_coverage")
+    corner_coverage_labels = (
+        _build_corner_coverage_labels(
+            total_runs=total_runs, corner_cfg=corner_coverage_cfg, rng=rng,
+        )
+        if fastchem
+        else [None] * total_runs
+    )
+
     roth_cfg = config["roth_sampler"]
 
     return SamplingPlan(
@@ -1410,6 +1571,8 @@ def build_sampling_plan(
         total_runs=total_runs,
         design=design,
         child_seeds=list(child_seeds),
+        corner_coverage_cfg=corner_coverage_cfg if fastchem else None,
+        corner_coverage_labels=corner_coverage_labels,
         sampling_cfg=sampling_cfg,
         roth_cfg=roth_cfg,
         he_frac_range=he_frac_range,
@@ -1451,6 +1614,7 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
     sampling_cfg = plan.sampling_cfg
     roth_cfg = plan.roth_cfg
     fastchem = plan.fastchem
+    corner_label = plan.corner_coverage_labels[run_idx]
 
     per_rng = np.random.default_rng(plan.child_seeds[run_idx])
     # Decide profile source first so we can clip the pressure grid to the
@@ -1468,14 +1632,20 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
         sampling_cfg, rng=per_rng, native_p_bounds=native_p_bounds,
     )
     if fastchem:
+        c_unit, o_unit = _apply_corner_abundance_units(
+            plan,
+            label=corner_label,
+            c_unit=float(design[run_idx, 1]),
+            o_unit=float(design[run_idx, 2]),
+        )
         he_frac = _scale_unit_interval(
             design[run_idx, 0], *plan.he_frac_range, plan.he_frac_scale,
         )
         c_frac = _scale_unit_interval(
-            design[run_idx, 1], *plan.c_frac_range, plan.c_frac_scale,
+            c_unit, *plan.c_frac_range, plan.c_frac_scale,
         )
         o_frac = _scale_unit_interval(
-            design[run_idx, 2], *plan.o_frac_range, plan.o_frac_scale,
+            o_unit, *plan.o_frac_range, plan.o_frac_scale,
         )
         n_frac = _scale_unit_interval(
             design[run_idx, 3], *plan.n_frac_range, plan.n_frac_scale,
@@ -1524,12 +1694,25 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
             design[run_idx, 10], *plan.s_frac_range, plan.s_frac_scale,
         )
 
-    temperature_k, temperature_metadata = _sample_temperature_profile_record(
-        pressure_bar,
-        config=config,
-        rng=per_rng,
-        source=profile_source,
-    )
+    if fastchem and corner_label is not None and plan.corner_coverage_cfg is not None:
+        temperature_k, temperature_metadata = _sample_corner_temperature_profile_record(
+            pressure_bar,
+            config=config,
+            rng=per_rng,
+            source=profile_source,
+            corner_cfg=plan.corner_coverage_cfg,
+        )
+        temperature_metadata = {
+            **temperature_metadata,
+            "corner_coverage_label": corner_label,
+        }
+    else:
+        temperature_k, temperature_metadata = _sample_temperature_profile_record(
+            pressure_bar,
+            config=config,
+            rng=per_rng,
+            source=profile_source,
+        )
     if fastchem:
         base_globals: dict[str, float] = {
             "He_H": float(he_frac),

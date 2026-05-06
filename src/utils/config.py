@@ -17,6 +17,7 @@ offending field.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +180,30 @@ def validate_transformer_model_config(
         raise ConfigValidationError(_format_pydantic_error(exc, scope)) from exc
 
 
+# Matches a JSON string literal OR a /* ... */ block comment OR a //... line
+# comment. The string-literal alternative is listed first so re.sub keeps
+# strings intact and only strips comments outside them.
+_JSONC_COMMENT_PATTERN = re.compile(
+    r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
+    re.DOTALL,
+)
+
+
+def _strip_jsonc_comments(text: str) -> str:
+    """Strip ``//`` line and ``/* */`` block comments from JSONC text.
+
+    Preserves comment-like substrings inside JSON strings (e.g. a path that
+    contains ``//``). Trailing commas are NOT stripped — keep configs valid
+    JSON aside from comments.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return token if token.startswith('"') else ""
+
+    return _JSONC_COMMENT_PATTERN.sub(_replace, text)
+
+
 def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     """Load a JSON config file, validate against the schema, and derive aliases.
 
@@ -195,7 +220,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     """
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
-        raw = json.load(handle)
+        raw = json.loads(_strip_jsonc_comments(handle.read()))
 
     try:
         validated = ConfigAdapter.validate_python(raw)

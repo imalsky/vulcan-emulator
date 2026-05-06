@@ -21,6 +21,18 @@ def _write_config(tmp_path: Path, name: str, payload: dict) -> Path:
     return config_path
 
 
+def _add_corner_coverage(payload: dict, **overrides) -> None:
+    payload["sampling"]["corner_coverage"] = {
+        "enabled": True,
+        "fraction": 0.2,
+        "abundance_quantile_width": 0.2,
+        "hot_tmax_k": 2500.0,
+        "large_trange_k": 800.0,
+        "max_profile_resample_attempts": 50,
+        **overrides,
+    }
+
+
 def test_shipped_fastchem_config_loads_and_validates():
     """The single shipped config must always validate cleanly.
 
@@ -34,6 +46,13 @@ def test_shipped_fastchem_config_loads_and_validates():
     assert sampler["power_law_probability"] > 0.0
     assert sampler["power_law_t0_range_k"] is not None
     assert sampler["power_law_alpha_range"] is not None
+    assert config["temperature_profiles"]["validation"]["min_temperature_k"] == 100.0
+    assert config["generation"]["parallel_workers"] == 24
+    assert config["generation"]["fastchem_timeout_seconds"] == 30.0
+    corner = config["sampling"]["corner_coverage"]
+    assert corner["enabled"] is True
+    assert corner["fraction"] == 0.3
+    assert corner["abundance_quantile_width"] == 0.15
     run_root = Path(config["paths"]["raw_root"]).parent
     assert run_root.name == "fastchem"
 
@@ -95,6 +114,39 @@ def test_fastchem_rejects_vulcan_only_sampling_keys(tmp_path):
     payload["sampling"]["planet_radius_range_cm"] = [7.0e9, 1.0e10]
     with pytest.raises(ConfigValidationError, match="chemistry_type='fastchem'"):
         load_and_validate_config(_write_config(tmp_path, "fastchem_planet_radius.json", payload))
+
+
+def test_fastchem_rejects_sub_100_k_temperature_floor(tmp_path):
+    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
+    payload["temperature_profiles"]["validation"]["min_temperature_k"] = 99.0
+    with pytest.raises(ConfigValidationError, match="min_temperature_k.*100.0"):
+        load_and_validate_config(_write_config(tmp_path, "fastchem_cold_validation.json", payload))
+
+
+def test_fastchem_rejects_sub_100_k_sampling_range(tmp_path):
+    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
+    payload["sampling"]["temperature_range_k"] = [99.0, 3000.0]
+    with pytest.raises(ConfigValidationError, match="temperature_range_k.*100.0"):
+        load_and_validate_config(_write_config(tmp_path, "fastchem_cold_sampling.json", payload))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"fraction": -0.1},
+        {"fraction": 1.1},
+        {"abundance_quantile_width": 0.0},
+        {"abundance_quantile_width": 0.6},
+        {"hot_tmax_k": 50.0},
+        {"hot_tmax_k": 4000.0},
+        {"large_trange_k": 3000.0},
+    ],
+)
+def test_corner_coverage_rejects_invalid_values(tmp_path, overrides):
+    payload = _load_raw_json(FIXTURE_ROOT / "fastchem_transformer_config.json")
+    _add_corner_coverage(payload, **overrides)
+    with pytest.raises(ConfigValidationError, match="corner_coverage"):
+        load_and_validate_config(_write_config(tmp_path, "invalid_corner_coverage.json", payload))
 
 
 def test_invalid_mixed_temperature_profile_probability_is_rejected(tmp_path):
