@@ -188,6 +188,7 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 | `parallel_workers` | Number of parallel generation workers (`0` = auto-detect from PBS/SLURM/OS) |
 | `sample_chunk_size` | Runs per streaming sample+execute chunk (default `1000`). Each chunk's per-run HDF5 files are merged into one `chunks/chunk_XXXXXX_YYYYYY.h5` immediately on completion and the originals deleted, so this also caps the peak per-run file count on disk. Lower values keep that peak smaller at the cost of more chunk files at the final merge step. |
 | `fastchem_timeout_seconds` | FastChem subprocess timeout in seconds (default `30.0`) |
+| `vulcan_timeout_seconds` | VULCAN subprocess timeout in seconds (default `1800.0`). Stalled condensation runs raise `subprocess.TimeoutExpired`, which the worker pool routes through the standard `backfill` path. |
 | `backfill` | `{enabled, max_retries}` for VULCAN failure recovery |
 
 `generation.mode` is a deprecated compatibility field. When present it must
@@ -289,7 +290,25 @@ use_initial_cold_trap, use_sat_surface_h2o
 | `t_cross_sp` | Cross-section species list |
 | `rocky` | Fixed runtime flag passed through to `vulcan_cfg.py` |
 
-Optional internal keys (not learned inputs): `python_executable`, `cfg_file`, `worker_root`, `regenerate_chem_funs`, `cfg_assignments`, `use_lowT_limit_rates`, `use_adaptive_rtol`.
+Optional internal keys (not learned inputs): `python_executable`, `cfg_file`, `worker_root`, `regenerate_chem_funs`, `cfg_assignments`, `use_lowT_limit_rates`, `use_adaptive_rtol`, `condensation`.
+
+#### `vulcan.runtime.condensation`
+
+Required when any science preset has `use_condensation = True`; forbidden
+otherwise (the validator rejects `use_condensation = False` configs that
+carry the block, and vice versa).
+
+| Key | Description |
+|-----|-------------|
+| `condense_sp` | Gas-phase species that condense. Must be a subset of `{H2O, NH3, H2SO4, S2, S4, S8, C, H2S}` (the species for which VULCAN ships saturation-pressure data). |
+| `non_gas_sp` | Paired condensate labels (e.g. `H2O_l_s`, `S8_l_s`). Same length as `condense_sp`. Every entry must also appear in `data_spec.state_species` and `data_spec.output_species`. |
+| `fix_species` | Optional. Species frozen after condensation–evaporation EQ. Typically `condense_sp ∪ non_gas_sp`. |
+| `use_relax` | Optional. Subset of `condense_sp` using the H2O/NH3 relaxation path. |
+| `humidity` | Optional. Default `1.0`. |
+| `start_conden_time`, `stop_conden_time`, `fix_species_time` | Optional. Defaults `1e6`, `1e8`, `1e8` seconds. |
+| `fix_species_from_coldtrap_lev` | Optional. Default `true`. |
+| `post_conden_rtol` | Optional. Default `0.1`. |
+| `r_p`, `rho_p` | Per-condensate particle radius (cm) and density (g/cm³) maps. Required to cover every entry in `non_gas_sp` when any preset has `use_settling = True`. |
 
 #### `vulcan.science_presets`
 

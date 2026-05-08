@@ -9,8 +9,13 @@ Supported chemistry targets:
 Supported model families:
 - `transformer`
 
-Shipped config:
+Shipped configs:
 - `config/fastchem.json` — gas-phase FastChem equilibrium
+- `config/vulcan_condensation.json` — VULCAN kinetics with H2O/S8 condensation
+  (paired with a no-condensation sibling: copy this config, flip the relevant
+  toggles off, drop `H2O_l_s`/`S8_l_s` from `data_spec.{state,output}_species`,
+  drop the `vulcan.runtime.condensation` block, and change the run/checkpoint
+  paths)
 
 CLI:
 
@@ -33,10 +38,15 @@ Chemistry contract:
 
 - these are hydrogen-normalized absolute abundances `n_X / n_H`
 
-Shipped defaults:
-- the VULCAN example config uses one `basic_h2` preset
-- photochemistry is off
-- condensation is on for `H2O` and `S8`
+VULCAN-side shipped defaults (in `config/vulcan_condensation.json`):
+- single default science preset (no `science_presets` block needed)
+- photochemistry is off (and required to be off — not yet supported)
+- condensation is on for `H2O` and `S8` via the typed
+  `vulcan.runtime.condensation` block (no longer hand-rolled through
+  `cfg_assignments`)
+- settling is on; particle radii / densities for `H2O_l_s` and `S8_l_s`
+  live under `vulcan.runtime.condensation.{r_p, rho_p}`
+- initial cold trap is on
 - eddy diffusion is on
 - `vulcan.runtime.chemistry_file` is `thermo/SNCHO_photo_network_2025.txt`
 - `vulcan.runtime.regenerate_chem_funs` is enabled so worker-local runs rebuild `chem_funs.py` with photochemistry disabled
@@ -46,6 +56,7 @@ Shipped defaults:
 - VULCAN surface gravity is sampled from `sampling.gravity_range_cm_s2`
 - VULCAN planet radius is sampled from `sampling.planet_radius_range_cm`
 - `vulcan.runtime.rocky` defaults to `false`
+- `generation.vulcan_timeout_seconds` (default `1800`) caps stalled VULCAN runs; timeouts route through the same backfill path as other failures
 
 Data layout:
 - each config uses a single dataset root under `data/<run_name>/`

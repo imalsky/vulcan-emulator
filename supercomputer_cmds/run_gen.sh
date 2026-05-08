@@ -1,7 +1,24 @@
 #!/bin/bash
+# Run pipeline stages: generation + (optional) normalization.
+#
+# Default invocation (FastChem):
+#   sbatch supercomputer_cmds/run_gen.sh
+#
+# Condensation emulator (VULCAN, much slower per run — bump wall time and
+# rename job/logs so concurrent FastChem and VULCAN submissions don't collide):
+#   sbatch -t 120:00:00 \
+#          --job-name=vulcan_gen_cond \
+#          --export=ALL,CONFIG_PATH=config/vulcan_condensation.json \
+#          supercomputer_cmds/run_gen.sh
+#
+# No-condensation VULCAN sibling (when you have one):
+#   sbatch -t 96:00:00 \
+#          --job-name=vulcan_gen_nocond \
+#          --export=ALL,CONFIG_PATH=config/vulcan_nocondensation.json \
+#          supercomputer_cmds/run_gen.sh
 #SBATCH -J vulcan_gen
-#SBATCH -o vulcan_gen.o%j
-#SBATCH -e vulcan_gen.e%j
+#SBATCH -o %x.o%j
+#SBATCH -e %x.e%j
 #SBATCH -p compute
 #SBATCH --mem=128G
 #SBATCH -t 48:00:00
@@ -65,7 +82,11 @@ export SRUN_CPUS_PER_TASK
 
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel
-  python -m pip install -U jax numpy scipy h5py optuna optax orbax-checkpoint pydantic
+  # sympy + matplotlib are VULCAN-runtime imports (vulcan.py imports both at
+  # module load; sympy is also used by make_chem_funs.py when
+  # vulcan.runtime.regenerate_chem_funs=true). FastChem doesn't need them but
+  # installing always keeps the env consistent across configs.
+  python -m pip install -U jax numpy scipy sympy matplotlib h5py optuna optax orbax-checkpoint pydantic
   python -m pip install -e . --no-deps
 fi
 
@@ -77,6 +98,18 @@ print(f"[preflight] chemistry_type={cfg['chemistry_type']} model_type={cfg['mode
 print(f"[preflight] num_runs={cfg['generation']['num_runs']}")
 print(f"[preflight] raw_root={cfg['paths']['raw_root']}")
 print(f"[preflight] processed_root={cfg['paths']['processed_root']}")
+print(f"[preflight] checkpoints_root={cfg['paths']['checkpoints_root']}")
+if cfg["chemistry_type"] == "vulcan":
+    timeout_s = cfg["generation"].get("vulcan_timeout_seconds", 1800.0)
+    print(f"[preflight] vulcan_timeout_seconds={timeout_s}")
+    presets = cfg["vulcan"].get("science_presets") or []
+    cond_on = any(p["physics_toggles"].get("use_condensation", False) for p in presets)
+    print(f"[preflight] use_condensation={cond_on}")
+    block = cfg["vulcan_runtime"].get("condensation")
+    if block is not None:
+        print(f"[preflight] condense_sp={block['condense_sp']}")
+        print(f"[preflight] non_gas_sp={block['non_gas_sp']}")
+    print(f"[preflight] target_dim={cfg['data_spec']['target_dim']}")
 PY
 
 python - <<'PY'

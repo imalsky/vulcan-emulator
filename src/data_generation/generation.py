@@ -1325,6 +1325,26 @@ def _patch_vulcan_cfg(
         assignments["top_BC_flux_file"] = str(runtime_top_bc_flux_file)
     if runtime_bot_bc_flux_file is not None:
         assignments["bot_BC_flux_file"] = str(runtime_bot_bc_flux_file)
+    condensation = runtime.get("condensation")
+    if condensation is not None and physics["use_condensation"]:
+        assignments.update(
+            {
+                "condense_sp": list(condensation["condense_sp"]),
+                "non_gas_sp": list(condensation["non_gas_sp"]),
+                "fix_species": list(condensation["fix_species"]),
+                "use_relax": list(condensation["use_relax"]),
+                "humidity": float(condensation["humidity"]),
+                "start_conden_time": float(condensation["start_conden_time"]),
+                "stop_conden_time": float(condensation["stop_conden_time"]),
+                "fix_species_time": float(condensation["fix_species_time"]),
+                "fix_species_from_coldtrap_lev": bool(
+                    condensation["fix_species_from_coldtrap_lev"]
+                ),
+                "post_conden_rtol": float(condensation["post_conden_rtol"]),
+                "r_p": dict(condensation["r_p"]),
+                "rho_p": dict(condensation["rho_p"]),
+            }
+        )
     cfg_file.write_text(patch_python_assignments(text, assignments), encoding="utf-8")
 
 
@@ -1647,7 +1667,8 @@ def _run_single_vulcan_spec(
         vulcan_cmd = [python_executable, "vulcan.py", "-n"]
     else:
         vulcan_cmd = [python_executable, "vulcan.py"]
-    subprocess.run(vulcan_cmd, cwd=worker_root, check=True)
+    timeout_seconds = float(config["generation"].get("vulcan_timeout_seconds", 1800.0))
+    subprocess.run(vulcan_cmd, cwd=worker_root, check=True, timeout=timeout_seconds)
 
     output_candidates = sorted((worker_root / "output").glob("*.vul"))
     if not output_candidates:

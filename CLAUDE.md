@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Environment
 
-Everything Python in this repo — training, export, the `exojax_demo/` notebooks — runs in the **`vulcan`** conda env. Activate before doing anything:
+Everything Python in this repo — training, export, and the example notebooks shipped in the standalone `For_Hajime/emulator_tests/` deliverable — runs in the **`vulcan`** conda env. Activate before doing anything:
 
 ```bash
 source /opt/homebrew/Caskroom/miniforge/base/etc/profile.d/conda.sh
@@ -112,13 +112,13 @@ All shared constants — physical constants, solar abundances (Asplund 2009 + Lo
 
 Modifications that share an HDF5 writer across workers will silently corrupt the dataset — preserve these invariants when touching this module.
 
-## Classical-reference contract (`exojax_demo/` notebooks)
+## Classical-reference contract (notebooks in `For_Hajime/emulator_tests/`)
 
-Notebooks under `exojax_demo/` compare the emulator against live FastChem (subprocess) and ExoGibbs (Gibbs minimizer). The training-matched bridge between FastChem's input file and ExoGibbs' 28-element vector is `src/models/classical_reference.py::build_exogibbs_element_vector(..., mode="fastchem_proxy")` — it is the **single source of truth** for that conversion (Lodders refractory background, volatile-weighted [α/H] proxy on the 11 metals, free `He/C/O/N/S` overrides, untracked elements zeroed, mole-fraction normalization). The matching ExoGibbs `ChemicalSetup` must come from `chemsetup_matched_to_fastchem(fastchem_source_root)`, which pins the classical reference to VULCAN-FastChem's shipped `logK_wo_ions.dat`.
+The shipped example notebooks live in the standalone `For_Hajime/emulator_tests/` deliverable (parallel to this repo). They compare the emulator against live FastChem (subprocess) and ExoGibbs (Gibbs minimizer). The training-matched bridge between FastChem's input file and ExoGibbs' 28-element vector is `src/models/classical_reference.py::build_exogibbs_element_vector(..., mode="fastchem_proxy")` — it is the **single source of truth** for that conversion (Lodders refractory background, volatile-weighted [α/H] proxy on the 11 metals, free `He/C/O/N/S` overrides, untracked elements zeroed, mole-fraction normalization). The matching ExoGibbs `ChemicalSetup` must come from `chemsetup_matched_to_fastchem(fastchem_source_root)`, which pins the classical reference to VULCAN-FastChem's shipped `logK_wo_ions.dat`.
 
 Solar anchors must come from `SOLAR_ABUNDANCES` in `src/constants.py` — not from `exojax.utils.zsol.nsol()` AAG21 ratios — or the emulator gets fed a reference point its training distribution wasn't centered on. A residual ~0.1–0.3 dex FC↔EG floor on sulfur polymers (S5/S6/S7) and several O-bearing species is expected and accepted; it is not an emulator defect (NASA-9 vs 5-term-logK polynomial mismatch + species-network differences).
 
-**H₂O is the dominant FC↔EG gap species in retrievals, not sulfur.** Near the CO/H₂O chemical transition (C/O ≈ 0.8), H₂O diverges by ~1.3 dex between FastChem (NASA-9) and ExoGibbs (5-term logK) because H₂O abundance equals total oxygen minus CO-locked oxygen — a small difference in CO thermodynamics amplifies into a large residual H₂O difference. At solar C/O the gap is ~0.19 dex; at C/O = 0.8 it reaches ~1.3 dex. CO itself is negligible (~0.01 dex). This means notebook 06's classical vs emulator corner plots will diverge significantly — the classical retrieval is fitting a fundamentally different forward model. **Notebook 07 (emulator vs FastChem, same mock) is the correct apples-to-apples recovery test.**
+**H₂O is the dominant FC↔EG gap species in retrievals, not sulfur.** Near the CO/H₂O chemical transition (C/O ≈ 0.8), H₂O diverges by ~1.3 dex between FastChem (NASA-9) and ExoGibbs (5-term logK) because H₂O abundance equals total oxygen minus CO-locked oxygen — a small difference in CO thermodynamics amplifies into a large residual H₂O difference. At solar C/O the gap is ~0.19 dex; at C/O = 0.8 it reaches ~1.3 dex. CO itself is negligible (~0.01 dex). The classical-vs-emulator corner plot in `For_Hajime/emulator_tests/07_classical_vs_emulator_retrieval.ipynb` therefore diverges by design — the classical retrieval is fitting a fundamentally different forward model. The apples-to-apples recovery test (emulator retrieval against a live-FastChem mock) is the dedicated emulator-only NUTS path in `For_Hajime/emulator_tests/04_full_nuts_retrieval.ipynb`.
 
 ## HPC entry points
 

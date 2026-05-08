@@ -144,6 +144,14 @@ PUBLIC_PHYSICS_TOGGLES = (
     "use_sat_surface_h2o",
 )
 
+# Gas-phase species for which VULCAN ships saturation-pressure data in
+# build_atm.sp_sat. Anything outside this set cannot be a member of
+# vulcan.runtime.condensation.condense_sp; the VULCAN runtime would raise
+# IOError on startup.
+VULCAN_SUPPORTED_CONDENSATE_SPECIES = frozenset(
+    {"H2O", "NH3", "H2SO4", "S2", "S4", "S8", "C", "H2S"}
+)
+
 # Valid top-level chemistry_type values.
 CHEMISTRY_TYPES = ("fastchem", "vulcan")
 

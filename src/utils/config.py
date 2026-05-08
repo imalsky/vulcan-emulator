@@ -204,6 +204,24 @@ def _strip_jsonc_comments(text: str) -> str:
     return _JSONC_COMMENT_PATTERN.sub(_replace, text)
 
 
+def _strip_comment_keys(node: Any) -> Any:
+    """Recursively drop any mapping key whose name starts with ``_comment``.
+
+    The pipeline configs are strict JSON (no // or /* */), so structured
+    notes are encoded as ``_comment``-prefixed keys. The schema is
+    ``extra="forbid"``, so these must be removed before validation.
+    """
+    if isinstance(node, dict):
+        return {
+            k: _strip_comment_keys(v)
+            for k, v in node.items()
+            if not (isinstance(k, str) and k.startswith("_comment"))
+        }
+    if isinstance(node, list):
+        return [_strip_comment_keys(v) for v in node]
+    return node
+
+
 def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     """Load a JSON config file, validate against the schema, and derive aliases.
 
@@ -220,7 +238,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     """
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
-        raw = json.loads(_strip_jsonc_comments(handle.read()))
+        raw = _strip_comment_keys(json.loads(_strip_jsonc_comments(handle.read())))
 
     try:
         validated = ConfigAdapter.validate_python(raw)

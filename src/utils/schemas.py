@@ -42,6 +42,7 @@ from ..constants import (
     FRACTION_SUM_TOLERANCE,
     PUBLIC_PHYSICS_TOGGLES,
     SUPPORTED_ATM_BASES,
+    VULCAN_SUPPORTED_CONDENSATE_SPECIES,
     _ALLOWED_ACTIVATIONS,
     _ALLOWED_NORMALIZATION_METHODS,
     _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS,
@@ -598,6 +599,7 @@ class GenerationConfig(_StrictModel):
     parallel_workers: NonNegativeInt
     sample_chunk_size: PositiveInt = 1000
     fastchem_timeout_seconds: PositiveFloat = 30.0
+    vulcan_timeout_seconds: PositiveFloat = 1800.0
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
 
 
@@ -806,6 +808,67 @@ class SciencePresetInput(_StrictModel):
         return value
 
 
+class CondensationConfig(_StrictModel):
+    """Condensation-specific knobs passed through to ``vulcan_cfg.py``.
+
+    Required when any science preset has ``use_condensation=True``. Every
+    species in ``condense_sp`` must be in
+    :data:`~src.constants.VULCAN_SUPPORTED_CONDENSATE_SPECIES` (the species
+    set for which VULCAN ships saturation-pressure data); the matching
+    condensate label in ``non_gas_sp`` (e.g. ``H2O_l_s``) must appear in
+    ``data_spec.state_species`` and ``data_spec.output_species`` so the
+    surrogate predicts the condensate VMR column.
+    """
+
+    condense_sp: list[str]
+    non_gas_sp: list[str]
+    fix_species: list[str] = Field(default_factory=list)
+    use_relax: list[str] = Field(default_factory=list)
+    humidity: float = 1.0
+    start_conden_time: PositiveFloat = 1.0e6
+    stop_conden_time: PositiveFloat = 1.0e8
+    fix_species_time: PositiveFloat = 1.0e8
+    fix_species_from_coldtrap_lev: bool = True
+    post_conden_rtol: PositiveFloat = 0.1
+    r_p: dict[str, PositiveFloat] = Field(default_factory=dict)
+    rho_p: dict[str, PositiveFloat] = Field(default_factory=dict)
+
+    @field_validator("condense_sp", "non_gas_sp", mode="after")
+    @classmethod
+    def _nonempty_unique(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("must be a non-empty list")
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("must contain non-empty strings")
+            if item in seen:
+                raise ValueError(f"contains duplicate entry {item!r}")
+            seen.add(item)
+        return list(value)
+
+    @field_validator("condense_sp", mode="after")
+    @classmethod
+    def _condense_sp_supported(cls, value: list[str]) -> list[str]:
+        unsupported = [sp for sp in value if sp not in VULCAN_SUPPORTED_CONDENSATE_SPECIES]
+        if unsupported:
+            raise ValueError(
+                f"condense_sp entries {unsupported} are not in "
+                f"{sorted(VULCAN_SUPPORTED_CONDENSATE_SPECIES)} — VULCAN ships "
+                "saturation-pressure data only for those species."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_paired_lists(self) -> "CondensationConfig":
+        if len(self.condense_sp) != len(self.non_gas_sp):
+            raise ValueError(
+                "condense_sp and non_gas_sp must have the same length "
+                f"(got {len(self.condense_sp)} and {len(self.non_gas_sp)})."
+            )
+        return self
+
+
 class VulcanRuntimeConfig(_StrictModel):
     """Runtime configuration passed to the VULCAN worker."""
 
@@ -828,6 +891,7 @@ class VulcanRuntimeConfig(_StrictModel):
     top_bc_flux_file: str | None = _INTERNAL_VULCAN_RUNTIME_DEFAULTS["top_bc_flux_file"]
     bot_bc_flux_file: str | None = _INTERNAL_VULCAN_RUNTIME_DEFAULTS["bot_bc_flux_file"]
     atm_base: AtmBase = "H2"
+    condensation: CondensationConfig | None = None
 
     @field_validator("t_cross_sp", mode="after")
     @classmethod
@@ -1014,6 +1078,7 @@ class VulcanConfig(_ConfigBase):
         _check_corner_coverage_temperature_thresholds(
             self.sampling, self.temperature_profiles,
         )
+        _check_vulcan_condensation_contract(self.vulcan, self.data_spec)
         return self
 
 
@@ -1101,3 +1166,60 @@ def _check_vulcan_normalization_keys(
         raise ValueError(
             f"normalization.global_methods must define exactly {expected_globals}."
         )
+
+
+def _check_vulcan_condensation_contract(
+    vulcan: VulcanSection, data_spec: DataSpecConfig
+) -> None:
+    """Cross-validate the condensation block against physics_toggles and species lists.
+
+    Three rules:
+    1. If any expanded science preset has ``use_condensation=True``, the runtime
+       must carry a ``condensation`` block (no silent default — condensation
+       requires explicit ``condense_sp`` / ``non_gas_sp`` choices).
+    2. Every condensate label in ``non_gas_sp`` must appear in both
+       ``data_spec.state_species`` and ``data_spec.output_species`` so the
+       trained surrogate predicts the condensate VMR column.
+    3. When ``use_settling=True`` for any preset, ``r_p`` and ``rho_p`` must
+       cover every entry in ``non_gas_sp`` (settling needs particle radius
+       and density per condensate).
+    """
+    presets = vulcan.science_presets or []
+    cond_on = any(p.physics_toggles.get("use_condensation", False) for p in presets)
+    settling_on = any(p.physics_toggles.get("use_settling", False) for p in presets)
+    block = vulcan.runtime.condensation
+
+    if cond_on and block is None:
+        raise ValueError(
+            "vulcan.runtime.condensation is required when any science preset has "
+            "use_condensation=True."
+        )
+    if not cond_on and block is not None:
+        raise ValueError(
+            "vulcan.runtime.condensation is set but no science preset has "
+            "use_condensation=True; remove the block or enable the toggle."
+        )
+    if block is None:
+        return
+
+    state_set = set(data_spec.state_species or [])
+    output_set = set(data_spec.output_species or [])
+    missing_state = [sp for sp in block.non_gas_sp if sp not in state_set]
+    missing_output = [sp for sp in block.non_gas_sp if sp not in output_set]
+    if missing_state:
+        raise ValueError(
+            f"non_gas_sp entries {missing_state} must appear in data_spec.state_species."
+        )
+    if missing_output:
+        raise ValueError(
+            f"non_gas_sp entries {missing_output} must appear in data_spec.output_species."
+        )
+
+    if settling_on:
+        missing_r_p = [sp for sp in block.non_gas_sp if sp not in block.r_p]
+        missing_rho_p = [sp for sp in block.non_gas_sp if sp not in block.rho_p]
+        if missing_r_p or missing_rho_p:
+            raise ValueError(
+                "use_settling=True requires r_p and rho_p entries for every condensate; "
+                f"missing r_p for {missing_r_p}, missing rho_p for {missing_rho_p}."
+            )

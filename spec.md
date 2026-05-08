@@ -34,8 +34,10 @@ Supported combinations:
 - `fastchem + transformer`
 - `vulcan + transformer`
 
-Shipped config:
-- `config/fastchem.json`
+Shipped configs:
+- `config/fastchem.json` — gas-phase FastChem equilibrium emulator
+- `config/vulcan_condensation.json` — VULCAN kinetics emulator with H2O/S8
+  condensation (separate model from a no-condensation variant)
 
 `chemistry_type` selects the target contract and learned inputs.
 `model_type` selects the prediction architecture only.
@@ -295,11 +297,46 @@ Internal runtime defaults that are not learned public inputs:
 - `rocky`
 - optional `top_bc_flux_file`
 - optional `bot_bc_flux_file`
+- optional `condensation` block (see below)
 
-The shipped `vulcan_transformer` example is a condensation-enabled,
-photochemistry-disabled H2 setup using `thermo/SNCHO_photo_network_2025.txt`
-and `vulcan.runtime.cfg_assignments` to pass the `H2O`/`S8` condensation
-recipe through to worker-local `vulcan_cfg.py`.
+#### `vulcan.runtime.condensation`
+
+Required when any science preset has `use_condensation = True`; forbidden
+otherwise. Carries the typed VULCAN condensation knobs that previously had
+to be smuggled through the free-form `cfg_assignments` dict. Required keys:
+
+- `condense_sp` — non-empty list of gas-phase species that condense.
+  Every entry must be in `VULCAN_SUPPORTED_CONDENSATE_SPECIES`
+  (`H2O`, `NH3`, `H2SO4`, `S2`, `S4`, `S8`, `C`, `H2S` — the species
+  for which VULCAN ships saturation-pressure data in `build_atm.sp_sat`).
+- `non_gas_sp` — paired condensate labels (e.g. `H2O_l_s`, `S8_l_s`),
+  same length as `condense_sp`. Every entry must also appear in
+  `data_spec.state_species` and `data_spec.output_species` so the
+  surrogate predicts the condensate VMR column.
+
+Optional keys (all carry sensible defaults):
+
+- `fix_species` — species frozen after condensation–evaporation EQ
+  (typically `condense_sp ∪ non_gas_sp`)
+- `use_relax` — subset of `condense_sp` using the H2O/NH3 relaxation
+  path
+- `humidity` — surface humidity (0–1; defaults to 1.0)
+- `start_conden_time`, `stop_conden_time`, `fix_species_time`
+- `fix_species_from_coldtrap_lev`
+- `post_conden_rtol`
+- `r_p`, `rho_p` — per-condensate particle radius (cm) and density
+  (g/cm³). Required for every entry in `non_gas_sp` when any preset
+  has `use_settling = True`.
+
+The shipped `config/vulcan_condensation.json` is a condensation-enabled,
+photochemistry-disabled H2 setup using
+`thermo/SNCHO_photo_network_2025.txt` and the H2O/S8 condensation recipe.
+
+Condensation is intentionally **not** sampled as a varying global. To
+train both a `cond` and a `nocond` model, ship two separate configs (with
+distinct `paths.run_root` and `paths.checkpoints_root`) and let the
+`fixed_globals` excision drop the constant toggle from each bundle's
+public ExoJAX surface.
 
 Worker runtime scratch directories use `tempfile.mkdtemp()` for staging and
 `data/vulcan_workers/` for per-worker VULCAN checkouts. No persistent
@@ -597,9 +634,10 @@ gravity and radius.
 
 ## Classical References (Notebook Contract)
 
-`exojax_demo/` ships six numbered notebooks (`01_..` through `06_..`) that
-compare the exported emulator against two classical equilibrium chemistry
-backends:
+The shipped example notebooks live in the standalone deliverable folder
+`For_Hajime/emulator_tests/` (parallel to this repository, not inside it).
+They compare the exported emulator against two classical equilibrium
+chemistry backends:
 
 - **Live FastChem** — subprocess rerun using the exact same runtime and
   input-writing logic as data generation
@@ -656,7 +694,7 @@ elements FastChem's solar file actually lists; it is derived directly from
 
 Notebooks that build an ExoGibbs element vector inside a JAX-traced
 function (rather than calling `build_exogibbs_element_vector` directly —
-e.g. `exojax_demo/06_classical_vs_emulator_retrieval.ipynb` for retrieval
+e.g. `For_Hajime/emulator_tests/07_classical_vs_emulator_retrieval.ipynb` for retrieval
 gradients) must reproduce the same five steps with the same
 `FASTCHEM_LODDERS_*`, `FASTCHEM_METALLICITY_SCALED_ELEMENTS`, and
 `SOLAR_ABUNDANCES` constants.
