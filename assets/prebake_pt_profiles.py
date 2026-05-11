@@ -14,8 +14,8 @@ The runtime preference for the bundle is wired up in
 
 Usage:
 
-    python scripts/prebake_pt_profiles.py
-    python scripts/prebake_pt_profiles.py \
+    python assets/prebake_pt_profiles.py
+    python assets/prebake_pt_profiles.py \
         --input-dir assets/PTprofiles --output-path assets/PTprofiles.bundle.npz
 """
 

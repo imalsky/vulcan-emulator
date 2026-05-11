@@ -317,8 +317,8 @@ def _make_objective(
             )
         finally:
             callback.close()
-        metrics = json.loads(Path(artifacts.metrics_path).read_text())
-        best_val = float(metrics["best_val_combined_loss"])
+        metadata = json.loads(Path(artifacts.metadata_path).read_text())
+        best_val = float(metadata["final_metrics"]["best_val_combined_loss"])
         LOGGER.info(
             "Trial %04d best_val_combined_loss=%.6f | csv=%s",
             trial.number,
@@ -331,21 +331,16 @@ def _make_objective(
 
 
 def _copy_best_checkpoint(study: optuna.Study, study_root: Path) -> Path | None:
-    """Copy the best trial's best checkpoint into ``<study_root>/best_overall/``.
-
-    Checkpoints are now Orbax directories; copy the whole tree.
-    """
+    """Copy the best trial's run directory into ``<study_root>/best_overall/``."""
     try:
         best_number = int(study.best_trial.number)
     except (ValueError, RuntimeError):
         return None
-    src = study_root / f"trial_{best_number:04d}" / "best"
-    if not src.exists():
-        LOGGER.warning("Best trial %d has no best checkpoint at %s", best_number, src)
+    src = study_root / f"trial_{best_number:04d}"
+    if not (src / "params_best.npz").exists():
+        LOGGER.warning("Best trial %d has no params_best.npz at %s", best_number, src)
         return None
-    dst_dir = study_root / "best_overall"
-    ensure_dir(dst_dir)
-    dst = dst_dir / "best"
+    dst = study_root / "best_overall"
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)

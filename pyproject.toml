@@ -15,7 +15,6 @@ dependencies = [
   "h5py>=3.8",
   "optuna>=3.5",
   "optax>=0.2.0",
-  "orbax-checkpoint>=0.5",
   "pydantic>=2.0",
 ]
 

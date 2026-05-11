@@ -2,12 +2,12 @@
 
 This module provides two main capabilities:
 
-1. **Checkpoint export**: Convert a training checkpoint (Orbax directory)
-   into a portable NPZ bundle that embeds model parameters, dimensions,
-   normalization metadata, data contract, and config — everything needed
-   for inference. Bundles are identified by their structural metadata;
-   stale bundles whose structure no longer matches the current loader
-   fail with a ``KeyError`` on missing metadata and must be re-exported.
+1. **Checkpoint export**: Convert a training run directory into a portable
+   NPZ bundle that embeds model parameters, dimensions, normalization
+   metadata, data contract, and config — everything needed for inference.
+   Bundles are identified by their structural metadata; stale bundles
+   whose structure no longer matches the current loader fail with a
+   ``KeyError`` on missing metadata and must be re-exported.
 
 2. **Physical-unit inference**: ``ExportedJAXModel`` wraps the exported
    bundle and provides ``predict_fastchem_profile()`` and
@@ -26,12 +26,11 @@ import json
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import orbax.checkpoint as ocp
 
 from ..constants import (
     NEAR_CONSTANT_STD_THRESHOLD,
@@ -583,12 +582,33 @@ def export_checkpoint_payload(payload: dict[str, Any], output_path: str | Path) 
     return destination
 
 
-def export_checkpoint_to_npz(
-    checkpoint_path: str | Path,
+def load_run_payload(
+    run_root: str | Path,
     *,
+    which: Literal["best", "last"] = "best",
+) -> dict[str, Any]:
+    """Load a training run's params + metadata + config from the flat layout.
+
+    Expects ``run_root`` to contain ``config.json``, ``metadata.json``, and
+    ``params_{best,last}.npz`` (written by the trainer).
+    """
+    root = Path(run_root).resolve()
+    params_file = f"params_{which}.npz"
+    with np.load(root / params_file) as archive:
+        flat = {key: archive[key] for key in archive.files}
+    params = _unflatten_params(flat)
+    config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    return {"params": params, "config": config, **metadata}
+
+
+def export_checkpoint_to_npz(
+    run_root: str | Path,
+    *,
+    which: Literal["best", "last"] = "best",
     output_path: str | Path | None = None,
 ) -> Path:
-    """Load a training checkpoint and export it as a portable NPZ bundle.
+    """Load a training run and export it as a portable NPZ bundle.
 
     The bundle includes all model parameters, architecture dimensions,
     normalization metadata, data contract, and config — everything needed
@@ -596,25 +616,24 @@ def export_checkpoint_to_npz(
 
     Parameters
     ----------
-    checkpoint_path : str or Path
-        Path to the Orbax checkpoint directory (``best/`` or ``last/``).
+    run_root : str or Path
+        Path to the run directory (e.g. ``models/<run_name>/``) containing
+        ``config.json``, ``metadata.json``, and ``params_{best,last}.npz``.
+    which : {"best", "last"}
+        Which params file to export.
     output_path : str, Path, or None
-        Destination path for the NPZ file.  If None, defaults to
-        ``<checkpoint_stem>_exported.npz`` in the same directory.
+        Destination path for the NPZ file. If None, writes to
+        ``<run_root>/<which>_exported.npz``.
 
     Returns
     -------
     Path
         Path to the written NPZ bundle.
     """
-    checkpoint = Path(checkpoint_path).resolve()
-    params_payload = ocp.StandardCheckpointer().restore(checkpoint / "params")
-    metadata = json.loads(
-        (checkpoint / "metadata.json").read_text(encoding="utf-8")
-    )
-    payload = {"params": params_payload["params"], **metadata}
-    destination = Path(output_path) if output_path is not None else checkpoint.with_name(
-        f"{checkpoint.stem}_exported.npz"
+    root = Path(run_root).resolve()
+    payload = load_run_payload(root, which=which)
+    destination = (
+        Path(output_path) if output_path is not None else root / f"{which}_exported.npz"
     )
     return export_checkpoint_payload(payload, destination)
 

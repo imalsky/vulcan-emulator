@@ -379,7 +379,7 @@ def roth_library_pressure_bounds(
 def _load_pt_bundle(path: Path) -> list[RothProfile]:
     """Load a prebaked single-file PT-library bundle.
 
-    The bundle layout is the one produced by ``scripts/prebake_pt_profiles.py``:
+    The bundle layout is the one produced by ``assets/prebake_pt_profiles.py``:
     concatenated ``pressure_bar`` and ``temperature_k`` arrays, an integer
     ``offsets`` index of length ``N_profiles + 1``, and an object array of
     JSON-encoded per-profile metadata. Reading the bundle is a single

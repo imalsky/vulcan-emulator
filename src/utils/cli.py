@@ -114,13 +114,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.stage == "training":
         artifact = train_model(config, project_root=project_root)
-        LOGGER.info("Training complete: %s", artifact.checkpoint_path)
+        LOGGER.info("Training complete: %s", artifact.run_root)
         print(
             json.dumps(
                 {
-                    "checkpoint_path": str(artifact.checkpoint_path),
+                    "run_root": str(artifact.run_root),
+                    "config_path": str(artifact.config_path),
                     "history_path": str(artifact.history_path),
-                    "metrics_path": str(artifact.metrics_path),
+                    "metadata_path": str(artifact.metadata_path),
+                    "params_best_path": str(artifact.params_best_path),
+                    "params_last_path": str(artifact.params_last_path),
                 },
                 indent=2,
             ),
@@ -131,11 +134,15 @@ def main(argv: list[str] | None = None) -> int:
         checkpoints_root = Path(config["paths"]["checkpoints_root"])
         if not checkpoints_root.is_absolute():
             checkpoints_root = project_root / checkpoints_root
-        best_checkpoint = checkpoints_root / "best"
-        if not best_checkpoint.exists():
-            LOGGER.error("No best checkpoint found at %s", best_checkpoint)
+        params_best = checkpoints_root / "params_best.npz"
+        if not params_best.exists():
+            LOGGER.error("No best params file found at %s", params_best)
             return 1
-        bundle_path = export_checkpoint_to_npz(best_checkpoint)
+        bundle_path = export_checkpoint_to_npz(
+            checkpoints_root,
+            which="best",
+            output_path=checkpoints_root / "best_exported.npz",
+        )
         LOGGER.info("Export complete: %s", bundle_path)
         print(json.dumps({"bundle_path": str(bundle_path)}, indent=2), flush=True)
         return 0

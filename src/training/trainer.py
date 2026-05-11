@@ -34,18 +34,18 @@ unified key ``log10_loss``.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import orbax.checkpoint as ocp
 
 from ..data_generation.data_loader import (
     iter_batches,
@@ -54,6 +54,7 @@ from ..data_generation.data_loader import (
 )
 from ..data_generation.generation import generate_raw_dataset
 from ..data_generation.preprocess import preprocess_raw_dataset
+from ..models.export_bundle import _flatten_params, _unflatten_params
 from ..models.jax_model import (
     TransformerDimensions,
     apply_transformer_model,
@@ -70,9 +71,12 @@ LOGGER = get_logger(__name__)
 class TrainingArtifacts:
     """Key output paths produced by a training run."""
 
-    checkpoint_path: Path
+    run_root: Path
+    config_path: Path
     history_path: Path
-    metrics_path: Path
+    metadata_path: Path
+    params_best_path: Path
+    params_last_path: Path
 
 
 def _build_optimizer(
@@ -697,77 +701,89 @@ def _strip_runtime_annotations(obj: Any) -> Any:
     return obj
 
 
-def _checkpoint_payload(
-    *,
-    params: Any,
-    dims: Any,
-    config: dict[str, Any],
-    normalization: dict[str, Any],
-    data_contract: dict[str, Any],
-    metrics: dict[str, Any],
-    history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Package model state and training metadata into a checkpoint payload.
-
-    Produces a dict with arrays under ``params`` and JSON-serializable
-    plain-Python values for the rest. ``_project_root`` is stripped
-    because it is a runtime-only Path annotation.
-    """
-    return {
-        "params": jax.tree_util.tree_map(np.asarray, params),
-        "model_dimensions": dims.to_dict(),
-        "config": _strip_runtime_annotations(config),
-        "normalization": normalization,
-        "data_contract": data_contract,
-        "metrics": metrics,
-        "history": history,
-    }
+CONFIG_FILENAME = "config.json"
+METADATA_FILENAME = "metadata.json"
+HISTORY_FILENAME = "history.csv"
+PARAMS_BEST_FILENAME = "params_best.npz"
+PARAMS_LAST_FILENAME = "params_last.npz"
 
 
-_METADATA_FILENAME = "metadata.json"
-_PARAMS_SUBDIR = "params"
+def _write_params_npz(path: Path, params: Any) -> None:
+    """Write a JAX parameter pytree to a flat NPZ archive under ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **_flatten_params(params))
 
 
-def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
-    """Serialize one training checkpoint to an Orbax directory layout.
+def _write_config(run_root: Path, config: dict[str, Any]) -> None:
+    """Write the input config (with runtime annotations stripped) to config.json."""
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / CONFIG_FILENAME).write_text(
+        json.dumps(_strip_runtime_annotations(config), indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
 
-    ``path`` is the checkpoint *directory* (e.g. ``best/``). Layout:
 
-    - ``<path>/params/`` — param tree written by
-      :class:`orbax.checkpoint.StandardCheckpointer` (must be numeric-only).
-    - ``<path>/metadata.json`` — every other key (config, normalization,
-      data contract, history, metrics) as JSON-serializable plain Python.
-
-    The split is required because StandardCheckpointer's pytree leaves
-    must be numeric, and we need ``force=True`` overwrite semantics that
-    would wipe metadata if it sat inside the Orbax dir. Existing contents
-    are replaced so per-epoch saves are idempotent.
-    """
-    absolute = path.resolve()
-    absolute.mkdir(parents=True, exist_ok=True)
-    params = payload["params"]
-    metadata = {key: value for key, value in payload.items() if key != "params"}
-    params_dir = absolute / _PARAMS_SUBDIR
-    checkpointer = ocp.StandardCheckpointer()
-    checkpointer.save(params_dir, {"params": params}, force=True)
-    checkpointer.wait_until_finished()
-    checkpointer.close()
-    (absolute / _METADATA_FILENAME).write_text(
+def _write_metadata(run_root: Path, metadata: dict[str, Any]) -> None:
+    """Write run-level metadata (model dims, normalization, contract, final metrics)."""
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / METADATA_FILENAME).write_text(
         json.dumps(metadata, indent=2, default=str) + "\n",
         encoding="utf-8",
     )
 
 
-def _read_checkpoint(path: Path) -> dict[str, Any]:
-    """Load a checkpoint saved by :func:`_write_checkpoint`."""
-    resolved = path.resolve()
-    params_payload = ocp.StandardCheckpointer().restore(
-        resolved / _PARAMS_SUBDIR,
-    )
-    metadata = json.loads(
-        (resolved / _METADATA_FILENAME).read_text(encoding="utf-8")
-    )
-    return {"params": params_payload["params"], **metadata}
+def _write_history_csv(run_root: Path, history: list[dict[str, Any]]) -> None:
+    """Write per-epoch training history as a flat CSV (one row per epoch).
+
+    Nested ``train`` / ``val`` metric dicts are flattened to ``train_<key>``
+    and ``val_<key>`` columns so the file is directly plottable in pandas.
+    """
+    run_root.mkdir(parents=True, exist_ok=True)
+    rows = [_flatten_history_record(record) for record in history]
+    field_names: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                field_names.append(key)
+    with (run_root / HISTORY_FILENAME).open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=field_names)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _flatten_history_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one history entry's nested train/val metric dicts to a flat row."""
+    flat: dict[str, Any] = {}
+    for key, value in record.items():
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                flat[f"{key}_{sub_key}"] = sub_value
+        else:
+            flat[key] = value
+    return flat
+
+
+def _read_checkpoint(
+    run_root: Path,
+    which: Literal["best", "last"] = "best",
+) -> dict[str, Any]:
+    """Load a training run's params plus config and metadata.
+
+    ``run_root`` is the run directory containing ``config.json``,
+    ``metadata.json``, and ``params_{best,last}.npz``. ``which`` selects
+    which params file to load.
+    """
+    resolved = run_root.resolve()
+    params_file = PARAMS_BEST_FILENAME if which == "best" else PARAMS_LAST_FILENAME
+    with np.load(resolved / params_file) as archive:
+        flat = {key: archive[key] for key in archive.files}
+    params = _unflatten_params(flat)
+    config = json.loads((resolved / CONFIG_FILENAME).read_text(encoding="utf-8"))
+    metadata = json.loads((resolved / METADATA_FILENAME).read_text(encoding="utf-8"))
+    return {"params": params, "config": config, **metadata}
 
 
 def train_model(
@@ -840,11 +856,12 @@ def train_model(
 
     checkpoints_root = resolve_path(config["paths"]["checkpoints_root"], project_root)
     ensure_dir(checkpoints_root)
+    _write_config(checkpoints_root, config)
 
     batch_size = int(config["training"]["batch_size"])
     epochs = int(config["training"]["epochs"])
     history: list[dict[str, Any]] = []
-    best_payload: dict[str, Any] | None = None
+    best_params_np: Any = None
     best_val = float("inf")
     best_epoch = 0
     no_improvement_epochs = 0
@@ -896,6 +913,7 @@ def train_model(
             float(plateau_state.scale) if plateau_state is not None else 1.0
         )
         plateau_scale_jax = jnp.asarray(plateau_scale, dtype=jnp.float32)
+        lr = base_lr
         for batch in train_batches:
             lr = _scheduled_learning_rate(
                 step=global_step,
@@ -985,22 +1003,15 @@ def train_model(
             )
         )
 
-        current_payload = _checkpoint_payload(
-            params=eval_params,
-            dims=dims,
-            config=config,
-            normalization=normalization,
-            data_contract=contract,
-            metrics={"epoch": epoch + 1, "train": train_summary, "val": val_summary},
-            history=history,
-        )
-        _write_checkpoint(checkpoints_root / "last", current_payload)
+        current_params_np = jax.tree_util.tree_map(np.asarray, eval_params)
+        _write_params_npz(checkpoints_root / PARAMS_LAST_FILENAME, current_params_np)
+        _write_history_csv(checkpoints_root, history)
         if val_summary["combined_loss"] < best_val:
             best_val = val_summary["combined_loss"]
             best_epoch = epoch + 1
             no_improvement_epochs = 0
-            best_payload = current_payload
-            _write_checkpoint(checkpoints_root / "best", current_payload)
+            best_params_np = current_params_np
+            _write_params_npz(checkpoints_root / PARAMS_BEST_FILENAME, current_params_np)
         else:
             no_improvement_epochs += 1
             if _should_early_stop(no_improvement_epochs, patience=early_stopping_patience):
@@ -1015,10 +1026,10 @@ def train_model(
         if on_epoch_end is not None:
             on_epoch_end(epoch + 1, dict(val_summary))
 
-    if best_payload is None:
+    if best_params_np is None:
         raise RuntimeError("Training completed without producing a best checkpoint.")
 
-    best_params = jax.tree_util.tree_map(jnp.asarray, best_payload["params"])
+    best_params = jax.tree_util.tree_map(jnp.asarray, best_params_np)
     test_batches = iter_batches(test_split, batch_size=batch_size, rng=rng)
     test_metrics_device: list[dict[str, jax.Array]] = []
     test_weights_epoch: list[float] = []
@@ -1035,20 +1046,28 @@ def train_model(
 
     final_metrics = {
         "best_val_combined_loss": float(best_val),
+        "best_epoch": int(best_epoch),
         "test": _mean_metrics(test_metrics_epoch, test_weights_epoch),
         "num_train_runs": train_split.num_runs,
         "num_val_runs": val_split.num_runs,
         "num_test_runs": test_split.num_runs,
         "parameter_count": int(count_parameters(best_params)),
     }
-    (checkpoints_root / "history.json").write_text(
-        json.dumps(history, indent=2) + "\n", encoding="utf-8",
-    )
-    (checkpoints_root / "metrics.json").write_text(
-        json.dumps(final_metrics, indent=2) + "\n", encoding="utf-8",
+    _write_history_csv(checkpoints_root, history)
+    _write_metadata(
+        checkpoints_root,
+        {
+            "model_dimensions": dims.to_dict(),
+            "normalization": normalization,
+            "data_contract": contract,
+            "final_metrics": final_metrics,
+        },
     )
     return TrainingArtifacts(
-        checkpoint_path=checkpoints_root / "best",
-        history_path=checkpoints_root / "history.json",
-        metrics_path=checkpoints_root / "metrics.json",
+        run_root=checkpoints_root,
+        config_path=checkpoints_root / CONFIG_FILENAME,
+        history_path=checkpoints_root / HISTORY_FILENAME,
+        metadata_path=checkpoints_root / METADATA_FILENAME,
+        params_best_path=checkpoints_root / PARAMS_BEST_FILENAME,
+        params_last_path=checkpoints_root / PARAMS_LAST_FILENAME,
     )

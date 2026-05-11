@@ -24,7 +24,7 @@ python -m src.utils --config config/fastchem.json --stage training
 python -m src.utils --config config/fastchem.json --stage export
 ```
 
-Each stage prints a JSON artefact summary to stdout. `export` reads `<checkpoints_root>/best`. The standalone `export_bundle.py` at the repo root is a separate CLI that bypasses the config and converts a checkpoint directly — it includes a NumPy 2.x → 1.x pickle compatibility shim because training often runs under NumPy 2.x while the inference env (`vulcan`) is pinned to 1.26 by ExoJAX.
+Each stage prints a JSON artefact summary to stdout. `export` reads `params_best.npz` from `<checkpoints_root>/` and writes `best_exported.npz` next to it. For ad-hoc exports outside the config pipeline, call `from src.models.export_bundle import export_checkpoint_to_npz` directly with a run directory.
 
 Hyperparameter sweeps live under `src/tuning/`:
 
@@ -94,7 +94,19 @@ data/<run_name>/
                                 position_coord.npy
 ```
 
-`paths.run_root` is the only user-set dataset path; `raw/`, `info/`, and `processed/` are auto-expanded by `load_and_validate_config()`. Training checkpoints live under `paths.checkpoints_root` (default `models/<run_name>/`). Bundles are written next to checkpoints as `best_exported.npz`. **No bundle is checked in** — produce one with `--stage export` before running notebooks.
+`paths.run_root` is the only user-set dataset path; `raw/`, `info/`, and `processed/` are auto-expanded by `load_and_validate_config()`. Training writes a flat run directory at `paths.checkpoints_root` (default `models/<run_name>/`):
+
+```
+models/<run_name>/
+  config.json          input config (stripped of runtime annotations)
+  history.csv          one row per epoch, ready for pandas/plotting
+  metadata.json        model_dimensions, normalization, data_contract, final_metrics
+  params_best.npz      flat NPZ of best-epoch weights ({dotted.key: ndarray})
+  params_last.npz      same format, last epoch
+  best_exported.npz    portable inference bundle (produced by --stage export)
+```
+
+**No bundle is checked in** — produce one with `--stage export` before running notebooks.
 
 There is no version tag on bundles or processed data. Cache invalidation is structural: the trainer rebuilds processed tensors whenever the data contract drifts, and stale bundles fail on missing metadata at load time and must be re-exported.
 
@@ -138,4 +150,3 @@ sbatch supercomputer_cmds/run_gen.sh                                 # SLURM gen
 - `spec.md` — full project spec (config surface, data contract, architecture contract, classical-reference contract). Treat as authoritative when something here is ambiguous.
 - `docs/config_guide.md` — key-by-key config reference.
 - `docs/training_diary.md` — short log of what each training run taught us about sizing, regularization, and sweep-proxy vs deployment loss. Append a new dated block when finishing a run.
-- `docs/AGENTS.md` — developer notes (conda env, bundle sanity check).

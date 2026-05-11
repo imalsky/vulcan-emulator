@@ -91,11 +91,14 @@ def test_transformer_forward_grad_and_jvp(tiny_config):
 def test_training_checkpoint_smoke(tiny_config):
     generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
     artifacts = train_model(tiny_config, project_root=tiny_config["_project_root"])
-    assert artifacts.checkpoint_path.exists()
+    assert artifacts.run_root.exists()
+    assert artifacts.config_path.exists()
     assert artifacts.history_path.exists()
-    assert artifacts.metrics_path.exists()
+    assert artifacts.metadata_path.exists()
+    assert artifacts.params_best_path.exists()
+    assert artifacts.params_last_path.exists()
 
-    payload = _read_checkpoint(artifacts.checkpoint_path)
+    payload = _read_checkpoint(artifacts.run_root, which="best")
     assert "params" in payload
     assert "model_dimensions" in payload
     assert "normalization" in payload
@@ -107,7 +110,8 @@ def test_training_checkpoint_smoke_with_cosine_scheduler(tiny_config):
     tiny_config["training"]["scheduler"] = {"name": "cosine"}
     generate_synthetic_raw_runs(tiny_config, project_root=tiny_config["_project_root"])
     artifacts = train_model(tiny_config, project_root=tiny_config["_project_root"])
-    assert artifacts.checkpoint_path.exists()
+    assert artifacts.run_root.exists()
+    assert artifacts.params_best_path.exists()
 
 
 def test_dropout_is_stochastic_only_in_training_mode(tiny_config):

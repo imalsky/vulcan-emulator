@@ -720,7 +720,7 @@ def _resolve_roth_data_glob(config: dict[str, Any], roth_cfg: dict[str, Any]) ->
     Prefers a prebaked sibling ``<dir>.bundle.npz`` file when present, since
     parsing the original ``.dat`` library is the dominant startup cost on a
     fresh process. The original glob is the fallback when no bundle exists.
-    Bake one with ``python scripts/prebake_pt_profiles.py``.
+    Bake one with ``python assets/prebake_pt_profiles.py``.
     """
     data_glob = str(roth_cfg["data_glob"])
     project_root = config.get("_project_root")
