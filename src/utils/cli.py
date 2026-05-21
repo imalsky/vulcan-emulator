@@ -1,16 +1,22 @@
 """CLI entry point dispatching the emulator stages.
 
 Invoked via ``python -m src.utils --config <path> --stage <stage>``.
-The CLI exposes four sequential pipeline stages:
+The CLI exposes the sequential pipeline stages:
 
 1. **generation** — sample atmospheric parameters and produce raw
-   HDF5 runs (calls ``generation.generate_raw_dataset``).
-2. **normalization** — fit normalization on the training split and
+   HDF5 runs (calls ``generation.generate_raw_dataset``). Optionally
+   sharded across a SLURM job array via ``--shard-id`` and
+   ``--num-shards``; each shard writes its own per-shard chunks subdir
+   and skips the final merge.
+2. **merge_shards** — when generation was sharded, this single-node stage
+   consolidates every shard's chunks into ``raw/runs.h5`` and writes the
+   unified manifest + sampling-coverage. Skipped for unsharded generation.
+3. **normalization** — fit normalization on the training split and
    convert raw HDF5 to processed NumPy tensors
    (calls ``preprocess.preprocess_raw_dataset``).
-3. **training** — train the JAX model on the processed data
+4. **training** — train the JAX model on the processed data
    (calls ``trainer.train_model``).
-4. **export** — convert the best checkpoint to a portable NPZ bundle
+5. **export** — convert the best checkpoint to a portable NPZ bundle
    (calls ``export_bundle.export_checkpoint_to_npz``).
 
 Each stage prints a JSON summary of produced artefacts to stdout.
@@ -23,7 +29,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..data_generation.generation import generate_raw_dataset
+from ..data_generation.generation import generate_raw_dataset, merge_shards_stage
 from ..data_generation.preprocess import preprocess_raw_dataset
 from ..models.export_bundle import export_checkpoint_to_npz
 from ..training.trainer import train_model
@@ -81,18 +87,84 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=("generation", "normalization", "training", "export"),
+        choices=("generation", "merge_shards", "normalization", "training", "export"),
         help="Pipeline stage to execute.",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=None,
+        help=(
+            "Generation only: zero-based shard index when running as part of a "
+            "SLURM job array. Must be paired with --num-shards. The shard owns "
+            "the half-open run-index slice [shard_id*N//K, (shard_id+1)*N//K)."
+        ),
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help=(
+            "Generation/merge_shards: total number of shards in the job array. "
+            "Required for both --stage generation with --shard-id and for "
+            "--stage merge_shards."
+        ),
+    )
+    parser.add_argument(
+        "--staging-root",
+        type=Path,
+        default=None,
+        help=(
+            "Generation only: directory to use for per-run HDF5 staging and "
+            "VULCAN/FastChem worker-tree copies. Intended for node-local "
+            "scratch like $SLURM_TMPDIR. The shared-FS chunks_sNN/ directory "
+            "is unaffected (chunks always persist on shared FS so they "
+            "survive a SLURM kill)."
+        ),
     )
 
     args = parser.parse_args(argv)
     project_root = resolve_project_root(Path(__file__).resolve())
     config = _load_config(args.config, project_root)
 
+    if args.stage == "generation":
+        if (args.shard_id is None) != (args.num_shards is None):
+            parser.error(
+                "--shard-id and --num-shards must be passed together (or both omitted)."
+            )
+        if args.shard_id is not None and not (0 <= args.shard_id < args.num_shards):
+            parser.error(
+                f"--shard-id={args.shard_id} out of range for --num-shards={args.num_shards}."
+            )
+    elif args.stage == "merge_shards":
+        if args.num_shards is None:
+            parser.error("--num-shards is required for --stage merge_shards.")
+        if args.shard_id is not None:
+            parser.error("--shard-id is not valid for --stage merge_shards.")
+        if args.staging_root is not None:
+            parser.error("--staging-root is not valid for --stage merge_shards.")
+    else:
+        if args.shard_id is not None or args.staging_root is not None:
+            parser.error(
+                f"--shard-id and --staging-root are only valid for --stage generation, "
+                f"not --stage {args.stage}."
+            )
+        if args.num_shards is not None:
+            parser.error(
+                f"--num-shards is only valid for --stage generation or merge_shards, "
+                f"not --stage {args.stage}."
+            )
+
     LOGGER.info("Starting stage: %s", args.stage)
 
     if args.stage == "generation":
-        artifact = generate_raw_dataset(config, project_root=project_root)
+        artifact = generate_raw_dataset(
+            config,
+            project_root=project_root,
+            shard_id=args.shard_id,
+            num_shards=args.num_shards,
+            staging_root=args.staging_root,
+        )
         LOGGER.info("Generation complete: %d runs", len(artifact.run_ids))
         print(
             json.dumps(
@@ -101,6 +173,27 @@ def main(argv: list[str] | None = None) -> int:
                     "num_runs": len(artifact.run_ids),
                     "manifest_path": str(artifact.manifest_path) if artifact.manifest_path is not None else None,
                     "coverage_path": str(artifact.coverage_path) if artifact.coverage_path is not None else None,
+                    "shard_id": args.shard_id,
+                    "num_shards": args.num_shards,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        return 0
+    if args.stage == "merge_shards":
+        artifact = merge_shards_stage(
+            config, project_root=project_root, num_shards=args.num_shards,
+        )
+        LOGGER.info("merge_shards complete: %d runs", len(artifact.run_ids))
+        print(
+            json.dumps(
+                {
+                    "runs_h5_path": str(artifact.consolidated_path),
+                    "num_runs": len(artifact.run_ids),
+                    "manifest_path": str(artifact.manifest_path) if artifact.manifest_path is not None else None,
+                    "coverage_path": str(artifact.coverage_path) if artifact.coverage_path is not None else None,
+                    "merged_shard_count": args.num_shards,
                 },
                 indent=2,
             ),

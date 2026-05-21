@@ -77,7 +77,7 @@
   },
   "generation": {
     "_comment": "VULCAN runs are minutes-to-tens-of-minutes each with condensation; budget accordingly. vulcan_timeout_seconds caps stalled runs so backfill replaces them instead of hanging the pool.",
-    "num_runs": 50000,
+    "num_runs": 500000,
     "seed": 1,
     "overwrite": false,
     "reuse_raw_if_present": true,

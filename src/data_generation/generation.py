@@ -35,12 +35,14 @@ these invariants and silently corrupt the dataset — preserve them.
 from __future__ import annotations
 
 import concurrent.futures
+import datetime as _dt
 import fcntl
 import json
 import os
 import pickle
 import re
 import shutil
+import socket
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -50,14 +52,6 @@ from typing import Any
 import h5py
 import numpy as np
 
-from ..utils.config import (
-    dataset_info_root,
-    dataset_raw_root,
-    dataset_run_root,
-    get_chemistry_type,
-    get_model_type,
-    uses_fastchem,
-)
 from ..constants import (
     ELEMENT_INPUT_ORDER,
     KZZ_LOG_FLOOR_CM2_S,
@@ -65,6 +59,14 @@ from ..constants import (
     PUBLIC_PHYSICS_TOGGLES,
     SOLAR_ABUNDANCES,
     SUPPORTED_ATM_BASES,
+)
+from ..utils.config import (
+    dataset_info_root,
+    dataset_raw_root,
+    dataset_run_root,
+    get_chemistry_type,
+    get_model_type,
+    uses_fastchem,
 )
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
 from ..utils.provenance import manifest_for_files
@@ -103,6 +105,14 @@ _FEMH_VOLATILE_WEIGHTS = {"C_H": 0.48, "O_H": 0.31, "S_H": 0.21}
 # Amarsi+2019 NLTE, Bedell+2018). Inverting [α/H] = (1 − slope)·[Fe/H] gives
 # [Fe/H] ≈ [α/H] / (1 − slope), i.e. the ~18% correction applied below.
 _ALPHA_FE_SLOPE = 0.15
+
+# Per-shard backfill ID slot. With target_count=500_000 and num_shards=40, each
+# shard owns IDs [target_count + shard_id*SLOT, target_count + (shard_id+1)*SLOT).
+# Sized to keep all run IDs under 1_000_000 so the ``run_{idx:06d}`` format never
+# overflows (7-character IDs would break HDF5 lexicographic key sort). Recompute
+# this when changing num_runs or num_shards.
+_SHARD_BACKFILL_SLOT_SIZE = 6_250
+_SHARD_RUN_ID_MAX_EXCLUSIVE = 1_000_000  # :06d ceiling — runtime-asserted before backfill writes.
 
 
 @dataclass(frozen=True)
@@ -277,11 +287,68 @@ def _generation_worker_count(config: dict[str, Any], total_runs: int) -> int:
     return max(1, min(configured, total_runs))
 
 
+def _attach_species_metadata(
+    specs: list[RunSpecification],
+    config: dict[str, Any],
+    *,
+    start_index: int | None = None,
+) -> list[RunSpecification]:
+    """Attach the current processed species contract and optionally re-ID specs.
+
+    Promoted to module level so the merge stage (which runs in a separate
+    process from generation and has no access to ``run_vulcan_generation``'s
+    closure) can rebuild deterministic specs from the seed and re-attach the
+    same species metadata before passing them to ``_write_generation_metadata``.
+
+    Parameters
+    ----------
+    specs : list[RunSpecification]
+        Newly sampled specs from ``sample_run_specifications_slice`` or
+        ``sample_run_specifications``.
+    config : dict[str, Any]
+        Validated config (provides ``data_spec.state_species`` and
+        ``data_spec.output_species`` for metadata stamping).
+    start_index : int or None, optional
+        If not None, run IDs are rewritten as ``run_{start_index + i:06d}`` in
+        the order specs were received. Used for backfill batches whose
+        intrinsic indices start at zero for each re-sampling seed.
+    """
+    state_species = list(config["data_spec"]["state_species"])
+    output_species = list(config["data_spec"]["output_species"])
+    prepared: list[RunSpecification] = []
+    for offset, spec in enumerate(specs):
+        run_id = (
+            f"run_{start_index + offset:06d}"
+            if start_index is not None
+            else spec.run_id
+        )
+        prepared.append(
+            RunSpecification(
+                run_id=run_id,
+                pressure_bar=spec.pressure_bar,
+                temperature_k=spec.temperature_k,
+                globals=spec.globals,
+                metadata={
+                    **spec.metadata,
+                    "state_species": state_species,
+                    "output_species": output_species,
+                },
+                kzz_cm2_s=spec.kzz_cm2_s,
+                spectrum=spec.spectrum,
+                elemental_abundances_frac=spec.elemental_abundances_frac,
+                gravity_cm_s2=spec.gravity_cm_s2,
+            )
+        )
+    return prepared
+
+
 def _prepare_generation_directory(
     config: dict[str, Any],
     *,
     project_root: Path,
     num_runs: int | None,
+    shard_id: int | None = None,
+    staging_root: Path | None = None,
 ) -> tuple[Path, Path, Path, Path | None, Path | None, Path | None]:
     """Prepare the raw-data output directory and resolve reuse semantics.
 
@@ -312,25 +379,62 @@ def _prepare_generation_directory(
     ensure_dir(info_root)
     requested_runs = _requested_run_count(config, num_runs)
     consolidated_path = raw_root / "runs.h5"
-    runs_dir = raw_root / "runs"
-    chunks_dir = raw_root / "chunks"
+    is_sharded = shard_id is not None
+    if is_sharded:
+        chunks_dir = raw_root / f"chunks_s{shard_id:02d}"
+        runs_dir = (
+            staging_root / f"runs_s{shard_id:02d}"
+            if staging_root is not None
+            else raw_root / f"runs_s{shard_id:02d}"
+        )
+        shard_fragment_path = info_root / "shards" / f"shard_s{shard_id:02d}.json"
+    else:
+        runs_dir = raw_root / "runs"
+        chunks_dir = raw_root / "chunks"
+        shard_fragment_path = None
 
     consolidated_count = 0
     if consolidated_path.exists():
         consolidated_count = len(list_run_ids_from_consolidated(consolidated_path))
     if bool(config["generation"]["overwrite"]):
+        if is_sharded:
+            # Sharded overwrite: only touch this shard's staging + fragment.
+            # The unified runs.h5 / generation_manifest.json / failed_runs.json
+            # belong to merge_shards_stage and must not be deleted by an
+            # individual shard.
+            if runs_dir.exists():
+                shutil.rmtree(runs_dir)
+            if chunks_dir.exists():
+                shutil.rmtree(chunks_dir)
+            if shard_fragment_path is not None and shard_fragment_path.exists():
+                shard_fragment_path.unlink()
+        else:
+            if consolidated_path.exists():
+                consolidated_path.unlink()
+            for staging in (runs_dir, chunks_dir):
+                if staging.exists():
+                    shutil.rmtree(staging)
+            for metadata_path in (
+                info_root / "generation_manifest.json",
+                info_root / "sampling_coverage.json",
+                info_root / "failed_runs.json",
+            ):
+                if metadata_path.exists():
+                    metadata_path.unlink()
+        ensure_dir(runs_dir)
+        ensure_dir(chunks_dir)
+        return run_root, raw_root, info_root, runs_dir, chunks_dir, None
+    if is_sharded:
+        # Sharded mode: the consolidated runs.h5 is owned by merge_shards_stage,
+        # not by individual shards. If it exists, the merge has already happened
+        # and re-running this shard would produce orphaned chunks the merge has
+        # since cleaned up. Refuse to silently re-do work.
         if consolidated_path.exists():
-            consolidated_path.unlink()
-        for staging in (runs_dir, chunks_dir):
-            if staging.exists():
-                shutil.rmtree(staging)
-        for metadata_path in (
-            info_root / "generation_manifest.json",
-            info_root / "sampling_coverage.json",
-            info_root / "failed_runs.json",
-        ):
-            if metadata_path.exists():
-                metadata_path.unlink()
+            raise RuntimeError(
+                f"Consolidated {consolidated_path} already exists; merge_shards "
+                "has already run. Pass generation.overwrite=true to redo this shard "
+                "(also delete runs.h5 manually before re-running merge_shards)."
+            )
         ensure_dir(runs_dir)
         ensure_dir(chunks_dir)
         return run_root, raw_root, info_root, runs_dir, chunks_dir, None
@@ -1106,7 +1210,12 @@ def _ensure_vulcan_chem_funs(worker_root: Path, python_executable: str) -> None:
 
 
 def _cleanup_worker_base(worker_base: Path) -> None:
-    """Remove every per-thread worker tree created under ``worker_base``."""
+    """Remove every per-thread worker tree created under ``worker_base``.
+
+    Must be called only with a per-shard or unsharded ``worker_base`` — never a
+    shared parent that contains other shards' subtrees, or a shard finishing
+    first will rmtree another shard's still-running ``thread_*`` directories.
+    """
     if not worker_base.exists():
         return
     for child in worker_base.iterdir():
@@ -1751,6 +1860,9 @@ def run_vulcan_generation(
     *,
     project_root: Path,
     num_runs: int | None = None,
+    shard_id: int | None = None,
+    num_shards: int | None = None,
+    staging_root: Path | None = None,
 ) -> GeneratedRawDataset:
     """Generate raw data by running the external VULCAN or FastChem backend.
 
@@ -1762,17 +1874,42 @@ def run_vulcan_generation(
         Repository root used to resolve runtime and data paths.
     num_runs : int or None, optional
         Optional override for ``generation.num_runs``.
-
-    Returns
-    -------
-    GeneratedRawDataset
-        Paths describing the generated raw dataset and its provenance files.
+    shard_id : int or None, optional
+        When set (paired with ``num_shards``), this invocation only generates
+        the half-open run-index slice ``[shard_id*N//K, (shard_id+1)*N//K)`` of
+        the deterministic sampling plan, writes to a per-shard staging
+        directory, and skips the final consolidation into ``raw/runs.h5``.
+        ``merge_shards_stage`` is responsible for combining shards.
+    num_shards : int or None, optional
+        Total number of shards in the sharded job array. Required iff
+        ``shard_id`` is set.
+    staging_root : Path or None, optional
+        When set, the per-shard ``runs_dir`` (per-run HDF5 staging) and
+        ``worker_base`` (VULCAN/FastChem source-tree copies) are reparented
+        beneath this path. Intended for node-local scratch (``$SLURM_TMPDIR``).
+        ``chunks_dir`` always lives on the shared filesystem so chunks survive
+        a SLURM kill.
     """
-    LOGGER.info("VULCAN generation starting (num_runs=%s)", num_runs or "config default")
+    is_sharded = shard_id is not None
+    if is_sharded != (num_shards is not None):
+        raise ValueError("shard_id and num_shards must be passed together or not at all.")
+    if is_sharded:
+        if not (0 <= shard_id < num_shards):
+            raise ValueError(
+                f"shard_id={shard_id} out of range for num_shards={num_shards}."
+            )
+        LOGGER.info(
+            "VULCAN generation starting (shard %d/%d, num_runs=%s, staging_root=%s)",
+            shard_id, num_shards, num_runs or "config default", staging_root,
+        )
+    else:
+        LOGGER.info("VULCAN generation starting (num_runs=%s)", num_runs or "config default")
     run_root, raw_root, info_root, runs_dir, chunks_dir, reusable_path = _prepare_generation_directory(
         config,
         project_root=project_root,
         num_runs=num_runs,
+        shard_id=shard_id,
+        staging_root=staging_root,
     )
     if reusable_path is not None:
         run_ids = list_run_ids_from_consolidated(reusable_path)
@@ -1793,56 +1930,33 @@ def run_vulcan_generation(
     fastchem = uses_fastchem(config)
     # vulcan_runtime is only derived for VULCAN configs; FastChem configs
     # use the canonical worker-root default (per constants.py runtime defaults).
-    if "vulcan_runtime" in config:
+    if is_sharded and staging_root is not None:
+        # Node-local staging: ignore the config worker_root (which lives on
+        # shared FS) and put worker trees on $SLURM_TMPDIR. The per-shard
+        # suffix below still appends so _cleanup_worker_base only ever touches
+        # this shard's subtree.
+        worker_base = staging_root
+    elif "vulcan_runtime" in config:
         worker_base = resolve_path(config["vulcan_runtime"]["worker_root"], project_root)
     else:
         worker_base = resolve_path("data/vulcan_workers", project_root)
+    if is_sharded:
+        worker_base = worker_base / f"shard_s{shard_id:02d}"
     run_single = _run_single_fastchem_spec if fastchem else _run_single_vulcan_spec
     backfill = config["generation"]["backfill"]
     target_count = num_runs or int(config["generation"]["num_runs"])
+    shard_start = (shard_id * target_count) // num_shards if is_sharded else 0
+    shard_end = ((shard_id + 1) * target_count) // num_shards if is_sharded else target_count
+    shard_count = shard_end - shard_start
+    shard_tag = f"_s{shard_id:02d}" if is_sharded else ""
 
-    def _attach_species_metadata(
+    def _attach(
         specs: list[RunSpecification],
         *,
         start_index: int | None = None,
     ) -> list[RunSpecification]:
-        """Attach the current processed species contract and optionally re-ID specs.
-
-        Parameters
-        ----------
-        specs : list[RunSpecification]
-            Newly sampled specs from ``sample_run_specifications_slice`` or
-            ``sample_run_specifications``.
-        start_index : int or None, optional
-            If not None, run IDs are rewritten as ``run_{start_index + i:05d}``
-            in the order specs were received. Used for backfill batches whose
-            intrinsic indices start at zero for each re-sampling seed.
-        """
-        prepared: list[RunSpecification] = []
-        for offset, spec in enumerate(specs):
-            run_id = (
-                f"run_{start_index + offset:05d}"
-                if start_index is not None
-                else spec.run_id
-            )
-            prepared.append(
-                RunSpecification(
-                    run_id=run_id,
-                    pressure_bar=spec.pressure_bar,
-                    temperature_k=spec.temperature_k,
-                    globals=spec.globals,
-                    metadata={
-                        **spec.metadata,
-                        "state_species": list(config["data_spec"]["state_species"]),
-                        "output_species": list(config["data_spec"]["output_species"]),
-                    },
-                    kzz_cm2_s=spec.kzz_cm2_s,
-                    spectrum=spec.spectrum,
-                    elemental_abundances_frac=spec.elemental_abundances_frac,
-                    gravity_cm_s2=spec.gravity_cm_s2,
-                )
-            )
-        return prepared
+        """Closure-bound wrapper around ``_attach_species_metadata`` for this config."""
+        return _attach_species_metadata(specs, config, start_index=start_index)
 
     def _sample_and_prepare(n: int, seed: int, *, start_index: int) -> list[RunSpecification]:
         """Sample run specs and attach the current processed species contract.
@@ -1867,7 +1981,7 @@ def run_vulcan_generation(
             num_runs=n,
             seed=seed,
         )
-        return _attach_species_metadata(specs, start_index=start_index)
+        return _attach(specs, start_index=start_index)
 
     # Pool size is fixed for the whole generation so the same threads (and
     # therefore the same worker_root directories under worker_base) are reused
@@ -1961,7 +2075,11 @@ def run_vulcan_generation(
     # next to ``runs_dir`` rather than inside it so the end-of-stage
     # empty-directory cleanup does not trip over it.
     ensure_dir(runs_dir)
-    _orphan_lock_path = runs_dir.parent / ".orphan_promotion.lock"
+    lock_filename = (
+        ".orphan_promotion.lock" if not is_sharded
+        else f".orphan_promotion_s{shard_id:02d}.lock"
+    )
+    _orphan_lock_path = runs_dir.parent / lock_filename
     with open(_orphan_lock_path, "w") as _orphan_lock_handle:
         try:
             fcntl.flock(_orphan_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1974,13 +2092,13 @@ def run_vulcan_generation(
         try:
             orphan_run_files = sorted(runs_dir.glob("run_*.h5"))
             if orphan_run_files:
-                resume_chunk = chunks_dir / "chunk_resume.h5"
+                resume_chunk = chunks_dir / f"chunk_resume{shard_tag}.h5"
                 # If a previous resume chunk survives, bump the suffix to avoid
                 # stomping its contents before we can merge them.
                 suffix = 0
                 while resume_chunk.exists():
                     suffix += 1
-                    resume_chunk = chunks_dir / f"chunk_resume_{suffix:03d}.h5"
+                    resume_chunk = chunks_dir / f"chunk_resume{shard_tag}_{suffix:03d}.h5"
                 LOGGER.info(
                     "Resuming: promoting %d orphan per-run files into %s",
                     len(orphan_run_files), resume_chunk,
@@ -2001,7 +2119,7 @@ def run_vulcan_generation(
     all_specs: list[RunSpecification] = []
 
     configured_chunk = int(config["generation"]["sample_chunk_size"])
-    sample_chunk_size = max(1, min(configured_chunk, target_count))
+    sample_chunk_size = max(1, min(configured_chunk, shard_count))
 
     plan = build_sampling_plan(
         config=config,
@@ -2009,11 +2127,19 @@ def run_vulcan_generation(
         num_runs=target_count,
         seed=base_seed,
     )
-    LOGGER.info(
-        "Streaming generation: target_count=%d, sample_chunk_size=%d",
-        target_count,
-        sample_chunk_size,
-    )
+    if is_sharded:
+        LOGGER.info(
+            "Streaming generation: shard %d/%d slice [%d, %d) of target_count=%d, "
+            "sample_chunk_size=%d",
+            shard_id, num_shards, shard_start, shard_end, target_count,
+            sample_chunk_size,
+        )
+    else:
+        LOGGER.info(
+            "Streaming generation: target_count=%d, sample_chunk_size=%d",
+            target_count,
+            sample_chunk_size,
+        )
 
     # Chunk merges run on a dedicated background thread so the next chunk's
     # generation starts immediately instead of waiting for the previous
@@ -2035,12 +2161,12 @@ def run_vulcan_generation(
         merge_futures.clear()
 
     skipped_total = 0
-    for chunk_start in range(0, target_count, sample_chunk_size):
-        chunk_end = min(chunk_start + sample_chunk_size, target_count)
+    for chunk_start in range(shard_start, shard_end, sample_chunk_size):
+        chunk_end = min(chunk_start + sample_chunk_size, shard_end)
         raw_chunk = sample_run_specifications_slice(
             plan, start=chunk_start, end=chunk_end,
         )
-        chunk_specs = _attach_species_metadata(raw_chunk)
+        chunk_specs = _attach(raw_chunk)
         all_specs.extend(chunk_specs)
         chunk_remaining = [s for s in chunk_specs if s.run_id not in completed_run_ids]
         chunk_skipped = len(chunk_specs) - len(chunk_remaining)
@@ -2055,7 +2181,7 @@ def run_vulcan_generation(
         new_successes, new_failures = _run_batch(chunk_remaining)
         all_failures.extend(new_failures)
         if new_successes:
-            chunk_path = chunks_dir / f"chunk_{chunk_start:06d}_{chunk_end:06d}.h5"
+            chunk_path = chunks_dir / f"chunk{shard_tag}_{chunk_start:06d}_{chunk_end:06d}.h5"
             # Pre-existing file would only appear if a previous crashed
             # run wrote the chunk but failed to delete its per-run files;
             # the promoted resume chunk already covers those. Use a unique
@@ -2064,28 +2190,52 @@ def run_vulcan_generation(
             while chunk_path.exists():
                 suffix += 1
                 chunk_path = chunks_dir / (
-                    f"chunk_{chunk_start:06d}_{chunk_end:06d}_{suffix:03d}.h5"
+                    f"chunk{shard_tag}_{chunk_start:06d}_{chunk_end:06d}_{suffix:03d}.h5"
                 )
             _submit_merge(new_successes, chunk_path)
             chunk_files.append(chunk_path)
             completed_run_ids.update(p.stem for p in new_successes)
 
-    next_run_index = target_count
+    # Backfill IDs live in a per-shard slot to avoid cross-shard collisions and
+    # to keep all run IDs under 1_000_000 so the ``run_{idx:06d}`` format remains
+    # safe (7-character IDs would break HDF5 lexicographic key sort).
+    if is_sharded:
+        next_run_index = target_count + shard_id * _SHARD_BACKFILL_SLOT_SIZE
+        backfill_id_slot_end = target_count + (shard_id + 1) * _SHARD_BACKFILL_SLOT_SIZE
+    else:
+        next_run_index = target_count
+        backfill_id_slot_end = _SHARD_RUN_ID_MAX_EXCLUSIVE
     if skipped_total:
         LOGGER.info("Resumed %d already-completed runs across all chunks", skipped_total)
 
-    # Backfill rounds.
+    # Backfill rounds. Note the shard-id stamp on backfill_seed: without it,
+    # two shards' first backfill rounds would draw identical specs.
+    # ``completed_run_ids`` holds only this shard's successes (deterministic +
+    # backfill) because chunks_dir is per-shard and the resume scan only sees
+    # this shard's chunks, so ``shard_count - len(completed_run_ids)`` is the
+    # correct shortfall in sharded mode.
+    target_for_shortfall = shard_count if is_sharded else target_count
     if bool(backfill["enabled"]) and all_failures:
         max_retries = int(backfill["max_retries"])
         for attempt in range(1, max_retries + 1):
-            shortfall = target_count - len(completed_run_ids)
+            shortfall = target_for_shortfall - len(completed_run_ids)
             if shortfall <= 0:
                 break
+            if next_run_index + shortfall > backfill_id_slot_end:
+                raise RuntimeError(
+                    f"Backfill would overflow this shard's ID slot: "
+                    f"next_run_index={next_run_index}, shortfall={shortfall}, "
+                    f"slot_end={backfill_id_slot_end}. Increase "
+                    "_SHARD_BACKFILL_SLOT_SIZE (and re-verify `:06d` ceiling) "
+                    "or reduce num_shards."
+                )
             LOGGER.info(
                 "Backfill attempt %d/%d: %d runs needed",
                 attempt, max_retries, shortfall,
             )
-            backfill_seed = base_seed + 1000 * attempt
+            backfill_seed = base_seed + 1000 * attempt + (
+                1_000_000 * shard_id if is_sharded else 0
+            )
             backfill_specs = _sample_and_prepare(
                 shortfall,
                 backfill_seed,
@@ -2096,7 +2246,7 @@ def run_vulcan_generation(
             all_failures.extend(new_failures)
             all_specs.extend(backfill_specs)
             if new_successes:
-                chunk_path = chunks_dir / f"chunk_backfill_{attempt:02d}.h5"
+                chunk_path = chunks_dir / f"chunk_backfill{shard_tag}_{attempt:02d}.h5"
                 _submit_merge(new_successes, chunk_path)
                 chunk_files.append(chunk_path)
                 completed_run_ids.update(p.stem for p in new_successes)
@@ -2114,20 +2264,87 @@ def run_vulcan_generation(
     # its chunk merged) go into a final catch-all chunk.
     straggler_run_files = sorted(runs_dir.glob("run_*.h5"))
     if straggler_run_files:
-        final_chunk = chunks_dir / "chunk_stragglers.h5"
+        final_chunk = chunks_dir / f"chunk_stragglers{shard_tag}.h5"
         merge_run_files_to_chunk(straggler_run_files, final_chunk)
         chunk_files.append(final_chunk)
         completed_run_ids.update(list_run_ids_from_consolidated(final_chunk))
 
+    final_target = shard_count if is_sharded else target_count
     if all_failures:
-        failed_log = info_root / "failed_runs.json"
+        if is_sharded:
+            # Per-shard failure log; merge_shards aggregates these into the
+            # unified info/failed_runs.json.
+            failed_log = info_root / "shards" / f"failed_runs_s{shard_id:02d}.json"
+            ensure_dir(failed_log.parent)
+        else:
+            failed_log = info_root / "failed_runs.json"
         failed_log.write_text(json.dumps(all_failures, indent=2), encoding="utf-8")
-        shortfall = target_count - len(completed_run_ids)
+        shortfall = final_target - len(completed_run_ids)
         if shortfall > 0:
             raise RuntimeError(
                 f"Generation finished {shortfall} successful runs short of the requested total. "
                 f"See {failed_log} for failed run IDs."
             )
+
+    if is_sharded:
+        LOGGER.info(
+            "VULCAN generation shard %d/%d complete: %d runs across %d chunk files",
+            shard_id, num_shards, len(completed_run_ids), len(chunk_files),
+        )
+        # Per-shard fragment, consumed by merge_shards_stage. Lightweight (no
+        # full specs — those are recoverable from the seed). Lists which
+        # deterministic IDs in [shard_start, shard_end) succeeded vs failed,
+        # which backfill IDs landed, and the metadata needed to validate
+        # cross-shard consistency before merging.
+        deterministic_ids = [f"run_{i:06d}" for i in range(shard_start, shard_end)]
+        deterministic_ok = sorted(rid for rid in completed_run_ids if rid in set(deterministic_ids))
+        deterministic_failed = sorted(rid for rid in deterministic_ids if rid not in completed_run_ids)
+        backfill_ok = sorted(
+            rid for rid in completed_run_ids
+            if rid.startswith("run_") and int(rid.split("_", 1)[1]) >= target_count
+        )
+        remaining_failures = sorted(set(all_failures) - completed_run_ids)
+        chunk_files_relpath = [
+            str(p.relative_to(raw_root)) for p in sorted(chunk_files)
+        ]
+        fragment = {
+            "schema_version": 1,
+            "shard_id": shard_id,
+            "num_shards": num_shards,
+            "shard_start": shard_start,
+            "shard_end": shard_end,
+            "config_chemistry_type": get_chemistry_type(config),
+            "config_seed": int(config["generation"]["seed"]),
+            "config_num_runs": target_count,
+            "deterministic_run_ids": deterministic_ids,
+            "successful_deterministic_run_ids": deterministic_ok,
+            "failed_deterministic_run_ids": deterministic_failed,
+            "successful_backfill_run_ids": backfill_ok,
+            "remaining_failures": remaining_failures,
+            "chunk_files_relpath": chunk_files_relpath,
+            "backfill_seed_formula": "base_seed + 1000*attempt + 1_000_000*shard_id",
+            "shard_backfill_slot_size": _SHARD_BACKFILL_SLOT_SIZE,
+            "backfill_id_slot_start": target_count + shard_id * _SHARD_BACKFILL_SLOT_SIZE,
+            "backfill_id_slot_end": target_count + (shard_id + 1) * _SHARD_BACKFILL_SLOT_SIZE,
+            "completed_at_iso8601": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "host": socket.gethostname(),
+            "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+            "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        }
+        fragment_path = info_root / "shards" / f"shard_s{shard_id:02d}.json"
+        ensure_dir(fragment_path.parent)
+        fragment_path.write_text(json.dumps(fragment, indent=2) + "\n", encoding="utf-8")
+        if runs_dir.exists() and not any(runs_dir.iterdir()):
+            runs_dir.rmdir()
+        _cleanup_worker_base(worker_base)
+        return GeneratedRawDataset(
+            run_root=run_root,
+            raw_root=raw_root,
+            run_ids=sorted(completed_run_ids),
+            consolidated_path=raw_root / "runs.h5",  # not yet written; merge_shards owns it.
+            manifest_path=fragment_path,
+            coverage_path=None,
+        )
 
     LOGGER.info(
         "VULCAN generation complete: %d runs across %d chunk files",
@@ -2218,6 +2435,9 @@ def generate_raw_dataset(
     *,
     project_root: Path,
     num_runs: int | None = None,
+    shard_id: int | None = None,
+    num_shards: int | None = None,
+    staging_root: Path | None = None,
 ) -> GeneratedRawDataset:
     """Dispatch raw-data generation to the configured backend.
 
@@ -2229,6 +2449,8 @@ def generate_raw_dataset(
         Repository root used to resolve backend paths.
     num_runs : int or None, optional
         Optional override for the configured run count.
+    shard_id, num_shards, staging_root
+        See ``run_vulcan_generation`` for the sharded-mode contract.
 
     Returns
     -------
@@ -2238,5 +2460,162 @@ def generate_raw_dataset(
     _check_assets_availability(config, project_root)
     chemistry_type = get_chemistry_type(config)
     if chemistry_type in {"fastchem", "vulcan"}:
-        return run_vulcan_generation(config, project_root=project_root, num_runs=num_runs)
+        return run_vulcan_generation(
+            config,
+            project_root=project_root,
+            num_runs=num_runs,
+            shard_id=shard_id,
+            num_shards=num_shards,
+            staging_root=staging_root,
+        )
     raise ValueError(f"Unsupported chemistry_type: {chemistry_type}")
+
+
+def merge_shards_stage(
+    config: dict[str, Any],
+    *,
+    project_root: Path,
+    num_shards: int,
+) -> GeneratedRawDataset:
+    """Combine per-shard chunk files into the unified ``raw/runs.h5`` and metadata.
+
+    Runs once after every shard's generation invocation has completed (typically
+    via a SLURM ``afterok`` dependency). Reads the per-shard fragments under
+    ``info/shards/``, validates cross-shard consistency, merges all chunk files
+    via ``merge_chunks_to_runs_h5``, and writes the unified
+    ``info/generation_manifest.json`` + ``info/sampling_coverage.json`` against
+    the deterministic 50,000-spec list (rebuilt from the seed).
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Validated config, same as the one used by every shard.
+    project_root : Path
+        Repository root used to resolve dataset paths.
+    num_shards : int
+        Total number of shards expected. Each must have written
+        ``info/shards/shard_s{id:02d}.json`` before this stage runs.
+    """
+    LOGGER.info("Merging %d shards into the unified dataset", num_shards)
+    run_root = resolve_path(dataset_run_root(config), project_root)
+    raw_root = resolve_path(dataset_raw_root(config), project_root)
+    info_root = resolve_path(dataset_info_root(config), project_root)
+    base_seed = int(config["generation"]["seed"])
+    target_count = int(config["generation"]["num_runs"])
+    chemistry_type = get_chemistry_type(config)
+
+    fragments_dir = info_root / "shards"
+    fragments: list[dict[str, Any]] = []
+    for sid in range(num_shards):
+        path = fragments_dir / f"shard_s{sid:02d}.json"
+        if not path.exists():
+            raise RuntimeError(
+                f"Missing shard fragment: {path}. "
+                "Has shard {sid} finished writing its per-shard manifest?"
+            )
+        fragments.append(json.loads(path.read_text(encoding="utf-8")))
+
+    deterministic_union: set[str] = set()
+    backfill_slots: list[tuple[int, int]] = []
+    for frag in fragments:
+        if frag["num_shards"] != num_shards:
+            raise RuntimeError(
+                f"Shard fragment {frag['shard_id']} disagrees on num_shards "
+                f"(fragment: {frag['num_shards']}, expected: {num_shards})."
+            )
+        if frag["config_seed"] != base_seed:
+            raise RuntimeError(
+                f"Shard fragment {frag['shard_id']} disagrees on config_seed "
+                f"(fragment: {frag['config_seed']}, expected: {base_seed})."
+            )
+        if frag["config_num_runs"] != target_count:
+            raise RuntimeError(
+                f"Shard fragment {frag['shard_id']} disagrees on config_num_runs "
+                f"(fragment: {frag['config_num_runs']}, expected: {target_count})."
+            )
+        if frag["config_chemistry_type"] != chemistry_type:
+            raise RuntimeError(
+                f"Shard fragment {frag['shard_id']} disagrees on chemistry_type "
+                f"(fragment: {frag['config_chemistry_type']}, expected: {chemistry_type})."
+            )
+        deterministic_union.update(frag["deterministic_run_ids"])
+        slot = (int(frag["backfill_id_slot_start"]), int(frag["backfill_id_slot_end"]))
+        backfill_slots.append(slot)
+    expected_ids = {f"run_{i:06d}" for i in range(target_count)}
+    if deterministic_union != expected_ids:
+        missing = sorted(expected_ids - deterministic_union)
+        extra = sorted(deterministic_union - expected_ids)
+        raise RuntimeError(
+            f"Deterministic run-ID coverage gap: missing={missing[:10]}... "
+            f"extra={extra[:10]}..."
+        )
+    sorted_slots = sorted(backfill_slots)
+    for (lo1, hi1), (lo2, hi2) in zip(sorted_slots, sorted_slots[1:]):
+        if hi1 > lo2:
+            raise RuntimeError(
+                f"Overlapping backfill ID slots across shards: "
+                f"[{lo1}, {hi1}) and [{lo2}, {hi2})."
+            )
+
+    all_chunk_files: list[Path] = []
+    for sid in range(num_shards):
+        shard_chunks_dir = raw_root / f"chunks_s{sid:02d}"
+        all_chunk_files.extend(sorted(shard_chunks_dir.glob("chunk_*.h5")))
+    if not all_chunk_files:
+        raise RuntimeError(f"No chunk files found under {raw_root}/chunks_s*/.")
+
+    consolidated_path = merge_chunks_to_runs_h5(all_chunk_files, raw_root / "runs.h5")
+
+    plan = build_sampling_plan(
+        config=config, project_root=project_root,
+        num_runs=target_count, seed=base_seed,
+    )
+    det_specs = sample_run_specifications_slice(plan, start=0, end=target_count)
+    det_specs = _attach_species_metadata(det_specs, config)
+    failed_set: set[str] = set()
+    for frag in fragments:
+        failed_set.update(frag["remaining_failures"])
+    successful_specs = [s for s in det_specs if s.run_id not in failed_set]
+
+    if failed_set:
+        (info_root / "failed_runs.json").write_text(
+            json.dumps(sorted(failed_set), indent=2) + "\n", encoding="utf-8",
+        )
+    manifest_path, coverage_path = _write_generation_metadata(
+        info_root=info_root,
+        run_files=[consolidated_path],
+        specs=successful_specs,
+        config=config,
+    )
+
+    backfill_success_ids: list[str] = []
+    for frag in fragments:
+        backfill_success_ids.extend(frag["successful_backfill_run_ids"])
+    all_run_ids = sorted({s.run_id for s in successful_specs} | set(backfill_success_ids))
+
+    for sid in range(num_shards):
+        for d in (raw_root / f"runs_s{sid:02d}", raw_root / f"chunks_s{sid:02d}"):
+            if d.exists() and not any(d.iterdir()):
+                d.rmdir()
+        frag_path = fragments_dir / f"shard_s{sid:02d}.json"
+        if frag_path.exists():
+            frag_path.unlink()
+        per_shard_failed_log = fragments_dir / f"failed_runs_s{sid:02d}.json"
+        if per_shard_failed_log.exists():
+            per_shard_failed_log.unlink()
+    if fragments_dir.exists() and not any(fragments_dir.iterdir()):
+        fragments_dir.rmdir()
+
+    LOGGER.info(
+        "merge_shards complete: %d runs (%d deterministic + %d backfill) into %s",
+        len(all_run_ids), len(successful_specs), len(backfill_success_ids),
+        consolidated_path,
+    )
+    return GeneratedRawDataset(
+        run_root=run_root,
+        raw_root=raw_root,
+        run_ids=all_run_ids,
+        consolidated_path=consolidated_path,
+        manifest_path=manifest_path,
+        coverage_path=coverage_path,
+    )

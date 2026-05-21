@@ -1752,7 +1752,7 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
     if fastchem:
         globals_map = {**base_globals, **element_fractions}
         return RunSpecification(
-            run_id=f"run_{run_idx:05d}",
+            run_id=f"run_{run_idx:06d}",
             pressure_bar=pressure_bar,
             temperature_k=temperature_k,
             globals=globals_map,
@@ -1771,7 +1771,7 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
     template = plan.spectra[spectrum_name]
     preset = plan.science_presets[int(per_rng.integers(0, len(plan.science_presets)))]
     spectrum = SpectrumRecord(
-        name=f"{template.name}_run{run_idx:05d}",
+        name=f"{template.name}_run{run_idx:06d}",
         wavelength_nm=template.wavelength_nm,
         flux_erg_cm2_s_nm=template.flux_erg_cm2_s_nm,
         metadata={**template.metadata, "template_name": template.name},
@@ -1782,7 +1782,7 @@ def _sample_one_from_plan(plan: SamplingPlan, run_idx: int) -> RunSpecification:
         **_science_preset_conditioning_inputs(preset),
     }
     return RunSpecification(
-        run_id=f"run_{run_idx:05d}",
+        run_id=f"run_{run_idx:06d}",
         pressure_bar=pressure_bar,
         temperature_k=temperature_k,
         globals=globals_map,

@@ -121,6 +121,7 @@ All shared constants — physical constants, solar abundances (Asplund 2009 + Lo
 - Each worker writes only to its own per-run file in `runs_dir`. Two threads never share an `h5py.File` handle.
 - Per-chunk consolidation runs on a separate single-worker executor (chunk writes are serial).
 - Orphan promotion on resume is `fcntl`-locked on a sentinel file in `runs_dir` so two concurrent generation invocations cannot promote the same orphan.
+- **Sharded mode (`--shard-id N --num-shards K`)**: each shard owns its own `runs_sNN/` staging dir (node-local under `--staging-root` when set, else under `raw/`), its own `chunks_sNN/` archive on shared FS, its own `worker_base` subtree (`worker_root/shard_sNN/`), and its own `.orphan_promotion_sNN.lock`. The chunk loop iterates only `[shard_start, shard_end)` of a sampling plan built for the **full** target count, preserving seed-byte identity to single-job mode. Backfill IDs live in disjoint per-shard slots of size `_SHARD_BACKFILL_SLOT_SIZE` (6,250 for 50k runs / 8 shards) so all run IDs stay within `:05d`. The final consolidated `runs.h5` and `info/generation_manifest.json` are produced exclusively by `--stage merge_shards`, which runs once after every shard succeeds. Each shard writes a per-shard fragment to `info/shards/shard_sNN.json` that the merge stage validates for cross-shard consistency before merging.
 
 Modifications that share an HDF5 writer across workers will silently corrupt the dataset — preserve these invariants when touching this module.
 
@@ -142,8 +143,11 @@ qsub -v CONFIG_PATH=path/to/other.json supercomputer_cmds/run.pbs    # custom co
 qsub -v DATA_ONLY=1 supercomputer_cmds/run.pbs                       # generation + normalization only (CPU)
 qsub -v SKIP_GEN=1 supercomputer_cmds/run.pbs                        # train + export against existing data
 sbatch supercomputer_cmds/run_train.sh                               # SLURM training-only
-sbatch supercomputer_cmds/run_gen.sh                                 # SLURM generation-only
+sbatch supercomputer_cmds/run_gen.sh                                 # SLURM generation-only (single node)
+bash   supercomputer_cmds/submit_gen_array.sh                        # SLURM generation sharded across 8 nodes + auto-merge
 ```
+
+The sharded path (`run_gen_array.sh` + `run_merge.sh`, wired together by `submit_gen_array.sh`) is the right tool for the 50k-run VULCAN condensation dataset; the single-node `run_gen.sh` is fine for FastChem and small VULCAN runs.
 
 ## Reference docs
 
