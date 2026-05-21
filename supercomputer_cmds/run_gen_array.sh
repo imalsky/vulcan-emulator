@@ -25,8 +25,8 @@
 #   # then resubmit run_merge.sh manually with --dependency=afterok:<new_id>
 #
 # Defaults: 500_000 runs across 40 shards (12_500 deterministic + 6_250 backfill
-# slots each). --array=0-39%20 caps at 20 concurrent tasks; bump to %40 if the
-# cluster lets you grab all 40 nodes at once.
+# slots each). --array=0-39%6 caps at 6 concurrent tasks (stays under the user's
+# QOSMaxCpuPerUserLimit on Edge); bump %N higher if your QOS allows more nodes.
 #
 #SBATCH -J vulcan_gen_array
 #SBATCH -o %x_%A_%a.o
@@ -38,7 +38,7 @@
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
-#SBATCH --array=0-39%20
+#SBATCH --array=0-39%6
 #SBATCH --mail-type=all
 #SBATCH --mail-user=isaac.n.malsky@jpl.nasa.gov
 

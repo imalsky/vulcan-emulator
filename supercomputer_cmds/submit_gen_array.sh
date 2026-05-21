@@ -21,13 +21,21 @@ if [ -z "${PROJECT_ROOT:-}" ]; then
 fi
 cd -P "${PROJECT_ROOT}"
 
-ARRAY_ID=$(sbatch --parsable \
+ARRAY_RAW=$(sbatch --parsable \
   --export=ALL,CONFIG_PATH="$CONFIG_PATH" \
   supercomputer_cmds/run_gen_array.sh)
-echo "Submitted generation array: $ARRAY_ID"
+# On multi-cluster SLURM setups (--clusters=edge), --parsable returns
+# "JOBID;CLUSTER". Strip the suffix so --dependency=afterok:<jobid> parses.
+ARRAY_ID="${ARRAY_RAW%%;*}"
+ARRAY_CLUSTER="${ARRAY_RAW##*;}"
+if [ "$ARRAY_CLUSTER" = "$ARRAY_RAW" ]; then
+  ARRAY_CLUSTER=""
+fi
+echo "Submitted generation array: $ARRAY_RAW"
 
-MERGE_ID=$(sbatch --parsable \
+MERGE_RAW=$(sbatch --parsable \
+  ${ARRAY_CLUSTER:+--clusters="$ARRAY_CLUSTER"} \
   --dependency=afterok:"$ARRAY_ID" \
   --export=ALL,CONFIG_PATH="$CONFIG_PATH" \
   supercomputer_cmds/run_merge.sh)
-echo "Submitted merge job: $MERGE_ID (depends on array $ARRAY_ID)"
+echo "Submitted merge job: $MERGE_RAW (depends on array $ARRAY_ID)"
