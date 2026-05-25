@@ -95,8 +95,11 @@ class RunSpecification:
 
 
 def _detect_available_cpus() -> int:
-    """Return the number of CPUs available to this process."""
-    for env_var in ("NCPUS", "SLURM_CPUS_ON_NODE", "SLURM_CPUS_PER_TASK"):
+    """Return the number of CPUs available to this process.
+
+    Checks SLURM env vars first, then falls back to ``os.cpu_count()``.
+    """
+    for env_var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
         value = os.environ.get(env_var)
         if value is not None:
             try:

@@ -1,10 +1,11 @@
 {
   "_comment_units": "Pressures: bar. Temperatures: K. Abundances: number ratio rel H (n_X/n_H), solar anchors from AAG21 (Asplund, Amarsi & Grevesse 2021).",
+  "_comment_purpose": "ExoGibbs thermochemical equilibrium emulator for brown dwarfs (Luhman 16 class). 100k training runs. AAG21 solar background with free He/C/O/N/S overrides. T-P profiles tuned for self-luminous objects: high T_int, negligible irradiation, power-law-dominant.",
   "chemistry_type": "exogibbs",
   "model_type": "transformer",
   "paths": {
-    "run_root": "data/exogibbs_luhman16a",
-    "checkpoints_root": "models/exogibbs_luhman16a",
+    "run_root": "data/exogibbs_bd_100k",
+    "checkpoints_root": "models/exogibbs_bd_100k",
     "vulcan_source_root": "../VULCAN-master"
   },
   "data_spec": {
@@ -19,15 +20,15 @@
   },
   "sampling": {
     "num_levels_range": [50, 80],
-    "pressure_top_bar_range":    [1.0e-05, 1.0e-04],
+    "pressure_top_bar_range": [1e-05, 0.0001],
     "pressure_bottom_bar_range": [100.0, 200.0],
     "temperature_range_k": [300.0, 3000.0],
-    "_comment_abundance_ranges": "Same broad ranges as FastChem config (~0.1x to 100x solar AAG21). Covers full retrieval prior volume.",
-    "he_frac_range": [5e-02, 3e-01],
-    "c_frac_range": [2e-05,  3e-02],
-    "o_frac_range": [4e-05,  5e-02],
-    "n_frac_range": [5e-06,  7e-03],
-    "s_frac_range": [1e-06,  2e-03],
+    "_comment_abundance_ranges": "Broad ranges (~0.1x to 100x solar AAG21). Covers full retrieval prior volume for brown dwarf compositions.",
+    "he_frac_range": [0.05, 0.3],
+    "c_frac_range": [2e-05, 0.03],
+    "o_frac_range": [4e-05, 0.05],
+    "n_frac_range": [5e-06, 0.007],
+    "s_frac_range": [1e-06, 0.002],
     "scales": {
       "he_frac": "log",
       "c_frac": "log",
@@ -37,7 +38,7 @@
     },
     "corner_coverage": {
       "enabled": true,
-      "fraction": 0.30,
+      "fraction": 0.3,
       "abundance_quantile_width": 0.15,
       "hot_tmax_k": 2500.0,
       "large_trange_k": 800.0,
@@ -45,7 +46,7 @@
     }
   },
   "temperature_profiles": {
-    "_comment": "Pure analytic: 60% power-law (ExoJAX retrieval param) + 40% Guillot with high T_int (isolated BD, no irradiation).",
+    "_comment": "Pure analytic: 60% power-law (self-luminous BD) + 40% Guillot with high T_int (no irradiation). Matches exogibbs_luhman16a.json.",
     "source_mode": "analytic",
     "filters": {},
     "validation": {
@@ -53,26 +54,26 @@
       "max_temperature_k": 3000.0
     },
     "analytic_sampler": {
-      "t_int_k_range":          [200.0, 1200.0],
-      "t_eq_k_range":           [1.0, 500.0],
-      "log10_delta_range":      [-4, 2],
-      "log10_gamma_range":      [-3.0, 3.0],
-      "alpha_range":            [0.0, 0.5],
-      "log10_p_trans_bar_range":[-5.0, 3.0],
+      "t_int_k_range": [200.0, 1200.0],
+      "t_eq_k_range": [1.0, 500.0],
+      "log10_delta_range": [-4, 2],
+      "log10_gamma_range": [-3.0, 3.0],
+      "alpha_range": [0.0, 0.5],
+      "log10_p_trans_bar_range": [-5.0, 3.0],
       "convection_probability": 0.3,
-      "adiabatic_gradient_range":[0.25, 0.35],
-      "power_law_probability":  0.60,
-      "power_law_t0_range_k":   [800.0, 2200.0],
-      "power_law_alpha_range":  [0.02, 0.20],
-      "power_law_p_ref_bar":    1.0
+      "adiabatic_gradient_range": [0.25, 0.35],
+      "power_law_probability": 0.6,
+      "power_law_t0_range_k": [800.0, 2200.0],
+      "power_law_alpha_range": [0.02, 0.2],
+      "power_law_p_ref_bar": 1.0
     }
   },
   "generation": {
-    "num_runs": 1000000,
+    "num_runs": 100000,
     "seed": 42,
     "overwrite": false,
     "reuse_raw_if_present": true,
-    "parallel_workers": 0,
+    "parallel_workers": 24,
     "sample_chunk_size": 5000,
     "backfill": {
       "enabled": true,
@@ -94,10 +95,10 @@
     },
     "global_methods": {
       "He_H": "log-standard",
-      "C_H":  "log-standard",
-      "O_H":  "log-standard",
-      "N_H":  "log-standard",
-      "S_H":  "log-standard"
+      "C_H": "log-standard",
+      "O_H": "log-standard",
+      "N_H": "log-standard",
+      "S_H": "log-standard"
     }
   },
   "training": {
@@ -114,7 +115,7 @@
       "patience": 10,
       "threshold": 0.0001
     },
-    "weight_decay": 1e-04,
+    "weight_decay": 0.0001,
     "gradient_clip": 1.0,
     "loss": {
       "type": "mae",

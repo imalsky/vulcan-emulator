@@ -27,17 +27,22 @@ and, for VULCAN, gravity, planet radius, and stellar-irradiation geometry.
 ## Overview
 
 The public config surface is defined by:
-- `chemistry_type`: `fastchem` or `vulcan`
+- `chemistry_type`: `fastchem`, `vulcan`, or `exogibbs`
 - `model_type`: `transformer`
 
 Supported combinations:
 - `fastchem + transformer`
 - `vulcan + transformer`
+- `exogibbs + transformer`
 
 Shipped configs:
 - `config/fastchem.json` — gas-phase FastChem equilibrium emulator
 - `config/vulcan_condensation.json` — VULCAN kinetics emulator with H2O/S8
-  condensation (separate model from a no-condensation variant)
+  condensation
+- `config/exogibbs_luhman16a.json` — ExoGibbs equilibrium for brown dwarf
+  Luhman 16A (1M runs)
+- `config/exogibbs_bd_100k.json` — ExoGibbs equilibrium, 100k-run variant
+- `config/vulcan_bd_100k.json` — VULCAN kinetics, 100k-run brown dwarf variant
 
 `chemistry_type` selects the target contract and learned inputs.
 `model_type` selects the prediction architecture only.

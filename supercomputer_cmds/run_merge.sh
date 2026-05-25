@@ -31,10 +31,10 @@ CONFIG_PATH=${CONFIG_PATH:-config/vulcan_condensation.json}
 SKIP_NORM=${SKIP_NORM:-0}
 
 # Must match NUM_SHARDS in run_gen_array.sh.
-NUM_SHARDS=${NUM_SHARDS:-40}
+NUM_SHARDS=${NUM_SHARDS:-4}
 
 if [ -z "${PROJECT_ROOT:-}" ]; then
-  submit_dir="${SLURM_SUBMIT_DIR:-${PBS_O_WORKDIR:-}}"
+  submit_dir="${SLURM_SUBMIT_DIR:-}"
   if [ -n "$submit_dir" ] && [ -d "$submit_dir/supercomputer_cmds" ]; then
     PROJECT_ROOT="$submit_dir"
   elif [ -n "$submit_dir" ] && [ "$(basename "$submit_dir")" = "supercomputer_cmds" ]; then

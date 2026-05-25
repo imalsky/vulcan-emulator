@@ -26,7 +26,6 @@ import csv
 import gc
 import json
 import shutil
-import sys
 from pathlib import Path
 from typing import Any
 

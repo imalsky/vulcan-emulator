@@ -5,6 +5,7 @@ JAX-first chemistry emulator pipeline with one shared workflow and a configurabl
 Supported chemistry targets:
 - `fastchem`: FastChem equilibrium chemistry from PT and profile-global `X/H`
 - `vulcan`: final converged VULCAN chemistry from PT, Kzz, surface gravity, planet radius, profile-global `X/H`, runtime science knobs, atmosphere-base flags, and stellar spectrum
+- `exogibbs`: ExoGibbs Gibbs free energy equilibrium chemistry (same input contract as FastChem, JAX-native solver)
 
 Supported model families:
 - `transformer`
@@ -12,10 +13,9 @@ Supported model families:
 Shipped configs:
 - `config/fastchem.json` — gas-phase FastChem equilibrium
 - `config/vulcan_condensation.json` — VULCAN kinetics with H2O/S8 condensation
-  (paired with a no-condensation sibling: copy this config, flip the relevant
-  toggles off, drop `H2O_l_s`/`S8_l_s` from `data_spec.{state,output}_species`,
-  drop the `vulcan.runtime.condensation` block, and change the run/checkpoint
-  paths)
+- `config/exogibbs_luhman16a.json` — ExoGibbs equilibrium for brown dwarf Luhman 16A (1M runs)
+- `config/exogibbs_bd_100k.json` — ExoGibbs equilibrium, 100k-run variant
+- `config/vulcan_bd_100k.json` — VULCAN kinetics, 100k-run brown dwarf variant
 
 CLI:
 

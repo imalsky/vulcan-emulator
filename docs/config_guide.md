@@ -6,15 +6,20 @@ Every config is defined by two top-level selectors:
 
 | Key | Values | Selects |
 |-----|--------|---------|
-| `chemistry_type` | `fastchem`, `vulcan` | Target contract and learned inputs |
+| `chemistry_type` | `fastchem`, `vulcan`, `exogibbs` | Target contract and learned inputs |
 | `model_type` | `transformer` | Prediction architecture |
 
-The two supported combinations are:
+The three supported combinations are:
 - `fastchem + transformer`
 - `vulcan + transformer`
+- `exogibbs + transformer`
 
-Shipped config:
+Shipped configs:
 - `config/fastchem.json` — FastChem equilibrium chemistry, gas-phase only
+- `config/vulcan_condensation.json` — VULCAN kinetics with H2O/S8 condensation
+- `config/exogibbs_luhman16a.json` — ExoGibbs equilibrium for Luhman 16A (1M runs)
+- `config/exogibbs_bd_100k.json` — ExoGibbs equilibrium, 100k-run variant
+- `config/vulcan_bd_100k.json` — VULCAN kinetics, 100k-run brown dwarf variant
 
 CLI:
 

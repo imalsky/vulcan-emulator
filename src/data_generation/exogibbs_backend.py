@@ -10,7 +10,9 @@ produces the same HDF5 layout consumed by normalization and training.
 
 from __future__ import annotations
 
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -185,6 +187,28 @@ def _run_single_profile(
     return vmr_output
 
 
+def _process_run(
+    runtime: _ExoGibbsRuntime,
+    spec: RunSpecification,
+    runs_dir: Path,
+    state_species: list[str],
+    output_species: list[str],
+) -> tuple[RunSpecification, Path | None]:
+    """Compute equilibrium + write HDF5 for one run. Thread-safe (unique paths)."""
+    vmr = _run_single_profile(runtime, spec)
+    if vmr is None:
+        return spec, None
+    run_path = runs_dir / f"{spec.run_id}.h5"
+    write_equilibrium_hdf5(
+        run_path,
+        spec=spec,
+        equilibrium_ymix=vmr,
+        state_species=state_species,
+        output_species=output_species,
+    )
+    return spec, run_path
+
+
 def run_exogibbs_generation(
     config: dict[str, Any],
     *,
@@ -228,11 +252,15 @@ def run_exogibbs_generation(
     state_species = list(config["data_spec"]["state_species"])
     output_species = list(config["data_spec"]["output_species"])
 
+    max_workers = int(config["generation"].get("parallel_workers", 0))
+    if max_workers <= 0:
+        max_workers = os.cpu_count() or 1
+    LOGGER.info("Using %d parallel workers for ExoGibbs generation.", max_workers)
+
     all_specs: list[RunSpecification] = []
     chunk_files: list[Path] = []
     failed_run_ids: list[str] = []
 
-    # JIT warmup
     LOGGER.info("Warming up ExoGibbs JIT compilation...")
     warmup_specs = sample_run_specifications_slice(plan, start=0, end=1)
     _run_single_profile(runtime, warmup_specs[0])
@@ -247,48 +275,61 @@ def run_exogibbs_generation(
     )
 
     t0 = time.time()
-    for chunk_idx in range(total_chunks):
-        start = chunk_idx * chunk_size
-        end = min(start + chunk_size, requested)
-        specs = sample_run_specifications_slice(plan, start=start, end=end)
-        specs = _attach_species_metadata(specs, config)
+    pool = ThreadPoolExecutor(max_workers=max_workers) if max_workers > 1 else None
+    try:
+        for chunk_idx in range(total_chunks):
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, requested)
+            specs = sample_run_specifications_slice(plan, start=start, end=end)
+            specs = _attach_species_metadata(specs, config)
 
-        run_files: list[Path] = []
-        for spec in specs:
-            vmr = _run_single_profile(runtime, spec)
-            if vmr is None:
-                failed_run_ids.append(spec.run_id)
-                LOGGER.debug("ExoGibbs failed for %s", spec.run_id)
-                continue
+            run_files: list[Path] = []
 
-            run_path = runs_dir / f"{spec.run_id}.h5"
-            write_equilibrium_hdf5(
-                run_path,
-                spec=spec,
-                equilibrium_ymix=vmr,
-                state_species=state_species,
-                output_species=output_species,
+            if pool is not None:
+                futs = {
+                    pool.submit(
+                        _process_run, runtime, spec, runs_dir,
+                        state_species, output_species,
+                    ): spec
+                    for spec in specs
+                }
+                for fut in as_completed(futs):
+                    s, rp = fut.result()
+                    if rp is None:
+                        failed_run_ids.append(s.run_id)
+                    else:
+                        run_files.append(rp)
+                        all_specs.append(s)
+            else:
+                for spec in specs:
+                    s, rp = _process_run(
+                        runtime, spec, runs_dir, state_species, output_species,
+                    )
+                    if rp is None:
+                        failed_run_ids.append(s.run_id)
+                    else:
+                        run_files.append(rp)
+                        all_specs.append(s)
+
+            if run_files:
+                chunk_path = chunks_dir / f"chunk_{chunk_idx:04d}.h5"
+                merge_run_files_to_chunk(run_files, chunk_path)
+                chunk_files.append(chunk_path)
+
+            elapsed = time.time() - t0
+            rate = end / max(elapsed, 1.0)
+            LOGGER.info(
+                "Chunk %d/%d done (%d runs, %.0f runs/s, %d failed total)",
+                chunk_idx + 1,
+                total_chunks,
+                len(run_files),
+                rate,
+                len(failed_run_ids),
             )
-            run_files.append(run_path)
-            all_specs.append(spec)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False)
 
-        if run_files:
-            chunk_path = chunks_dir / f"chunk_{chunk_idx:04d}.h5"
-            merge_run_files_to_chunk(run_files, chunk_path)
-            chunk_files.append(chunk_path)
-
-        elapsed = time.time() - t0
-        rate = end / max(elapsed, 1.0)
-        LOGGER.info(
-            "Chunk %d/%d done (%d runs, %.0f runs/s, %d failed total)",
-            chunk_idx + 1,
-            total_chunks,
-            len(run_files),
-            rate,
-            len(failed_run_ids),
-        )
-
-    # Backfill failed runs using a separate plan with a different seed
     backfill_cfg = config["generation"].get("backfill", {})
     if failed_run_ids and backfill_cfg.get("enabled", False):
         max_retries = int(backfill_cfg.get("max_retries", 10))
@@ -297,43 +338,61 @@ def run_exogibbs_generation(
             len(failed_run_ids),
             max_retries,
         )
-        backfill_id_counter = requested
-        for retry in range(max_retries):
-            if not failed_run_ids:
-                break
-            n_needed = len(failed_run_ids)
-            failed_run_ids.clear()
-            backfill_plan = build_sampling_plan(
-                config=config,
-                project_root=project_root,
-                num_runs=n_needed,
-                seed=int(config["generation"]["seed"]) + 1000 + retry,
-            )
-            backfill_specs = sample_run_specifications_slice(
-                backfill_plan, start=0, end=n_needed
-            )
-            backfill_specs = _attach_species_metadata(
-                backfill_specs, config,
-                start_index=backfill_id_counter,
-            )
-            backfill_id_counter += n_needed
-            for spec in backfill_specs:
-                vmr = _run_single_profile(runtime, spec)
-                if vmr is None:
-                    failed_run_ids.append(spec.run_id)
-                    continue
-                run_path = runs_dir / f"{spec.run_id}.h5"
-                write_equilibrium_hdf5(
-                    run_path,
-                    spec=spec,
-                    equilibrium_ymix=vmr,
-                    state_species=state_species,
-                    output_species=output_species,
+        backfill_pool = ThreadPoolExecutor(max_workers=max_workers) if max_workers > 1 else None
+        try:
+            backfill_id_counter = requested
+            for retry in range(max_retries):
+                if not failed_run_ids:
+                    break
+                n_needed = len(failed_run_ids)
+                failed_run_ids.clear()
+                backfill_plan = build_sampling_plan(
+                    config=config,
+                    project_root=project_root,
+                    num_runs=n_needed,
+                    seed=int(config["generation"]["seed"]) + 1000 + retry,
                 )
-                chunk_path = chunks_dir / f"backfill_{retry:02d}_{spec.run_id}.h5"
-                merge_run_files_to_chunk([run_path], chunk_path)
-                chunk_files.append(chunk_path)
-                all_specs.append(spec)
+                backfill_specs = sample_run_specifications_slice(
+                    backfill_plan, start=0, end=n_needed
+                )
+                backfill_specs = _attach_species_metadata(
+                    backfill_specs, config,
+                    start_index=backfill_id_counter,
+                )
+                backfill_id_counter += n_needed
+
+                if backfill_pool is not None:
+                    futs = {
+                        backfill_pool.submit(
+                            _process_run, runtime, spec, runs_dir,
+                            state_species, output_species,
+                        ): spec
+                        for spec in backfill_specs
+                    }
+                    for fut in as_completed(futs):
+                        s, rp = fut.result()
+                        if rp is None:
+                            failed_run_ids.append(s.run_id)
+                        else:
+                            chunk_path = chunks_dir / f"backfill_{retry:02d}_{s.run_id}.h5"
+                            merge_run_files_to_chunk([rp], chunk_path)
+                            chunk_files.append(chunk_path)
+                            all_specs.append(s)
+                else:
+                    for spec in backfill_specs:
+                        s, rp = _process_run(
+                            runtime, spec, runs_dir, state_species, output_species,
+                        )
+                        if rp is None:
+                            failed_run_ids.append(s.run_id)
+                        else:
+                            chunk_path = chunks_dir / f"backfill_{retry:02d}_{s.run_id}.h5"
+                            merge_run_files_to_chunk([rp], chunk_path)
+                            chunk_files.append(chunk_path)
+                            all_specs.append(s)
+        finally:
+            if backfill_pool is not None:
+                backfill_pool.shutdown(wait=False)
 
     if failed_run_ids:
         LOGGER.warning(

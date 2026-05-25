@@ -73,6 +73,7 @@ from ..utils.helpers import ensure_dir, get_logger, resolve_path
 from ..utils.provenance import manifest_for_files
 from .sampling import (
     RunSpecification,
+    _detect_available_cpus,
     build_sampling_plan,
     sample_run_specifications,
     sample_run_specifications_slice,
@@ -247,24 +248,6 @@ def list_run_ids_from_consolidated(consolidated_path: Path) -> list[str]:
         return sorted(f.keys())
 
 
-def _detect_available_cpus() -> int:
-    """Return the number of CPUs available to this process.
-
-    Checks PBS (``NCPUS``), SLURM (``SLURM_CPUS_ON_NODE``), and
-    ``os.cpu_count()`` in that order.
-    """
-    for env_var in ("NCPUS", "SLURM_CPUS_ON_NODE", "SLURM_CPUS_PER_TASK"):
-        value = os.environ.get(env_var)
-        if value is not None:
-            try:
-                n = int(value)
-                if n >= 1:
-                    return n
-            except ValueError:
-                pass
-    return os.cpu_count() or 1
-
-
 def _generation_worker_count(config: dict[str, Any], total_runs: int) -> int:
     """Return the effective number of parallel generation workers to launch.
 
@@ -273,7 +256,7 @@ def _generation_worker_count(config: dict[str, Any], total_runs: int) -> int:
     config : dict[str, Any]
         Validated config containing ``generation.parallel_workers``.
         A value of ``0`` means *auto-detect* from the runtime environment
-        (PBS ``NCPUS``, SLURM, or ``os.cpu_count()``).
+        (SLURM env vars or ``os.cpu_count()``).
     total_runs : int
         Number of runs that still need to be generated.
 

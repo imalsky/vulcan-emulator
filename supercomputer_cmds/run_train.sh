@@ -4,15 +4,13 @@
 # Default invocation (FastChem):
 #   sbatch supercomputer_cmds/run_train.sh
 #
-# Condensation emulator (rename job/logs so the condensation and FastChem
-# checkpoints land on disjoint paths and concurrent submissions don't collide):
-#   sbatch --job-name=vulcan_train_cond \
-#          --export=ALL,CONFIG_PATH=config/vulcan_condensation.json \
+# ExoGibbs:
+#   sbatch --export=ALL,CONFIG_PATH=config/exogibbs_luhman16a.json \
 #          supercomputer_cmds/run_train.sh
 #
-# No-condensation VULCAN sibling (when you have one):
-#   sbatch --job-name=vulcan_train_nocond \
-#          --export=ALL,CONFIG_PATH=config/vulcan_nocondensation.json \
+# VULCAN condensation:
+#   sbatch --job-name=vulcan_train_cond \
+#          --export=ALL,CONFIG_PATH=config/vulcan_condensation.json \
 #          supercomputer_cmds/run_train.sh
 #SBATCH -J vulcan_train
 #SBATCH -o %x.o%j
@@ -35,10 +33,8 @@ CONFIG_PATH=${CONFIG_PATH:-config/fastchem.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
 SKIP_EXPORT=${SKIP_EXPORT:-0}
 
-# Under SLURM/PBS the script is copied to a spool directory, so BASH_SOURCE
-# points there instead of the original path. Prefer the scheduler's submit dir.
 if [ -z "${PROJECT_ROOT:-}" ]; then
-  submit_dir="${SLURM_SUBMIT_DIR:-${PBS_O_WORKDIR:-}}"
+  submit_dir="${SLURM_SUBMIT_DIR:-}"
   if [ -n "$submit_dir" ] && [ -d "$submit_dir/supercomputer_cmds" ]; then
     PROJECT_ROOT="$submit_dir"
   elif [ -n "$submit_dir" ] && [ "$(basename "$submit_dir")" = "supercomputer_cmds" ]; then
@@ -73,9 +69,6 @@ export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false --xla_gpu_au
 
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel
-  # sympy + matplotlib aren't strictly needed by training, but keeping the env
-  # consistent with run_gen.sh means the same conda env can do both stages
-  # without a re-install round-trip.
   python -m pip install -U "jax[cuda12]" numpy scipy sympy matplotlib h5py optuna optax orbax-checkpoint pydantic
   python -m pip install -e . --no-deps
 fi
@@ -112,14 +105,6 @@ for split in ("train", "val", "test"):
 print(f"[preflight] chemistry_type={cfg['chemistry_type']} model_type={cfg['model_type']}")
 print(f"[preflight] processed_root={processed_root}")
 print(f"[preflight] checkpoints_root={cfg['paths']['checkpoints_root']}")
-print(f"[preflight] target_dim={cfg['data_spec']['target_dim']}")
-if cfg["chemistry_type"] == "vulcan":
-    presets = cfg["vulcan"].get("science_presets") or []
-    cond_on = any(p["physics_toggles"].get("use_condensation", False) for p in presets)
-    print(f"[preflight] use_condensation={cond_on}")
-    block = cfg["vulcan_runtime"].get("condensation")
-    if block is not None:
-        print(f"[preflight] non_gas_sp={block['non_gas_sp']}")
 PY
 
 srun python -u -m src.utils --config "$CONFIG_PATH" --stage training
