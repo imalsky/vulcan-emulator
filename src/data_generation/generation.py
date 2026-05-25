@@ -66,6 +66,7 @@ from ..utils.config import (
     dataset_run_root,
     get_chemistry_type,
     get_model_type,
+    uses_exogibbs,
     uses_fastchem,
 )
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
@@ -512,7 +513,7 @@ def _sampling_coverage_payload(
         realized min/max values, and coverage fractions for key sampled
         parameters.
     """
-    fastchem = uses_fastchem(config)
+    fastchem = uses_fastchem(config) or uses_exogibbs(config)
     del run_files  # In-memory specs already carry the realized profiles.
     frac_keys = ("He_H", "C_H", "O_H", "N_H", "S_H")
     frac_arrays = {
@@ -2467,6 +2468,12 @@ def generate_raw_dataset(
             shard_id=shard_id,
             num_shards=num_shards,
             staging_root=staging_root,
+        )
+    if chemistry_type == "exogibbs":
+        from .exogibbs_backend import run_exogibbs_generation
+
+        return run_exogibbs_generation(
+            config, project_root=project_root, num_runs=num_runs
         )
     raise ValueError(f"Unsupported chemistry_type: {chemistry_type}")
 

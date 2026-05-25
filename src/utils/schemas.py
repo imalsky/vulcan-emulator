@@ -1058,6 +1058,29 @@ class FastChemConfig(_ConfigBase):
         return self
 
 
+class ExoGibbsConfig(_ConfigBase):
+    chemistry_type: Literal["exogibbs"]
+    sampling: FastChemSamplingConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_vulcan_block(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "vulcan" in data:
+                raise ValueError(
+                    "vulcan must not be defined when chemistry_type='exogibbs'."
+                )
+        return data
+
+    @model_validator(mode="after")
+    def _check_normalization_keys(self) -> "ExoGibbsConfig":
+        _check_fastchem_normalization_keys(self.normalization, self.data_spec)
+        _check_corner_coverage_temperature_thresholds(
+            self.sampling, self.temperature_profiles,
+        )
+        return self
+
+
 class VulcanConfig(_ConfigBase):
     chemistry_type: Literal["vulcan"]
     sampling: VulcanSamplingConfig
@@ -1083,7 +1106,7 @@ class VulcanConfig(_ConfigBase):
 
 
 Config = Annotated[
-    Union[FastChemConfig, VulcanConfig],
+    Union[FastChemConfig, VulcanConfig, ExoGibbsConfig],
     Field(discriminator="chemistry_type"),
 ]
 

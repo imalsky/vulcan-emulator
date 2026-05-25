@@ -54,7 +54,7 @@ class ConfigValidationError(ValueError):
 
 
 _DISCRIMINATOR_ERROR_TYPES = {"union_tag_not_found", "union_tag_invalid"}
-_TOP_LEVEL_DISCRIMINATORS = {"fastchem", "vulcan"}
+_TOP_LEVEL_DISCRIMINATORS = {"fastchem", "vulcan", "exogibbs"}
 
 
 def _format_pydantic_error(exc: ValidationError, scope: str) -> str:
@@ -112,6 +112,11 @@ def get_model_type(config: dict[str, Any]) -> str:
 def uses_fastchem(config: dict[str, Any]) -> bool:
     """Report whether the config targets FastChem equilibrium chemistry."""
     return get_chemistry_type(config) == "fastchem"
+
+
+def uses_exogibbs(config: dict[str, Any]) -> bool:
+    """Report whether the config targets ExoGibbs equilibrium chemistry."""
+    return get_chemistry_type(config) == "exogibbs"
 
 
 def uses_vulcan_chemistry(config: dict[str, Any]) -> bool:
@@ -258,7 +263,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     output_species = list(data_spec["output_species"])
     derived_globals = (
         list(FASTCHEM_CORE_GLOBAL_INPUTS)
-        if chemistry_type == "fastchem"
+        if chemistry_type in ("fastchem", "exogibbs")
         else list(DEFAULT_REQUIRED_GLOBAL_INPUTS)
     )
     data_spec["state_species"] = state_species
@@ -269,7 +274,7 @@ def load_and_validate_config(path: str | Path) -> dict[str, Any]:
     data_spec["target_dim"] = len(output_species)
     data_spec["sequence_static_feature_order"] = (
         ["pressure_bar", "temperature_k"]
-        if chemistry_type == "fastchem"
+        if chemistry_type in ("fastchem", "exogibbs")
         else ["pressure_bar", "temperature_k", "kzz_cm2_s"]
     )
     data_spec["global_static_feature_order"] = list(derived_globals)

@@ -46,7 +46,7 @@ from ..constants import (
     PUBLIC_PHYSICS_TOGGLES,
     SUPPORTED_ATM_BASES,
 )
-from ..utils.config import uses_fastchem
+from ..utils.config import uses_exogibbs, uses_fastchem
 from ..utils.helpers import get_logger
 from .roth_sampling import (
     RothFilterValue,
@@ -1480,7 +1480,7 @@ def build_sampling_plan(
         int(config["generation"]["seed"] if seed is None else seed)
     )
     total_runs = int(config["generation"]["num_runs"] if num_runs is None else num_runs)
-    fastchem = uses_fastchem(config)
+    fastchem = uses_fastchem(config) or uses_exogibbs(config)
 
     if fastchem:
         # LHC over (He_H, C_H, O_H, N_H, S_H) — 5 dimensions.

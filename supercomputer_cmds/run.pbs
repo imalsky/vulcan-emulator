@@ -129,7 +129,9 @@ import sys
 from src.utils.config import load_and_validate_config
 
 config = load_and_validate_config(Path(sys.argv[1]).resolve())
-use_condensation = bool(config["vulcan"]["physics_toggles"]["use_condensation"]) if config["chemistry_type"] == "vulcan" else False
+use_condensation = False
+if config["chemistry_type"] == "vulcan":
+    use_condensation = bool(config["vulcan"]["physics_toggles"]["use_condensation"])
 print(config["chemistry_type"])
 print(config["model_type"])
 print(int(use_condensation))
@@ -146,8 +148,8 @@ fi
 CONFIG_CHEMISTRY_TYPE="${CONFIG_SUMMARY[0]}"
 CONFIG_MODEL_TYPE="${CONFIG_SUMMARY[1]}"
 CONFIG_USE_CONDENSATION="${CONFIG_SUMMARY[2]}"
-if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ] && [ "${CONFIG_CHEMISTRY_TYPE}" != "fastchem" ]; then
-  echo "ERROR: run.pbs supports vulcan and fastchem, but chemistry_type=${CONFIG_CHEMISTRY_TYPE}."
+if [ "${CONFIG_CHEMISTRY_TYPE}" != "vulcan" ] && [ "${CONFIG_CHEMISTRY_TYPE}" != "fastchem" ] && [ "${CONFIG_CHEMISTRY_TYPE}" != "exogibbs" ]; then
+  echo "ERROR: run.pbs supports vulcan, fastchem, and exogibbs, but chemistry_type=${CONFIG_CHEMISTRY_TYPE}."
   exit 1
 fi
 if [ "${CONFIG_MODEL_TYPE}" != "transformer" ]; then

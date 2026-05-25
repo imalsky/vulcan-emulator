@@ -74,6 +74,22 @@ FASTCHEM_LODDERS_SOLAR_ABUNDANCES: dict[str, float] = {
     "Fe": 10.0 ** (7.5151 - 12.0),
 }
 
+# =========================================================================
+# Solar reference abundances — AAG21 (Asplund, Amarsi & Grevesse 2021)
+# =========================================================================
+
+# Hydrogen-normalized elemental number fractions (n_X / n_H) from AAG21.
+# Used as the solar anchor for ExoGibbs-based training data generation.
+# Values derived from exojax.utils.zsol.nsol() mole fractions divided by
+# the H mole fraction (0.9232609).
+AAG21_SOLAR_ABUNDANCES: dict[str, float] = {
+    "He_H": 8.203515e-02,
+    "C_H": 2.884032e-04,
+    "O_H": 4.897788e-04,
+    "N_H": 6.760830e-05,
+    "S_H": 1.318257e-05,
+}
+
 # The 16 elements FastChem tracks via its solar file (H is implicit — the
 # abundances are n_X/n_H). Elements in a broader classical-chemistry setup
 # (e.g. Al/Ar/Co/Cr/Cu/Ge/Mn/Ne/Ni/Zn in ExoGibbs' 28-element setup) that
@@ -153,7 +169,7 @@ VULCAN_SUPPORTED_CONDENSATE_SPECIES = frozenset(
 )
 
 # Valid top-level chemistry_type values.
-CHEMISTRY_TYPES = ("fastchem", "vulcan")
+CHEMISTRY_TYPES = ("fastchem", "vulcan", "exogibbs")
 
 # Valid top-level model_type values.
 MODEL_TYPES = ("transformer",)

@@ -39,6 +39,7 @@ from ..utils.config import (
     get_chemistry_type,
     get_model_type,
     resolve_conditioning_inputs,
+    uses_exogibbs,
     uses_fastchem,
 )
 from ..utils.helpers import ensure_dir, get_logger, resolve_path
@@ -1227,7 +1228,7 @@ def preprocess_raw_dataset(
         Summary payload containing the processed-root path, normalization
         metadata, data contract, and train/val/test split indices.
     """
-    if uses_fastchem(config):
+    if uses_fastchem(config) or uses_exogibbs(config):
         return preprocess_equilibrium_dataset(config, project_root=project_root)
     LOGGER.info("Preprocessing VULCAN dataset")
     chemistry_type = get_chemistry_type(config)
