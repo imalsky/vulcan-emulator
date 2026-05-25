@@ -60,13 +60,9 @@ def _init_runtime(config: dict[str, Any]) -> _ExoGibbsRuntime:
     if _RUNTIME is not None:
         return _RUNTIME
 
-    from exogibbs.api import (
-        get_default_equilibrium_grid_path,
-        load_equilibrium_grid_netcdf,
-    )
     from exogibbs.api.equilibrium import (
+        DefaultEquilibriumInitializer,
         EquilibriumOptions,
-        GridEquilibriumInitializer,
     )
     from exogibbs.presets.fastchem import chemsetup
 
@@ -74,9 +70,7 @@ def _init_runtime(config: dict[str, Any]) -> _ExoGibbsRuntime:
 
     LOGGER.info("Initializing ExoGibbs runtime...")
     chem = chemsetup()
-    grid_path = get_default_equilibrium_grid_path("fastchem")
-    grid = load_equilibrium_grid_netcdf(str(grid_path))
-    initializer = GridEquilibriumInitializer(grid=grid, preset_name="fastchem")
+    initializer = DefaultEquilibriumInitializer()
     opts = EquilibriumOptions(
         epsilon_crit=1e-11, max_iter=1000, method="vmap_cold"
     )
