@@ -14,7 +14,6 @@ from pathlib import Path
 
 PROJECT_MARKERS = (
     ("pyproject.toml", "src"),
-    ("pyproject.toml", "spec.md"),
 )
 
 
@@ -114,16 +113,11 @@ def ensure_dir(path: Path) -> Path:
 def resolve_project_root(start: Path | None = None) -> Path:
     """Walk upward from ``start`` until the repository root markers are found.
 
-    Looks for any supported pair of co-located root indicators
-    (``PROJECT_MARKERS``): either ``pyproject.toml`` + ``src/`` or
-    ``pyproject.toml`` + ``spec.md``. Both pairs are first-class; the
-    ``spec.md`` pair lets detached source trees without a top-level ``src``
-    directory still identify the project root. When the runtime exports
-    ``VULCAN_PROJECT_ROOT``, that location is trusted first so batch
-    launchers can pin the working tree explicitly. When ``start`` points
-    into a detached source tree, the current working directory is used as a
-    fallback search origin. Raises ``FileNotFoundError`` if neither location
-    contains a supported marker set.
+    Looks for co-located ``pyproject.toml`` + ``src/`` directory.
+    When the runtime exports ``VULCAN_PROJECT_ROOT``, that location is
+    trusted first so batch launchers can pin the working tree explicitly.
+    Falls back to the current working directory as a search origin.
+    Raises ``FileNotFoundError`` if no marker set is found.
 
     Parameters
     ----------

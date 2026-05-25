@@ -152,6 +152,5 @@ The sharded path (`run_gen_array.sh` + `run_merge.sh`, wired together by `submit
 
 ## Reference docs
 
-- `spec.md` — full project spec (config surface, data contract, architecture contract, classical-reference contract). Treat as authoritative when something here is ambiguous.
 - `docs/config_guide.md` — key-by-key config reference.
 - `docs/training_diary.md` — short log of what each training run taught us about sizing, regularization, and sweep-proxy vs deployment loss. Append a new dated block when finishing a run.

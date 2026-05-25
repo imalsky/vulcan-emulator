@@ -9,9 +9,8 @@ then either:
 * **vulcan chemistry** — patches the VULCAN configuration, launches
   VULCAN as a subprocess, and writes the final converged output state.
 
-All generated HDF5 files follow a shared layout (see ``spec.md``,
-"Shared Data Contract") and are consumed downstream by
-``preprocess.py``.  A generation manifest and sampling-coverage
+All generated HDF5 files follow a shared layout and are consumed
+downstream by ``preprocess.py``.  A generation manifest and sampling-coverage
 summary are persisted alongside the runs for provenance.
 
 Concurrency contract

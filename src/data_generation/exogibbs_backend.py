@@ -10,7 +10,6 @@ produces the same HDF5 layout consumed by normalization and training.
 
 from __future__ import annotations
 
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ from ..utils.helpers import get_logger
 from .generation import (
     GeneratedRawDataset,
     _attach_species_metadata,
+    _generation_worker_count,
     _prepare_generation_directory,
     _requested_run_count,
     _write_generation_metadata,
@@ -108,17 +108,26 @@ def _build_element_vector(
 ) -> jnp.ndarray:
     """Build the 28-element + electron ExoGibbs vector from sampled globals.
 
-    Uses AAG21 solar for all elements as background, overrides He/C/O/N/S
-    with the sampled n_X/n_H values, then converts to mole fractions.
+    Uses the ExoGibbs reference vector for all elements as background,
+    overrides He/C/O/N/S with sampled n_X/n_H values, then converts to mole
+    fractions.
     """
-    from exojax.utils.zsol import nsol
-
-    solar = nsol()
     chem = runtime.chem
+    reference = np.asarray(chem.element_vector_reference, dtype=np.float64)
+    if reference.shape[0] != len(chem.elements):
+        raise ValueError(
+            "ExoGibbs element_vector_reference does not match chem.elements."
+        )
+
+    reference_by_element = {
+        str(element): float(value)
+        for element, value in zip(chem.elements, reference)
+    }
+    h_reference = reference_by_element["H"]
 
     x_over_h: dict[str, float] = {}
     for element in chem.elements[:-1]:  # exclude 'e-'
-        x_over_h[str(element)] = float(solar[str(element)]) / float(solar["H"])
+        x_over_h[str(element)] = reference_by_element[str(element)] / h_reference
 
     # Override with sampled globals
     _ELEMENT_TO_SYMBOL = {"He_H": "He", "C_H": "C", "O_H": "O", "N_H": "N", "S_H": "S"}
@@ -246,9 +255,7 @@ def run_exogibbs_generation(
     state_species = list(config["data_spec"]["state_species"])
     output_species = list(config["data_spec"]["output_species"])
 
-    max_workers = int(config["generation"].get("parallel_workers", 0))
-    if max_workers <= 0:
-        max_workers = os.cpu_count() or 1
+    max_workers = _generation_worker_count(config, requested)
     LOGGER.info("Using %d parallel workers for ExoGibbs generation.", max_workers)
 
     all_specs: list[RunSpecification] = []

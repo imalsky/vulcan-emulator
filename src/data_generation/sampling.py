@@ -509,7 +509,7 @@ def _power_law_temperature(
     parameterization driving NUTS in
     ``exojax_demo/06_classical_vs_emulator_retrieval.ipynb``. Adding this
     shape to training keeps the emulator in-distribution under that
-    retrieval prior. See spec.md "Analytic profile shapes".
+    retrieval prior.
     """
     pressure_bar = np.asarray(pressure_bar, dtype=np.float64)
     return t0_k * (pressure_bar / p_ref_bar) ** alpha

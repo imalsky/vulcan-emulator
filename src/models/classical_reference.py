@@ -500,7 +500,7 @@ def chemsetup_matched_to_fastchem(fastchem_source_root: Path, *, silent: bool = 
     is built against the NASA-9 polynomial form in
     ``nasa9_logK_SNCHOPTi.dat``; switching FastChem to the 5-term file
     would require rebuilding the trained emulator, which is out of scope
-    for notebook comparisons (see ``spec.md`` "Classical References").
+    for notebook comparisons.
     """
 
     logk_path = fastchem_source_root / "fastchem_vulcan" / "input" / "logK_wo_ions.dat"
@@ -658,8 +658,7 @@ def read_fastchem_monitor_fail_mask(monitor_path: Path) -> np.ndarray | None:
     its inner Newton step did not satisfy that element's mass-balance
     constraint, even when the outer iteration reports ``c_convergence=ok``.
     Notebooks use this mask to exclude non-converged levels from
-    FastChem↔ExoGibbs comparison metrics (see spec.md "Classical
-    References").
+    FastChem↔ExoGibbs comparison metrics.
 
     Returns ``None`` when ``monitor_path`` does not exist (e.g. when the
     monitor file was not emitted).

@@ -204,6 +204,6 @@ def test_public_surfaces_default_to_shipped_fastchem_config():
     assert 'default="config/fastchem.json"' in tuning_text
     assert 'CONFIG_PATH="${CONFIG_PATH:-config/fastchem.json}"' in run_pbs_text
 
-    for path in (ROOT / "docs" / "README.md", ROOT / "docs" / "config_guide.md", ROOT / "spec.md"):
+    for path in (ROOT / "docs" / "README.md", ROOT / "docs" / "config_guide.md"):
         text = path.read_text(encoding="utf-8")
         assert "config/fastchem.json" in text
