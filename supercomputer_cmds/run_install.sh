@@ -5,6 +5,10 @@
 # array. The array tasks depend on this job via --dependency=afterok, so
 # they never race on pip install.
 #
+# After pip install, compiles FastChem natively from ../VULCAN-master and
+# patches the installed vulcan-jax package with the resulting binary.
+# The TestPyPI wheel ships a macOS binary that cannot run on Linux.
+#
 # Can also be run standalone:
 #   sbatch supercomputer_cmds/run_install.sh
 #
@@ -55,5 +59,27 @@ python -m pip install -U exogibbs jax numpy scipy sympy matplotlib h5py optuna o
 echo "[setup] installing vulcan-jax into conda env '$CONDA_ENV' from TestPyPI"
 python -m pip install -U -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ --no-deps vulcan-jax
 python -m pip install -e . --no-deps
+
+# --- Compile FastChem natively and patch the installed vulcan-jax package ---
+# The TestPyPI wheel bundles a macOS ARM binary; we need a Linux binary.
+VULCAN_SOURCE="${PROJECT_ROOT}/../VULCAN-master"
+FC_BUILD_DIR="${VULCAN_SOURCE}/fastchem_vulcan"
+
+if [ -d "$FC_BUILD_DIR/fastchem_src" ]; then
+  echo "[setup] compiling FastChem from ${FC_BUILD_DIR} ..."
+  make -C "$FC_BUILD_DIR" clean 2>/dev/null || true
+  make -C "$FC_BUILD_DIR" all
+  if [ -x "$FC_BUILD_DIR/fastchem" ]; then
+    VULCAN_JAX_PKG=$(python -c "import vulcan_jax, pathlib; print(pathlib.Path(vulcan_jax.__file__).resolve().parent)")
+    cp "$FC_BUILD_DIR/fastchem" "$VULCAN_JAX_PKG/fastchem_vulcan/fastchem"
+    chmod +x "$VULCAN_JAX_PKG/fastchem_vulcan/fastchem"
+    echo "[setup] patched installed vulcan-jax with native FastChem binary"
+    file "$VULCAN_JAX_PKG/fastchem_vulcan/fastchem"
+  else
+    echo "[WARNING] FastChem compilation produced no executable — VULCAN generation will fail"
+  fi
+else
+  echo "[WARNING] VULCAN-master source not found at ${FC_BUILD_DIR} — skipping FastChem compilation"
+fi
 
 echo "[install] done — env '$CONDA_ENV' is ready"
