@@ -3,7 +3,8 @@
 #
 # Usage:
 #   bash supercomputer_cmds/submit_gen_array.sh
-#   CONFIG_PATH=config/other.json bash supercomputer_cmds/submit_gen_array.sh
+#   CONFIG_PATH=config/exogibbs_luhman16a_10k.json bash supercomputer_cmds/submit_gen_array.sh
+#   CONFIG_PATH=config/vulcan_luhman16a_10k.json bash supercomputer_cmds/submit_gen_array.sh
 #
 # Prints both job IDs. The merge job fires automatically once every array
 # task succeeds (--dependency=afterok). If any shard fails, the merge job
@@ -13,7 +14,7 @@
 
 set -euo pipefail
 
-CONFIG_PATH=${CONFIG_PATH:-config/vulcan_condensation.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
 
 if [ -z "${PROJECT_ROOT:-}" ]; then
   SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"

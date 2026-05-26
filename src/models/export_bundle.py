@@ -704,6 +704,16 @@ class ExportedJAXModel:
         return self.chemistry_type == "fastchem"
 
     @property
+    def uses_exogibbs(self: "ExportedJAXModel") -> bool:
+        """Report whether the exported bundle predicts ExoGibbs outputs."""
+        return self.chemistry_type == "exogibbs"
+
+    @property
+    def uses_equilibrium_chemistry(self: "ExportedJAXModel") -> bool:
+        """Report whether the bundle uses the equilibrium-profile contract."""
+        return self.chemistry_type in {"fastchem", "exogibbs"}
+
+    @property
     def uses_vulcan_chemistry(self: "ExportedJAXModel") -> bool:
         """Report whether the exported bundle predicts VULCAN chemistry outputs.
 
@@ -826,11 +836,14 @@ class ExportedJAXModel:
             JIT-compiled function with signature
             ``(pressure_bar, temperature_k, global_inputs) -> predictions``.
         """
-        if not self.uses_fastchem:
-            raise ValueError("make_compiled_fastchem_profile_predictor requires a fastchem export bundle.")
+        if not self.uses_equilibrium_chemistry:
+            raise ValueError(
+                "make_compiled_fastchem_profile_predictor requires a fastchem "
+                "or exogibbs equilibrium export bundle."
+            )
         return self._compiled_fastchem_predictors[bool(return_log10)]
 
-    def predict_fastchem_profile(
+    def _predict_equilibrium_profile(
         self: "ExportedJAXModel",
         *,
         pressure_bar: jax.Array | np.ndarray,
@@ -838,35 +851,12 @@ class ExportedJAXModel:
         global_inputs: dict[str, float] | jax.Array | np.ndarray,
         return_log10: bool = False,
     ) -> jax.Array:
-        """Run FastChem inference directly from physical-unit inputs.
-
-        Handles all normalization internally: sequence-static features are
-        normalized per-column (log-standard for pressure, standard for
-        temperature), global inputs are normalized via the mixed block,
-        and predictions are inverse-normalized back to physical mixing
-        ratios.
-
-        Parameters
-        ----------
-        pressure_bar : array-like
-            Pressure grid in bar, shape ``(nz,)``.
-        temperature_k : array-like
-            Temperature profile in Kelvin, shape ``(nz,)``.
-        global_inputs : dict or array-like
-            Global conditioning scalars.  If a dict, keys must match
-            ``data_contract["global_static_feature_order"]`` (e.g.,
-            ``{"He_H": 7.84e-2, "C_H": 3.3e-4, "O_H": 4.9e-4, "N_H": 7.8e-5, "S_H": 1.6e-5}``).
-            If an array, must have shape ``(global_dim,)`` in the correct order.
-        return_log10 : bool
-            If True, return log10 mixing ratios instead of linear.
-
-        Returns
-        -------
-        jax.Array
-            Predicted mixing ratios, shape ``(nz, target_dim)``.
-        """
-        if not self.uses_fastchem:
-            raise ValueError("predict_fastchem_profile requires a fastchem export bundle.")
+        """Run equilibrium-profile inference from physical-unit inputs."""
+        if not self.uses_equilibrium_chemistry:
+            raise ValueError(
+                "Equilibrium profile prediction requires a fastchem or exogibbs "
+                "export bundle."
+            )
         _validate_pressure_grid(pressure_bar, self.data_contract)
         _validate_near_constant_standard_globals(
             global_inputs,
@@ -879,6 +869,42 @@ class ExportedJAXModel:
             dims=self.dims,
             normalization=self.normalization,
             data_contract=self.data_contract,
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            global_inputs=global_inputs,
+            return_log10=return_log10,
+        )
+
+    def predict_fastchem_profile(
+        self: "ExportedJAXModel",
+        *,
+        pressure_bar: jax.Array | np.ndarray,
+        temperature_k: jax.Array | np.ndarray,
+        global_inputs: dict[str, float] | jax.Array | np.ndarray,
+        return_log10: bool = False,
+    ) -> jax.Array:
+        """Run FastChem inference directly from physical-unit inputs."""
+        if not self.uses_fastchem:
+            raise ValueError("predict_fastchem_profile requires a fastchem export bundle.")
+        return self._predict_equilibrium_profile(
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            global_inputs=global_inputs,
+            return_log10=return_log10,
+        )
+
+    def predict_exogibbs_profile(
+        self: "ExportedJAXModel",
+        *,
+        pressure_bar: jax.Array | np.ndarray,
+        temperature_k: jax.Array | np.ndarray,
+        global_inputs: dict[str, float] | jax.Array | np.ndarray,
+        return_log10: bool = False,
+    ) -> jax.Array:
+        """Run ExoGibbs inference directly from physical-unit inputs."""
+        if not self.uses_exogibbs:
+            raise ValueError("predict_exogibbs_profile requires an exogibbs export bundle.")
+        return self._predict_equilibrium_profile(
             pressure_bar=pressure_bar,
             temperature_k=temperature_k,
             global_inputs=global_inputs,
@@ -958,6 +984,22 @@ class ExportedJAXModel:
             return_log10=return_log10,
         )
 
+    def predict_exogibbs(
+        self: "ExportedJAXModel",
+        pressure_bar: jax.Array | np.ndarray,
+        temperature_k: jax.Array | np.ndarray,
+        global_inputs: dict[str, float] | jax.Array | np.ndarray,
+        *,
+        return_log10: bool = False,
+    ) -> jax.Array:
+        """Alias for :meth:`predict_exogibbs_profile` with positional inputs."""
+        return self.predict_exogibbs_profile(
+            pressure_bar=pressure_bar,
+            temperature_k=temperature_k,
+            global_inputs=global_inputs,
+            return_log10=return_log10,
+        )
+
     def predict_vulcan(
         self: "ExportedJAXModel",
         pressure_bar: jax.Array | np.ndarray,
@@ -982,6 +1024,18 @@ class ExportedJAXModel:
         return_log10: bool = False,
     ) -> Callable[[Any, Any, Any], jax.Array]:
         """Alias for :meth:`make_compiled_fastchem_profile_predictor`."""
+        return self.make_compiled_fastchem_profile_predictor(return_log10=return_log10)
+
+    def make_compiled_exogibbs_profile_predictor(
+        self: "ExportedJAXModel",
+        *,
+        return_log10: bool = False,
+    ) -> Callable[[Any, Any, Any], jax.Array]:
+        """Return a cached JIT-compiled ExoGibbs profile predictor."""
+        if not self.uses_exogibbs:
+            raise ValueError(
+                "make_compiled_exogibbs_profile_predictor requires an exogibbs export bundle."
+            )
         return self.make_compiled_fastchem_profile_predictor(return_log10=return_log10)
 
 
@@ -1031,7 +1085,7 @@ def load_exported_model(
         lambda x: jax.device_put(jnp.asarray(x), target_device) if target_device is not None else jnp.asarray(x),
         params,
     )
-    if chemistry_type not in {"fastchem", "vulcan"} or model_type != "transformer":
+    if chemistry_type not in {"fastchem", "vulcan", "exogibbs"} or model_type != "transformer":
         raise ValueError(
             f"Unsupported chemistry_type={chemistry_type!r} or model_type={model_type!r}."
         )

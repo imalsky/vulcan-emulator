@@ -12,12 +12,10 @@ code out of the production data pipeline.
 from __future__ import annotations
 
 import concurrent.futures
-import shutil
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from src.data_generation.generation import (
     GeneratedRawDataset,
     _element_abundances_from_spec,

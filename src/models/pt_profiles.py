@@ -7,7 +7,7 @@ the same Guillot/Piette functional forms the bundle was trained on.
 
 The shapes here mirror exactly the analytic family the FastChem bundle is
 trained against — see ``temperature_profiles.analytic_sampler`` in
-``config/fastchem.json`` and the ``_guillot_temperature`` /
+``config/vulcan_luhman16a_10k.json`` and the ``_guillot_temperature`` /
 ``_apply_upper_atmosphere_modification`` helpers in
 ``src/data_generation/sampling.py``.
 """

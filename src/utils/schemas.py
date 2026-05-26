@@ -15,7 +15,6 @@ the codebase expects, and emit a plain ``dict`` via ``model_dump(mode="python")`
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import (
@@ -27,12 +26,15 @@ from pydantic import (
     PositiveFloat,
     PositiveInt,
     TypeAdapter,
-    ValidationError,
     field_validator,
     model_validator,
 )
 
 from ..constants import (
+    _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS,
+    _ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS,
+    _DEFAULT_SCIENCE_PRESET_NAME,
+    _INTERNAL_VULCAN_RUNTIME_DEFAULTS,
     DBIN1_NM_DEFAULT,
     DBIN2_NM_DEFAULT,
     DBIN_12TRANS_NM_DEFAULT,
@@ -41,17 +43,8 @@ from ..constants import (
     FASTCHEM_CORE_GLOBAL_INPUTS,
     FRACTION_SUM_TOLERANCE,
     PUBLIC_PHYSICS_TOGGLES,
-    SUPPORTED_ATM_BASES,
     VULCAN_SUPPORTED_CONDENSATE_SPECIES,
-    _ALLOWED_ACTIVATIONS,
-    _ALLOWED_NORMALIZATION_METHODS,
-    _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS,
-    _ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS,
-    _ALLOWED_TEMPERATURE_PROFILE_NUMERIC_FILTER_KEYS,
-    _DEFAULT_SCIENCE_PRESET_NAME,
-    _INTERNAL_VULCAN_RUNTIME_DEFAULTS,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared base and helpers
@@ -71,6 +64,7 @@ Activation = Literal[
 NormType = Literal["layernorm", "rmsnorm"]
 FfnType = Literal["dense", "swiglu"]
 AtmBase = Literal["H2", "N2", "O2", "CO2", "H2O"]
+VulcanBackend = Literal["master", "vulcan_jax"]
 
 
 def _range_pair(low_name: str, high_name: str, *, allow_equal: bool):
@@ -872,6 +866,7 @@ class CondensationConfig(_StrictModel):
 class VulcanRuntimeConfig(_StrictModel):
     """Runtime configuration passed to the VULCAN worker."""
 
+    backend: VulcanBackend = "master"
     chemistry_file: str = Field(..., min_length=1)
     t_cross_sp: list[str]
     python_executable: str = Field(
@@ -1052,6 +1047,9 @@ class FastChemConfig(_ConfigBase):
     def _check_normalization_keys(self) -> "FastChemConfig":
         _check_fastchem_normalization_keys(self.normalization, self.data_spec)
         _check_fastchem_temperature_floor(self.sampling, self.temperature_profiles)
+        _check_sampling_temperature_range_matches_validation(
+            self.sampling, self.temperature_profiles,
+        )
         _check_corner_coverage_temperature_thresholds(
             self.sampling, self.temperature_profiles,
         )
@@ -1075,6 +1073,9 @@ class ExoGibbsConfig(_ConfigBase):
     @model_validator(mode="after")
     def _check_normalization_keys(self) -> "ExoGibbsConfig":
         _check_fastchem_normalization_keys(self.normalization, self.data_spec)
+        _check_sampling_temperature_range_matches_validation(
+            self.sampling, self.temperature_profiles,
+        )
         _check_corner_coverage_temperature_thresholds(
             self.sampling, self.temperature_profiles,
         )
@@ -1098,6 +1099,9 @@ class VulcanConfig(_ConfigBase):
     @model_validator(mode="after")
     def _check_normalization_keys(self) -> "VulcanConfig":
         _check_vulcan_normalization_keys(self.normalization, self.data_spec)
+        _check_sampling_temperature_range_matches_validation(
+            self.sampling, self.temperature_profiles,
+        )
         _check_corner_coverage_temperature_thresholds(
             self.sampling, self.temperature_profiles,
         )
@@ -1146,6 +1150,24 @@ def _check_fastchem_temperature_floor(
     if min_validation_temperature < 100.0:
         raise ValueError(
             "FastChem temperature_profiles.validation.min_temperature_k must be >= 100.0 K."
+        )
+
+
+def _check_sampling_temperature_range_matches_validation(
+    sampling: _SamplingBase,
+    temperature_profiles: TemperatureProfilesConfig,
+) -> None:
+    """Ensure the sampling temperature range bounds active profile validation."""
+    sampling_lo, sampling_hi = (float(value) for value in sampling.temperature_range_k)
+    validation = temperature_profiles.validation
+    validation_lo = float(validation.min_temperature_k)
+    validation_hi = float(validation.max_temperature_k)
+    tolerance = 1.0e-9
+    if validation_lo < sampling_lo - tolerance or validation_hi > sampling_hi + tolerance:
+        raise ValueError(
+            "temperature_profiles.validation min/max_temperature_k must lie within "
+            "sampling.temperature_range_k so the configured sampling envelope bounds "
+            "the active sampler."
         )
 
 

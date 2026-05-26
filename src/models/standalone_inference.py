@@ -7,7 +7,8 @@ re-export of the canonical implementations in ``src/models``:
 - forward pass — ``apply_transformer_model`` (``src/models/transformer.py``)
 - bundle I/O + physical-unit prediction — ``ExportedModel``, ``load_model``
   (``src/models/export_bundle.py``)
-- ExoJAX-ready callables — ``make_fastchem_vmr_fn``, ``make_vulcan_vmr_fn``
+- ExoJAX-ready callables — ``make_fastchem_vmr_fn``, ``make_exogibbs_vmr_fn``,
+  ``make_vulcan_vmr_fn``
   (``src/models/exojax_api.py``)
 
 Usage
@@ -28,9 +29,9 @@ exported bundle is weights + JSON metadata, not a self-contained forward pass.
 from __future__ import annotations
 
 from ..constants import FASTCHEM_GLOBAL_LABELS, VULCAN_GLOBAL_LABELS
+from .exojax_api import make_exogibbs_vmr_fn, make_fastchem_vmr_fn, make_vulcan_vmr_fn
 from .export_bundle import ExportedJAXModel as ExportedModel
 from .export_bundle import load_exported_model as load_model
-from .exojax_api import make_fastchem_vmr_fn, make_vulcan_vmr_fn
 from .jax_model import TransformerDimensions, apply_transformer_model
 from .pt_profiles import guillot_temperature
 
@@ -43,5 +44,6 @@ __all__ = [
     "guillot_temperature",
     "load_model",
     "make_fastchem_vmr_fn",
+    "make_exogibbs_vmr_fn",
     "make_vulcan_vmr_fn",
 ]

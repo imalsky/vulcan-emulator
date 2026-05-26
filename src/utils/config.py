@@ -23,11 +23,6 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .schemas import (
-    ConfigAdapter,
-    ModelConfig,
-)
-
 from ..constants import (  # noqa: F401 — re-exported for downstream consumers
     CHEMISTRY_TYPES,
     DBIN1_NM_DEFAULT,
@@ -46,6 +41,10 @@ from ..constants import (  # noqa: F401 — re-exported for downstream consumers
     VULCAN_CORE_GLOBAL_INPUTS,
     VULCAN_OPTIONAL_GLOBAL_INPUTS,
     VULCAN_STELLAR_GLOBAL_INPUTS,
+)
+from .schemas import (
+    ConfigAdapter,
+    ModelConfig,
 )
 
 

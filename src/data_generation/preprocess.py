@@ -661,15 +661,24 @@ def _split_indices(num_runs: int, *, config: dict[str, Any]) -> dict[str, list[i
     dict[str, list[int]]
         Mapping from split names to lists of shuffled run indices.
     """
+    if num_runs < 3:
+        raise ValueError(
+            f"At least 3 valid raw runs are required for non-empty train/val/test "
+            f"splits; got {num_runs}."
+        )
     split_cfg = config["normalization"]["split"]
     # The public config contract stores split settings under normalization.split.
     rng = np.random.default_rng(int(split_cfg["seed"]))
     perm = np.arange(num_runs, dtype=np.int32)
     rng.shuffle(perm)
-    train_n = max(1, int(round(num_runs * float(split_cfg["train_fraction"]))))
-    val_n = max(1, int(round(num_runs * float(split_cfg["val_fraction"]))))
-    if train_n + val_n >= num_runs:
-        val_n = max(1, num_runs - train_n - 1)
+    train_n = min(
+        max(1, int(round(num_runs * float(split_cfg["train_fraction"])))),
+        num_runs - 2,
+    )
+    val_n = min(
+        max(1, int(round(num_runs * float(split_cfg["val_fraction"])))),
+        num_runs - train_n - 1,
+    )
     test_n = num_runs - train_n - val_n
     if test_n < 1:
         test_n = 1
@@ -677,6 +686,11 @@ def _split_indices(num_runs: int, *, config: dict[str, Any]) -> dict[str, list[i
             train_n -= 1
         else:
             val_n -= 1
+    if train_n < 1 or val_n < 1 or test_n < 1:
+        raise ValueError(
+            "Split fractions produced an empty split; adjust normalization.split "
+            f"for num_runs={num_runs}."
+        )
     return {
         "train": perm[:train_n].tolist(),
         "val": perm[train_n : train_n + val_n].tolist(),
@@ -1015,22 +1029,44 @@ def _write_processed_info_dir(
     )
 
 
-def _load_raw_runs(
-    raw_root: Path,
+def _load_raw_runs_by_id(
+    consolidated_path: Path,
+    run_ids: list[str],
     *,
     config: dict[str, Any],
     load_run_fn: Callable[..., Any],
-) -> tuple[list[Any], list[Path]]:
-    """Load raw runs from the consolidated ``runs.h5`` file."""
-    consolidated_path, consolidated_ids = _consolidated_raw_runs(raw_root)
-    LOGGER.info(
-        "Reading %d runs from consolidated %s", len(consolidated_ids), consolidated_path,
-    )
+) -> list[Any]:
+    """Load selected raw runs from the consolidated ``runs.h5`` file."""
+    LOGGER.info("Reading %d runs from consolidated %s", len(run_ids), consolidated_path)
     with h5py.File(consolidated_path, "r") as f:
-        raw_runs = [
-            load_run_fn(f[rid], config=config, run_id=rid) for rid in consolidated_ids
-        ]
-    return raw_runs, [consolidated_path]
+        return [load_run_fn(f[rid], config=config, run_id=rid) for rid in run_ids]
+
+
+def _valid_equilibrium_run_ids(
+    consolidated_path: Path,
+    run_ids: list[str],
+    *,
+    config: dict[str, Any],
+) -> list[str]:
+    """Return equilibrium run IDs whose target arrays are finite."""
+    valid_ids: list[str] = []
+    n_dropped = 0
+    with h5py.File(consolidated_path, "r") as f:
+        for run_id in run_ids:
+            run = load_raw_equilibrium_run(f[run_id], config=config, run_id=run_id)
+            if np.all(np.isfinite(run.equilibrium_ymix)):
+                valid_ids.append(run_id)
+            else:
+                n_dropped += 1
+                LOGGER.warning(
+                    "Dropping run %s: non-finite equilibrium mixing ratios detected.",
+                    run.run_id,
+                )
+    if n_dropped > 0:
+        LOGGER.info("Dropped %d / %d runs with non-finite equilibrium data.", n_dropped, len(run_ids))
+    if not valid_ids:
+        raise RuntimeError("All raw runs contain non-finite data; nothing to preprocess.")
+    return valid_ids
 
 
 def preprocess_equilibrium_dataset(
@@ -1061,36 +1097,27 @@ def preprocess_equilibrium_dataset(
     ensure_dir(processed_root)
     info_dir = ensure_dir(processed_info_dir(processed_root))
 
-    raw_runs_unfiltered, raw_source_files = _load_raw_runs(
-        raw_root, config=config, load_run_fn=load_raw_equilibrium_run,
+    consolidated_path, raw_run_ids = _consolidated_raw_runs(raw_root)
+    valid_run_ids = _valid_equilibrium_run_ids(
+        consolidated_path,
+        raw_run_ids,
+        config=config,
     )
+    raw_source_files = [consolidated_path]
 
-    # Filter out runs where VULCAN produced non-finite equilibrium mixing ratios.
-    # This can happen for extreme parameter combinations (very low abundances).
-    raw_runs = []
-    n_dropped = 0
-    for run in raw_runs_unfiltered:
-        if np.all(np.isfinite(run.equilibrium_ymix)):
-            raw_runs.append(run)
-        else:
-            n_dropped += 1
-            LOGGER.warning(
-                "Dropping run %s: non-finite equilibrium mixing ratios detected.", run.run_id,
-            )
-    if n_dropped > 0:
-        LOGGER.info(
-            "Dropped %d / %d runs with non-finite equilibrium data.",
-            n_dropped, len(raw_runs_unfiltered),
-        )
-    if not raw_runs:
-        raise RuntimeError("All raw runs contain non-finite data; nothing to preprocess.")
-
-    split_indices = _split_indices(len(raw_runs), config=config)
-    train_runs = [raw_runs[i] for i in split_indices["train"]]
+    split_indices = _split_indices(len(valid_run_ids), config=config)
+    train_ids = [valid_run_ids[i] for i in split_indices["train"]]
+    train_runs = _load_raw_runs_by_id(
+        consolidated_path,
+        train_ids,
+        config=config,
+        load_run_fn=load_raw_equilibrium_run,
+    )
     global_static_order = list(config["data_spec"]["global_static_feature_order"])
     normalization = _equilibrium_normalization_payload(
         train_runs, config=config, global_static_order=global_static_order,
     )
+    del train_runs
     sequence_feature_order = list(config["data_spec"]["sequence_static_feature_order"])
     num_levels_range = [
         int(config["sampling"]["num_levels_range"][0]),
@@ -1101,7 +1128,13 @@ def preprocess_equilibrium_dataset(
 
     for split_name, indices in split_indices.items():
         split_dir = ensure_dir(processed_root / split_name)
-        runs = [raw_runs[i] for i in indices]
+        split_run_ids = [valid_run_ids[i] for i in indices]
+        runs = _load_raw_runs_by_id(
+            consolidated_path,
+            split_run_ids,
+            config=config,
+            load_run_fn=load_raw_equilibrium_run,
+        )
         target_dim = runs[0].equilibrium_ymix.shape[-1]
         n_seq_features = len(sequence_feature_order)
 
@@ -1238,18 +1271,23 @@ def preprocess_raw_dataset(
     ensure_dir(processed_root)
     info_dir = ensure_dir(processed_info_dir(processed_root))
 
-
-    raw_runs, raw_source_files = _load_raw_runs(
-        raw_root, config=config, load_run_fn=load_raw_run,
+    consolidated_path, raw_run_ids = _consolidated_raw_runs(raw_root)
+    raw_source_files = [consolidated_path]
+    split_indices = _split_indices(len(raw_run_ids), config=config)
+    train_ids = [raw_run_ids[i] for i in split_indices["train"]]
+    train_runs = _load_raw_runs_by_id(
+        consolidated_path,
+        train_ids,
+        config=config,
+        load_run_fn=load_raw_run,
     )
-    split_indices = _split_indices(len(raw_runs), config=config)
-    train_runs = [raw_runs[i] for i in split_indices["train"]]
     global_static_order = list(config["data_spec"]["global_static_feature_order"])
     normalization = _normalization_payload(
         train_runs,
         config=config,
         global_static_order=global_static_order,
     )
+    del train_runs
 
     num_levels_range = [
         int(config["sampling"]["num_levels_range"][0]),
@@ -1260,7 +1298,13 @@ def preprocess_raw_dataset(
 
     for split_name, indices in split_indices.items():
         split_dir = ensure_dir(processed_root / split_name)
-        runs = [raw_runs[i] for i in indices]
+        split_run_ids = [raw_run_ids[i] for i in indices]
+        runs = _load_raw_runs_by_id(
+            consolidated_path,
+            split_run_ids,
+            config=config,
+            load_run_fn=load_raw_run,
+        )
         target_dim = runs[0].final_ymix_output.shape[-1]
 
         sequence_inputs = np.zeros((len(runs), max_num_levels, 3), dtype=np.float32)

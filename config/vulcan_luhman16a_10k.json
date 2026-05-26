@@ -1,11 +1,11 @@
 {
   "_comment_units": "Pressures: bar (or log10(bar) for log10_*_bar keys). Temperatures: K. Times: seconds. Abundances: number ratio rel H (n_X/n_H), solar anchors in src/constants.py:SOLAR_ABUNDANCES. Log10 quantities: dex.",
-  "_comment_purpose": "VULCAN disequilibrium (vertical mixing) emulator for isolated brown dwarfs. 100k training runs. Kzz varied over [1e4, 1e10] cm2/s. Condensation ON (H2O + S8). Stellar/orbital parameters fixed to placeholders (no irradiation). Gravity and radius span the full L/T dwarf range.",
+  "_comment_purpose": "VULCAN disequilibrium vertical-mixing emulator for the Luhman 16A brown-dwarf high-resolution retrieval test case. 10k training runs. Kzz varied over [1e4, 1e10] cm2/s. Condensation ON (H2O + S8). T-P profiles use 30% simple power-law profiles and 70% modified-Guillot profiles; no Roth/PT-library profiles.",
   "chemistry_type": "vulcan",
   "model_type": "transformer",
   "paths": {
-    "run_root": "data/vulcan_bd_100k",
-    "checkpoints_root": "models/vulcan_bd_100k",
+    "run_root": "data/vulcan_luhman16a_10k",
+    "checkpoints_root": "models/vulcan_luhman16a_10k",
     "vulcan_source_root": "../VULCAN-master"
   },
   "data_spec": {
@@ -25,7 +25,7 @@
     "num_levels_range": [40, 60],
     "pressure_top_bar_range": [1.0e-06, 1.0e-05],
     "pressure_bottom_bar_range": [100.0, 200.0],
-    "temperature_range_k": [300.0, 3500.0],
+    "temperature_range_k": [200.0, 4500.0],
     "_comment_abundance_ranges": "Same ranges as FastChem/ExoGibbs configs — solar-anchored Latin-hypercube with retrieval-prior margin.",
     "he_frac_range": [5e-02, 3e-01],
     "c_frac_range": [2e-05, 3e-02],
@@ -59,31 +59,31 @@
     }
   },
   "temperature_profiles": {
-    "_comment": "Self-luminous BD profiles: 70% power-law (dominant for isolated objects) + 30% Guillot with high T_int and near-zero irradiation. Convection probability boosted (BDs are deeply convective).",
+    "_comment": "Pure analytic sampler for the Luhman 16A high-resolution retrieval setup. source_mode='analytic' keeps Roth/PT-library profiles disabled; power_law_probability=0.3 gives 30% power-law and 70% modified-Guillot profiles.",
     "source_mode": "analytic",
     "filters": {},
     "validation": {
-      "min_temperature_k": 300.0,
-      "max_temperature_k": 3500.0
+      "min_temperature_k": 200.0,
+      "max_temperature_k": 4500.0
     },
     "analytic_sampler": {
-      "t_int_k_range": [300.0, 2000.0],
+      "t_int_k_range": [500.0, 1800.0],
       "t_eq_k_range": [1.0, 100.0],
       "log10_delta_range": [-4, 2],
       "log10_gamma_range": [-3.0, 3.0],
       "alpha_range": [0.0, 0.5],
-      "log10_p_trans_bar_range": [-5.0, 3.0],
+      "log10_p_trans_bar_range": [-5.0, 2.3],
       "convection_probability": 0.4,
       "adiabatic_gradient_range": [0.25, 0.35],
-      "power_law_probability": 0.7,
-      "power_law_t0_range_k": [800.0, 2500.0],
-      "power_law_alpha_range": [0.02, 0.25],
+      "power_law_probability": 0.3,
+      "power_law_t0_range_k": [600.0, 2500.0],
+      "power_law_alpha_range": [0.0, 0.15],
       "power_law_p_ref_bar": 1.0
     }
   },
   "generation": {
-    "_comment": "100k VULCAN kinetics runs with condensation; minutes each. Designed for 4-shard SLURM array (25k/shard).",
-    "num_runs": 100000,
+    "_comment": "10k VULCAN-JAX kinetics runs with condensation; designed for 4-shard SLURM array (2.5k/shard).",
+    "num_runs": 10000,
     "seed": 7,
     "overwrite": false,
     "reuse_raw_if_present": true,
@@ -195,6 +195,7 @@
       "use_sat_surface_h2o": false
     },
     "runtime": {
+      "backend": "vulcan_jax",
       "chemistry_file": "thermo/SNCHO_photo_network_2025.txt",
       "t_cross_sp": ["H2O"],
       "regenerate_chem_funs": true,

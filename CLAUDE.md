@@ -18,10 +18,10 @@ The env carries ExoJAX + NumPyro + JAX with 64-bit support. Do not install into 
 The whole project is one four-stage pipeline driven by a single config. Stages must be run in order on a fresh dataset; later ones can be rerun independently if their inputs already exist.
 
 ```bash
-python -m src.utils --config config/fastchem.json --stage generation
-python -m src.utils --config config/fastchem.json --stage normalization   # split + fit + write processed tensors (one stage, not two)
-python -m src.utils --config config/fastchem.json --stage training
-python -m src.utils --config config/fastchem.json --stage export
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage generation
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage normalization   # split + fit + write processed tensors (one stage, not two)
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage training
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage export
 ```
 
 Each stage prints a JSON artefact summary to stdout. `export` reads `params_best.npz` from `<checkpoints_root>/` and writes `best_exported.npz` next to it. For ad-hoc exports outside the config pipeline, call `from src.models.export_bundle import export_checkpoint_to_npz` directly with a run directory.
@@ -29,7 +29,7 @@ Each stage prints a JSON artefact summary to stdout. `export` reads `params_best
 Hyperparameter sweeps live under `src/tuning/`:
 
 ```bash
-python -m src.tuning --config config/fastchem.json --trials 100 --epochs 100
+python -m src.tuning --config config/vulcan_luhman16a_10k.json --trials 100 --epochs 100
 ```
 
 ## Tests and lint
@@ -138,17 +138,17 @@ Solar anchors must come from `SOLAR_ABUNDANCES` in `src/constants.py` — not fr
 PBS and SLURM submission scripts live in `supercomputer_cmds/` and self-locate the project root, so submit from anywhere:
 
 ```bash
-qsub supercomputer_cmds/run.pbs                                      # full pipeline (default fastchem)
+qsub supercomputer_cmds/run.pbs                                      # full pipeline (default Luhman 16A VULCAN-JAX)
 qsub -v CONFIG_PATH=path/to/other.json supercomputer_cmds/run.pbs    # custom config
 qsub -v DATA_ONLY=1 supercomputer_cmds/run.pbs                       # generation + normalization only (CPU)
 qsub -v SKIP_GEN=1 supercomputer_cmds/run.pbs                        # train + export against existing data
 sbatch supercomputer_cmds/run_train.sh                               # SLURM training-only
 sbatch supercomputer_cmds/run_gen.sh                                 # SLURM generation-only (single node)
-CONFIG_PATH=config/exogibbs_luhman16a.json \
+CONFIG_PATH=config/exogibbs_luhman16a_10k.json \
   bash supercomputer_cmds/submit_gen_array.sh                        # SLURM sharded generation (4 nodes) + auto-merge
 ```
 
-The sharded path (`run_gen_array.sh` + `run_merge.sh`, wired together by `submit_gen_array.sh`) is the right tool for large datasets (ExoGibbs 1M runs, VULCAN condensation); the single-node `run_gen.sh` is fine for FastChem and small runs.
+The sharded path (`run_gen_array.sh` + `run_merge.sh`, wired together by `submit_gen_array.sh`) is the right tool for the 10k Luhman 16A generation configs; the single-node `run_gen.sh` is available for small smoke runs.
 
 ## Reference docs
 

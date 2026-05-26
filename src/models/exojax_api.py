@@ -1,8 +1,9 @@
 """ExoJAX-facing JAX wrappers for exported emulator bundles.
 
-Two chemistry-specific factories are provided:
+Three chemistry-specific factories are provided:
 
     make_fastchem_vmr_fn(bundle)
+    make_exogibbs_vmr_fn(bundle)
     make_vulcan_vmr_fn(bundle)
 
 Both return pure JAX callables plus species labels. The public API uses
@@ -31,6 +32,7 @@ from .abundance_utils import (  # noqa: F401 — re-exported for user convenienc
     solar_abundances,
 )
 from .export_bundle import ExportedJAXModel
+
 
 def _validate_fastchem_bundle_global_order(bundle: ExportedJAXModel) -> None:
     """Reject FastChem bundles that use an outdated global-input ordering.
@@ -154,38 +156,19 @@ def _require_matching_level_shapes(
         raise ValueError(f"{name} must share the same shape.")
 
 
-def make_fastchem_vmr_fn(
+def _make_equilibrium_vmr_fn(
     bundle: ExportedJAXModel,
     *,
+    chemistry_label: str,
     pressure_order: Literal["top_to_bottom", "bottom_to_top"] = "top_to_bottom",
 ) -> tuple[Any, list[str]]:
-    """Create an ExoJAX-compatible FastChem profile inference callable.
-
-    Parameters
-    ----------
-    bundle : ExportedJAXModel
-        Exported FastChem emulator bundle with physical-unit preprocessing
-        embedded in the wrapper.
-    pressure_order : ``"top_to_bottom"`` or ``"bottom_to_top"``
-        Level ordering convention for inputs and outputs.
-        ``"top_to_bottom"`` (default) means index 0 is the top of the
-        atmosphere (lowest pressure).  ``"bottom_to_top"`` means index 0
-        is the bottom (highest pressure), matching the internal training
-        convention.
-
-    Returns
-    -------
-    tuple[Any, list[str]]
-        Callable ``vmr_fn`` plus the ordered output-species labels. The
-        callable returns linear VMR predictions with shape ``(nz, n_species)``
-        in the requested level order.
-    """
+    """Create an ExoJAX-compatible equilibrium-profile inference callable."""
     if pressure_order not in ("top_to_bottom", "bottom_to_top"):
         raise ValueError(
             f"pressure_order must be 'top_to_bottom' or 'bottom_to_top', got {pressure_order!r}"
         )
-    if not bundle.uses_fastchem:
-        raise ValueError("make_fastchem_vmr_fn requires a fastchem bundle.")
+    if not bundle.uses_equilibrium_chemistry:
+        raise ValueError(f"make_{chemistry_label.lower()}_vmr_fn requires an equilibrium bundle.")
 
     _validate_fastchem_bundle_global_order(bundle)
     species_labels = list(bundle.data_contract["output_species_order"])
@@ -232,6 +215,36 @@ def make_fastchem_vmr_fn(
         return vmr_internal[::-1, :] if _flip else vmr_internal
 
     return vmr_fn, species_labels
+
+
+def make_fastchem_vmr_fn(
+    bundle: ExportedJAXModel,
+    *,
+    pressure_order: Literal["top_to_bottom", "bottom_to_top"] = "top_to_bottom",
+) -> tuple[Any, list[str]]:
+    """Create an ExoJAX-compatible FastChem profile inference callable."""
+    if not bundle.uses_fastchem:
+        raise ValueError("make_fastchem_vmr_fn requires a fastchem bundle.")
+    return _make_equilibrium_vmr_fn(
+        bundle,
+        chemistry_label="fastchem",
+        pressure_order=pressure_order,
+    )
+
+
+def make_exogibbs_vmr_fn(
+    bundle: ExportedJAXModel,
+    *,
+    pressure_order: Literal["top_to_bottom", "bottom_to_top"] = "top_to_bottom",
+) -> tuple[Any, list[str]]:
+    """Create an ExoJAX-compatible ExoGibbs profile inference callable."""
+    if not bundle.uses_exogibbs:
+        raise ValueError("make_exogibbs_vmr_fn requires an exogibbs bundle.")
+    return _make_equilibrium_vmr_fn(
+        bundle,
+        chemistry_label="exogibbs",
+        pressure_order=pressure_order,
+    )
 
 
 def make_vulcan_vmr_fn(

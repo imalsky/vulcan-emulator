@@ -6,8 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
-from src.data_generation import generation
+from src.data_generation import exogibbs_backend, generation
 from src.data_generation.sampling import RunSpecification
 from src.utils.config import load_and_validate_config
 
@@ -110,3 +109,68 @@ def test_fastchem_generation_uses_configured_timeout_and_rejects_monitor_failure
         )
 
     assert observed["timeout"] == 12.5
+
+
+def test_patch_python_assignments_replaces_multiline_assignment():
+    text = "sl_angle = (\n    48 / 180.0 * 3.14159\n)\natom_list = ['H']\n"
+
+    patched = generation.patch_python_assignments(text, {"sl_angle": 0.5})
+
+    namespace = {}
+    exec(compile(patched, "<patched_vulcan_cfg>", "exec"), namespace)
+    assert namespace["sl_angle"] == 0.5
+    assert "48 / 180.0" not in patched
+
+
+def test_vulcan_jax_backend_requires_importable_package(monkeypatch):
+    def fake_import_module(name: str):
+        if name == "vulcan_jax":
+            raise ImportError("missing vulcan_jax")
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(generation.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(RuntimeError, match="requires an importable vulcan_jax"):
+        generation._discover_installed_vulcan_jax_root()
+
+
+def test_exogibbs_generation_honors_shard_slice(tmp_path, monkeypatch):
+    config = _load_fastchem_fixture_config(tmp_path)
+    config["chemistry_type"] = "exogibbs"
+    config["paths"]["run_root"] = str(tmp_path / "exogibbs")
+    config["paths"]["raw_root"] = str(tmp_path / "exogibbs" / "raw")
+    config["paths"]["processed_root"] = str(tmp_path / "exogibbs" / "processed")
+    config["generation"]["num_runs"] = 4
+    config["generation"]["overwrite"] = True
+    config["generation"]["sample_chunk_size"] = 2
+    config["generation"]["parallel_workers"] = 1
+    config["generation"]["backfill"] = {"enabled": False, "max_retries": 0}
+    config["temperature_profiles"]["source_mode"] = "analytic"
+    config["roth_sampler"]["enabled"] = False
+
+    monkeypatch.setattr(exogibbs_backend, "_init_runtime", lambda _: object())
+
+    def fake_profile(runtime, spec):
+        del runtime
+        return np.full(
+            (spec.pressure_bar.size, len(config["data_spec"]["output_species"])),
+            1.0e-8,
+            dtype=np.float64,
+        )
+
+    monkeypatch.setattr(exogibbs_backend, "_run_single_profile", fake_profile)
+
+    artifact = exogibbs_backend.run_exogibbs_generation(
+        config,
+        project_root=ROOT,
+        shard_id=1,
+        num_shards=2,
+        staging_root=tmp_path / "scratch",
+    )
+
+    fragment = json.loads(Path(artifact.manifest_path).read_text(encoding="utf-8"))
+    assert artifact.run_ids == ["run_000002", "run_000003"]
+    assert fragment["shard_start"] == 2
+    assert fragment["shard_end"] == 4
+    assert fragment["deterministic_run_ids"] == ["run_000002", "run_000003"]
+    assert not (Path(config["paths"]["raw_root"]) / "runs.h5").exists()

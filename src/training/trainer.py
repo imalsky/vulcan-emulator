@@ -859,6 +859,14 @@ def train_model(
     _write_config(checkpoints_root, config)
 
     batch_size = int(config["training"]["batch_size"])
+    drop_last_train = train_split.num_runs >= batch_size
+    if not drop_last_train:
+        LOGGER.warning(
+            "Training split has %d runs but batch_size=%d; keeping the partial "
+            "training batch so the epoch has at least one optimizer step.",
+            train_split.num_runs,
+            batch_size,
+        )
     epochs = int(config["training"]["epochs"])
     history: list[dict[str, Any]] = []
     best_params_np: Any = None
@@ -878,10 +886,14 @@ def train_model(
         )
         plateau_state = plateau_transform.init(params)
 
-    # Training drops the partial last batch (see ``iter_batches`` call below)
-    # so ``steps_per_epoch`` is a floor division, not a ceil. This must match
-    # the actual loop or warmup/cosine schedules drift.
-    steps_per_epoch = max(1, train_split.num_runs // batch_size)
+    # Training usually drops the partial last batch (see ``iter_batches`` call
+    # below) so JIT sees one leading batch dimension. Tiny smoke datasets keep
+    # the partial batch to avoid zero-step epochs.
+    steps_per_epoch = (
+        max(1, train_split.num_runs // batch_size)
+        if drop_last_train
+        else max(1, -(-train_split.num_runs // batch_size))
+    )
     warmup_steps = int(config["training"]["warmup_epochs"]) * steps_per_epoch
     total_steps = epochs * steps_per_epoch
     LOGGER.info(
@@ -903,7 +915,10 @@ def train_model(
     for epoch in range(epochs):
         epoch_t0 = time.monotonic()
         train_batches = iter_batches(
-            train_split, batch_size=batch_size, rng=rng, drop_last=True,
+            train_split,
+            batch_size=batch_size,
+            rng=rng,
+            drop_last=drop_last_train,
         )
         train_metrics_device: list[dict[str, jax.Array]] = []
         train_weights_epoch: list[float] = []

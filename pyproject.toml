@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vulcan-emulator"
 version = "0.1.0"
 description = "FastChem/VULCAN chemistry surrogate with sulfur chemistry and WASP-39b stellar forcing."
-readme = "README.md"
+readme = "docs/README.md"
 requires-python = ">=3.9"
 dependencies = [
   "jax>=0.4",
@@ -19,6 +19,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+exogibbs = [
+  "exogibbs",
+]
 dev = [
   "pytest>=8.0",
   "ruff>=0.15",

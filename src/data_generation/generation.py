@@ -33,9 +33,11 @@ these invariants and silently corrupt the dataset — preserve them.
 
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import datetime as _dt
 import fcntl
+import importlib
 import json
 import os
 import pickle
@@ -148,6 +150,33 @@ def patch_python_assignments(text: str, assignments: dict[str, Any]) -> str:
     updated = text
     for name, value in assignments.items():
         replacement = f"{name} = {value!r}"
+        try:
+            tree = ast.parse(updated)
+        except SyntaxError:
+            tree = None
+
+        if tree is not None:
+            lines = updated.splitlines(keepends=True)
+            for node in tree.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for target in node.targets
+                ):
+                    continue
+                if node.end_lineno is None:
+                    break
+                line_end = "\n" if lines[node.end_lineno - 1].endswith("\n") else ""
+                lines[node.lineno - 1:node.end_lineno] = [replacement + line_end]
+                updated = "".join(lines)
+                break
+            else:
+                if not updated.endswith("\n"):
+                    updated += "\n"
+                updated += replacement + "\n"
+            continue
+
         pattern = re.compile(rf"^\s*{re.escape(name)}\s*=.*$", re.MULTILINE)
         if pattern.search(updated):
             updated = pattern.sub(replacement, updated, count=1)
@@ -323,6 +352,52 @@ def _attach_species_metadata(
             )
         )
     return prepared
+
+
+def _run_specification_to_payload(spec: RunSpecification) -> dict[str, Any]:
+    """Serialize a run specification for lightweight shard metadata."""
+    return {
+        "run_id": spec.run_id,
+        "pressure_bar": np.asarray(spec.pressure_bar, dtype=np.float64).tolist(),
+        "temperature_k": np.asarray(spec.temperature_k, dtype=np.float64).tolist(),
+        "globals": {str(k): float(v) for k, v in spec.globals.items()},
+        "metadata": dict(spec.metadata),
+        "kzz_cm2_s": (
+            None
+            if spec.kzz_cm2_s is None
+            else np.asarray(spec.kzz_cm2_s, dtype=np.float64).tolist()
+        ),
+        "elemental_abundances_frac": (
+            None
+            if spec.elemental_abundances_frac is None
+            else np.asarray(spec.elemental_abundances_frac, dtype=np.float64).tolist()
+        ),
+        "gravity_cm_s2": (
+            None
+            if spec.gravity_cm_s2 is None
+            else np.asarray(spec.gravity_cm_s2, dtype=np.float64).tolist()
+        ),
+    }
+
+
+def _run_specification_from_payload(payload: dict[str, Any]) -> RunSpecification:
+    """Rebuild a run specification serialized by ``_run_specification_to_payload``."""
+    kzz = payload.get("kzz_cm2_s")
+    elemental = payload.get("elemental_abundances_frac")
+    gravity = payload.get("gravity_cm_s2")
+    return RunSpecification(
+        run_id=str(payload["run_id"]),
+        pressure_bar=np.asarray(payload["pressure_bar"], dtype=np.float64),
+        temperature_k=np.asarray(payload["temperature_k"], dtype=np.float64),
+        globals={str(k): float(v) for k, v in dict(payload["globals"]).items()},
+        metadata=dict(payload.get("metadata", {})),
+        kzz_cm2_s=None if kzz is None else np.asarray(kzz, dtype=np.float64),
+        spectrum=None,
+        elemental_abundances_frac=(
+            None if elemental is None else np.asarray(elemental, dtype=np.float64)
+        ),
+        gravity_cm_s2=None if gravity is None else np.asarray(gravity, dtype=np.float64),
+    )
 
 
 def _prepare_generation_directory(
@@ -1087,8 +1162,51 @@ def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
 
 
 _VULCAN_TREE_READY_MARKER = ".vulcan_tree_ready"
+_VULCAN_JAX_TREE_READY_MARKER = ".vulcan_jax_tree_ready"
 _FASTCHEM_TREE_READY_MARKER = ".fastchem_tree_ready"
 _VULCAN_CHEM_FUNS_MARKER = ".chem_funs_ready"
+
+
+def _vulcan_backend(config: dict[str, Any]) -> str:
+    """Return the configured VULCAN backend name."""
+    return str(config["vulcan_runtime"].get("backend", "master"))
+
+
+def _validate_vulcan_jax_package_root(package_root: Path) -> Path:
+    """Validate an installed ``vulcan_jax`` package tree for worker execution."""
+    required = (
+        package_root / "vulcan_cfg.py",
+        package_root / "vulcan_jax_cli.py",
+        package_root / "thermo",
+        package_root / "atm",
+        package_root / "fastchem_vulcan",
+    )
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Installed vulcan_jax package is missing required runtime files: "
+            + ", ".join(missing)
+        )
+    return package_root
+
+
+def _discover_installed_vulcan_jax_root() -> Path:
+    """Return the package root for the active environment's ``vulcan_jax`` install."""
+    try:
+        module = importlib.import_module("vulcan_jax")
+    except ImportError as exc:
+        raise RuntimeError(
+            "vulcan.runtime.backend='vulcan_jax' requires an importable "
+            "vulcan_jax package in the active environment. Install it with "
+            "`python -m pip install -i https://test.pypi.org/simple/ "
+            "--extra-index-url https://pypi.org/simple/ vulcan-jax`."
+        ) from exc
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        raise RuntimeError(
+            "Imported vulcan_jax module has no __file__; cannot locate package data."
+        )
+    return _validate_vulcan_jax_package_root(Path(module_file).resolve().parent)
 
 
 def _ensure_vulcan_worker_tree(source_root: Path, worker_root: Path) -> None:
@@ -1098,6 +1216,20 @@ def _ensure_vulcan_worker_tree(source_root: Path, worker_root: Path) -> None:
         return
     _copy_vulcan_source(source_root, worker_root)
     marker.write_text("")
+
+
+def _ensure_vulcan_jax_worker_tree(package_root: Path, worker_root: Path) -> Path:
+    """Idempotently seed ``worker_root`` with the installed VULCAN-JAX package."""
+    marker = worker_root / _VULCAN_JAX_TREE_READY_MARKER
+    worker_package_root = worker_root / "vulcan_jax"
+    if marker.exists():
+        return worker_package_root
+    if worker_root.exists():
+        shutil.rmtree(worker_root)
+    worker_root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(package_root, worker_package_root)
+    marker.write_text("")
+    return worker_package_root
 
 
 def _ensure_fastchem_worker_tree(source_root: Path, worker_root: Path) -> Path:
@@ -1126,6 +1258,24 @@ def _reset_vulcan_worker_between_runs(
     if atm_dir.exists():
         shutil.rmtree(atm_dir)
     shutil.copy2(source_root / cfg_relpath, worker_root / cfg_relpath)
+
+
+def _reset_vulcan_jax_worker_between_runs(
+    package_root: Path,
+    worker_root: Path,
+) -> Path:
+    """Clear volatile state in a reused installed-package VULCAN-JAX worker."""
+    worker_package_root = worker_root / "vulcan_jax"
+    output_dir = worker_root / "output"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    atm_dir = worker_package_root / "atm"
+    if atm_dir.exists():
+        for generated_tp in atm_dir.glob("run_*_tp.txt"):
+            generated_tp.unlink()
+    shutil.copy2(package_root / "vulcan_cfg.py", worker_package_root / "vulcan_cfg.py")
+    return worker_package_root
 
 
 def _reset_fastchem_worker_between_runs(fastchem_root: Path) -> None:
@@ -1179,17 +1329,54 @@ def _raise_on_fastchem_monitor_failures(monitor_path: Path, *, run_id: str) -> N
     )
 
 
-def _ensure_vulcan_chem_funs(worker_root: Path, python_executable: str) -> None:
-    """Run ``make_chem_funs.py`` once per worker tree; the network is constant."""
+def _vulcan_chem_funs_cache_payload(
+    config: dict[str, Any],
+    spec: RunSpecification,
+) -> dict[str, Any]:
+    """Return settings that affect generated VULCAN chemistry functions."""
+    runtime = config["vulcan_runtime"]
+    default_preset = dict(config.get("default_science_preset", {}))
+    default_physics = dict(default_preset.get("physics_toggles", {}))
+    physics = {
+        name: bool(spec.globals.get(name, default_physics.get(name, False)))
+        for name in PUBLIC_PHYSICS_TOGGLES
+    }
+    condensation = runtime.get("condensation") if physics["use_condensation"] else None
+    return {
+        "atom_list": _vulcan_atom_list(config),
+        "network": str(runtime["chemistry_file"]),
+        "use_ion": physics["use_ion_chemistry"],
+        "use_photo": physics["use_photochemistry"],
+        "use_condense": physics["use_condensation"],
+        "use_lowT_limit_rates": bool(runtime["use_lowT_limit_rates"]),
+        "t_cross_sp": list(runtime["t_cross_sp"]),
+        "condense_sp": [] if condensation is None else list(condensation["condense_sp"]),
+        "non_gas_sp": [] if condensation is None else list(condensation["non_gas_sp"]),
+    }
+
+
+def _ensure_vulcan_chem_funs(
+    worker_root: Path,
+    python_executable: str,
+    *,
+    config: dict[str, Any],
+    spec: RunSpecification,
+) -> None:
+    """Run ``make_chem_funs.py`` when network-affecting settings change."""
     marker = worker_root / _VULCAN_CHEM_FUNS_MARKER
-    if marker.exists():
+    payload = json.dumps(
+        _vulcan_chem_funs_cache_payload(config, spec),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if marker.exists() and marker.read_text(encoding="utf-8") == payload:
         return
     subprocess.run(
         [python_executable, "make_chem_funs.py"],
         cwd=worker_root,
         check=True,
     )
-    marker.write_text("")
+    marker.write_text(payload, encoding="utf-8")
 
 
 def _cleanup_worker_base(worker_base: Path) -> None:
@@ -1680,13 +1867,14 @@ def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tu
     Returns
     -------
     tuple[Path, Path]
-        Source-root path plus the backend-specific key path: either the
-        FastChem binary or the configured VULCAN chemistry file.
+        Runtime-root path plus the backend-specific key path: either the
+        FastChem binary, configured VULCAN-master chemistry file, or installed
+        VULCAN-JAX chemistry file.
     """
     source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
-    if not source_root.exists():
-        raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
     if uses_fastchem(config):
+        if not source_root.exists():
+            raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
         fastchem_root = source_root / "fastchem_vulcan"
         if not fastchem_root.exists():
             raise FileNotFoundError(f"Configured FastChem runtime does not exist: {fastchem_root}")
@@ -1703,6 +1891,26 @@ def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tu
                 f"{chemical_elements}"
             )
         return source_root, fastchem_binary
+
+    backend = _vulcan_backend(config)
+    if backend == "vulcan_jax":
+        cfg_relpath = Path(str(config["vulcan_runtime"]["cfg_file"]))
+        if cfg_relpath != Path("vulcan_cfg.py"):
+            raise ValueError(
+                "vulcan.runtime.backend='vulcan_jax' requires "
+                "vulcan.runtime.cfg_file='vulcan_cfg.py' because the installed "
+                "package imports vulcan_jax.vulcan_cfg directly."
+            )
+        package_root = _discover_installed_vulcan_jax_root()
+        chemistry_file = package_root / str(config["vulcan_runtime"]["chemistry_file"])
+        if not chemistry_file.exists():
+            raise FileNotFoundError(
+                f"Installed VULCAN-JAX chemistry file does not exist: {chemistry_file}"
+            )
+        return package_root, chemistry_file
+
+    if not source_root.exists():
+        raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
     chemistry_file = source_root / str(config["vulcan_runtime"]["chemistry_file"])
     if not chemistry_file.exists():
         raise FileNotFoundError(f"Configured chemistry file does not exist: {chemistry_file}")
@@ -1755,7 +1963,12 @@ def _run_single_vulcan_spec(
     )
     python_executable = str(config["vulcan_runtime"]["python_executable"])
     if bool(config["vulcan_runtime"]["regenerate_chem_funs"]):
-        _ensure_vulcan_chem_funs(worker_root, python_executable)
+        _ensure_vulcan_chem_funs(
+            worker_root,
+            python_executable,
+            config=config,
+            spec=spec,
+        )
         vulcan_cmd = [python_executable, "vulcan.py", "-n"]
     else:
         vulcan_cmd = [python_executable, "vulcan.py"]
@@ -1766,6 +1979,64 @@ def _run_single_vulcan_spec(
     if not output_candidates:
         raise FileNotFoundError(
             f"No VULCAN output file found for run {spec.run_id} under {worker_root / 'output'}."
+        )
+    output_h5 = runs_dir / f"{spec.run_id}.h5"
+    return convert_vulcan_output_to_hdf5(
+        output_candidates[-1],
+        output_h5_path=output_h5,
+        spec=spec,
+        config=config,
+    )
+
+
+def _run_single_vulcan_jax_spec(
+    spec: RunSpecification,
+    *,
+    source_root: Path,
+    worker_base: Path,
+    runs_dir: Path,
+    config: dict[str, Any],
+) -> Path:
+    """Execute one worker-local installed-package VULCAN-JAX run."""
+    worker_root = worker_base / f"thread_{threading.get_ident()}"
+    package_root = _ensure_vulcan_jax_worker_tree(source_root, worker_root)
+    package_root = _reset_vulcan_jax_worker_between_runs(source_root, worker_root)
+    tp_file, spectrum_file = _write_worker_inputs(package_root, spec)
+    cfg_file = package_root / "vulcan_cfg.py"
+    _patch_vulcan_cfg(
+        cfg_file,
+        spec=spec,
+        config=config,
+        tp_file=tp_file,
+        spectrum_file=spectrum_file,
+    )
+
+    python_executable = str(config["vulcan_runtime"]["python_executable"])
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(worker_root)
+        if not existing_pythonpath
+        else str(worker_root) + os.pathsep + existing_pythonpath
+    )
+    env.setdefault("JAX_PLATFORMS", "cpu")
+    env.setdefault("JAX_ENABLE_X64", "1")
+    env.setdefault("OMP_NUM_THREADS", "1")
+
+    timeout_seconds = float(config["generation"].get("vulcan_timeout_seconds", 1800.0))
+    subprocess.run(
+        [python_executable, "-m", "vulcan_jax.vulcan_jax_cli"],
+        cwd=worker_root,
+        env=env,
+        check=True,
+        timeout=timeout_seconds,
+    )
+
+    output_candidates = sorted((worker_root / "output").glob("*.vul"))
+    if not output_candidates:
+        raise FileNotFoundError(
+            f"No VULCAN-JAX output file found for run {spec.run_id} "
+            f"under {worker_root / 'output'}."
         )
     output_h5 = runs_dir / f"{spec.run_id}.h5"
     return convert_vulcan_output_to_hdf5(
@@ -1909,8 +2180,10 @@ def run_vulcan_generation(
         )
     if runs_dir is None or chunks_dir is None:
         raise RuntimeError("VULCAN generation requires writable staging directories.")
-    source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
     fastchem = uses_fastchem(config)
+    source_root, _ = _validated_vulcan_paths(config, project_root=project_root)
+    backend = "fastchem" if fastchem else _vulcan_backend(config)
+    LOGGER.info("Generation backend: %s", backend)
     # vulcan_runtime is only derived for VULCAN configs; FastChem configs
     # use the canonical worker-root default (per constants.py runtime defaults).
     if is_sharded and staging_root is not None:
@@ -1925,7 +2198,12 @@ def run_vulcan_generation(
         worker_base = resolve_path("data/vulcan_workers", project_root)
     if is_sharded:
         worker_base = worker_base / f"shard_s{shard_id:02d}"
-    run_single = _run_single_fastchem_spec if fastchem else _run_single_vulcan_spec
+    if fastchem:
+        run_single = _run_single_fastchem_spec
+    elif backend == "vulcan_jax":
+        run_single = _run_single_vulcan_jax_spec
+    else:
+        run_single = _run_single_vulcan_spec
     backfill = config["generation"]["backfill"]
     target_count = num_runs or int(config["generation"]["num_runs"])
     shard_start = (shard_id * target_count) // num_shards if is_sharded else 0
@@ -2286,6 +2564,12 @@ def run_vulcan_generation(
             rid for rid in completed_run_ids
             if rid.startswith("run_") and int(rid.split("_", 1)[1]) >= target_count
         )
+        backfill_ok_set = set(backfill_ok)
+        backfill_specs = [
+            _run_specification_to_payload(spec)
+            for spec in all_specs
+            if spec.run_id in backfill_ok_set
+        ]
         remaining_failures = sorted(set(all_failures) - completed_run_ids)
         chunk_files_relpath = [
             str(p.relative_to(raw_root)) for p in sorted(chunk_files)
@@ -2303,6 +2587,7 @@ def run_vulcan_generation(
             "successful_deterministic_run_ids": deterministic_ok,
             "failed_deterministic_run_ids": deterministic_failed,
             "successful_backfill_run_ids": backfill_ok,
+            "successful_backfill_specs": backfill_specs,
             "remaining_failures": remaining_failures,
             "chunk_files_relpath": chunk_files_relpath,
             "backfill_seed_formula": "base_seed + 1000*attempt + 1_000_000*shard_id",
@@ -2455,7 +2740,12 @@ def generate_raw_dataset(
         from .exogibbs_backend import run_exogibbs_generation
 
         return run_exogibbs_generation(
-            config, project_root=project_root, num_runs=num_runs
+            config,
+            project_root=project_root,
+            num_runs=num_runs,
+            shard_id=shard_id,
+            num_shards=num_shards,
+            staging_root=staging_root,
         )
     raise ValueError(f"Unsupported chemistry_type: {chemistry_type}")
 
@@ -2562,13 +2852,34 @@ def merge_shards_stage(
     det_specs = sample_run_specifications_slice(plan, start=0, end=target_count)
     det_specs = _attach_species_metadata(det_specs, config)
     failed_set: set[str] = set()
+    backfill_specs: list[RunSpecification] = []
+    backfill_success_ids: list[str] = []
     for frag in fragments:
         failed_set.update(frag["remaining_failures"])
-    successful_specs = [s for s in det_specs if s.run_id not in failed_set]
+        backfill_success_ids.extend(frag["successful_backfill_run_ids"])
+        backfill_specs.extend(
+            _run_specification_from_payload(payload)
+            for payload in frag.get("successful_backfill_specs", [])
+        )
+    successful_specs = [s for s in det_specs if s.run_id not in failed_set] + backfill_specs
 
     if failed_set:
         (info_root / "failed_runs.json").write_text(
             json.dumps(sorted(failed_set), indent=2) + "\n", encoding="utf-8",
+        )
+
+    all_run_ids = sorted({s.run_id for s in successful_specs} | set(backfill_success_ids))
+    if len(all_run_ids) != target_count:
+        raise RuntimeError(
+            f"Merged shard dataset has {len(all_run_ids)} runs, expected {target_count}. "
+            "Check shard failed_runs logs and backfill metadata."
+        )
+    if len(backfill_specs) != len(set(backfill_success_ids)):
+        LOGGER.warning(
+            "Shard fragments list %d successful backfill IDs but only %d backfill "
+            "spec payloads; sampling coverage will omit missing backfill specs.",
+            len(set(backfill_success_ids)),
+            len(backfill_specs),
         )
     manifest_path, coverage_path = _write_generation_metadata(
         info_root=info_root,
@@ -2576,11 +2887,6 @@ def merge_shards_stage(
         specs=successful_specs,
         config=config,
     )
-
-    backfill_success_ids: list[str] = []
-    for frag in fragments:
-        backfill_success_ids.extend(frag["successful_backfill_run_ids"])
-    all_run_ids = sorted({s.run_id for s in successful_specs} | set(backfill_success_ids))
 
     for sid in range(num_shards):
         for d in (raw_root / f"runs_s{sid:02d}", raw_root / f"chunks_s{sid:02d}"):

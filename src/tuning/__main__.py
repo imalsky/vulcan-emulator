@@ -4,7 +4,7 @@ Runs ``n_trials`` independent training runs, each for ``epochs_per_trial``
 epochs, and minimizes validation ``combined_loss``. The processed dataset is
 loaded once at study startup and shared with every trial via
 ``train_model(..., preloaded=...)``. Per-epoch pruning uses
-``optuna.pruners.MedianPruner`` via a callback plumbed through
+``optuna.pruners.HyperbandPruner`` via a callback plumbed through
 ``train_model(..., on_epoch_end=...)``.
 
 Search space is restricted to architectural and regularization choices
@@ -14,7 +14,7 @@ kept fixed at the base-config values.
 
 Invocation::
 
-    python -m src.tuning --config config/fastchem.json \\
+    python -m src.tuning --config config/vulcan_luhman16a_10k.json \\
         --trials 100 --epochs 100
 """
 
@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any
 
 import jax
-
 import optuna
 
 from ..constants import (
@@ -43,7 +42,7 @@ from ..constants import (
 )
 from ..data_generation.data_loader import load_processed_dataset
 from ..training.trainer import ensure_processed, train_model
-from ..utils.config import validate_transformer_model_config, load_and_validate_config
+from ..utils.config import load_and_validate_config, validate_transformer_model_config
 from ..utils.helpers import ensure_dir, get_logger, resolve_path, resolve_project_root
 
 LOGGER = get_logger(__name__)
@@ -352,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--config",
-        default="config/fastchem.json",
+        default="config/vulcan_luhman16a_10k.json",
         help="Path to the base configuration JSON file.",
     )
     parser.add_argument("--trials", type=int, default=60, help="Number of Optuna trials.")

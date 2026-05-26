@@ -9,13 +9,12 @@ All operations are pure JAX and compatible with ``jax.grad`` / ``jax.jvp``.
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
 
-from ..constants import ATTN_MASK_NEG_INF, _POSITION_SCALE, _SINUSOIDAL_BASE_WAVELENGTH
-
+from ..constants import _POSITION_SCALE, _SINUSOIDAL_BASE_WAVELENGTH, ATTN_MASK_NEG_INF
 
 # ---------------------------------------------------------------------------
 # Low-level primitives

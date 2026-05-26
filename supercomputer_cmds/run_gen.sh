@@ -1,16 +1,16 @@
 #!/bin/bash
 # Run pipeline stages: generation + (optional) normalization.
 #
-# Default invocation (FastChem):
+# Default invocation (VULCAN-JAX Luhman 16A 10k):
 #   sbatch supercomputer_cmds/run_gen.sh
 #
-# ExoGibbs:
-#   sbatch --export=ALL,CONFIG_PATH=config/exogibbs_luhman16a.json \
+# ExoGibbs Luhman 16A 10k:
+#   sbatch --export=ALL,CONFIG_PATH=config/exogibbs_luhman16a_10k.json \
 #          supercomputer_cmds/run_gen.sh
 #
-# VULCAN condensation:
-#   sbatch -t 120:00:00 --job-name=vulcan_gen_cond \
-#          --export=ALL,CONFIG_PATH=config/vulcan_condensation.json \
+# VULCAN-JAX Luhman 16A 10k:
+#   sbatch -t 120:00:00 --job-name=vulcan_gen_luhman16a \
+#          --export=ALL,CONFIG_PATH=config/vulcan_luhman16a_10k.json \
 #          supercomputer_cmds/run_gen.sh
 #SBATCH -J vulcan_gen
 #SBATCH -o %x.o%j
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/fastchem.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
 SKIP_NORM=${SKIP_NORM:-0}
 
@@ -59,6 +59,8 @@ export PYTHONNOUSERSITE=1
 export PYTHONPATH="$(pwd)/src:$(pwd):${PYTHONPATH:-}"
 export MPLBACKEND=Agg
 export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export JAX_ENABLE_X64=${JAX_ENABLE_X64:-1}
+export XLA_FLAGS="${XLA_FLAGS:---xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1}"
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -70,21 +72,37 @@ export PYTHONUNBUFFERED=1
 
 SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-64}}}
 export SRUN_CPUS_PER_TASK
+JAX_COMPILATION_CACHE_DIR=${JAX_COMPILATION_CACHE_DIR:-/tmp/vulcan_jax_cache_${SLURM_JOB_ID:-local}}
+export JAX_COMPILATION_CACHE_DIR
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel
+  python -m pip uninstall -y jax-cuda12-plugin jax-cuda12-pjrt >/dev/null 2>&1 || true
   python -m pip install -U exogibbs jax numpy scipy sympy matplotlib h5py optuna optax orbax-checkpoint pydantic
+  echo "[setup] installing vulcan-jax into conda env '$CONDA_ENV' from TestPyPI"
+  python -m pip install -U -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ --no-deps vulcan-jax
   python -m pip install -e . --no-deps
 fi
 
 python - <<PY
 from pathlib import Path
+import sys
 from src.utils.config import load_and_validate_config
 cfg = load_and_validate_config(Path("$CONFIG_PATH").expanduser().resolve())
+backend = cfg.get("vulcan_runtime", {}).get("backend", "n/a")
+print(f"[preflight] conda_env=$CONDA_ENV")
+print(f"[preflight] python_executable={sys.executable}")
 print(f"[preflight] chemistry_type={cfg['chemistry_type']} model_type={cfg['model_type']}")
+print(f"[preflight] vulcan_backend={backend}")
 print(f"[preflight] num_runs={cfg['generation']['num_runs']}")
 print(f"[preflight] raw_root={cfg['paths']['raw_root']}")
 print(f"[preflight] parallel_workers={cfg['generation'].get('parallel_workers', 0)}")
+print(f"[preflight] jax_compilation_cache=$JAX_COMPILATION_CACHE_DIR")
+if backend == "vulcan_jax":
+    import vulcan_jax
+    print(f"[preflight] vulcan_jax_version={getattr(vulcan_jax, '__version__', '<unknown>')}")
+    print(f"[preflight] vulcan_jax_path={Path(vulcan_jax.__file__).resolve()}")
 PY
 
 srun --ntasks=1 --cpus-per-task="$SRUN_CPUS_PER_TASK" --cpu-bind=cores python -u -m src.utils --config "$CONFIG_PATH" --stage generation

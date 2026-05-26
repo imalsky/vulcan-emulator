@@ -82,23 +82,68 @@ def blackbody_surface_flux(
     return surface_exitance * 1.0e-7
 
 
+def binned_wavelength_grid(
+    *,
+    wavelength_min_nm: float,
+    wavelength_max_nm: float,
+    dbin1_nm: float,
+    dbin2_nm: float,
+    dbin_12trans_nm: float,
+) -> np.ndarray:
+    """Build the configured two-resolution stellar wavelength grid."""
+    lo = float(wavelength_min_nm)
+    hi = float(wavelength_max_nm)
+    transition = float(np.clip(dbin_12trans_nm, lo, hi))
+    if lo >= hi:
+        raise ValueError("wavelength_min_nm must be smaller than wavelength_max_nm.")
+
+    if transition <= lo:
+        grid = np.arange(lo, hi, float(dbin2_nm), dtype=np.float64)
+    elif transition >= hi:
+        grid = np.arange(lo, hi, float(dbin1_nm), dtype=np.float64)
+    else:
+        short = np.arange(lo, transition, float(dbin1_nm), dtype=np.float64)
+        long = np.arange(transition, hi, float(dbin2_nm), dtype=np.float64)
+        grid = np.concatenate([short, long])
+    grid = np.unique(np.concatenate([grid, np.array([lo, hi], dtype=np.float64)]))
+    return grid
+
+
 def generate_blackbody_template(
     *,
     num_points: int = 2401,
     wavelength_min_nm: float = 100.0,
     wavelength_max_nm: float = 700.0,
+    max_points: int | None = None,
+    dbin1_nm: float | None = None,
+    dbin2_nm: float | None = None,
+    dbin_12trans_nm: float | None = None,
     teff_k: float = 5485.0,
     radius_rsun: float = 0.939,
     semi_major_axis_au: float = 0.04858,
     name: str = "blackbody_template",
 ) -> SpectrumRecord:
     """Generate a blackbody stellar surface-flux template."""
-    wavelength_nm = np.linspace(
-        wavelength_min_nm,
-        wavelength_max_nm,
-        int(num_points),
-        dtype=np.float64,
-    )
+    if dbin1_nm is None or dbin2_nm is None or dbin_12trans_nm is None:
+        wavelength_nm = np.linspace(
+            wavelength_min_nm,
+            wavelength_max_nm,
+            int(num_points),
+            dtype=np.float64,
+        )
+    else:
+        wavelength_nm = binned_wavelength_grid(
+            wavelength_min_nm=wavelength_min_nm,
+            wavelength_max_nm=wavelength_max_nm,
+            dbin1_nm=dbin1_nm,
+            dbin2_nm=dbin2_nm,
+            dbin_12trans_nm=dbin_12trans_nm,
+        )
+    if max_points is not None and wavelength_nm.size > int(max_points):
+        raise ValueError(
+            f"Synthesized blackbody template has {wavelength_nm.size} wavelength "
+            f"samples, exceeding stellar_spectrum.max_tokens={max_points}."
+        )
     flux = blackbody_surface_flux(wavelength_nm, temperature_k=teff_k)
     record = SpectrumRecord(
         name=name,
@@ -109,6 +154,11 @@ def generate_blackbody_template(
             "teff_k": float(teff_k),
             "radius_rsun": float(radius_rsun),
             "semi_major_axis_au": float(semi_major_axis_au),
+            "dbin1_nm": None if dbin1_nm is None else float(dbin1_nm),
+            "dbin2_nm": None if dbin2_nm is None else float(dbin2_nm),
+            "dbin_12trans_nm": (
+                None if dbin_12trans_nm is None else float(dbin_12trans_nm)
+            ),
         },
     )
     record.validate()

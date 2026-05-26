@@ -36,13 +36,10 @@ Supported combinations:
 - `exogibbs + transformer`
 
 Shipped configs:
-- `config/fastchem.json` — gas-phase FastChem equilibrium emulator
-- `config/vulcan_condensation.json` — VULCAN kinetics emulator with H2O/S8
-  condensation
-- `config/exogibbs_luhman16a.json` — ExoGibbs equilibrium for brown dwarf
-  Luhman 16A (1M runs)
-- `config/exogibbs_bd_100k.json` — ExoGibbs equilibrium, 100k-run variant
-- `config/vulcan_bd_100k.json` — VULCAN kinetics, 100k-run brown dwarf variant
+- `config/exogibbs_luhman16a_10k.json` — ExoGibbs thermochemical equilibrium
+  for the Luhman 16A brown-dwarf retrieval case
+- `config/vulcan_luhman16a_10k.json` — VULCAN-JAX vertical-mixing kinetics
+  for the same 10k-profile Luhman 16A setup
 
 `chemistry_type` selects the target contract and learned inputs.
 `model_type` selects the prediction architecture only.
@@ -333,7 +330,7 @@ Optional keys (all carry sensible defaults):
   (g/cm³). Required for every entry in `non_gas_sp` when any preset
   has `use_settling = True`.
 
-The shipped `config/vulcan_condensation.json` is a condensation-enabled,
+The shipped `config/vulcan_luhman16a_10k.json` is a condensation-enabled,
 photochemistry-disabled H2 setup using
 `thermo/SNCHO_photo_network_2025.txt` and the H2O/S8 condensation recipe.
 

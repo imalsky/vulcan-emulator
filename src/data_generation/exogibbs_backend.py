@@ -10,6 +10,10 @@ produces the same HDF5 layout consumed by normalization and training.
 
 from __future__ import annotations
 
+import datetime as _dt
+import json
+import os
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -21,12 +25,16 @@ import numpy as np
 
 from ..utils.helpers import get_logger
 from .generation import (
+    _SHARD_BACKFILL_SLOT_SIZE,
+    _SHARD_RUN_ID_MAX_EXCLUSIVE,
     GeneratedRawDataset,
     _attach_species_metadata,
     _generation_worker_count,
     _prepare_generation_directory,
     _requested_run_count,
+    _run_specification_to_payload,
     _write_generation_metadata,
+    list_run_ids_from_consolidated,
     merge_chunks_to_runs_h5,
     merge_run_files_to_chunk,
     write_equilibrium_hdf5,
@@ -217,13 +225,34 @@ def run_exogibbs_generation(
     *,
     project_root: Path,
     num_runs: int | None = None,
+    shard_id: int | None = None,
+    num_shards: int | None = None,
+    staging_root: Path | None = None,
 ) -> GeneratedRawDataset:
     """Generate equilibrium chemistry training data using ExoGibbs.
 
     Mirrors the FastChem generation path but calls ExoGibbs directly in
     Python (no subprocess). The output HDF5 contract is identical.
     """
-    requested = _requested_run_count(config, num_runs)
+    is_sharded = shard_id is not None
+    if is_sharded != (num_shards is not None):
+        raise ValueError("shard_id and num_shards must be passed together or not at all.")
+    if is_sharded:
+        if not (0 <= shard_id < num_shards):
+            raise ValueError(
+                f"shard_id={shard_id} out of range for num_shards={num_shards}."
+            )
+        LOGGER.info(
+            "ExoGibbs generation starting (shard %d/%d, num_runs=%s, staging_root=%s)",
+            shard_id,
+            num_shards,
+            num_runs or "config default",
+            staging_root,
+        )
+    else:
+        LOGGER.info("ExoGibbs generation starting (num_runs=%s)", num_runs or "config default")
+
+    target_count = _requested_run_count(config, num_runs)
     (
         run_root,
         raw_root,
@@ -232,12 +261,14 @@ def run_exogibbs_generation(
         chunks_dir,
         reuse_path,
     ) = _prepare_generation_directory(
-        config, project_root=project_root, num_runs=num_runs
+        config,
+        project_root=project_root,
+        num_runs=num_runs,
+        shard_id=shard_id,
+        staging_root=staging_root,
     )
 
     if reuse_path is not None:
-        from .generation import list_run_ids_from_consolidated
-
         LOGGER.info("Reusing existing ExoGibbs raw data at %s", reuse_path)
         run_ids = list_run_ids_from_consolidated(reuse_path)
         return GeneratedRawDataset(
@@ -251,169 +282,326 @@ def run_exogibbs_generation(
 
     runtime = _init_runtime(config)
     plan = build_sampling_plan(config=config, project_root=project_root)
-    chunk_size = int(config["generation"]["sample_chunk_size"])
+    configured_chunk_size = int(config["generation"]["sample_chunk_size"])
     state_species = list(config["data_spec"]["state_species"])
     output_species = list(config["data_spec"]["output_species"])
 
-    max_workers = _generation_worker_count(config, requested)
-    LOGGER.info("Using %d parallel workers for ExoGibbs generation.", max_workers)
+    shard_start = (shard_id * target_count) // num_shards if is_sharded else 0
+    shard_end = (
+        ((shard_id + 1) * target_count) // num_shards
+        if is_sharded
+        else target_count
+    )
+    shard_count = shard_end - shard_start
+    shard_tag = f"_s{shard_id:02d}" if is_sharded else ""
+    chunk_size = max(1, min(configured_chunk_size, max(shard_count, 1)))
 
-    all_specs: list[RunSpecification] = []
-    chunk_files: list[Path] = []
-    failed_run_ids: list[str] = []
+    max_workers = _generation_worker_count(config, max(shard_count, 1))
+    LOGGER.info("Using %d parallel workers for ExoGibbs generation.", max_workers)
 
     LOGGER.info("Warming up ExoGibbs JIT compilation...")
     warmup_specs = sample_run_specifications_slice(plan, start=0, end=1)
     _run_single_profile(runtime, warmup_specs[0])
     LOGGER.info("JIT warmup complete.")
 
-    total_chunks = (requested + chunk_size - 1) // chunk_size
+    chunk_files: list[Path] = sorted(chunks_dir.glob("chunk_*.h5"))
+    completed_run_ids: set[str] = set()
+    for chunk_path in chunk_files:
+        completed_run_ids.update(list_run_ids_from_consolidated(chunk_path))
+    if chunk_files:
+        LOGGER.info(
+            "Resuming: found %d existing chunk files covering %d runs in %s",
+            len(chunk_files),
+            len(completed_run_ids),
+            chunks_dir,
+        )
+
+    deterministic_specs: list[RunSpecification] = []
+    successful_backfill_specs: list[RunSpecification] = []
+    all_failures: list[str] = []
+
+    total_chunks = (shard_count + chunk_size - 1) // chunk_size
     LOGGER.info(
         "Generating %d ExoGibbs equilibrium runs in %d chunks of %d...",
-        requested,
+        shard_count,
         total_chunks,
         chunk_size,
     )
 
-    t0 = time.time()
     pool = ThreadPoolExecutor(max_workers=max_workers) if max_workers > 1 else None
+
+    def _run_batch(
+        specs: list[RunSpecification],
+    ) -> tuple[list[Path], list[RunSpecification], list[str]]:
+        """Run one ExoGibbs batch while isolating per-profile failures."""
+        run_files: list[Path] = []
+        successes: list[RunSpecification] = []
+        failures: list[str] = []
+        if pool is None:
+            for spec in specs:
+                try:
+                    completed_spec, run_path = _process_run(
+                        runtime,
+                        spec,
+                        runs_dir,
+                        state_species,
+                        output_species,
+                    )
+                except Exception:
+                    LOGGER.warning("Run %s failed, will backfill", spec.run_id, exc_info=True)
+                    failures.append(spec.run_id)
+                    continue
+                if run_path is None:
+                    failures.append(completed_spec.run_id)
+                else:
+                    run_files.append(run_path)
+                    successes.append(completed_spec)
+            return run_files, successes, failures
+
+        future_to_spec = {
+            pool.submit(
+                _process_run,
+                runtime,
+                spec,
+                runs_dir,
+                state_species,
+                output_species,
+            ): spec
+            for spec in specs
+        }
+        for future in as_completed(future_to_spec):
+            spec = future_to_spec[future]
+            try:
+                completed_spec, run_path = future.result()
+            except Exception:
+                LOGGER.warning("Run %s failed, will backfill", spec.run_id, exc_info=True)
+                failures.append(spec.run_id)
+                continue
+            if run_path is None:
+                failures.append(completed_spec.run_id)
+            else:
+                run_files.append(run_path)
+                successes.append(completed_spec)
+        return run_files, successes, failures
+
+    t0 = time.time()
     try:
-        for chunk_idx in range(total_chunks):
-            start = chunk_idx * chunk_size
-            end = min(start + chunk_size, requested)
+        for chunk_idx, start in enumerate(range(shard_start, shard_end, chunk_size)):
+            end = min(start + chunk_size, shard_end)
             specs = sample_run_specifications_slice(plan, start=start, end=end)
             specs = _attach_species_metadata(specs, config)
+            deterministic_specs.extend(specs)
+            pending_specs = [spec for spec in specs if spec.run_id not in completed_run_ids]
+            skipped = len(specs) - len(pending_specs)
+            if skipped:
+                LOGGER.info(
+                    "Chunk [%d, %d): skipping %d already-completed runs",
+                    start,
+                    end,
+                    skipped,
+                )
+            if not pending_specs:
+                continue
 
-            run_files: list[Path] = []
-
-            if pool is not None:
-                futs = {
-                    pool.submit(
-                        _process_run, runtime, spec, runs_dir,
-                        state_species, output_species,
-                    ): spec
-                    for spec in specs
-                }
-                for fut in as_completed(futs):
-                    s, rp = fut.result()
-                    if rp is None:
-                        failed_run_ids.append(s.run_id)
-                    else:
-                        run_files.append(rp)
-                        all_specs.append(s)
-            else:
-                for spec in specs:
-                    s, rp = _process_run(
-                        runtime, spec, runs_dir, state_species, output_species,
-                    )
-                    if rp is None:
-                        failed_run_ids.append(s.run_id)
-                    else:
-                        run_files.append(rp)
-                        all_specs.append(s)
+            run_files, _, failures = _run_batch(pending_specs)
+            all_failures.extend(failures)
 
             if run_files:
-                chunk_path = chunks_dir / f"chunk_{chunk_idx:04d}.h5"
+                chunk_path = chunks_dir / f"chunk{shard_tag}_{start:06d}_{end:06d}.h5"
+                suffix = 0
+                while chunk_path.exists():
+                    suffix += 1
+                    chunk_path = chunks_dir / (
+                        f"chunk{shard_tag}_{start:06d}_{end:06d}_{suffix:03d}.h5"
+                    )
                 merge_run_files_to_chunk(run_files, chunk_path)
                 chunk_files.append(chunk_path)
+                completed_run_ids.update(path.stem for path in run_files)
 
             elapsed = time.time() - t0
-            rate = end / max(elapsed, 1.0)
+            rate = len(completed_run_ids) / max(elapsed, 1.0)
             LOGGER.info(
-                "Chunk %d/%d done (%d runs, %.0f runs/s, %d failed total)",
+                "Chunk %d/%d done (%d new runs, %.0f runs/s, %d failed total)",
                 chunk_idx + 1,
                 total_chunks,
                 len(run_files),
                 rate,
-                len(failed_run_ids),
+                len(all_failures),
             )
-    finally:
-        if pool is not None:
-            pool.shutdown(wait=False)
 
-    backfill_cfg = config["generation"].get("backfill", {})
-    if failed_run_ids and backfill_cfg.get("enabled", False):
-        max_retries = int(backfill_cfg.get("max_retries", 10))
-        LOGGER.info(
-            "Backfilling %d failed runs (max %d retries)...",
-            len(failed_run_ids),
-            max_retries,
-        )
-        backfill_pool = ThreadPoolExecutor(max_workers=max_workers) if max_workers > 1 else None
-        try:
-            backfill_id_counter = requested
-            for retry in range(max_retries):
-                if not failed_run_ids:
+        backfill_cfg = config["generation"].get("backfill", {})
+        target_for_shortfall = shard_count if is_sharded else target_count
+        if is_sharded:
+            next_run_index = target_count + shard_id * _SHARD_BACKFILL_SLOT_SIZE
+            backfill_id_slot_end = target_count + (shard_id + 1) * _SHARD_BACKFILL_SLOT_SIZE
+        else:
+            next_run_index = target_count
+            backfill_id_slot_end = _SHARD_RUN_ID_MAX_EXCLUSIVE
+
+        if bool(backfill_cfg.get("enabled", False)) and all_failures:
+            max_retries = int(backfill_cfg.get("max_retries", 10))
+            LOGGER.info(
+                "Backfilling failed ExoGibbs runs (max %d retries)...",
+                max_retries,
+            )
+            base_seed = int(config["generation"]["seed"])
+            for attempt in range(1, max_retries + 1):
+                shortfall = target_for_shortfall - len(completed_run_ids)
+                if shortfall <= 0:
                     break
-                n_needed = len(failed_run_ids)
-                failed_run_ids.clear()
+                if next_run_index + shortfall > backfill_id_slot_end:
+                    raise RuntimeError(
+                        f"Backfill would overflow this shard's ID slot: "
+                        f"next_run_index={next_run_index}, shortfall={shortfall}, "
+                        f"slot_end={backfill_id_slot_end}."
+                    )
+                backfill_seed = base_seed + 1000 * attempt + (
+                    1_000_000 * shard_id if is_sharded else 0
+                )
                 backfill_plan = build_sampling_plan(
                     config=config,
                     project_root=project_root,
-                    num_runs=n_needed,
-                    seed=int(config["generation"]["seed"]) + 1000 + retry,
+                    num_runs=shortfall,
+                    seed=backfill_seed,
                 )
-                backfill_specs = sample_run_specifications_slice(
-                    backfill_plan, start=0, end=n_needed
+                raw_backfill_specs = sample_run_specifications_slice(
+                    backfill_plan,
+                    start=0,
+                    end=shortfall,
                 )
                 backfill_specs = _attach_species_metadata(
-                    backfill_specs, config,
-                    start_index=backfill_id_counter,
+                    raw_backfill_specs,
+                    config,
+                    start_index=next_run_index,
                 )
-                backfill_id_counter += n_needed
-
-                if backfill_pool is not None:
-                    futs = {
-                        backfill_pool.submit(
-                            _process_run, runtime, spec, runs_dir,
-                            state_species, output_species,
-                        ): spec
-                        for spec in backfill_specs
-                    }
-                    for fut in as_completed(futs):
-                        s, rp = fut.result()
-                        if rp is None:
-                            failed_run_ids.append(s.run_id)
-                        else:
-                            chunk_path = chunks_dir / f"backfill_{retry:02d}_{s.run_id}.h5"
-                            merge_run_files_to_chunk([rp], chunk_path)
-                            chunk_files.append(chunk_path)
-                            all_specs.append(s)
-                else:
-                    for spec in backfill_specs:
-                        s, rp = _process_run(
-                            runtime, spec, runs_dir, state_species, output_species,
+                next_run_index += len(backfill_specs)
+                run_files, success_specs, failures = _run_batch(backfill_specs)
+                all_failures.extend(failures)
+                successful_backfill_specs.extend(success_specs)
+                if run_files:
+                    chunk_path = chunks_dir / f"chunk_backfill{shard_tag}_{attempt:02d}.h5"
+                    suffix = 0
+                    while chunk_path.exists():
+                        suffix += 1
+                        chunk_path = chunks_dir / (
+                            f"chunk_backfill{shard_tag}_{attempt:02d}_{suffix:03d}.h5"
                         )
-                        if rp is None:
-                            failed_run_ids.append(s.run_id)
-                        else:
-                            chunk_path = chunks_dir / f"backfill_{retry:02d}_{s.run_id}.h5"
-                            merge_run_files_to_chunk([rp], chunk_path)
-                            chunk_files.append(chunk_path)
-                            all_specs.append(s)
-        finally:
-            if backfill_pool is not None:
-                backfill_pool.shutdown(wait=False)
+                    merge_run_files_to_chunk(run_files, chunk_path)
+                    chunk_files.append(chunk_path)
+                    completed_run_ids.update(path.stem for path in run_files)
+                if not failures:
+                    break
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
 
-    if failed_run_ids:
-        LOGGER.warning(
-            "%d runs failed after backfill and will be missing from the dataset.",
-            len(failed_run_ids),
+    straggler_run_files = sorted(runs_dir.glob("run_*.h5"))
+    if straggler_run_files:
+        final_chunk = chunks_dir / f"chunk_stragglers{shard_tag}.h5"
+        merge_run_files_to_chunk(straggler_run_files, final_chunk)
+        chunk_files.append(final_chunk)
+        completed_run_ids.update(list_run_ids_from_consolidated(final_chunk))
+
+    final_target = shard_count if is_sharded else target_count
+    shortfall = final_target - len(completed_run_ids)
+    remaining_failures = sorted(set(all_failures) - completed_run_ids)
+    failed_log = (
+        info_root / "shards" / f"failed_runs_s{shard_id:02d}.json"
+        if is_sharded
+        else info_root / "failed_runs.json"
+    )
+    if all_failures or shortfall > 0:
+        failed_log.parent.mkdir(parents=True, exist_ok=True)
+        failed_log.write_text(
+            json.dumps(remaining_failures or all_failures, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    if shortfall > 0:
+        raise RuntimeError(
+            f"ExoGibbs generation finished {shortfall} successful runs "
+            f"short of the requested total. See {failed_log} for failed run IDs."
+        )
+
+    successful_deterministic_specs = [
+        spec for spec in deterministic_specs if spec.run_id in completed_run_ids
+    ]
+    successful_specs = successful_deterministic_specs + successful_backfill_specs
+
+    if is_sharded:
+        deterministic_ids = [f"run_{i:06d}" for i in range(shard_start, shard_end)]
+        deterministic_set = set(deterministic_ids)
+        deterministic_ok = sorted(rid for rid in completed_run_ids if rid in deterministic_set)
+        deterministic_failed = sorted(rid for rid in deterministic_ids if rid not in completed_run_ids)
+        backfill_ok = sorted(
+            rid for rid in completed_run_ids
+            if rid.startswith("run_") and int(rid.split("_", 1)[1]) >= target_count
+        )
+        fragment = {
+            "schema_version": 1,
+            "shard_id": shard_id,
+            "num_shards": num_shards,
+            "shard_start": shard_start,
+            "shard_end": shard_end,
+            "config_chemistry_type": "exogibbs",
+            "config_seed": int(config["generation"]["seed"]),
+            "config_num_runs": target_count,
+            "deterministic_run_ids": deterministic_ids,
+            "successful_deterministic_run_ids": deterministic_ok,
+            "failed_deterministic_run_ids": deterministic_failed,
+            "successful_backfill_run_ids": backfill_ok,
+            "successful_backfill_specs": [
+                _run_specification_to_payload(spec)
+                for spec in successful_backfill_specs
+            ],
+            "remaining_failures": remaining_failures,
+            "chunk_files_relpath": [
+                str(path.relative_to(raw_root)) for path in sorted(chunk_files)
+            ],
+            "backfill_seed_formula": "base_seed + 1000*attempt + 1_000_000*shard_id",
+            "shard_backfill_slot_size": _SHARD_BACKFILL_SLOT_SIZE,
+            "backfill_id_slot_start": target_count + shard_id * _SHARD_BACKFILL_SLOT_SIZE,
+            "backfill_id_slot_end": target_count + (shard_id + 1) * _SHARD_BACKFILL_SLOT_SIZE,
+            "completed_at_iso8601": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "host": socket.gethostname(),
+            "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+            "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        }
+        fragment_path = info_root / "shards" / f"shard_s{shard_id:02d}.json"
+        fragment_path.parent.mkdir(parents=True, exist_ok=True)
+        fragment_path.write_text(json.dumps(fragment, indent=2) + "\n", encoding="utf-8")
+        if runs_dir.exists() and not any(runs_dir.iterdir()):
+            runs_dir.rmdir()
+        LOGGER.info(
+            "ExoGibbs shard %d/%d complete: %d runs across %d chunk files",
+            shard_id,
+            num_shards,
+            len(completed_run_ids),
+            len(chunk_files),
+        )
+        return GeneratedRawDataset(
+            run_root=run_root,
+            raw_root=raw_root,
+            run_ids=sorted(completed_run_ids),
+            consolidated_path=raw_root / "runs.h5",
+            manifest_path=fragment_path,
+            coverage_path=None,
         )
 
     # Merge all chunks into runs.h5
     consolidated_path = raw_root / "runs.h5"
     merge_chunks_to_runs_h5(chunk_files, consolidated_path)
+    if chunks_dir.exists() and not any(chunks_dir.iterdir()):
+        chunks_dir.rmdir()
+    if runs_dir.exists() and not any(runs_dir.iterdir()):
+        runs_dir.rmdir()
 
     # Write metadata
     manifest_path, coverage_path = _write_generation_metadata(
         info_root=info_root,
         run_files=[consolidated_path],
-        specs=all_specs,
+        specs=successful_specs,
         config=config,
     )
-
-    from .generation import list_run_ids_from_consolidated
 
     run_ids = list_run_ids_from_consolidated(consolidated_path)
     elapsed = time.time() - t0

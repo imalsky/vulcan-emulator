@@ -5,7 +5,7 @@
 # submit_gen_array.sh (which wires up the --dependency=afterok between the
 # array and this job) or manually with:
 #   sbatch --dependency=afterok:<array_job_id> \
-#          --export=ALL,CONFIG_PATH=config/vulcan_condensation.json \
+#          --export=ALL,CONFIG_PATH=config/vulcan_luhman16a_10k.json \
 #          supercomputer_cmds/run_merge.sh
 #
 # Set SKIP_NORM=1 to stop after producing runs.h5 (e.g. to inspect failed
@@ -27,7 +27,7 @@
 set -euo pipefail
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/vulcan_condensation.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
 SKIP_NORM=${SKIP_NORM:-0}
 
 # Must match NUM_SHARDS in run_gen_array.sh.

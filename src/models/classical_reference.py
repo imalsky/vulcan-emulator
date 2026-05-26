@@ -14,8 +14,8 @@ notebooks can stay focused on analysis and commentary.
 
 from __future__ import annotations
 
-import subprocess
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path

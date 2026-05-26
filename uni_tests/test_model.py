@@ -9,7 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from src.data_generation.data_loader import build_batch, load_processed_dataset
-from synthetic_fixture import generate_synthetic_raw_runs
 from src.data_generation.preprocess import preprocess_raw_dataset
 from src.models.jax_model import (
     TransformerDimensions,
@@ -18,6 +17,8 @@ from src.models.jax_model import (
     initialize_model,
 )
 from src.training.trainer import _read_checkpoint, train_model
+
+from synthetic_fixture import generate_synthetic_raw_runs
 
 
 def _prepare_batch(tiny_config: dict) -> tuple[dict[str, np.ndarray], dict, dict]:

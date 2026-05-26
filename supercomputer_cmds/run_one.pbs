@@ -16,12 +16,12 @@
 # tuning-pruner short trials.
 #
 # Usage (submit from anywhere; the script self-locates the project root):
-#   qsub supercomputer_cmds/run_one.pbs                                                    # default fastchem
+#   qsub supercomputer_cmds/run_one.pbs                                                    # default Luhman 16A VULCAN-JAX
 #   qsub -v CONFIG_PATH=path/to/other.json supercomputer_cmds/run_one.pbs
 #   qsub -v SKIP_GEN=0,SKIP_NORM=0 supercomputer_cmds/run_one.pbs                           # force a data pass
 #
 # Environment Variables:
-#   CONFIG_PATH     — config file path (default: config/fastchem.json)
+#   CONFIG_PATH     — config file path (default: config/vulcan_luhman16a_10k.json)
 #   SKIP_GEN        — skip generation (default: 1, data is already on disk)
 #   SKIP_NORM       — skip normalization (default: 1, processed data is already on disk)
 #   CONDA_ENV       — conda environment name (default: pyt2_8_gh)
@@ -64,7 +64,7 @@ if [[ "$(basename "${CONDA_PREFIX:-}")" != "${CONDA_ENV}" ]]; then
 fi
 
 # --- Configuration ---
-CONFIG_PATH="${CONFIG_PATH:-config/fastchem.json}"
+CONFIG_PATH="${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}"
 if [[ "${CONFIG_PATH}" != /* ]]; then
   CONFIG_PATH="${PROJECT_ROOT}/${CONFIG_PATH}"
 fi

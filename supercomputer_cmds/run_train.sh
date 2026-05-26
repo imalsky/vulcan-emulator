@@ -1,16 +1,16 @@
 #!/bin/bash
 # Run pipeline stages: training + (optional) export.
 #
-# Default invocation (FastChem):
+# Default invocation (VULCAN-JAX Luhman 16A 10k):
 #   sbatch supercomputer_cmds/run_train.sh
 #
 # ExoGibbs:
-#   sbatch --export=ALL,CONFIG_PATH=config/exogibbs_luhman16a.json \
+#   sbatch --export=ALL,CONFIG_PATH=config/exogibbs_luhman16a_10k.json \
 #          supercomputer_cmds/run_train.sh
 #
-# VULCAN condensation:
-#   sbatch --job-name=vulcan_train_cond \
-#          --export=ALL,CONFIG_PATH=config/vulcan_condensation.json \
+# VULCAN-JAX Luhman 16A 10k:
+#   sbatch --job-name=vulcan_train_luhman16a \
+#          --export=ALL,CONFIG_PATH=config/vulcan_luhman16a_10k.json \
 #          supercomputer_cmds/run_train.sh
 #SBATCH -J vulcan_train
 #SBATCH -o %x.o%j
@@ -29,7 +29,7 @@
 set -euo pipefail
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/fastchem.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
 SKIP_EXPORT=${SKIP_EXPORT:-0}
 

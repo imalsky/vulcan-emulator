@@ -8,16 +8,13 @@ shared numeric primitives (linear, LayerNorm, RMSNorm, attention) live in
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 
 from .transformer import (
     TransformerDimensions,
-    apply_transformer_model,
+    apply_transformer_model,  # noqa: F401 - re-exported for public callers/tests
     init_transformer_params,
 )
-
 
 # ---------------------------------------------------------------------------
 # Model construction helpers

@@ -11,19 +11,16 @@ Supported model families:
 - `transformer`
 
 Shipped configs:
-- `config/fastchem.json` — gas-phase FastChem equilibrium
-- `config/vulcan_condensation.json` — VULCAN kinetics with H2O/S8 condensation
-- `config/exogibbs_luhman16a.json` — ExoGibbs equilibrium for brown dwarf Luhman 16A (1M runs)
-- `config/exogibbs_bd_100k.json` — ExoGibbs equilibrium, 100k-run variant
-- `config/vulcan_bd_100k.json` — VULCAN kinetics, 100k-run brown dwarf variant
+- `config/exogibbs_luhman16a_10k.json` — ExoGibbs thermochemical equilibrium for the Luhman 16A brown-dwarf retrieval case
+- `config/vulcan_luhman16a_10k.json` — VULCAN-JAX vertical-mixing kinetics for the same 10k-profile Luhman 16A setup
 
 CLI:
 
 ```bash
-python -m src.utils --config config/fastchem.json --stage generation
-python -m src.utils --config config/fastchem.json --stage normalization
-python -m src.utils --config config/fastchem.json --stage training
-python -m src.utils --config config/fastchem.json --stage export
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage generation
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage normalization
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage training
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage export
 ```
 
 `--stage normalization` performs the full raw-to-processed step: split creation, train-only normalization fitting, and processed tensor writing.
@@ -38,7 +35,7 @@ Chemistry contract:
 
 - these are hydrogen-normalized absolute abundances `n_X / n_H`
 
-VULCAN-side shipped defaults (in `config/vulcan_condensation.json`):
+VULCAN-side shipped defaults (in `config/vulcan_luhman16a_10k.json`):
 - single default science preset (no `science_presets` block needed)
 - photochemistry is off (and required to be off — not yet supported)
 - condensation is on for `H2O` and `S8` via the typed

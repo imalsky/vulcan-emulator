@@ -1191,6 +1191,10 @@ def _ensure_stellar_template(
         return generate_blackbody_template(
             wavelength_min_nm=float(spectrum_cfg["wavelength_min_nm"]),
             wavelength_max_nm=float(spectrum_cfg["wavelength_max_nm"]),
+            max_points=int(spectrum_cfg["max_tokens"]),
+            dbin1_nm=float(spectrum_cfg["dbin1_nm"]),
+            dbin2_nm=float(spectrum_cfg["dbin2_nm"]),
+            dbin_12trans_nm=float(spectrum_cfg["dbin_12trans_nm"]),
             teff_k=float(spectrum_cfg["teff_k"]),
             radius_rsun=float(spectrum_cfg["radius_rsun"]),
             semi_major_axis_au=float(spectrum_cfg["semi_major_axis_au"]),

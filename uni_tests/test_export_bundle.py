@@ -188,6 +188,17 @@ def _make_fastchem_payload() -> tuple[dict, dict, TransformerDimensions]:
     return payload, normalization, dims
 
 
+def _make_exogibbs_payload() -> tuple[dict, dict, TransformerDimensions]:
+    payload, normalization, dims = _make_fastchem_payload()
+    payload = dict(payload)
+    payload["data_contract"] = {
+        **payload["data_contract"],
+        "chemistry_type": "exogibbs",
+    }
+    payload["config"] = {"chemistry_type": "exogibbs", "model_type": "transformer"}
+    return payload, normalization, dims
+
+
 def _make_vulcan_payload() -> tuple[dict, dict, TransformerDimensions]:
     normalization = _vulcan_normalization()
     dims = _vulcan_transformer_dims()
@@ -359,6 +370,33 @@ def test_exported_fastchem_compiled_predictor_matches_eager_and_is_cached(tmp_pa
         rtol=1.0e-5,
         atol=1.0e-6,
     )
+
+
+def test_exported_exogibbs_bundle_loads_and_predicts_from_physical_inputs(tmp_path):
+    payload, normalization, dims = _make_exogibbs_payload()
+    bundle = load_exported_model(export_checkpoint_payload(payload, tmp_path / "exogibbs_transformer_export.npz"))
+
+    pressure_bar = np.array([100.0, 10.0, 1.0, 0.1], dtype=np.float32)
+    temperature_k = np.array([1450.0, 1300.0, 1050.0, 900.0], dtype=np.float32)
+    global_inputs = _element_globals()
+    expected_physical, _ = _expected_fastchem_prediction(
+        dims,
+        payload["params"],
+        normalization,
+        pressure_bar,
+        temperature_k,
+        global_inputs,
+    )
+
+    predicted_physical = bundle.predict_exogibbs_profile(
+        pressure_bar=pressure_bar,
+        temperature_k=temperature_k,
+        global_inputs=global_inputs,
+    )
+
+    assert bundle.uses_exogibbs
+    assert bundle.uses_equilibrium_chemistry
+    np.testing.assert_allclose(np.asarray(predicted_physical), expected_physical, rtol=1.0e-5, atol=1.0e-6)
 
 
 def test_exported_vulcan_transformer_bundle_predicts_from_physical_inputs(tmp_path):

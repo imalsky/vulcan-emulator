@@ -15,19 +15,16 @@ The three supported combinations are:
 - `exogibbs + transformer`
 
 Shipped configs:
-- `config/fastchem.json` — FastChem equilibrium chemistry, gas-phase only
-- `config/vulcan_condensation.json` — VULCAN kinetics with H2O/S8 condensation
-- `config/exogibbs_luhman16a.json` — ExoGibbs equilibrium for Luhman 16A (1M runs)
-- `config/exogibbs_bd_100k.json` — ExoGibbs equilibrium, 100k-run variant
-- `config/vulcan_bd_100k.json` — VULCAN kinetics, 100k-run brown dwarf variant
+- `config/exogibbs_luhman16a_10k.json` — ExoGibbs thermochemical equilibrium for the Luhman 16A brown-dwarf retrieval case
+- `config/vulcan_luhman16a_10k.json` — VULCAN-JAX vertical-mixing kinetics for the same 10k-profile Luhman 16A setup
 
 CLI:
 
 ```bash
-python -m src.utils --config config/fastchem.json --stage generation
-python -m src.utils --config config/fastchem.json --stage normalization
-python -m src.utils --config config/fastchem.json --stage training
-python -m src.utils --config config/fastchem.json --stage export
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage generation
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage normalization
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage training
+python -m src.utils --config config/vulcan_luhman16a_10k.json --stage export
 ```
 
 ---
@@ -248,7 +245,7 @@ MSE term (`lambda_z`) with a log10-space penalty on the physical residual
 | `huber_delta_log10` | `huber` | Huber transition point in dex (must be `> 0`). Quadratic for `|r| <= delta`, linear otherwise. `0.1` is a sensible default (~26% fractional error at the transition). |
 
 MAE is the `delta -> 0` limit of Huber and is the current default in the
-shipped `config/fastchem.json`. Huber is the preferred
+shipped `config/vulcan_luhman16a_10k.json`. Huber is the preferred
 variant when outliers in the log-ratio tail dominate training signal.
 
 ### `model`
