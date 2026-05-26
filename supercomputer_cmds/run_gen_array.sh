@@ -34,7 +34,7 @@ set -euo pipefail
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
 CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
-SKIP_INSTALL=${SKIP_INSTALL:-0}
+SKIP_INSTALL=${SKIP_INSTALL:-1}
 
 # Must match the --array range above and --num-shards in run_merge.sh.
 NUM_SHARDS=4
