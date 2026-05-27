@@ -21,12 +21,20 @@ set -euo pipefail
 
 CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
+NUM_SHARDS=${NUM_SHARDS:-4}
+if [ "$NUM_SHARDS" -lt 1 ]; then
+  echo "ERROR: NUM_SHARDS must be >= 1 (got ${NUM_SHARDS})." >&2
+  exit 2
+fi
 
 if [ -z "${PROJECT_ROOT:-}" ]; then
   SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 fi
 cd -P "${PROJECT_ROOT}"
+echo "[submit] project_root=$PROJECT_ROOT"
+echo "[submit] config_path=$CONFIG_PATH"
+echo "[submit] num_shards=$NUM_SHARDS"
 
 # --- Step 1: install job (single node, runs once) -----------------------
 # Skippable with SKIP_INSTALL=1 if the env is already set up.
@@ -50,7 +58,8 @@ fi
 # --- Step 2: generation array (depends on install) ----------------------
 ARRAY_RAW=$(sbatch --parsable \
   ${ARRAY_DEP:+"$ARRAY_DEP"} \
-  --export=ALL,CONFIG_PATH="$CONFIG_PATH",SKIP_INSTALL=1 \
+  --array=0-$((NUM_SHARDS - 1)) \
+  --export=ALL,CONFIG_PATH="$CONFIG_PATH",SKIP_INSTALL=1,NUM_SHARDS="$NUM_SHARDS" \
   supercomputer_cmds/run_gen_array.sh)
 # On multi-cluster SLURM setups (--clusters=edge), --parsable returns
 # "JOBID;CLUSTER". Strip the suffix so --dependency=afterok:<jobid> parses.
@@ -65,6 +74,6 @@ echo "Submitted generation array: $ARRAY_RAW"
 MERGE_RAW=$(sbatch --parsable \
   ${ARRAY_CLUSTER:+--clusters="$ARRAY_CLUSTER"} \
   --dependency=afterok:"$ARRAY_ID" \
-  --export=ALL,CONFIG_PATH="$CONFIG_PATH" \
+  --export=ALL,CONFIG_PATH="$CONFIG_PATH",NUM_SHARDS="$NUM_SHARDS" \
   supercomputer_cmds/run_merge.sh)
 echo "Submitted merge job: $MERGE_RAW (depends on array $ARRAY_ID)"

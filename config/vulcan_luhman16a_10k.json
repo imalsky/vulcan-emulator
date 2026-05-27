@@ -87,7 +87,7 @@
     "seed": 7,
     "overwrite": false,
     "reuse_raw_if_present": true,
-    "parallel_workers": 24,
+    "parallel_workers": 48,
     "sample_chunk_size": 500,
     "fastchem_timeout_seconds": 30.0,
     "vulcan_timeout_seconds": 1800.0,

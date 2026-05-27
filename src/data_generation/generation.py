@@ -46,6 +46,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -297,6 +298,15 @@ def _generation_worker_count(config: dict[str, Any], total_runs: int) -> int:
     if configured <= 0:
         configured = _detect_available_cpus()
     return max(1, min(configured, total_runs))
+
+
+def _format_seconds(seconds: float) -> str:
+    """Format an elapsed or estimated duration for progress logs."""
+    if seconds < 60.0:
+        return f"{seconds:.0f}s"
+    if seconds < 3600.0:
+        return f"{seconds / 60.0:.1f}m"
+    return f"{seconds / 3600.0:.2f}h"
 
 
 def _attach_species_metadata(
@@ -1214,8 +1224,14 @@ def _ensure_vulcan_worker_tree(source_root: Path, worker_root: Path) -> None:
     marker = worker_root / _VULCAN_TREE_READY_MARKER
     if marker.exists():
         return
+    start = time.monotonic()
     _copy_vulcan_source(source_root, worker_root)
     marker.write_text("")
+    LOGGER.info(
+        "Seeded VULCAN worker tree %s in %s",
+        worker_root,
+        _format_seconds(time.monotonic() - start),
+    )
 
 
 def _ensure_vulcan_jax_worker_tree(package_root: Path, worker_root: Path) -> Path:
@@ -1227,8 +1243,14 @@ def _ensure_vulcan_jax_worker_tree(package_root: Path, worker_root: Path) -> Pat
     if worker_root.exists():
         shutil.rmtree(worker_root)
     worker_root.mkdir(parents=True, exist_ok=True)
+    start = time.monotonic()
     shutil.copytree(package_root, worker_package_root)
     marker.write_text("")
+    LOGGER.info(
+        "Seeded VULCAN-JAX worker tree %s in %s",
+        worker_root,
+        _format_seconds(time.monotonic() - start),
+    )
     return worker_package_root
 
 
@@ -1238,8 +1260,14 @@ def _ensure_fastchem_worker_tree(source_root: Path, worker_root: Path) -> Path:
     fastchem_root = worker_root / "fastchem_vulcan"
     if marker.exists():
         return fastchem_root
+    start = time.monotonic()
     _copy_fastchem_runtime(source_root, worker_root)
     marker.write_text("")
+    LOGGER.info(
+        "Seeded FastChem worker tree %s in %s",
+        worker_root,
+        _format_seconds(time.monotonic() - start),
+    )
     return fastchem_root
 
 
@@ -1920,6 +1948,66 @@ def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tu
     return source_root, chemistry_file
 
 
+def _tail_text(text: str | bytes | None, n_lines: int = 30) -> str:
+    """Return the last *n_lines* of *text*, or a placeholder when empty."""
+    if text is None:
+        return "(no output captured)"
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines:
+        return "(empty)"
+    return "\n".join(lines[-n_lines:])
+
+
+def _run_chemistry_subprocess(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    run_id: str,
+    timeout: float,
+    env: dict[str, str] | None = None,
+    label: str = "Chemistry",
+) -> subprocess.CompletedProcess[str]:
+    """Run a chemistry-solver subprocess with output capture and diagnostics.
+
+    Captures stdout/stderr so that failures and timeouts are logged at
+    ERROR level with the subprocess output tail before the exception
+    propagates.  Slow successful runs (>120 s) are logged at INFO.
+    """
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, env=env,
+            capture_output=True, text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - t0
+        LOGGER.error(
+            "%s %s TIMED OUT after %.0fs (limit %.0fs).\n"
+            "--- stdout tail ---\n%s\n--- stderr tail ---\n%s",
+            label, run_id, elapsed, timeout,
+            _tail_text(exc.stdout), _tail_text(exc.stderr),
+        )
+        raise
+    elapsed = time.monotonic() - t0
+    if result.returncode != 0:
+        LOGGER.error(
+            "%s %s FAILED (rc=%d, %.1fs).\n"
+            "--- stdout tail ---\n%s\n--- stderr tail ---\n%s",
+            label, run_id, result.returncode, elapsed,
+            _tail_text(result.stdout), _tail_text(result.stderr),
+        )
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd,
+            output=result.stdout, stderr=result.stderr,
+        )
+    if elapsed > 120:
+        LOGGER.info("%s %s completed in %.1fs (slow)", label, run_id, elapsed)
+    return result
+
+
 def _run_single_vulcan_spec(
     spec: RunSpecification,
     *,
@@ -1973,7 +2061,10 @@ def _run_single_vulcan_spec(
     else:
         vulcan_cmd = [python_executable, "vulcan.py"]
     timeout_seconds = float(config["generation"].get("vulcan_timeout_seconds", 1800.0))
-    subprocess.run(vulcan_cmd, cwd=worker_root, check=True, timeout=timeout_seconds)
+    _run_chemistry_subprocess(
+        vulcan_cmd, cwd=worker_root, run_id=spec.run_id,
+        timeout=timeout_seconds, label="VULCAN",
+    )
 
     output_candidates = sorted((worker_root / "output").glob("*.vul"))
     if not output_candidates:
@@ -2024,12 +2115,10 @@ def _run_single_vulcan_jax_spec(
     env.setdefault("OMP_NUM_THREADS", "1")
 
     timeout_seconds = float(config["generation"].get("vulcan_timeout_seconds", 1800.0))
-    subprocess.run(
+    _run_chemistry_subprocess(
         [python_executable, "-m", "vulcan_jax.vulcan_jax_cli"],
-        cwd=worker_root,
-        env=env,
-        check=True,
-        timeout=timeout_seconds,
+        cwd=worker_root, env=env, run_id=spec.run_id,
+        timeout=timeout_seconds, label="VULCAN-JAX",
     )
 
     output_candidates = sorted((worker_root / "output").glob("*.vul"))
@@ -2085,11 +2174,10 @@ def _run_single_fastchem_spec(
     )
     _write_fastchem_tp_profile(fastchem_root, spec)
     timeout_seconds = float(config["generation"].get("fastchem_timeout_seconds", 30.0))
-    subprocess.run(
+    _run_chemistry_subprocess(
         ["./fastchem", "input/config.input"],
-        cwd=fastchem_root,
-        check=True,
-        timeout=timeout_seconds,
+        cwd=fastchem_root, run_id=spec.run_id,
+        timeout=timeout_seconds, label="FastChem",
     )
     _raise_on_fastchem_monitor_failures(
         fastchem_root / "output" / "monitor_output.dat",
@@ -2262,6 +2350,7 @@ def run_vulcan_generation(
         "Generation pool: %d workers (reused across all chunks)",
         generation_worker_count,
     )
+    vulcan_jax_cache_warmed = backend != "vulcan_jax"
 
     def _run_batch(specs: list[RunSpecification]) -> tuple[list[Path], list[str]]:
         """Execute one batch of run specifications through the active backend.
@@ -2277,10 +2366,62 @@ def run_vulcan_generation(
             Successfully written raw-run files and failed run IDs that may be
             backfilled later.
         """
+        nonlocal vulcan_jax_cache_warmed
         successes: list[Path] = []
         failures: list[str] = []
+        batch_total = len(specs)
+        batch_t0 = time.monotonic()
+
+        def _log_progress(n: int) -> None:
+            if n == 1 or n % 50 == 0 or n == batch_total:
+                elapsed = max(time.monotonic() - batch_t0, 1.0e-9)
+                runs_per_min = 60.0 * n / elapsed
+                eta_seconds = (batch_total - n) / (n / elapsed) if n else 0.0
+                LOGGER.info(
+                    "Batch progress: %d/%d processed (%d ok, %d failed, %s wall, "
+                    "%.2f runs/min, eta %s)",
+                    n, batch_total, len(successes), len(failures),
+                    _format_seconds(elapsed), runs_per_min, _format_seconds(eta_seconds),
+                )
+
+        pending_specs = specs
+        if (
+            generation_executor is not None
+            and not vulcan_jax_cache_warmed
+            and pending_specs
+        ):
+            warmup_spec = pending_specs[0]
+            LOGGER.info(
+                "VULCAN-JAX cache warmup: running %s serially before %d-worker fan-out",
+                warmup_spec.run_id,
+                generation_worker_count,
+            )
+            try:
+                successes.append(
+                    run_single(
+                        warmup_spec,
+                        source_root=source_root,
+                        worker_base=worker_base,
+                        runs_dir=runs_dir,
+                        config=config,
+                    )
+                )
+                LOGGER.info("VULCAN-JAX cache warmup complete: %s", warmup_spec.run_id)
+            except Exception:
+                LOGGER.warning(
+                    "VULCAN-JAX cache warmup run %s failed, will backfill",
+                    warmup_spec.run_id,
+                    exc_info=True,
+                )
+                failures.append(warmup_spec.run_id)
+            vulcan_jax_cache_warmed = True
+            _log_progress(1)
+            pending_specs = pending_specs[1:]
+            if not pending_specs:
+                return successes, failures
+
         if generation_executor is None:
-            for spec in specs:
+            for i, spec in enumerate(pending_specs, len(successes) + len(failures) + 1):
                 try:
                     successes.append(
                         run_single(
@@ -2294,6 +2435,7 @@ def run_vulcan_generation(
                 except Exception:
                     LOGGER.warning("Run %s failed, will backfill", spec.run_id, exc_info=True)
                     failures.append(spec.run_id)
+                _log_progress(i)
         else:
             future_to_id = {
                 generation_executor.submit(
@@ -2304,8 +2446,9 @@ def run_vulcan_generation(
                     runs_dir=runs_dir,
                     config=config,
                 ): spec.run_id
-                for spec in specs
+                for spec in pending_specs
             }
+            processed = len(successes) + len(failures)
             for future in concurrent.futures.as_completed(future_to_id):
                 run_id = future_to_id[future]
                 try:
@@ -2313,6 +2456,8 @@ def run_vulcan_generation(
                 except Exception:
                     LOGGER.warning("Run %s failed, will backfill", run_id, exc_info=True)
                     failures.append(run_id)
+                processed += 1
+                _log_progress(processed)
         return successes, failures
 
     # Resume: reuse chunk files already written by a previous invocation,
@@ -2439,7 +2584,19 @@ def run_vulcan_generation(
             )
         if not chunk_remaining:
             continue
+        chunk_t0 = time.monotonic()
+        LOGGER.info(
+            "Chunk [%d, %d): starting %d runs (%d workers)",
+            chunk_start, chunk_end, len(chunk_remaining), generation_worker_count,
+        )
         new_successes, new_failures = _run_batch(chunk_remaining)
+        chunk_elapsed = max(time.monotonic() - chunk_t0, 1.0e-9)
+        chunk_rate = 3600.0 * len(new_successes) / chunk_elapsed
+        LOGGER.info(
+            "Chunk [%d, %d) done: %d ok, %d failed in %s (%.1f successful runs/hour)",
+            chunk_start, chunk_end, len(new_successes), len(new_failures),
+            _format_seconds(chunk_elapsed), chunk_rate,
+        )
         all_failures.extend(new_failures)
         if new_successes:
             chunk_path = chunks_dir / f"chunk{shard_tag}_{chunk_start:06d}_{chunk_end:06d}.h5"

@@ -25,19 +25,39 @@
 #SBATCH --clusters=edge
 #SBATCH -N 1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=48
 #SBATCH --array=0-3
 #SBATCH --mail-type=all
 #SBATCH --mail-user=isaac.n.malsky@jpl.nasa.gov
 
 set -euo pipefail
+JOB_START_SECONDS=$SECONDS
+finish() {
+  status=$?
+  elapsed=$((SECONDS - JOB_START_SECONDS))
+  echo "[job] finished status=${status} elapsed=${elapsed}s at $(date -Is)"
+}
+trap finish EXIT
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
 CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-1}
+export CONDA_ENV CONFIG_PATH
 
-# Must match the --array range above and --num-shards in run_merge.sh.
-NUM_SHARDS=4
+NUM_SHARDS=${NUM_SHARDS:-${SLURM_ARRAY_TASK_COUNT:-4}}
+if [ "$NUM_SHARDS" -lt 1 ]; then
+  echo "ERROR: NUM_SHARDS must be >= 1 (got ${NUM_SHARDS})." >&2
+  exit 2
+fi
+if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+  echo "ERROR: run_gen_array.sh must run as a SLURM array job." >&2
+  exit 2
+fi
+if [ "$SLURM_ARRAY_TASK_ID" -ge "$NUM_SHARDS" ]; then
+  echo "ERROR: SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} outside NUM_SHARDS=${NUM_SHARDS}." >&2
+  exit 2
+fi
+export NUM_SHARDS
 
 if [ -z "${PROJECT_ROOT:-}" ]; then
   submit_dir="${SLURM_SUBMIT_DIR:-}"
@@ -51,6 +71,7 @@ if [ -z "${PROJECT_ROOT:-}" ]; then
   fi
 fi
 cd -P "${PROJECT_ROOT}"
+export VULCAN_PROJECT_ROOT="$PROJECT_ROOT"
 CONDA_EXE="$(command -v conda)"
 CONDA_BASE="$(dirname "$(dirname "$CONDA_EXE")")"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -79,14 +100,26 @@ export VECLIB_MAXIMUM_THREADS=1
 export BLIS_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
-SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-64}}}
+SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-48}}}
 export SRUN_CPUS_PER_TASK
 
-STAGING_ROOT="${SLURM_TMPDIR:-/tmp/vulcan_gen_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}}"
+STAGING_ROOT="${SLURM_TMPDIR:-/tmp/vulcan_gen_${SLURM_ARRAY_JOB_ID:-local}_${SLURM_ARRAY_TASK_ID}}"
+export STAGING_ROOT
 mkdir -p "$STAGING_ROOT"
 JAX_COMPILATION_CACHE_DIR=${JAX_COMPILATION_CACHE_DIR:-$STAGING_ROOT/jax_cache}
 export JAX_COMPILATION_CACHE_DIR
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+
+echo "========== VULCAN generation shard preflight =========="
+echo "[preflight] date=$(date -Is)"
+echo "[preflight] host=$(hostname)"
+echo "[preflight] project_root=$PROJECT_ROOT"
+echo "[preflight] config_path=$CONFIG_PATH"
+echo "[preflight] job_id=${SLURM_JOB_ID:-local} array_job_id=${SLURM_ARRAY_JOB_ID:-local} task_id=${SLURM_ARRAY_TASK_ID}"
+echo "[preflight] num_shards=$NUM_SHARDS cpus_per_task=$SRUN_CPUS_PER_TASK nodelist=${SLURM_JOB_NODELIST:-unknown}"
+echo "[preflight] staging_root=$STAGING_ROOT"
+echo "[preflight] jax_compilation_cache=$JAX_COMPILATION_CACHE_DIR"
+echo "[preflight] xla_flags=$XLA_FLAGS"
 
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel
@@ -97,29 +130,37 @@ if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -e . --no-deps
 fi
 
-python - <<PY
+python - <<'PY'
+import os
 from pathlib import Path
 import sys
 from src.utils.config import load_and_validate_config
-cfg = load_and_validate_config(Path("$CONFIG_PATH").expanduser().resolve())
+config_path = Path(os.environ["CONFIG_PATH"]).expanduser().resolve()
+cfg = load_and_validate_config(config_path)
 backend = cfg.get("vulcan_runtime", {}).get("backend", "n/a")
-print(f"[preflight] conda_env=$CONDA_ENV")
+num_runs = int(cfg["generation"]["num_runs"])
+num_shards = int(os.environ["NUM_SHARDS"])
+shard_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
+shard_start = shard_id * num_runs // num_shards
+shard_end = (shard_id + 1) * num_runs // num_shards
+print(f"[preflight] conda_env={os.environ['CONDA_ENV']}")
 print(f"[preflight] python_executable={sys.executable}")
 print(f"[preflight] chemistry_type={cfg['chemistry_type']} model_type={cfg['model_type']}")
 print(f"[preflight] vulcan_backend={backend}")
-print(f"[preflight] num_runs={cfg['generation']['num_runs']}")
+print(f"[preflight] num_runs={num_runs}")
 print(f"[preflight] raw_root={cfg['paths']['raw_root']}")
-print(f"[preflight] num_shards=$NUM_SHARDS shard_id=$SLURM_ARRAY_TASK_ID")
-print(f"[preflight] staging_root=$STAGING_ROOT")
+print(f"[preflight] shard={shard_id}/{num_shards} slice=[{shard_start}, {shard_end}) runs={shard_end - shard_start}")
+print(f"[preflight] staging_root={os.environ['STAGING_ROOT']}")
 print(f"[preflight] parallel_workers={cfg['generation'].get('parallel_workers', 0)}")
-print(f"[preflight] cpus_available={$SRUN_CPUS_PER_TASK}")
-print(f"[preflight] jax_compilation_cache=$JAX_COMPILATION_CACHE_DIR")
+print(f"[preflight] cpus_available={os.environ['SRUN_CPUS_PER_TASK']}")
+print(f"[preflight] jax_compilation_cache={os.environ['JAX_COMPILATION_CACHE_DIR']}")
 if backend == "vulcan_jax":
     import vulcan_jax
     print(f"[preflight] vulcan_jax_version={getattr(vulcan_jax, '__version__', '<unknown>')}")
     print(f"[preflight] vulcan_jax_path={Path(vulcan_jax.__file__).resolve()}")
 PY
 
+echo "========== VULCAN generation shard start =========="
 srun --ntasks=1 --cpus-per-task="$SRUN_CPUS_PER_TASK" --cpu-bind=cores \
      python -u -m src.utils \
        --config "$CONFIG_PATH" \

@@ -25,13 +25,25 @@
 #SBATCH --mail-user=isaac.n.malsky@jpl.nasa.gov
 
 set -euo pipefail
+JOB_START_SECONDS=$SECONDS
+finish() {
+  status=$?
+  elapsed=$((SECONDS - JOB_START_SECONDS))
+  echo "[job] finished status=${status} elapsed=${elapsed}s at $(date -Is)"
+}
+trap finish EXIT
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
 CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
 SKIP_NORM=${SKIP_NORM:-0}
+export CONDA_ENV CONFIG_PATH SKIP_NORM
 
-# Must match NUM_SHARDS in run_gen_array.sh.
 NUM_SHARDS=${NUM_SHARDS:-4}
+if [ "$NUM_SHARDS" -lt 1 ]; then
+  echo "ERROR: NUM_SHARDS must be >= 1 (got ${NUM_SHARDS})." >&2
+  exit 2
+fi
+export NUM_SHARDS
 
 if [ -z "${PROJECT_ROOT:-}" ]; then
   submit_dir="${SLURM_SUBMIT_DIR:-}"
@@ -45,6 +57,7 @@ if [ -z "${PROJECT_ROOT:-}" ]; then
   fi
 fi
 cd -P "${PROJECT_ROOT}"
+export VULCAN_PROJECT_ROOT="$PROJECT_ROOT"
 CONDA_EXE="$(command -v conda)"
 CONDA_BASE="$(dirname "$(dirname "$CONDA_EXE")")"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -61,11 +74,30 @@ export PYTHONUNBUFFERED=1
 SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-8}}
 export SRUN_CPUS_PER_TASK
 
+echo "========== VULCAN shard merge preflight =========="
+echo "[preflight] date=$(date -Is)"
+echo "[preflight] host=$(hostname)"
+echo "[preflight] project_root=$PROJECT_ROOT"
+echo "[preflight] config_path=$CONFIG_PATH"
+echo "[preflight] job_id=${SLURM_JOB_ID:-local} num_shards=$NUM_SHARDS cpus_per_task=$SRUN_CPUS_PER_TASK"
+python - <<'PY'
+import os
+from pathlib import Path
+from src.utils.config import load_and_validate_config
+cfg = load_and_validate_config(Path(os.environ["CONFIG_PATH"]).expanduser().resolve())
+print(f"[preflight] chemistry_type={cfg['chemistry_type']} model_type={cfg['model_type']}")
+print(f"[preflight] num_runs={cfg['generation']['num_runs']}")
+print(f"[preflight] raw_root={cfg['paths']['raw_root']}")
+print(f"[preflight] normalizing_after_merge={os.environ.get('SKIP_NORM', '0') != '1'}")
+PY
+
+echo "========== VULCAN shard merge start =========="
 srun --ntasks=1 --cpus-per-task="$SRUN_CPUS_PER_TASK" \
      python -u -m src.utils \
        --config "$CONFIG_PATH" --stage merge_shards --num-shards "$NUM_SHARDS"
 
 if [ "$SKIP_NORM" != "1" ]; then
+  echo "========== normalization start =========="
   srun --ntasks=1 --cpus-per-task="$SRUN_CPUS_PER_TASK" \
        python -u -m src.utils --config "$CONFIG_PATH" --stage normalization
 fi
