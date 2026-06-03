@@ -1,0 +1,78 @@
+#!/bin/bash
+#PBS -N vulcan_install
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#
+# =============================================================================
+# Standalone PBS installer — installs EVERYTHING the run needs, on a GH200
+# compute node, via `qsub`. No login-node step required.
+#
+#   cd /nobackup/$USER/vulcan-emulator
+#   qsub supercomputer_cmds/run_install.pbs
+#
+# What it does (all into /nobackup, never $HOME, never the read-only shared env):
+#   * sets the NAS web proxy so the compute node can reach TestPyPI/PyPI for pip
+#     (compute nodes have no direct internet),
+#   * pip install --user vulcan-jax (+ any missing deps), skipping if already
+#     present, and
+#   * compiles FastChem for aarch64.
+# Then it runs the readiness check. Re-running is safe and fast (no-ops when
+# already satisfied).
+#
+# Env vars (pass with -v):
+#   CONDA_ENV       interpreter env (default pyt2_8_gh)
+#   VULCAN_SCRATCH  scratch root (default /nobackup/$USER/.vulcan)
+#   HTTPS_PROXY     web proxy (default http://proxy.nas.nasa.gov:3128)
+#   FORCE           1 = reinstall vulcan-jax even if already importable
+# =============================================================================
+set -uo pipefail
+
+# --- Locate the repo (PBS spools the script; use PBS_O_WORKDIR) ---------------
+if [ -n "${PROJECT_ROOT:-}" ]; then
+  :                                                                   # honor -v PROJECT_ROOT=...
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/supercomputer_cmds" ]; then
+  PROJECT_ROOT="${PBS_O_WORKDIR}"                                     # submitted from repo root
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ "$(basename "${PBS_O_WORKDIR}")" = "supercomputer_cmds" ]; then
+  PROJECT_ROOT="$(cd -- "${PBS_O_WORKDIR}/.." && pwd -P)"             # submitted from supercomputer_cmds/
+else
+  _sd="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  PROJECT_ROOT="$(cd -- "${_sd}/.." && pwd -P)"                       # direct `bash`, not qsub
+fi
+if [ ! -d "${PROJECT_ROOT}/supercomputer_cmds" ]; then
+  echo "ERROR: cannot locate the vulcan-emulator repo (PROJECT_ROOT='${PROJECT_ROOT}')."
+  echo "       Clone it and submit FROM THE REPO ROOT:"
+  echo "         cd /nobackup/\$USER/vulcan-emulator && qsub supercomputer_cmds/run_install.pbs"
+  echo "       or: qsub -v PROJECT_ROOT=/path/to/vulcan-emulator supercomputer_cmds/run_install.pbs"
+  exit 1
+fi
+cd -P "${PROJECT_ROOT}"
+echo "PROJECT_ROOT: ${PROJECT_ROOT}"
+echo "node:         $(hostname)  arch=$(uname -m)"
+
+# --- NAS web proxy: compute nodes have no direct internet; pip needs this -----
+export http_proxy="${HTTPS_PROXY:-${http_proxy:-http://proxy.nas.nasa.gov:3128}}"
+export https_proxy="${http_proxy}"
+export HTTP_PROXY="${http_proxy}" HTTPS_PROXY="${https_proxy}"
+echo "proxy:        ${https_proxy}"
+
+if curl -sSI --max-time 20 https://test.pypi.org/simple/ >/dev/null 2>&1; then
+  echo "[net] reached TestPyPI through the proxy."
+else
+  echo "[net] WARNING: could not reach TestPyPI through '${https_proxy}'."
+  echo "[net] If pip fails below, set the right proxy:"
+  echo "        qsub -v HTTPS_PROXY=http://<nas-proxy>:<port> supercomputer_cmds/run_install.pbs"
+  echo "      or run 'bash supercomputer_cmds/run_install.sh' on a login node (direct internet)."
+fi
+
+# --- Do the install (idempotent; sources hpc_env, --user, builds FastChem) ----
+bash "${PROJECT_ROOT}/supercomputer_cmds/run_install.sh"
+rc=$?
+
+echo ""
+echo "========== readiness check =========="
+bash "${PROJECT_ROOT}/supercomputer_cmds/check_ready.sh" || true   # informational; install rc is authoritative
+
+exit "${rc}"

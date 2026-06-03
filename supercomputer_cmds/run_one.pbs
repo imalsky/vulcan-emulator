@@ -30,10 +30,28 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd -P)}"
+# Locate the repo. PBS SPOOLS the job script (BASH_SOURCE points into
+# /var/spool/pbs), so use PBS_O_WORKDIR — the dir you ran `qsub` from.
+if [ -n "${PROJECT_ROOT:-}" ]; then
+  :                                                                   # honor -v PROJECT_ROOT=...
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/supercomputer_cmds" ]; then
+  PROJECT_ROOT="${PBS_O_WORKDIR}"                                     # submitted from repo root
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ "$(basename "${PBS_O_WORKDIR}")" = "supercomputer_cmds" ]; then
+  PROJECT_ROOT="$(cd -- "${PBS_O_WORKDIR}/.." && pwd -P)"             # submitted from supercomputer_cmds/
+else
+  _sd="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  PROJECT_ROOT="$(cd -- "${_sd}/.." && pwd -P)"                       # direct `bash`, not qsub
+fi
+if [ ! -d "${PROJECT_ROOT}/supercomputer_cmds" ]; then
+  echo "ERROR: cannot locate the vulcan-emulator repo (PROJECT_ROOT='${PROJECT_ROOT}')."
+  echo "       Submit FROM THE REPO ROOT, e.g.:"
+  echo "         cd /nobackup/\$USER/vulcan-emulator && qsub supercomputer_cmds/run_one.pbs"
+  echo "       or: qsub -v PROJECT_ROOT=/path/to/vulcan-emulator supercomputer_cmds/run_one.pbs"
+  exit 1
+fi
 cd -P "${PROJECT_ROOT}"
 PROJECT_ROOT="$(pwd -P)"
+SCRIPT_DIR="${PROJECT_ROOT}/supercomputer_cmds"
 export VULCAN_PROJECT_ROOT="${PROJECT_ROOT}"
 
 LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"

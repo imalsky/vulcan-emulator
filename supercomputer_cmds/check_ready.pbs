@@ -24,12 +24,24 @@
 # =============================================================================
 set -uo pipefail
 
-# Locate the repo: prefer the submit dir, fall back to the script's own location.
-if [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/supercomputer_cmds" ]; then
-  PROJECT_ROOT="${PBS_O_WORKDIR}"
+# Locate the repo. PBS SPOOLS the job script (BASH_SOURCE points into
+# /var/spool/pbs), so use PBS_O_WORKDIR — the dir you ran `qsub` from.
+if [ -n "${PROJECT_ROOT:-}" ]; then
+  :                                                                   # honor -v PROJECT_ROOT=...
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/supercomputer_cmds" ]; then
+  PROJECT_ROOT="${PBS_O_WORKDIR}"                                     # submitted from repo root
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ "$(basename "${PBS_O_WORKDIR}")" = "supercomputer_cmds" ]; then
+  PROJECT_ROOT="$(cd -- "${PBS_O_WORKDIR}/.." && pwd -P)"             # submitted from supercomputer_cmds/
 else
-  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-  PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+  _sd="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  PROJECT_ROOT="$(cd -- "${_sd}/.." && pwd -P)"                       # direct `bash`, not qsub
+fi
+if [ ! -d "${PROJECT_ROOT}/supercomputer_cmds" ]; then
+  echo "ERROR: cannot locate the vulcan-emulator repo (PROJECT_ROOT='${PROJECT_ROOT}')."
+  echo "       Clone it and submit FROM THE REPO ROOT:"
+  echo "         cd /nobackup/\$USER/vulcan-emulator && qsub supercomputer_cmds/check_ready.pbs"
+  echo "       or pass it explicitly: qsub -v PROJECT_ROOT=/path/to/vulcan-emulator supercomputer_cmds/check_ready.pbs"
+  exit 1
 fi
 cd -P "${PROJECT_ROOT}"
 echo "PROJECT_ROOT: ${PROJECT_ROOT}"
