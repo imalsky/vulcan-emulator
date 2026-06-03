@@ -1,0 +1,115 @@
+#!/bin/bash
+#PBS -N vulcan_train
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=10:00:00
+#PBS -j oe
+#
+# =============================================================================
+# GPU training for the 100k Luhman 16A dataset: normalization -> training ->
+# export. Run AFTER run_gen.pbs reports the dataset complete.
+#
+#   cd /nobackup/$USER/vulcan-emulator
+#   qsub supercomputer_cmds/run_train.pbs
+#
+# Produces models/vulcan_luhman16a_100k/{params_best.npz, best_exported.npz, ...}.
+#
+# Env (-v):
+#   CONFIG_PATH   default config/vulcan_luhman16a_100k.json
+#   SKIP_NORM     1 to skip normalization (processed tensors already on disk)
+#   CONDA_ENV, VULCAN_SCRATCH   as in run_install
+# =============================================================================
+set -uo pipefail
+
+# --- locate the repo (PBS spools the script; use PBS_O_WORKDIR) ---------------
+if [ -n "${PROJECT_ROOT:-}" ]; then :
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/supercomputer_cmds" ]; then
+  PROJECT_ROOT="${PBS_O_WORKDIR}"
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ "$(basename "${PBS_O_WORKDIR}")" = "supercomputer_cmds" ]; then
+  PROJECT_ROOT="$(cd -- "${PBS_O_WORKDIR}/.." && pwd -P)"
+else
+  _sd="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"; PROJECT_ROOT="$(cd -- "${_sd}/.." && pwd -P)"
+fi
+if [ ! -d "${PROJECT_ROOT}/supercomputer_cmds" ]; then
+  echo "ERROR: submit from the repo root: cd /nobackup/\$USER/vulcan-emulator && qsub supercomputer_cmds/run_train.pbs"
+  exit 1
+fi
+cd -P "${PROJECT_ROOT}"
+SCRIPT_DIR="${PROJECT_ROOT}/supercomputer_cmds"
+
+CONFIG_PATH="${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}"
+[ -f "${CONFIG_PATH}" ] || { echo "ERROR: config not found: ${CONFIG_PATH}"; exit 1; }
+SKIP_NORM="${SKIP_NORM:-0}"
+
+# --- caches off $HOME, conda, vulcan_jax ready --------------------------------
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/hpc_env.sh"
+module purge 2>/dev/null || true
+module use -a /swbuild/analytix/tools/modulefiles 2>/dev/null || true
+module load miniconda3/gh2 2>/dev/null || true
+# shellcheck disable=SC1090
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV:-pyt2_8_gh}"
+"${SCRIPT_DIR}/ensure_vulcan_jax.sh"
+
+# --- runtime env (GPU training) ----------------------------------------------
+export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED=1
+export HDF5_USE_FILE_LOCKING=FALSE
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
+export XLA_FLAGS="${XLA_FLAGS:---xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0}"
+
+echo "config=${CONFIG_PATH}  node=$(hostname)  arch=$(uname -m)"
+
+# --- GPU preflight: training REQUIRES the GPU backend -------------------------
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+  echo "ERROR: no visible NVIDIA GPU in this job."; exit 1
+fi
+python - <<'PY' || { echo "ERROR: JAX is not on the GPU — training would run on CPU."; exit 1; }
+import jax, sys
+be = jax.default_backend()
+print(f"jax {jax.__version__}  backend={be}  devices={jax.devices()}")
+sys.exit(0 if be in ("gpu", "cuda", "rocm") else 1)
+PY
+
+# --- data completeness: don't train on a partial dataset ----------------------
+read -r EXPECTED COUNT < <(python - "${CONFIG_PATH}" <<'PY'
+import json, sys, pathlib
+cfg = json.load(open(sys.argv[1]))
+rr = pathlib.Path(str(cfg["paths"]["run_root"]))
+if not rr.is_absolute(): rr = (pathlib.Path.cwd() / rr).resolve()
+runs = rr / "raw" / "runs.h5"
+n = int(cfg["generation"]["num_runs"]); c = 0
+if runs.exists():
+    import h5py
+    with h5py.File(runs, "r") as h: c = len(h.keys())
+print(n, c)
+PY
+)
+echo "dataset: ${COUNT}/${EXPECTED} runs consolidated."
+if [ "${COUNT}" -lt "${EXPECTED}" ]; then
+  echo "ERROR: dataset incomplete (${COUNT}/${EXPECTED}). Run generation first:"
+  echo "         qsub supercomputer_cmds/run_gen.pbs"
+  exit 1
+fi
+
+# --- normalization (CPU) ------------------------------------------------------
+if [ "${SKIP_NORM}" != "1" ]; then
+  echo "========== Stage: normalization =========="
+  python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization
+else
+  echo "========== Stage: normalization (SKIPPED via SKIP_NORM=1) =========="
+fi
+
+# --- training (GPU) -----------------------------------------------------------
+echo "========== Stage: training =========="
+python -u -m src.utils --config "${CONFIG_PATH}" --stage training
+
+# --- export portable bundle ---------------------------------------------------
+echo "========== Stage: export =========="
+python -u -m src.utils --config "${CONFIG_PATH}" --stage export
+
+echo "========== done: models/$(python -c "import json;print(json.load(open('${CONFIG_PATH}'))['paths']['checkpoints_root'].split('/')[-1])") =========="
