@@ -67,8 +67,10 @@ FORCE="${FORCE:-0}"
 if [ "${FORCE}" != "1" ] && python -c "import vulcan_jax" 2>/dev/null; then
   echo "[install] vulcan_jax already importable — skipping pip install (FORCE=1 to reinstall)"
 else
-  echo "[install] pip install --user vulcan-jax (TestPyPI, --no-deps)"
-  python -m pip install --user \
+  echo "[install] pip install --user -U vulcan-jax (TestPyPI, --no-deps)"
+  # -U so FORCE=1 actually upgrades to a newer release (e.g. 0.1.7 -> 0.1.8);
+  # the skip-if-importable guard above keeps the no-FORCE re-run offline/fast.
+  python -m pip install --user -U \
     -i https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/ \
     --no-deps vulcan-jax
