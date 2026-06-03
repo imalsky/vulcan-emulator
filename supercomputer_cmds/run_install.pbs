@@ -19,8 +19,7 @@
 #   * pip install --user vulcan-jax (+ any missing deps), skipping if already
 #     present, and
 #   * compiles FastChem for aarch64.
-# Then it runs the readiness check. Re-running is safe and fast (no-ops when
-# already satisfied).
+# Re-running is safe and fast (no-ops when already satisfied).
 #
 # Env vars (pass with -v):
 #   CONDA_ENV       interpreter env (default pyt2_8_gh)
@@ -68,11 +67,5 @@ else
 fi
 
 # --- Do the install (idempotent; sources hpc_env, --user, builds FastChem) ----
+# run_install.sh's exit code becomes the job's: 0 = ready to qsub run.pbs.
 bash "${PROJECT_ROOT}/supercomputer_cmds/run_install.sh"
-rc=$?
-
-echo ""
-echo "========== readiness check =========="
-bash "${PROJECT_ROOT}/supercomputer_cmds/check_ready.sh" || true   # informational; install rc is authoritative
-
-exit "${rc}"

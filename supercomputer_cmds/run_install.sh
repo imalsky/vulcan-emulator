@@ -85,10 +85,51 @@ print(" ".join(pip for mod, pip in req.items() if u.find_spec(mod) is None))
 PY
 )"
 if [ -n "${MISSING}" ]; then
-  echo "[install] pip install --user missing deps: ${MISSING}"
-  python -m pip install --user -U ${MISSING}
+  # CRITICAL: optax/optuna depend on jax. Without a constraint, pip pulls a
+  # fresh CPU jax/jaxlib into the user-site, which then SHADOWS the env's GPU
+  # JAX on import. Pin jax/jaxlib to the versions the shared ENV already
+  # provides (query with PYTHONNOUSERSITE=1 so a prior bad user-site install
+  # doesn't poison the pin) so pip reuses the env jax and picks dep versions
+  # compatible with it.
+  CONSTRAINTS="${VULCAN_SCRATCH}/pip-constraints.txt"
+  PYTHONNOUSERSITE=1 python - <<'PY' > "${CONSTRAINTS}"
+import importlib.metadata as md
+for pkg in ("jax", "jaxlib"):
+    try: print(f"{pkg}=={md.version(pkg)}")
+    except md.PackageNotFoundError: pass
+PY
+  if [ -s "${CONSTRAINTS}" ]; then
+    echo "[install] pinning deps to the env's JAX (protect GPU build):"
+    sed 's/^/    /' "${CONSTRAINTS}"
+    echo "[install] pip install --user missing deps: ${MISSING}"
+    python -m pip install --user -U -c "${CONSTRAINTS}" ${MISSING}
+  else
+    echo "[WARNING] env '${CONDA_ENV}' provides NO jax — cannot pin it."
+    echo "[WARNING] Installing ${MISSING} may pull a CPU jax that won't use the GPU."
+    echo "[WARNING] If this run needs GPU JAX, stop and tell the maintainer:"
+    echo "[WARNING]   the env needs a GPU jax (e.g. jax[cuda12]) before installing optax/optuna."
+    python -m pip install --user -U ${MISSING}
+  fi
 else
   echo "[install] all emulator Python deps already present"
+fi
+
+# Defensive: a jax/jaxlib/nvidia in the USER-site shadows the env's GPU JAX on
+# import. If the env itself provides jax, strip any user-site copy so the GPU
+# build wins. (If the env has NO jax, we leave the user-site jax in place —
+# it's the only one — and the warning above applies.)
+if PYTHONNOUSERSITE=1 python -c "import jax" 2>/dev/null; then
+  USERSITE="$(python -c 'import site; print(site.getusersitepackages())' 2>/dev/null || true)"
+  if [ -n "${USERSITE}" ] && [ -d "${USERSITE}" ]; then
+    shopt -s nullglob
+    for stray in "${USERSITE}"/jax "${USERSITE}"/jaxlib "${USERSITE}"/jax_plugins \
+                 "${USERSITE}"/jax-*.dist-info "${USERSITE}"/jaxlib-*.dist-info \
+                 "${USERSITE}"/jax_cuda*; do
+      echo "[install] removing user-site $(basename "${stray}") so the env GPU JAX is used"
+      rm -rf "${stray}"
+    done
+    shopt -u nullglob
+  fi
 fi
 
 # Sanity: the core imports the emulator needs must resolve.
