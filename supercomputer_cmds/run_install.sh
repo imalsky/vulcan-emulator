@@ -76,7 +76,26 @@ else
     --no-deps vulcan-jax
 fi
 
-# --- 2. Install ONLY missing deps into the user-site; never touch jax ---------
+# --- 2. JAX: the emulator needs a *GPU* JAX. pyt2_8_gh is PyTorch-only (ships
+#        no jax), so install one into the user-site. On Python 3.10 + aarch64
+#        (GH200) the newest jax with cp310 aarch64 CUDA12 wheels is 0.6.2; newer
+#        jax dropped Python 3.10. If a future env already provides its own GPU
+#        jax, we detect and reuse it instead.
+JAX_SPEC="${JAX_SPEC:-jax[cuda12]==0.6.2}"   # installed when the env lacks jax
+ENV_JAX_VER="$(PYTHONNOUSERSITE=1 python -c 'import importlib.metadata as m;print(m.version("jax"))' 2>/dev/null || true)"
+if [ -n "${ENV_JAX_VER}" ]; then
+  JAX_PIN="${ENV_JAX_VER}"
+  JAXLIB_PIN="$(PYTHONNOUSERSITE=1 python -c 'import importlib.metadata as m;print(m.version("jaxlib"))' 2>/dev/null || echo "${JAX_PIN}")"
+  STRIP_USERSITE_JAX=1                        # env jax wins; drop any user-site shadow
+  echo "[install] env '${CONDA_ENV}' provides jax ${ENV_JAX_VER}; reusing it (pinning deps to it)."
+else
+  echo "[install] env has no jax; installing GPU ${JAX_SPEC} into the user-site (aarch64 GH200)."
+  python -m pip install --user -U "${JAX_SPEC}"
+  JAX_PIN="0.6.2"; JAXLIB_PIN="0.6.2"
+  STRIP_USERSITE_JAX=0                        # the user-site jax IS our GPU jax — keep it
+fi
+
+# --- 3. Other deps, PINNED to the chosen jax so pip can't bump/replace it ------
 MISSING="$(python - <<'PY'
 import importlib.util as u
 req = {"sympy":"sympy","optuna":"optuna","optax":"optax",
@@ -85,40 +104,17 @@ print(" ".join(pip for mod, pip in req.items() if u.find_spec(mod) is None))
 PY
 )"
 if [ -n "${MISSING}" ]; then
-  # CRITICAL: optax/optuna depend on jax. Without a constraint, pip pulls a
-  # fresh CPU jax/jaxlib into the user-site, which then SHADOWS the env's GPU
-  # JAX on import. Pin jax/jaxlib to the versions the shared ENV already
-  # provides (query with PYTHONNOUSERSITE=1 so a prior bad user-site install
-  # doesn't poison the pin) so pip reuses the env jax and picks dep versions
-  # compatible with it.
   CONSTRAINTS="${VULCAN_SCRATCH}/pip-constraints.txt"
-  PYTHONNOUSERSITE=1 python - <<'PY' > "${CONSTRAINTS}"
-import importlib.metadata as md
-for pkg in ("jax", "jaxlib"):
-    try: print(f"{pkg}=={md.version(pkg)}")
-    except md.PackageNotFoundError: pass
-PY
-  if [ -s "${CONSTRAINTS}" ]; then
-    echo "[install] pinning deps to the env's JAX (protect GPU build):"
-    sed 's/^/    /' "${CONSTRAINTS}"
-    echo "[install] pip install --user missing deps: ${MISSING}"
-    python -m pip install --user -U -c "${CONSTRAINTS}" ${MISSING}
-  else
-    echo "[WARNING] env '${CONDA_ENV}' provides NO jax — cannot pin it."
-    echo "[WARNING] Installing ${MISSING} may pull a CPU jax that won't use the GPU."
-    echo "[WARNING] If this run needs GPU JAX, stop and tell the maintainer:"
-    echo "[WARNING]   the env needs a GPU jax (e.g. jax[cuda12]) before installing optax/optuna."
-    python -m pip install --user -U ${MISSING}
-  fi
+  printf 'jax==%s\njaxlib==%s\n' "${JAX_PIN}" "${JAXLIB_PIN}" > "${CONSTRAINTS}"
+  echo "[install] pip install --user deps (${MISSING}) pinned to jax==${JAX_PIN}"
+  python -m pip install --user -U -c "${CONSTRAINTS}" ${MISSING}
 else
   echo "[install] all emulator Python deps already present"
 fi
 
-# Defensive: a jax/jaxlib/nvidia in the USER-site shadows the env's GPU JAX on
-# import. If the env itself provides jax, strip any user-site copy so the GPU
-# build wins. (If the env has NO jax, we leave the user-site jax in place —
-# it's the only one — and the warning above applies.)
-if PYTHONNOUSERSITE=1 python -c "import jax" 2>/dev/null; then
+# If the ENV ships its own jax, strip any user-site jax so the env GPU build
+# wins on import. When we installed jax into the user-site ourselves, keep it.
+if [ "${STRIP_USERSITE_JAX}" = "1" ]; then
   USERSITE="$(python -c 'import site; print(site.getusersitepackages())' 2>/dev/null || true)"
   if [ -n "${USERSITE}" ] && [ -d "${USERSITE}" ]; then
     shopt -s nullglob
@@ -132,7 +128,8 @@ if PYTHONNOUSERSITE=1 python -c "import jax" 2>/dev/null; then
   fi
 fi
 
-# Sanity: the core imports the emulator needs must resolve.
+# Sanity: core imports resolve, and report the JAX backend. This install runs
+# on a GH200 node, so a healthy GPU JAX prints backend=gpu here.
 python - <<'PY'
 import importlib.util as u
 core = ["jax","numpy","scipy","h5py","sympy","optuna","optax","pydantic","vulcan_jax"]
@@ -140,9 +137,15 @@ missing = [m for m in core if u.find_spec(m) is None]
 if missing:
     raise SystemExit(f"ERROR: still missing required modules: {missing}")
 print("[install] core imports OK:", ", ".join(core))
+import jax
+be = jax.default_backend()
+print(f"[install] jax {jax.__version__}  backend={be}  devices={jax.devices()}")
+if be not in ("gpu", "cuda", "rocm"):
+    print("[install] WARNING: JAX is NOT on the GPU. If this ran on a GH200 node, the")
+    print("[install]          CUDA plugin is missing/incompatible — run.pbs will fail its GPU preflight.")
 PY
 
-# --- 3. Compile FastChem for this node's arch (into the user-site copy) --------
+# --- 4. Compile FastChem for this node's arch (into the user-site copy) --------
 "${SCRIPT_DIR}/ensure_vulcan_jax.sh"
 
 echo ""
