@@ -1,99 +1,104 @@
 #!/bin/bash
-# One-shot dependency install for the shared conda env.
+# run_install.sh — one-time setup for the VULCAN emulator + VULCAN-JAX backend.
 #
-# Submitted automatically by submit_gen_array.sh before the generation
-# array. The array tasks depend on this job via --dependency=afterok, so
-# they never race on pip install.
+# Run this ONCE on a LOGIN / front-end node (pip needs internet, which the PBS
+# compute nodes do not have):
 #
-# After pip install, compiles FastChem natively from ../VULCAN-master and
-# patches the installed vulcan-jax package with the resulting binary.
-# The TestPyPI wheel ships a macOS binary that cannot run on Linux.
+#   bash supercomputer_cmds/run_install.sh
 #
-# Can also be run standalone:
-#   sbatch supercomputer_cmds/run_install.sh
+# Design for this system (NAS GH200):
+#   * $HOME (/home4/$USER) is small and often OVER QUOTA, and the shared conda
+#     env (pyt2_8_gh) is READ-ONLY. So we do NOT write to either:
+#       - hpc_env.sh redirects every cache (pip/conda/JAX/mpl/tmp) AND the
+#         Python user-site (PYTHONUSERBASE) to /nobackup.
+#       - we keep using the shared env's interpreter (with its working GPU JAX)
+#         and install our extra packages with `pip install --user`, which lands
+#         in the writable PYTHONUSERBASE on /nobackup.
+#   * The login node is aarch64 (same as the GH200 compute nodes), so the
+#     FastChem binary compiled here also runs on the compute nodes.
 #
-#SBATCH -J vulcan_install
-#SBATCH -o %x.o%j
-#SBATCH -e %x.e%j
-#SBATCH -p compute
-#SBATCH --mem=8G
-#SBATCH -t 00:30:00
-#SBATCH --clusters=edge
-#SBATCH -N 1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mail-type=FAIL
-#SBATCH --mail-user=isaac.n.malsky@jpl.nasa.gov
-
+# After this, just `qsub supercomputer_cmds/run.pbs` (or run_one.pbs). Those
+# scripts source hpc_env.sh too, so they see the same PYTHONUSERBASE and caches.
+#
+# vulcan-jax is published on TestPyPI only (not on PyPI), hence the pinned index.
+#
+# Env vars:
+#   VULCAN_SCRATCH   scratch root for caches + user-site (default /nobackup/$USER/.vulcan)
+#   CONDA_ENV        interpreter env to use (default pyt2_8_gh)
+#   CXX              C++ compiler for the FastChem build (default g++)
 set -euo pipefail
 
-CONDA_ENV=${CONDA_ENV:-vulcan}
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
-if [ -z "${PROJECT_ROOT:-}" ]; then
-  submit_dir="${SLURM_SUBMIT_DIR:-}"
-  if [ -n "$submit_dir" ] && [ -d "$submit_dir/supercomputer_cmds" ]; then
-    PROJECT_ROOT="$submit_dir"
-  elif [ -n "$submit_dir" ] && [ "$(basename "$submit_dir")" = "supercomputer_cmds" ]; then
-    PROJECT_ROOT="$(cd -- "$submit_dir/.." && pwd -P)"
-  else
-    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-    PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
-  fi
+# Redirect all HOME-bound caches + the user-site to /nobackup BEFORE anything
+# touches $HOME (must precede conda/pip).
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/hpc_env.sh"
+
+# --- Conda interpreter (shared, read-only env is fine; we install --user) -----
+module purge 2>/dev/null || true
+module use -a /swbuild/analytix/tools/modulefiles 2>/dev/null || true
+module load miniconda3/gh2 2>/dev/null || true
+if ! command -v conda >/dev/null 2>&1; then
+  echo "ERROR: conda not found. Run 'module load miniconda3/gh2' first."
+  exit 1
 fi
-cd -P "${PROJECT_ROOT}"
-CONDA_EXE="$(command -v conda)"
-CONDA_BASE="$(dirname "$(dirname "$CONDA_EXE")")"
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
+conda activate "${CONDA_ENV}" || {
+  echo "ERROR: could not activate ${CONDA_ENV}."; exit 2;
+}
+echo "[install] interpreter: $(command -v python)  (env ${CONDA_ENV})"
+echo "[install] user-site target: ${PYTHONUSERBASE}"
 
-if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
-  echo "[setup] creating conda env '$CONDA_ENV' (python=3.11, conda-forge)"
-  conda create -y -n "$CONDA_ENV" -c conda-forge --override-channels python=3.11 pip
+# Verify the user-site really is on /nobackup and writable.
+if [ ! -w "${PYTHONUSERBASE}" ]; then
+  echo "ERROR: PYTHONUSERBASE not writable: ${PYTHONUSERBASE}"
+  echo "       Set VULCAN_SCRATCH to a writable /nobackup path and retry."
+  exit 2
 fi
-conda activate "$CONDA_ENV"
 
-export PYTHONNOUSERSITE=1
+python -m pip install --user -U pip setuptools wheel
 
-# Serialize concurrent install jobs via flock so two submit_gen_array.sh
-# invocations (one per config) don't corrupt pip state on shared NFS.
-LOCKFILE="${PROJECT_ROOT}/.install.lock"
-exec 9>"$LOCKFILE"
-flock -x 9
-echo "[install] acquired lock ($$)"
+# --- 1. vulcan-jax (TestPyPI, --user, --no-deps so GPU JAX is untouched) ------
+echo "[install] pip install --user vulcan-jax (TestPyPI, --no-deps)"
+python -m pip install --user -U \
+  -i https://test.pypi.org/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  --no-deps vulcan-jax
 
-python -m pip install -U pip setuptools wheel
-python -m pip uninstall -y jax-cuda12-plugin jax-cuda12-pjrt >/dev/null 2>&1 || true
-python -m pip install -U exogibbs jax numpy scipy sympy matplotlib h5py optuna optax orbax-checkpoint pydantic
-echo "[setup] installing vulcan-jax into conda env '$CONDA_ENV' from TestPyPI"
-python -m pip install -U -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ --no-deps vulcan-jax
-python -m pip install -e . --no-deps
-
-# --- Compile FastChem natively and patch the installed vulcan-jax package ---
-# The TestPyPI wheel bundles a macOS ARM binary; we need a Linux binary.
-VULCAN_SOURCE="${PROJECT_ROOT}/../VULCAN-master"
-FC_BUILD_DIR="${VULCAN_SOURCE}/fastchem_vulcan"
-
-if [ -d "$FC_BUILD_DIR/fastchem_src" ]; then
-  VULCAN_JAX_PKG=$(python -c "import vulcan_jax, pathlib; print(pathlib.Path(vulcan_jax.__file__).resolve().parent)")
-  FC_INSTALLED="$VULCAN_JAX_PKG/fastchem_vulcan/fastchem"
-  # Only recompile if the installed binary isn't already a native Linux executable.
-  if file "$FC_INSTALLED" 2>/dev/null | grep -q "ELF.*x86-64"; then
-    echo "[setup] installed FastChem binary is already native Linux — skipping recompile"
-  else
-    echo "[setup] compiling FastChem from ${FC_BUILD_DIR} ..."
-    make -C "$FC_BUILD_DIR" clean 2>/dev/null || true
-    make -C "$FC_BUILD_DIR" all
-    if [ -x "$FC_BUILD_DIR/fastchem" ]; then
-      cp "$FC_BUILD_DIR/fastchem" "$FC_INSTALLED"
-      chmod +x "$FC_INSTALLED"
-      echo "[setup] patched installed vulcan-jax with native FastChem binary"
-    else
-      echo "[WARNING] FastChem compilation produced no executable — VULCAN generation will fail"
-    fi
-  fi
-  file "$FC_INSTALLED"
+# --- 2. Install ONLY missing deps into the user-site; never touch jax ---------
+MISSING="$(python - <<'PY'
+import importlib.util as u
+req = {"sympy":"sympy","optuna":"optuna","optax":"optax",
+       "pydantic":"pydantic","matplotlib":"matplotlib"}
+print(" ".join(pip for mod, pip in req.items() if u.find_spec(mod) is None))
+PY
+)"
+if [ -n "${MISSING}" ]; then
+  echo "[install] pip install --user missing deps: ${MISSING}"
+  python -m pip install --user -U ${MISSING}
 else
-  echo "[WARNING] VULCAN-master source not found at ${FC_BUILD_DIR} — skipping FastChem compilation"
+  echo "[install] all emulator Python deps already present"
 fi
 
-flock -u 9
-echo "[install] done — env '$CONDA_ENV' is ready"
+# Sanity: the core imports the emulator needs must resolve.
+python - <<'PY'
+import importlib.util as u
+core = ["jax","numpy","scipy","h5py","sympy","optuna","optax","pydantic","vulcan_jax"]
+missing = [m for m in core if u.find_spec(m) is None]
+if missing:
+    raise SystemExit(f"ERROR: still missing required modules: {missing}")
+print("[install] core imports OK:", ", ".join(core))
+PY
+
+# --- 3. Compile FastChem for this node's arch (into the user-site copy) --------
+"${SCRIPT_DIR}/ensure_vulcan_jax.sh"
+
+echo ""
+echo "[install] done. Everything lives under VULCAN_SCRATCH=${VULCAN_SCRATCH} (on /nobackup)."
+echo "[install] submit a run with:"
+echo "    qsub supercomputer_cmds/run.pbs        # generation + tuning"
+echo "    qsub supercomputer_cmds/run_one.pbs    # single full training run"

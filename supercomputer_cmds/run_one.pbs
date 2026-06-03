@@ -39,6 +39,12 @@ export VULCAN_PROJECT_ROOT="${PROJECT_ROOT}"
 LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
 mkdir -p "${LOG_ROOT}"
 
+# --- Redirect caches + Python user-site off the (over-quota) $HOME to /nobackup ---
+# Must run before conda/python so pip/conda/JAX never write to $HOME, and so the
+# PYTHONUSERBASE packages installed by run_install.sh are importable.
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/hpc_env.sh"
+
 # --- Conda Environment ---
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
@@ -182,6 +188,18 @@ PY
 then
   echo "ERROR: runtime preflight failed."
   exit 1
+fi
+
+# =============================================================================
+# Ensure the VULCAN-JAX backend is installed and FastChem is built for THIS
+# node's architecture (only needed when we are going to generate data).
+# Recompiles FastChem in place if the binary is missing or built for another
+# arch (e.g. x86_64 login node vs aarch64 GH200). If vulcan_jax is not
+# installed at all, this fails fast with instructions to run run_install.sh
+# on a login node (pip needs internet, which compute nodes lack).
+# =============================================================================
+if [ "${SKIP_GEN}" != "1" ]; then
+  "${SCRIPT_DIR}/ensure_vulcan_jax.sh"
 fi
 
 # =============================================================================
