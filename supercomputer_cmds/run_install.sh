@@ -60,14 +60,19 @@ if [ ! -w "${PYTHONUSERBASE}" ]; then
   exit 2
 fi
 
-python -m pip install --user -U pip setuptools wheel
+FORCE="${FORCE:-0}"
 
 # --- 1. vulcan-jax (TestPyPI, --user, --no-deps so GPU JAX is untouched) ------
-echo "[install] pip install --user vulcan-jax (TestPyPI, --no-deps)"
-python -m pip install --user -U \
-  -i https://test.pypi.org/simple/ \
-  --extra-index-url https://pypi.org/simple/ \
-  --no-deps vulcan-jax
+# Skip the network install entirely if it already imports (FORCE=1 to override).
+if [ "${FORCE}" != "1" ] && python -c "import vulcan_jax" 2>/dev/null; then
+  echo "[install] vulcan_jax already importable — skipping pip install (FORCE=1 to reinstall)"
+else
+  echo "[install] pip install --user vulcan-jax (TestPyPI, --no-deps)"
+  python -m pip install --user \
+    -i https://test.pypi.org/simple/ \
+    --extra-index-url https://pypi.org/simple/ \
+    --no-deps vulcan-jax
+fi
 
 # --- 2. Install ONLY missing deps into the user-site; never touch jax ---------
 MISSING="$(python - <<'PY'
