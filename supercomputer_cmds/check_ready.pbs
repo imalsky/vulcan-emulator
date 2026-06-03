@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -N vulcan_check
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=00:10:00
+#PBS -j oe
+#
+# =============================================================================
+# Readiness check ON A GH200 COMPUTE NODE.
+#
+# Verifies everything run.pbs / run_one.pbs need — packages, the FastChem binary
+# (correct aarch64 arch), src + config, AND the GPU JAX backend (which the login
+# node cannot show). Installs and builds NOTHING.
+#
+# Submit from the repo root:
+#   qsub supercomputer_cmds/check_ready.pbs
+#
+# Then read the tail of vulcan_check.o<jobid>: "READY" means run.pbs will work.
+#
+# Env vars (pass with -v):
+#   CONDA_ENV       interpreter env (default pyt2_8_gh)
+#   VULCAN_SCRATCH  scratch root (default /nobackup/$USER/.vulcan)
+# =============================================================================
+set -uo pipefail
+
+# Locate the repo: prefer the submit dir, fall back to the script's own location.
+if [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/supercomputer_cmds" ]; then
+  PROJECT_ROOT="${PBS_O_WORKDIR}"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+fi
+cd -P "${PROJECT_ROOT}"
+echo "PROJECT_ROOT: ${PROJECT_ROOT}"
+echo "node:         $(hostname)  arch=$(uname -m)"
+
+# Run the read-only checker with GPU verification ON. Its exit code becomes ours.
+CHECK_GPU=1 bash "${PROJECT_ROOT}/supercomputer_cmds/check_ready.sh"

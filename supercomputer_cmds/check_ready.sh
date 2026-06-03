@@ -57,8 +57,20 @@ echo "--- emulator source ---"
 [ -d "${SCRIPT_DIR}/../src" ] && ok "src/ present" || miss "src/ missing (wrong cwd / incomplete clone)"
 [ -f "${SCRIPT_DIR}/../config/vulcan_luhman16a_10k.json" ] && ok "default config present" || miss "default config missing"
 
-echo "--- jax backend (informational; GPU only on compute nodes) ---"
-python -c "import jax; print('  backend:', jax.default_backend())" 2>/dev/null || echo "  (jax import failed)"
+CHECK_GPU="${CHECK_GPU:-0}"
+echo "--- jax backend ---"
+backend="$(python -c 'import jax; print(jax.default_backend())' 2>/dev/null || echo error)"
+if [ "${CHECK_GPU}" = "1" ]; then
+  # On a compute node (via check_ready.pbs): a GPU backend is REQUIRED for training.
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then ok "nvidia-smi sees a GPU"
+  else miss "no usable GPU (nvidia-smi failed)"; fi
+  case "${backend}" in
+    gpu|cuda|rocm) ok "jax backend = ${backend}" ;;
+    *) miss "jax backend = '${backend}' (expected gpu/cuda)" ;;
+  esac
+else
+  echo "  backend: ${backend}  (informational on a login node; run check_ready.pbs to verify GPU)"
+fi
 
 echo "----------------------------------------"
 if [ "${fail}" = 0 ]; then
