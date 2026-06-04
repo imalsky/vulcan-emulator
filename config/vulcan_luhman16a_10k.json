@@ -82,7 +82,7 @@
     }
   },
   "generation": {
-    "_comment": "10k VULCAN-JAX kinetics runs with condensation; designed for 4-shard SLURM array (2.5k/shard).",
+    "_comment": "10k VULCAN-JAX kinetics runs with condensation. Single GH200 node, CPU subprocess pool. parallel_workers=48 is the measured sweet spot (2026-06: ~88% CPU, no I/O wait, ~36 profiles/min -> ~4.6 h for 10k); each vulcan_jax worker uses ~2 threads so 72 would oversubscribe the 72 cores.",
     "num_runs": 10000,
     "seed": 7,
     "overwrite": false,

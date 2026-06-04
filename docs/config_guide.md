@@ -196,12 +196,19 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 
 #### `generation.gpu_batch` (GPU nodes, `chemistry_type = "vulcan"` only)
 
-On a GPU node, set `gpu_batch.enabled: true` to run generation **in-process on the
-GPU** — profiles are bucketed by `(nz, toggle-combo, atm_base)` and each bucket is
-integrated in one `jax.vmap`'d call via `vulcan_jax.OuterLoop.run_batch`, instead of
-one CPU subprocess per profile. The HPC scripts auto-detect a usable GPU and flip this
-on (`$VULCAN_GEN_GPU_BATCH`), so no config edit is needed on the cluster. Requires
+On a GPU node, set `gpu_batch.enabled: true` (or `GEN_GPU_BATCH=1` to `run_gen.pbs`) to
+run generation **in-process on the GPU** — profiles are bucketed by
+`(nz, toggle-combo, atm_base)` and each bucket is integrated in one `jax.vmap`'d call via
+`vulcan_jax.OuterLoop.run_batch`, instead of one CPU subprocess per profile. Requires
 **`vulcan-jax >= 0.1.10`**. `parallel_workers` is ignored in this mode.
+
+> **This path is OFF by default and not recommended for current workloads.** Benchmarking
+> on the GH200 (2026-06) found it ~15× *slower* than the CPU subprocess pool here: small
+> per-`nz` batches (~24 profiles, float64) under-fill the H100 (~170 W of 900 W) and each
+> `vmap` batch runs to its slowest lane (straggler tax) with no dynamic compaction. The
+> CPU pool, by contrast, is perfectly load-balanced. `run_gen.pbs` therefore defaults to
+> CPU; only enable the GPU path to experiment, or once dynamic compaction + larger batches
+> are implemented.
 
 | Key | Description |
 |-----|-------------|

@@ -191,12 +191,12 @@
   }
  },
  "generation": {
-  "_comment": "100k VULCAN-JAX kinetics runs with condensation. Single GH200 node: 72 worker subprocesses (each single-threaded vulcan_jax). Resume-safe; run_gen.pbs self-chains until all runs are consolidated.",
+  "_comment": "100k VULCAN-JAX kinetics runs with condensation. Single GH200 node, CPU subprocess pool. parallel_workers=48: each vulcan_jax worker uses ~2 threads (measured 2026-06 on the GH200: 48 workers -> ~88% CPU, mild oversubscribe of the 72 cores), so 72 would 2x-oversubscribe and thrash. ~80 s/profile -> ~46 h for 100k single-node; SHARD across nodes (run_gen_array.sh) for production. Resume-safe.",
   "num_runs": 100000,
   "seed": 7,
   "overwrite": false,
   "reuse_raw_if_present": true,
-  "parallel_workers": 72,
+  "parallel_workers": 48,
   "sample_chunk_size": 1000,
   "fastchem_timeout_seconds": 30.0,
   "vulcan_timeout_seconds": 1800.0,

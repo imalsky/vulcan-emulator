@@ -24,7 +24,9 @@
 #
 # Env (-v):
 #   CONFIG_PATH        default config/vulcan_luhman16a_100k.json
-#   GEN_GPU_BATCH      auto (default) use GPU if usable; 1 force GPU; 0 force CPU
+#   GEN_GPU_BATCH      0/cpu (default) CPU subprocess pool; 1 force GPU vmap path;
+#                      auto = GPU if usable. CPU is default — it benchmarked
+#                      ~15x faster than the GPU path for this workload.
 #   GEN_HOST_SETUP_WORKERS  GPU mode only: size of the CPU pool that builds
 #                      profiles (FastChem) to feed the GPU. unset/0 = auto
 #                      (detect the Grace cores).
@@ -62,15 +64,22 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV:-pyt2_8_gh}"
 "${SCRIPT_DIR}/ensure_vulcan_jax.sh"
 
-# --- generation mode: use the GPU if one is usable, else the CPU pool --------
-# GEN_GPU_BATCH selects the in-process vmapped GPU path (OuterLoop.run_batch on
-# the GH200 H100) vs the 72-core CPU subprocess pool:
-#   auto (default) — use the GPU when JAX can see one, else fall back to CPU
-#   1              — force the GPU path (hard-fail below if no usable GPU)
-#   0              — force the CPU subprocess pool
+# --- generation mode: CPU subprocess pool (default) vs in-process GPU vmap ---
+# GEN_GPU_BATCH selects the path:
+#   0 / cpu (DEFAULT) — the load-balanced CPU subprocess pool on the Grace cores
+#   1               — force the in-process vmapped GPU path (OuterLoop.run_batch)
+#   auto            — use the GPU when JAX can see one, else fall back to CPU
+# Default is CPU because benchmarking on the GH200 (2026-06) showed the GPU path
+# is much slower for THIS workload: small per-(nz)-bucket batches (~24 profiles,
+# float64) under-fill the H100 (~170 W of 900 W) and each vmap batch runs to its
+# slowest lane (straggler tax), with no dynamic compaction. The CPU pool is
+# perfectly load-balanced and was measured ~15x faster. The GPU path only wins
+# once dynamic compaction + bigger batches are added — keep it opt-in until then.
 # Only the vulcan_jax backend has a GPU path; generation.py gates on that, so
 # this just exports VULCAN_GEN_GPU_BATCH for the pipeline to honor.
-GEN_GPU_BATCH="${GEN_GPU_BATCH:-auto}"
+GEN_GPU_BATCH="${GEN_GPU_BATCH:-0}"
+[ "${GEN_GPU_BATCH}" = "cpu" ] && GEN_GPU_BATCH=0
+[ "${GEN_GPU_BATCH}" = "gpu" ] && GEN_GPU_BATCH=1
 
 # A GPU is "usable" iff nvidia-smi works AND JAX actually lands on it. Probed in
 # a subshell with JAX_PLATFORMS unset so JAX auto-selects the device.
