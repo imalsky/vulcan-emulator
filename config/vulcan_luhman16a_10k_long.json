@@ -1,0 +1,231 @@
+{
+  "_comment_units": "Pressures: bar (or log10(bar) for log10_*_bar keys). Temperatures: K. Times: seconds. Abundances: number ratio rel H (n_X/n_H), solar anchors in src/constants.py:SOLAR_ABUNDANCES. Log10 quantities: dex.",
+  "_comment_purpose": "VULCAN disequilibrium vertical-mixing emulator for the Luhman 16A brown-dwarf high-resolution retrieval test case. 10k training runs. Kzz varied over [1e4, 1e10] cm2/s. Condensation ON (H2O + S8). T-P profiles use 30% simple power-law profiles and 70% modified-Guillot profiles; no Roth/PT-library profiles.",
+  "chemistry_type": "vulcan",
+  "model_type": "transformer",
+  "paths": {
+    "run_root": "data/vulcan_luhman16a_10k",
+    "checkpoints_root": "models/vulcan_luhman16a_10k_long",
+    "vulcan_source_root": "../VULCAN-master"
+  },
+  "data_spec": {
+    "_comment_state_species": "Includes H2O_l_s and S8_l_s for condensation tracking.",
+    "state_species": [
+      "H2", "He", "H", "O", "OH", "H2O", "CO", "CO2", "CH4",
+      "N2", "NH3", "H2S", "SH", "S", "SO", "SO2", "S2", "S8",
+      "H2O_l_s", "S8_l_s"
+    ],
+    "output_species": [
+      "H2", "He", "H", "O", "OH", "H2O", "CO", "CO2", "CH4",
+      "N2", "NH3", "H2S", "SH", "S", "SO", "SO2", "S2", "S8",
+      "H2O_l_s", "S8_l_s"
+    ]
+  },
+  "sampling": {
+    "num_levels_range": [40, 60],
+    "pressure_top_bar_range": [1.0e-06, 1.0e-05],
+    "pressure_bottom_bar_range": [100.0, 200.0],
+    "temperature_range_k": [200.0, 4500.0],
+    "_comment_abundance_ranges": "Same ranges as FastChem/ExoGibbs configs — solar-anchored Latin-hypercube with retrieval-prior margin.",
+    "he_frac_range": [5e-02, 3e-01],
+    "c_frac_range": [2e-05, 3e-02],
+    "o_frac_range": [4e-05, 5e-02],
+    "n_frac_range": [5e-06, 7e-03],
+    "s_frac_range": [1e-06, 2e-03],
+    "scales": {
+      "he_frac": "log",
+      "c_frac": "log",
+      "o_frac": "log",
+      "n_frac": "log",
+      "s_frac": "log"
+    },
+    "_comment_planetary_globals": "Gravity and radius span the full L/T dwarf range: log(g) ~ 3.5-5.5 in cgs, R ~ 0.7-1.4 R_Jup.",
+    "gravity_range_cm_s2": [3000.0, 300000.0],
+    "planet_radius_range_cm": [5.0e9, 1.0e10],
+    "_comment_stellar_globals": "FIXED: isolated brown dwarf, no host-star irradiation. Degenerate ranges produce constant values; normalization set to 'none' so no div-by-zero on std.",
+    "stellar_radius_range_rsun": [0.001, 0.001],
+    "semi_major_axis_range_au": [1000.0, 1000.0],
+    "zenith_angle_range_deg": [48.0, 48.0],
+    "diurnal_factor_range": [0.5, 0.5],
+    "_comment_kzz": "Kzz range spans quiescent to vigorously mixing brown dwarfs (Miles+20, Zahnle & Marley 2014). Depth-constant per run.",
+    "kzz_range_cm2_s": [1.0e4, 1.0e10],
+    "corner_coverage": {
+      "enabled": true,
+      "fraction": 0.3,
+      "abundance_quantile_width": 0.15,
+      "hot_tmax_k": 2500.0,
+      "large_trange_k": 800.0,
+      "max_profile_resample_attempts": 50
+    }
+  },
+  "temperature_profiles": {
+    "_comment": "Pure analytic sampler for the Luhman 16A high-resolution retrieval setup. source_mode='analytic' keeps Roth/PT-library profiles disabled; power_law_probability=0.3 gives 30% power-law and 70% modified-Guillot profiles.",
+    "source_mode": "analytic",
+    "filters": {},
+    "validation": {
+      "min_temperature_k": 200.0,
+      "max_temperature_k": 4500.0
+    },
+    "analytic_sampler": {
+      "t_int_k_range": [500.0, 1800.0],
+      "t_eq_k_range": [1.0, 100.0],
+      "log10_delta_range": [-4, 2],
+      "log10_gamma_range": [-3.0, 3.0],
+      "alpha_range": [0.0, 0.5],
+      "log10_p_trans_bar_range": [-5.0, 2.3],
+      "convection_probability": 0.4,
+      "adiabatic_gradient_range": [0.25, 0.35],
+      "power_law_probability": 0.3,
+      "power_law_t0_range_k": [600.0, 2500.0],
+      "power_law_alpha_range": [0.0, 0.15],
+      "power_law_p_ref_bar": 1.0
+    }
+  },
+  "generation": {
+    "_comment": "10k VULCAN-JAX kinetics runs with condensation. Single GH200 node, CPU subprocess pool. parallel_workers=48 is the measured sweet spot (2026-06: ~88% CPU, no I/O wait, ~36 profiles/min -> ~4.6 h for 10k); each vulcan_jax worker uses ~2 threads so 72 would oversubscribe the 72 cores.",
+    "num_runs": 10000,
+    "seed": 7,
+    "overwrite": false,
+    "reuse_raw_if_present": true,
+    "parallel_workers": 48,
+    "sample_chunk_size": 500,
+    "fastchem_timeout_seconds": 30.0,
+    "vulcan_timeout_seconds": 1800.0,
+    "backfill": {
+      "enabled": true,
+      "max_retries": 20
+    }
+  },
+  "normalization": {
+    "split": {
+      "train_fraction": 0.8,
+      "val_fraction": 0.1,
+      "test_fraction": 0.1,
+      "seed": 123
+    },
+    "state_floor": 1.0e-20,
+    "target_method": "log-standard",
+    "sequence_methods": {
+      "pressure_bar": "log-minmax",
+      "temperature_k": "standard",
+      "kzz_cm2_s": "log-standard"
+    },
+    "global_methods": {
+      "gravity_cm_s2":      "log-standard",
+      "planet_radius_cm":   "log-standard",
+      "He_H":               "log-standard",
+      "C_H":                "log-standard",
+      "O_H":                "log-standard",
+      "N_H":                "log-standard",
+      "S_H":                "log-standard",
+      "r_star_rsun":        "none",
+      "semi_major_axis_au": "none",
+      "zenith_angle_deg":   "none",
+      "diurnal_factor":     "none",
+      "use_photochemistry":            "none",
+      "use_ion_chemistry":             "none",
+      "use_eddy_diffusion":            "none",
+      "use_molecular_diffusion":       "none",
+      "use_upwind_molecular_diffusion":"none",
+      "use_boundary_conditions":       "none",
+      "use_condensation":              "none",
+      "use_settling":                  "none",
+      "use_initial_cold_trap":         "none",
+      "use_sat_surface_h2o":           "none",
+      "atm_base_H2":  "none",
+      "atm_base_N2":  "none",
+      "atm_base_O2":  "none",
+      "atm_base_CO2": "none",
+      "atm_base_H2O": "none"
+    }
+  },
+  "training": {
+    "seed": 123,
+    "batch_size": 256,
+    "epochs": 2000,
+    "learning_rate": 0.0001,
+    "min_lr": 1e-06,
+    "warmup_epochs": 20,
+    "early_stopping_patience": 100,
+    "scheduler": {
+      "name": "reduce_on_plateau",
+      "factor": 0.5,
+      "patience": 20,
+      "threshold": 0.0001
+    },
+    "weight_decay": 1e-04,
+    "gradient_clip": 1.0,
+    "loss": {
+      "type": "mae",
+      "lambda_z": 1.0,
+      "lambda_log10_mae": 0.25
+    },
+    "ema": {
+      "enabled": true,
+      "decay": 0.999
+    }
+  },
+  "model": {
+    "d_model": 256,
+    "nhead": 4,
+    "num_layers": 6,
+    "dim_feedforward": 1024,
+    "conditioning_hidden_dim": 256,
+    "film_clamp": 100.0,
+    "output_head_divisor": 1,
+    "activation": "silu",
+    "dropout_rate": 0.0,
+    "norm_type": "layernorm",
+    "use_qk_norm": false,
+    "ffn_type": "dense",
+    "zero_init_film": false
+  },
+  "vulcan": {
+    "_comment": "Isolated BD: no photochemistry, no irradiation. Eddy diffusion ON (vertical mixing is the science target). Condensation ON (H2O + S8). Stellar spectrum is a placeholder — VULCAN reads it at startup unconditionally but does not use it with photochem off.",
+    "physics_toggles": {
+      "use_photochemistry": false,
+      "use_ion_chemistry": false,
+      "use_eddy_diffusion": true,
+      "use_molecular_diffusion": false,
+      "use_upwind_molecular_diffusion": false,
+      "use_boundary_conditions": false,
+      "use_condensation": true,
+      "use_settling": true,
+      "use_initial_cold_trap": true,
+      "use_sat_surface_h2o": false
+    },
+    "runtime": {
+      "backend": "vulcan_jax",
+      "chemistry_file": "thermo/SNCHO_photo_network_2025.txt",
+      "t_cross_sp": ["H2O"],
+      "regenerate_chem_funs": true,
+      "use_lowT_limit_rates": true,
+      "use_adaptive_rtol": true,
+      "rocky": false,
+      "atm_base": "H2",
+      "condensation": {
+        "_comment": "H2O and S8 condensation. Particle radii/densities are standard giant-planet defaults (Ackerman & Marley 2001 / Lyons 2008).",
+        "condense_sp":   ["H2O", "S8"],
+        "non_gas_sp":    ["H2O_l_s", "S8_l_s"],
+        "fix_species":   ["H2O", "S8", "H2O_l_s", "S8_l_s"],
+        "use_relax":     ["H2O"],
+        "humidity":       1.0,
+        "start_conden_time": 1.0e6,
+        "stop_conden_time":  1.0e8,
+        "fix_species_time":  1.0e8,
+        "fix_species_from_coldtrap_lev": true,
+        "post_conden_rtol": 0.1,
+        "r_p":   { "H2O_l_s": 5.0e-5, "S8_l_s": 1.0e-4 },
+        "rho_p": { "H2O_l_s": 0.9,    "S8_l_s": 2.07 }
+      }
+    },
+    "stellar_spectrum": {
+      "_comment": "Placeholder — VULCAN reads sflux_file unconditionally, even with photochem off. Blackbody at 5485 K is harmless.",
+      "template_name": "blackbody_5485K",
+      "max_tokens": 4096,
+      "wavelength_min_nm": 1.0,
+      "wavelength_max_nm": 1000.0,
+      "teff_k": 5485.0
+    }
+  }
+}
