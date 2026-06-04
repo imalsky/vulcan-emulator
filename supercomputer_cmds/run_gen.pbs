@@ -13,9 +13,9 @@
 # GPU and runs the in-process vmap-across-profiles path (OuterLoop.run_batch),
 # integrating whole (nz, toggle-combo) buckets in one device call. If no GPU is
 # visible it falls back to 72 single-threaded vulcan_jax subprocesses on the
-# Grace cores. Generation RESUMES from already-consolidated chunks, and this job
-# SELF-RESUBMITS (PBS depend=afterany) until all num_runs are present — so 100k
-# completes across as many 10h jobs as it takes, with no manual babysitting.
+# Grace cores. This submits ONE job — no self-resubmit / dependency chain.
+# Generation RESUMES from already-consolidated chunks, so if the job is killed
+# at walltime before num_runs is reached, just resubmit to continue.
 #
 #   cd /nobackup/$USER/vulcan-emulator
 #   qsub supercomputer_cmds/run_gen.pbs
@@ -25,9 +25,6 @@
 # Env (-v):
 #   CONFIG_PATH        default config/vulcan_luhman16a_100k.json
 #   GEN_GPU_BATCH      auto (default) use GPU if usable; 1 force GPU; 0 force CPU
-#   GEN_AUTORESUBMIT   1 (default) self-chain until complete; 0 = one job only
-#   GEN_MAX_ATTEMPTS   safety cap on the self-chain (default 15)
-#   GEN_ATTEMPT        internal chain counter — do not set by hand
 #   CONDA_ENV, VULCAN_SCRATCH   as in run_install
 # =============================================================================
 set -uo pipefail
@@ -50,9 +47,6 @@ SCRIPT_DIR="${PROJECT_ROOT}/supercomputer_cmds"
 
 CONFIG_PATH="${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}"
 [ -f "${CONFIG_PATH}" ] || { echo "ERROR: config not found: ${CONFIG_PATH}"; exit 1; }
-GEN_AUTORESUBMIT="${GEN_AUTORESUBMIT:-1}"
-GEN_ATTEMPT="${GEN_ATTEMPT:-1}"
-GEN_MAX_ATTEMPTS="${GEN_MAX_ATTEMPTS:-15}"
 
 # --- caches off $HOME, conda, vulcan_jax + FastChem ready ---------------------
 # shellcheck source=/dev/null
@@ -109,7 +103,7 @@ if [ "${USE_GPU}" = "1" ]; then
   export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
   export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
   export XLA_FLAGS="${XLA_FLAGS:---xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0}"
-  echo "config=${CONFIG_PATH}  mode=gpu-batched  attempt=${GEN_ATTEMPT}/${GEN_MAX_ATTEMPTS}  node=$(hostname)  arch=$(uname -m)"
+  echo "config=${CONFIG_PATH}  mode=gpu-batched  node=$(hostname)  arch=$(uname -m)"
   if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
     echo "ERROR: GEN_GPU_BATCH=1 but no visible NVIDIA GPU in this job."; exit 1
   fi
@@ -126,7 +120,7 @@ else
   export VULCAN_GEN_GPU_BATCH=0
   export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
   export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false"
-  echo "config=${CONFIG_PATH}  mode=cpu-subprocess  attempt=${GEN_ATTEMPT}/${GEN_MAX_ATTEMPTS}  node=$(hostname)  arch=$(uname -m)"
+  echo "config=${CONFIG_PATH}  mode=cpu-subprocess  node=$(hostname)  arch=$(uname -m)"
 fi
 
 # --- completion check (consolidated runs.h5 vs num_runs) ---------------------
@@ -149,26 +143,9 @@ if [ "${COUNT}" -ge "${EXPECTED}" ]; then
   exit 0
 fi
 
-# --- self-chain: queue a successor that starts when this job ends (afterany),
-#     so a walltime-killed job is automatically continued. The successor's own
-#     completion check above makes it a no-op once generation finishes; the
-#     attempt cap prevents a runaway chain. ------------------------------------
-if [ "${GEN_AUTORESUBMIT}" = "1" ] && [ "${GEN_ATTEMPT}" -lt "${GEN_MAX_ATTEMPTS}" ] && [ -n "${PBS_JOBID:-}" ]; then
-  NEXT=$((GEN_ATTEMPT + 1))
-  if qsub -W depend=afterany:"${PBS_JOBID}" \
-          -v "CONFIG_PATH=${CONFIG_PATH},GEN_ATTEMPT=${NEXT},GEN_MAX_ATTEMPTS=${GEN_MAX_ATTEMPTS},GEN_AUTORESUBMIT=1" \
-          "${SCRIPT_DIR}/run_gen.pbs" 2>/tmp/vulcan_gen_qsub.err; then
-    echo "queued successor gen job (attempt ${NEXT}, depend=afterany:${PBS_JOBID})."
-  else
-    echo "WARNING: could not queue successor (in-job qsub blocked?): $(cat /tmp/vulcan_gen_qsub.err 2>/dev/null)"
-    echo "         when this job ends, resume manually: qsub supercomputer_cmds/run_gen.pbs"
-  fi
-elif [ "${GEN_ATTEMPT}" -ge "${GEN_MAX_ATTEMPTS}" ]; then
-  echo "NOTE: reached GEN_MAX_ATTEMPTS=${GEN_MAX_ATTEMPTS}; not self-chaining further."
-  echo "      If still incomplete after this job, resubmit: qsub supercomputer_cmds/run_gen.pbs"
-fi
-
 # --- run generation (resumes from existing chunks/per-run files) -------------
+# Single job: no successor is queued. If this is killed at walltime before
+# num_runs is reached, resume by resubmitting: qsub supercomputer_cmds/run_gen.pbs
 echo "========== Stage: generation =========="
 python -u -m src.utils --config "${CONFIG_PATH}" --stage generation
 echo "generation stage returned."

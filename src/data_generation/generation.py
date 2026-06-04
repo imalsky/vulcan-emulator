@@ -38,6 +38,7 @@ import concurrent.futures
 import datetime as _dt
 import fcntl
 import importlib
+import importlib.util
 import json
 import os
 import pickle
@@ -1247,22 +1248,40 @@ def _validate_vulcan_jax_package_root(package_root: Path) -> Path:
 
 
 def _discover_installed_vulcan_jax_root() -> Path:
-    """Return the package root for the active environment's ``vulcan_jax`` install."""
+    """Return the package root for the active environment's ``vulcan_jax`` install.
+
+    Locates the package with ``importlib.util.find_spec`` instead of importing
+    it. ``vulcan_jax`` parses its chemical network exactly once, at the first
+    ``import vulcan_jax`` (``__init__`` -> ``state`` -> ``chem_funs`` reads
+    ``vulcan_cfg.network`` at module level), so that first import freezes the
+    network for the whole process. ``_run_batch_vulcan_jax_gpu`` relies on being
+    the first importer: it sets ``$VULCAN_JAX_NETWORK`` to the dataset network
+    immediately before its own import. Importing here — earlier, before that env
+    var is set — would lock in the default NCHO network, and every dataset whose
+    output species include sulfur / condensates (S8, SO2, H2S, ...) would then
+    fail the output-species guard in ``_run_batch_vulcan_jax_gpu``. ``find_spec``
+    resolves the install directory without executing ``__init__``.
+    """
     try:
-        module = importlib.import_module("vulcan_jax")
-    except ImportError as exc:
+        spec = importlib.util.find_spec("vulcan_jax")
+    except (ImportError, AttributeError, ValueError):
+        spec = None
+    if spec is None:
         raise RuntimeError(
             "vulcan.runtime.backend='vulcan_jax' requires an importable "
             "vulcan_jax package in the active environment. Install it with "
             "`python -m pip install -i https://test.pypi.org/simple/ "
             "--extra-index-url https://pypi.org/simple/ vulcan-jax`."
-        ) from exc
-    module_file = getattr(module, "__file__", None)
-    if module_file is None:
-        raise RuntimeError(
-            "Imported vulcan_jax module has no __file__; cannot locate package data."
         )
-    return _validate_vulcan_jax_package_root(Path(module_file).resolve().parent)
+    if spec.origin and spec.origin != "namespace":
+        package_root = Path(spec.origin).resolve().parent
+    elif spec.submodule_search_locations:
+        package_root = Path(next(iter(spec.submodule_search_locations))).resolve()
+    else:
+        raise RuntimeError(
+            "Located vulcan_jax has no filesystem path; cannot locate package data."
+        )
+    return _validate_vulcan_jax_package_root(package_root)
 
 
 def _ensure_vulcan_worker_tree(source_root: Path, worker_root: Path) -> None:
