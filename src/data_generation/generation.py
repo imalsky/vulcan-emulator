@@ -116,12 +116,15 @@ _ALPHA_FE_SLOPE = 0.15
 # overflows (7-character IDs would break HDF5 lexicographic key sort). Recompute
 # this when changing num_runs or num_shards.
 _SHARD_BACKFILL_SLOT_SIZE = 6_250
-_SHARD_RUN_ID_MAX_EXCLUSIVE = 1_000_000  # :06d ceiling — runtime-asserted before backfill writes.
+_SHARD_RUN_ID_MAX_EXCLUSIVE = (
+    1_000_000  # :06d ceiling — runtime-asserted before backfill writes.
+)
 
 
 @dataclass(frozen=True)
 class GeneratedRawDataset:
     """Paths describing one completed raw-data generation run."""
+
     run_root: Path
     raw_root: Path
     run_ids: list[str]
@@ -169,7 +172,7 @@ def patch_python_assignments(text: str, assignments: dict[str, Any]) -> str:
                 if node.end_lineno is None:
                     break
                 line_end = "\n" if lines[node.end_lineno - 1].endswith("\n") else ""
-                lines[node.lineno - 1:node.end_lineno] = [replacement + line_end]
+                lines[node.lineno - 1 : node.end_lineno] = [replacement + line_end]
                 updated = "".join(lines)
                 break
             else:
@@ -406,7 +409,9 @@ def _run_specification_from_payload(payload: dict[str, Any]) -> RunSpecification
         elemental_abundances_frac=(
             None if elemental is None else np.asarray(elemental, dtype=np.float64)
         ),
-        gravity_cm_s2=None if gravity is None else np.asarray(gravity, dtype=np.float64),
+        gravity_cm_s2=None
+        if gravity is None
+        else np.asarray(gravity, dtype=np.float64),
     )
 
 
@@ -507,7 +512,10 @@ def _prepare_generation_directory(
         ensure_dir(chunks_dir)
         return run_root, raw_root, info_root, runs_dir, chunks_dir, None
     if consolidated_count > 0:
-        if bool(config["generation"]["reuse_raw_if_present"]) and consolidated_count == requested_runs:
+        if (
+            bool(config["generation"]["reuse_raw_if_present"])
+            and consolidated_count == requested_runs
+        ):
             manifest_path = info_root / "generation_manifest.json"
             if not manifest_path.exists():
                 raise RuntimeError(
@@ -515,7 +523,9 @@ def _prepare_generation_directory(
                     "Set generation.overwrite=true to regenerate them."
                 )
             manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest_chemistry_type = str(manifest_payload.get("chemistry_type", "")).lower()
+            manifest_chemistry_type = str(
+                manifest_payload.get("chemistry_type", "")
+            ).lower()
             current_chemistry_type = get_chemistry_type(config)
             if manifest_chemistry_type != current_chemistry_type:
                 raise RuntimeError(
@@ -532,7 +542,9 @@ def _prepare_generation_directory(
     return run_root, raw_root, info_root, runs_dir, chunks_dir, None
 
 
-def _coverage_fraction(low: float, high: float, observed_low: float, observed_high: float) -> float:
+def _coverage_fraction(
+    low: float, high: float, observed_low: float, observed_high: float
+) -> float:
     """Compute how much of a configured interval is covered by sampled values.
 
     Parameters
@@ -628,62 +640,76 @@ def _sampling_coverage_payload(
         }
         for key in frac_keys
     }
-    realized.update({
-        "temperature_k": {
-            "min": float(np.min(temperature)),
-            "max": float(np.max(temperature)),
-            "coverage_fraction": _coverage_fraction(
-                *temperature_range, float(np.min(temperature)), float(np.max(temperature)),
-            ),
-        },
-        "pressure_bar": {
-            "min": float(np.min(pressure)),
-            "max": float(np.max(pressure)),
-        },
-    })
+    realized.update(
+        {
+            "temperature_k": {
+                "min": float(np.min(temperature)),
+                "max": float(np.max(temperature)),
+                "coverage_fraction": _coverage_fraction(
+                    *temperature_range,
+                    float(np.min(temperature)),
+                    float(np.max(temperature)),
+                ),
+            },
+            "pressure_bar": {
+                "min": float(np.min(pressure)),
+                "max": float(np.max(pressure)),
+            },
+        }
+    )
 
     if not fastchem:
-        gravity = np.asarray([spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64)
+        gravity = np.asarray(
+            [spec.globals["gravity_cm_s2"] for spec in specs], dtype=np.float64
+        )
         planet_radius = np.asarray(
             [spec.globals["planet_radius_cm"] for spec in specs],
             dtype=np.float64,
         )
-        log10_kzz = np.log10(
-            np.concatenate([spec.kzz_cm2_s for spec in specs])
-        )
+        log10_kzz = np.log10(np.concatenate([spec.kzz_cm2_s for spec in specs]))
         gravity_range = [float(x) for x in config["sampling"]["gravity_range_cm_s2"]]
-        planet_radius_range = [float(x) for x in config["sampling"]["planet_radius_range_cm"]]
+        planet_radius_range = [
+            float(x) for x in config["sampling"]["planet_radius_range_cm"]
+        ]
         kzz_lo, kzz_hi = (float(x) for x in config["sampling"]["kzz_range_cm2_s"])
         kzz_range = [
             float(np.log10(max(kzz_lo, KZZ_LOG_FLOOR_CM2_S))),
             float(np.log10(max(kzz_hi, KZZ_LOG_FLOOR_CM2_S))),
         ]
-        configured_ranges.update({
-            "gravity_cm_s2": gravity_range,
-            "planet_radius_cm": planet_radius_range,
-            "log10_kzz_cm2_s": kzz_range,
-        })
-        realized.update({
-            "gravity_cm_s2": {
-                "min": float(np.min(gravity)),
-                "max": float(np.max(gravity)),
-                "coverage_fraction": _coverage_fraction(*gravity_range, float(np.min(gravity)), float(np.max(gravity))),
-            },
-            "planet_radius_cm": {
-                "min": float(np.min(planet_radius)),
-                "max": float(np.max(planet_radius)),
-                "coverage_fraction": _coverage_fraction(
-                    *planet_radius_range,
-                    float(np.min(planet_radius)),
-                    float(np.max(planet_radius)),
-                ),
-            },
-            "log10_kzz_cm2_s": {
-                "min": float(np.min(log10_kzz)),
-                "max": float(np.max(log10_kzz)),
-                "coverage_fraction": _coverage_fraction(*kzz_range, float(np.min(log10_kzz)), float(np.max(log10_kzz))),
-            },
-        })
+        configured_ranges.update(
+            {
+                "gravity_cm_s2": gravity_range,
+                "planet_radius_cm": planet_radius_range,
+                "log10_kzz_cm2_s": kzz_range,
+            }
+        )
+        realized.update(
+            {
+                "gravity_cm_s2": {
+                    "min": float(np.min(gravity)),
+                    "max": float(np.max(gravity)),
+                    "coverage_fraction": _coverage_fraction(
+                        *gravity_range, float(np.min(gravity)), float(np.max(gravity))
+                    ),
+                },
+                "planet_radius_cm": {
+                    "min": float(np.min(planet_radius)),
+                    "max": float(np.max(planet_radius)),
+                    "coverage_fraction": _coverage_fraction(
+                        *planet_radius_range,
+                        float(np.min(planet_radius)),
+                        float(np.max(planet_radius)),
+                    ),
+                },
+                "log10_kzz_cm2_s": {
+                    "min": float(np.min(log10_kzz)),
+                    "max": float(np.max(log10_kzz)),
+                    "coverage_fraction": _coverage_fraction(
+                        *kzz_range, float(np.min(log10_kzz)), float(np.max(log10_kzz))
+                    ),
+                },
+            }
+        )
 
     return {
         "chemistry_type": get_chemistry_type(config),
@@ -725,7 +751,9 @@ def _write_generation_metadata(
         "chemistry_type": get_chemistry_type(config),
         "run_files": manifest_for_files(run_files),
     }
-    manifest_path.write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8"
+    )
     coverage_path.write_text(
         json.dumps(
             _sampling_coverage_payload(config=config, specs=specs, run_files=run_files),
@@ -752,7 +780,9 @@ def _sulfur_enabled(config: dict[str, Any]) -> bool:
         ``True`` when any requested species name contains ``"S"`` and the
         downstream chemistry runtime should include sulfur-bearing elements.
     """
-    species = list(config["data_spec"]["state_species"]) + list(config["data_spec"]["output_species"])
+    species = list(config["data_spec"]["state_species"]) + list(
+        config["data_spec"]["output_species"]
+    )
     return any("S" in name for name in species)
 
 
@@ -832,7 +862,7 @@ def _element_abundances_from_spec(spec: RunSpecification) -> dict[str, float]:
     feh_proxy = volatile_dex / (1.0 - _ALPHA_FE_SLOPE)
     return {
         **fractions,
-        "fastchem_met_scale": float(10.0 ** feh_proxy),
+        "fastchem_met_scale": float(10.0**feh_proxy),
     }
 
 
@@ -860,7 +890,9 @@ def _element_profile_from_spec(spec: RunSpecification) -> np.ndarray:
             )
         return profile
     fractions = {name: float(spec.globals[name]) for name in ELEMENT_INPUT_ORDER}
-    vector = np.array([fractions[name] for name in ELEMENT_INPUT_ORDER], dtype=np.float64)
+    vector = np.array(
+        [fractions[name] for name in ELEMENT_INPUT_ORDER], dtype=np.float64
+    )
     return np.repeat(vector[None, :], int(spec.pressure_bar.size), axis=0)
 
 
@@ -996,17 +1028,25 @@ def write_equilibrium_hdf5(
         inputs = handle.create_group("inputs")
         inputs.create_dataset("pressure_bar", data=spec.pressure_bar)
         inputs.create_dataset("temperature_k", data=spec.temperature_k)
-        inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
+        inputs.create_dataset(
+            "element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S")
+        )
         inputs.create_dataset("elemental_abundances_frac", data=element_profile)
         inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
-        inputs.create_dataset("state_species", data=np.asarray(state_species, dtype="S"))
-        inputs.create_dataset("output_species", data=np.asarray(output_species, dtype="S"))
+        inputs.create_dataset(
+            "state_species", data=np.asarray(state_species, dtype="S")
+        )
+        inputs.create_dataset(
+            "output_species", data=np.asarray(output_species, dtype="S")
+        )
         globals_group = handle.create_group("globals")
         for key, value in sorted(spec.globals.items()):
             globals_group.create_dataset(key, data=float(value))
         _write_scalar_metadata(handle, spec.metadata)
         eq_group = handle.create_group("equilibrium")
-        eq_group.create_dataset("ymix", data=np.asarray(equilibrium_ymix, dtype=np.float64))
+        eq_group.create_dataset(
+            "ymix", data=np.asarray(equilibrium_ymix, dtype=np.float64)
+        )
     return path
 
 
@@ -1060,7 +1100,9 @@ def write_raw_run_hdf5(
             "RunSpecification.metadata is missing required key 'state_species'; "
             "cannot write raw HDF5 run."
         )
-    output_species = list(output_species or spec.metadata.get("output_species", state_species))
+    output_species = list(
+        output_species or spec.metadata.get("output_species", state_species)
+    )
     element_profile = _element_profile_from_spec(spec)
     gravity_profile = _gravity_profile_from_spec(spec)
     with h5py.File(path, "w") as handle:
@@ -1069,7 +1111,9 @@ def write_raw_run_hdf5(
         inputs.create_dataset("temperature_k", data=spec.temperature_k)
         if spec.kzz_cm2_s is not None:
             inputs.create_dataset("kzz_cm2_s", data=spec.kzz_cm2_s)
-        inputs.create_dataset("element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S"))
+        inputs.create_dataset(
+            "element_input_order", data=np.asarray(ELEMENT_INPUT_ORDER, dtype="S")
+        )
         inputs.create_dataset("elemental_abundances_frac", data=element_profile)
         inputs.create_dataset("gravity_cm_s2", data=gravity_profile)
         inputs.create_dataset(
@@ -1161,7 +1205,9 @@ def _copy_fastchem_runtime(source_root: Path, worker_root: Path) -> Path:
     worker_root.mkdir(parents=True, exist_ok=True)
     fastchem_root = worker_root / "fastchem_vulcan"
     ensure_dir(fastchem_root)
-    shutil.copy2(source_root / "fastchem_vulcan" / "fastchem", fastchem_root / "fastchem")
+    shutil.copy2(
+        source_root / "fastchem_vulcan" / "fastchem", fastchem_root / "fastchem"
+    )
     shutil.copytree(source_root / "fastchem_vulcan" / "input", fastchem_root / "input")
     shutil.copytree(
         source_root / "fastchem_vulcan" / "fastchem_src" / "chem_input",
@@ -1378,7 +1424,9 @@ def _vulcan_chem_funs_cache_payload(
         "use_condense": physics["use_condensation"],
         "use_lowT_limit_rates": bool(runtime["use_lowT_limit_rates"]),
         "t_cross_sp": list(runtime["t_cross_sp"]),
-        "condense_sp": [] if condensation is None else list(condensation["condense_sp"]),
+        "condense_sp": []
+        if condensation is None
+        else list(condensation["condense_sp"]),
         "non_gas_sp": [] if condensation is None else list(condensation["non_gas_sp"]),
     }
 
@@ -1421,7 +1469,9 @@ def _cleanup_worker_base(worker_base: Path) -> None:
             shutil.rmtree(child, ignore_errors=True)
 
 
-def _write_worker_inputs(worker_root: Path, spec: RunSpecification) -> tuple[Path, Path]:
+def _write_worker_inputs(
+    worker_root: Path, spec: RunSpecification
+) -> tuple[Path, Path]:
     """Write worker-local TP and stellar-spectrum inputs for one run.
 
     Parameters
@@ -1517,10 +1567,16 @@ def _write_fastchem_element_abundances(
                 key = "He_H" if species_name == "He" else f"{species_name}_H"
                 number_frac = element_abundances.get(key)
                 if number_frac is None:
-                    raise ValueError(f"Missing elemental abundance for {species_name} in FastChem setup.")
-                output_lines.append(f"{species_name}\t{12.0 + np.log10(float(number_frac)):.4f}\n")
+                    raise ValueError(
+                        f"Missing elemental abundance for {species_name} in FastChem setup."
+                    )
+                output_lines.append(
+                    f"{species_name}\t{12.0 + np.log10(float(number_frac)):.4f}\n"
+                )
             elif species_name in _FASTCHEM_METALLICITY_SCALED_ELEMENTS:
-                output_lines.append(f"{species_name}\t{float(parts[1]) + metallicity_offset:.4f}\n")
+                output_lines.append(
+                    f"{species_name}\t{float(parts[1]) + metallicity_offset:.4f}\n"
+                )
             else:
                 output_lines.append(raw_line)
     abundance_path = input_dir / "element_abundances_vulcan.dat"
@@ -1528,38 +1584,22 @@ def _write_fastchem_element_abundances(
     return abundance_path
 
 
-def _patch_vulcan_cfg(
-    cfg_file: Path,
-    *,
+def _vulcan_jax_cfg_assignments(
     spec: RunSpecification,
     config: dict[str, Any],
-    tp_file: Path,
-    spectrum_file: Path,
-) -> None:
-    """Patch a worker-local ``vulcan_cfg.py`` with run-specific inputs.
+    *,
+    atm_file_str: str,
+    sflux_file_str: str,
+) -> dict[str, Any]:
+    """Build the ``vulcan_cfg`` assignment dict for one VULCAN-JAX run.
 
-    Parameters
-    ----------
-    cfg_file : Path
-        Worker-local config file to update in place.
-    spec : RunSpecification
-        Run specification supplying the sampled atmospheric inputs and global
-        conditioning values.
-    config : dict[str, Any]
-        Validated pipeline config containing runtime defaults and spectrum
-        settings.
-    tp_file : Path
-        Worker-local TP profile consumed by VULCAN.
-    spectrum_file : Path
-        Worker-local stellar-spectrum file consumed by VULCAN.
-
-    Returns
-    -------
-    None
-        ``cfg_file`` is updated in place with run-specific profile, spectrum,
-        elemental abundance, and runtime toggle assignments.
+    Single source of truth shared by the subprocess path (``_patch_vulcan_cfg``
+    writes these into a worker-local ``vulcan_cfg.py``) and the in-process
+    GPU-batched path (``_set_vulcan_jax_cfg_inprocess`` sets them as module
+    attributes). ``atm_file_str`` / ``sflux_file_str`` are the paths the run's
+    atmosphere / stellar-flux readers will resolve (relative for the file
+    path, absolute for the in-process module).
     """
-    text = cfg_file.read_text(encoding="utf-8")
     runtime = config["vulcan_runtime"]
     element_abundances = _element_abundances_from_spec(spec)
     default_preset = dict(config.get("default_science_preset", {}))
@@ -1598,8 +1638,8 @@ def _patch_vulcan_cfg(
             "ini_mix": "EQ",
             "use_solar": False,
             "network": str(runtime["chemistry_file"]),
-            "atm_file": str(tp_file.relative_to(cfg_file.parent)),
-            "sflux_file": str(spectrum_file.relative_to(cfg_file.parent)),
+            "atm_file": atm_file_str,
+            "sflux_file": sflux_file_str,
             "atm_base": atm_base,
             "atm_type": "file",
             "Kzz_prof": "file",
@@ -1652,6 +1692,30 @@ def _patch_vulcan_cfg(
                 "rho_p": dict(condensation["rho_p"]),
             }
         )
+    return assignments
+
+
+def _patch_vulcan_cfg(
+    cfg_file: Path,
+    *,
+    spec: RunSpecification,
+    config: dict[str, Any],
+    tp_file: Path,
+    spectrum_file: Path,
+) -> None:
+    """Patch a worker-local ``vulcan_cfg.py`` with run-specific inputs.
+
+    Thin wrapper over :func:`_vulcan_jax_cfg_assignments` that resolves the
+    TP / spectrum paths relative to the worker config file and writes the
+    assignments into ``cfg_file``.
+    """
+    text = cfg_file.read_text(encoding="utf-8")
+    assignments = _vulcan_jax_cfg_assignments(
+        spec,
+        config,
+        atm_file_str=str(tp_file.relative_to(cfg_file.parent)),
+        sflux_file_str=str(spectrum_file.relative_to(cfg_file.parent)),
+    )
     cfg_file.write_text(patch_python_assignments(text, assignments), encoding="utf-8")
 
 
@@ -1753,7 +1817,9 @@ def convert_vulcan_output_to_hdf5(
     # Kzz may be on cell edges (nz-1); interpolate to cell centres if needed.
     kzz_raw = np.asarray(_fetch(data, "atm", "Kzz"), dtype=np.float64)
     if kzz_raw.ndim == 1 and kzz_raw.size == pressure_bar.size - 1:
-        kzz_cm2_s = np.concatenate([[kzz_raw[0]], 0.5 * (kzz_raw[:-1] + kzz_raw[1:]), [kzz_raw[-1]]])
+        kzz_cm2_s = np.concatenate(
+            [[kzz_raw[0]], 0.5 * (kzz_raw[:-1] + kzz_raw[1:]), [kzz_raw[-1]]]
+        )
     else:
         kzz_cm2_s = np.asarray(kzz_raw, dtype=np.float64)
     # The layerwise runtime gravity lives at ``atm.g`` in current VULCAN
@@ -1856,14 +1922,18 @@ def convert_fastchem_output_to_hdf5(
     """
     fc = np.genfromtxt(fastchem_output_path, names=True, dtype=None, encoding=None)
     if fc.dtype.names is None:
-        raise ValueError(f"FastChem output at {fastchem_output_path} does not contain a named header.")
+        raise ValueError(
+            f"FastChem output at {fastchem_output_path} does not contain a named header."
+        )
     state_species = list(config["data_spec"]["state_species"])
     output_species = list(config["data_spec"]["output_species"])
     requested_species = list(dict.fromkeys([*state_species, *output_species]))
     missing = [name for name in requested_species if name not in fc.dtype.names]
     if missing:
         raise ValueError(f"FastChem output is missing requested species: {missing}")
-    reference_ymix_state = np.column_stack([np.asarray(fc[name], dtype=np.float64) for name in state_species])
+    reference_ymix_state = np.column_stack(
+        [np.asarray(fc[name], dtype=np.float64) for name in state_species]
+    )
     if reference_ymix_state.shape[0] != spec.pressure_bar.size:
         raise ValueError(
             "FastChem output row count does not match the configured pressure grid size."
@@ -1881,7 +1951,9 @@ def convert_fastchem_output_to_hdf5(
     )
 
 
-def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tuple[Path, Path]:
+def _validated_vulcan_paths(
+    config: dict[str, Any], *, project_root: Path
+) -> tuple[Path, Path]:
     """Validate external runtime paths for the active chemistry backend.
 
     Parameters
@@ -1902,17 +1974,27 @@ def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tu
     source_root = resolve_path(config["paths"]["vulcan_source_root"], project_root)
     if uses_fastchem(config):
         if not source_root.exists():
-            raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
+            raise FileNotFoundError(
+                f"Configured VULCAN source root does not exist: {source_root}"
+            )
         fastchem_root = source_root / "fastchem_vulcan"
         if not fastchem_root.exists():
-            raise FileNotFoundError(f"Configured FastChem runtime does not exist: {fastchem_root}")
+            raise FileNotFoundError(
+                f"Configured FastChem runtime does not exist: {fastchem_root}"
+            )
         fastchem_binary = fastchem_root / "fastchem"
         if not fastchem_binary.exists():
-            raise FileNotFoundError(f"Configured FastChem binary does not exist: {fastchem_binary}")
+            raise FileNotFoundError(
+                f"Configured FastChem binary does not exist: {fastchem_binary}"
+            )
         fastchem_input = fastchem_root / "input" / "config.input"
         if not fastchem_input.exists():
-            raise FileNotFoundError(f"Configured FastChem input config does not exist: {fastchem_input}")
-        chemical_elements = fastchem_root / "fastchem_src" / "chem_input" / "chemical_elements.dat"
+            raise FileNotFoundError(
+                f"Configured FastChem input config does not exist: {fastchem_input}"
+            )
+        chemical_elements = (
+            fastchem_root / "fastchem_src" / "chem_input" / "chemical_elements.dat"
+        )
         if not chemical_elements.exists():
             raise FileNotFoundError(
                 "Configured FastChem chemical element table does not exist: "
@@ -1938,13 +2020,19 @@ def _validated_vulcan_paths(config: dict[str, Any], *, project_root: Path) -> tu
         return package_root, chemistry_file
 
     if not source_root.exists():
-        raise FileNotFoundError(f"Configured VULCAN source root does not exist: {source_root}")
+        raise FileNotFoundError(
+            f"Configured VULCAN source root does not exist: {source_root}"
+        )
     chemistry_file = source_root / str(config["vulcan_runtime"]["chemistry_file"])
     if not chemistry_file.exists():
-        raise FileNotFoundError(f"Configured chemistry file does not exist: {chemistry_file}")
+        raise FileNotFoundError(
+            f"Configured chemistry file does not exist: {chemistry_file}"
+        )
     cfg_file = source_root / str(config["vulcan_runtime"]["cfg_file"])
     if not cfg_file.exists():
-        raise FileNotFoundError(f"Configured VULCAN cfg file does not exist: {cfg_file}")
+        raise FileNotFoundError(
+            f"Configured VULCAN cfg file does not exist: {cfg_file}"
+        )
     return source_root, chemistry_file
 
 
@@ -1978,8 +2066,11 @@ def _run_chemistry_subprocess(
     t0 = time.monotonic()
     try:
         result = subprocess.run(
-            cmd, cwd=cwd, env=env,
-            capture_output=True, text=True,
+            cmd,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
@@ -1987,8 +2078,12 @@ def _run_chemistry_subprocess(
         LOGGER.error(
             "%s %s TIMED OUT after %.0fs (limit %.0fs).\n"
             "--- stdout tail ---\n%s\n--- stderr tail ---\n%s",
-            label, run_id, elapsed, timeout,
-            _tail_text(exc.stdout), _tail_text(exc.stderr),
+            label,
+            run_id,
+            elapsed,
+            timeout,
+            _tail_text(exc.stdout),
+            _tail_text(exc.stderr),
         )
         raise
     elapsed = time.monotonic() - t0
@@ -1996,12 +2091,18 @@ def _run_chemistry_subprocess(
         LOGGER.error(
             "%s %s FAILED (rc=%d, %.1fs).\n"
             "--- stdout tail ---\n%s\n--- stderr tail ---\n%s",
-            label, run_id, result.returncode, elapsed,
-            _tail_text(result.stdout), _tail_text(result.stderr),
+            label,
+            run_id,
+            result.returncode,
+            elapsed,
+            _tail_text(result.stdout),
+            _tail_text(result.stderr),
         )
         raise subprocess.CalledProcessError(
-            result.returncode, cmd,
-            output=result.stdout, stderr=result.stderr,
+            result.returncode,
+            cmd,
+            output=result.stdout,
+            stderr=result.stderr,
         )
     if elapsed > 120:
         LOGGER.info("%s %s completed in %.1fs (slow)", label, run_id, elapsed)
@@ -2062,8 +2163,11 @@ def _run_single_vulcan_spec(
         vulcan_cmd = [python_executable, "vulcan.py"]
     timeout_seconds = float(config["generation"].get("vulcan_timeout_seconds", 1800.0))
     _run_chemistry_subprocess(
-        vulcan_cmd, cwd=worker_root, run_id=spec.run_id,
-        timeout=timeout_seconds, label="VULCAN",
+        vulcan_cmd,
+        cwd=worker_root,
+        run_id=spec.run_id,
+        timeout=timeout_seconds,
+        label="VULCAN",
     )
 
     output_candidates = sorted((worker_root / "output").glob("*.vul"))
@@ -2117,8 +2221,11 @@ def _run_single_vulcan_jax_spec(
     timeout_seconds = float(config["generation"].get("vulcan_timeout_seconds", 1800.0))
     _run_chemistry_subprocess(
         [python_executable, "-m", "vulcan_jax.vulcan_jax_cli"],
-        cwd=worker_root, env=env, run_id=spec.run_id,
-        timeout=timeout_seconds, label="VULCAN-JAX",
+        cwd=worker_root,
+        env=env,
+        run_id=spec.run_id,
+        timeout=timeout_seconds,
+        label="VULCAN-JAX",
     )
 
     output_candidates = sorted((worker_root / "output").glob("*.vul"))
@@ -2134,6 +2241,262 @@ def _run_single_vulcan_jax_spec(
         spec=spec,
         config=config,
     )
+
+
+def _gpu_bucket_key(spec: RunSpecification, config: dict[str, Any]) -> tuple:
+    """Bucketing key so each vmapped batch is homogeneous.
+
+    A `jax.vmap` batch must share array shapes (vertical resolution ``nz``)
+    and physics toggles (the VULCAN-JAX runner bakes toggles as static
+    closures and the batched ``AtmStatic`` flags are broadcast, not batched),
+    plus the atmosphere base. Profiles with different keys go to separate
+    `run_batch` calls (and separate JIT compiles).
+    """
+    default_physics = dict(
+        config.get("default_science_preset", {}).get("physics_toggles", {})
+    )
+    toggles = tuple(
+        bool(spec.globals.get(name, default_physics.get(name, False)))
+        for name in PUBLIC_PHYSICS_TOGGLES
+    )
+    atm_base = next(
+        (
+            name
+            for name in SUPPORTED_ATM_BASES
+            if float(spec.globals.get(f"atm_base_{name}", 0.0)) > 0.5
+        ),
+        str(config.get("default_science_preset", {}).get("atm_base", "H2")),
+    )
+    return (int(spec.pressure_bar.size), toggles, atm_base)
+
+
+def _set_vulcan_jax_cfg_inprocess(
+    vjcfg: Any,
+    spec: RunSpecification,
+    config: dict[str, Any],
+    tp_file: Path,
+    spectrum_file: Path,
+) -> None:
+    """Apply one run's config to the live ``vulcan_jax.vulcan_cfg`` module.
+
+    In-process analogue of :func:`_patch_vulcan_cfg`. ``vulcan_jax.state``
+    reads the global ``vulcan_cfg`` module (not just the cfg passed to
+    ``with_pre_loop_setup``), so this MUST run sequentially per spec before
+    building that spec's ``RunState``.
+    """
+    assignments = _vulcan_jax_cfg_assignments(
+        spec,
+        config,
+        atm_file_str=str(Path(tp_file).resolve()),
+        sflux_file_str=str(Path(spectrum_file).resolve()),
+    )
+    for key, value in assignments.items():
+        setattr(vjcfg, key, value)
+
+
+def _write_batched_run_hdf5(
+    final_state: Any,
+    *,
+    spec: RunSpecification,
+    config: dict[str, Any],
+    output_h5_path: Path,
+    species_list: list[str],
+) -> Path:
+    """Write one in-process GPU-batched VULCAN-JAX result in the raw HDF5
+    contract.
+
+    Mirrors :func:`convert_vulcan_output_to_hdf5` but reads the converged
+    mixing ratios from an unstacked ``JaxIntegState`` (``.ymix``, shape
+    ``(nz, ni)`` in network-species order) rather than a ``.vul`` pickle, then
+    reuses :func:`write_raw_run_hdf5` so the file layout is byte-compatible
+    with the subprocess path. Pressure / temperature / Kzz / gravity come from
+    the input ``spec`` (the conditioning contract; identical to the runtime
+    grid for the file-based TP used here).
+    """
+    ymix = np.asarray(final_state.ymix, dtype=np.float64)
+    if not np.all(np.isfinite(ymix)):
+        raise ValueError(
+            f"VULCAN-JAX-GPU output for {spec.run_id} has non-finite ymix."
+        )
+    output_species = list(config["data_spec"]["output_species"])
+    output_indices = [species_list.index(name) for name in output_species]
+    final_ymix_output = ymix[:, output_indices]
+    if not np.all(np.isfinite(final_ymix_output)):
+        raise ValueError(
+            f"VULCAN-JAX-GPU selected ymix for {spec.run_id} is non-finite."
+        )
+    converted_spec = RunSpecification(
+        run_id=spec.run_id,
+        pressure_bar=spec.pressure_bar,
+        temperature_k=spec.temperature_k,
+        kzz_cm2_s=spec.kzz_cm2_s,
+        globals=spec.globals,
+        spectrum=spec.spectrum,
+        metadata={
+            **spec.metadata,
+            "state_species": list(config["data_spec"]["state_species"]),
+            "output_species": output_species,
+        },
+        elemental_abundances_frac=spec.elemental_abundances_frac,
+        gravity_cm_s2=spec.gravity_cm_s2,
+    )
+    return write_raw_run_hdf5(
+        output_h5_path,
+        spec=converted_spec,
+        final_ymix_output=final_ymix_output,
+        output_species=output_species,
+    )
+
+
+def _run_batch_vulcan_jax_gpu(
+    specs: list[RunSpecification],
+    *,
+    source_root: Path,
+    worker_base: Path,
+    runs_dir: Path,
+    config: dict[str, Any],
+) -> tuple[list[Path], list[str]]:
+    """In-process GPU-batched VULCAN-JAX generation.
+
+    Integrates a whole bucket of profiles in one ``jax.vmap``'d device call via
+    ``OuterLoop.run_batch``, replacing the per-profile subprocess pool on GPU
+    nodes. Profiles are bucketed by ``(nz, toggle-combo, atm_base)`` so each
+    batch is shape/network-homogeneous. Per-spec ``RunState`` construction is
+    SEQUENTIAL (``vulcan_jax.state`` reads the global ``vulcan_cfg`` module);
+    the bucket then integrates in parallel on device. Returns
+    ``(successes, failures)`` matching the ``_run_batch`` contract.
+
+    NOT YET VALIDATED end-to-end (needs a GPU + the FastChem ``ini_mix='EQ'``
+    runtime). Correct-by-construction over the CPU-validated
+    ``OuterLoop.run_batch`` and the tested ``write_raw_run_hdf5`` contract;
+    validate against the real pipeline before a production run.
+    """
+    # Imported lazily so non-GPU generation never pays the JAX import cost.
+    # CRITICAL ordering: vulcan_jax parses the chemical network ONCE at the very
+    # first `import vulcan_jax` (vulcan_jax/__init__ -> state -> chem_funs read
+    # vulcan_cfg.network at module level). It therefore CANNOT be changed by
+    # mutating the module afterwards. vulcan_cfg reads $VULCAN_JAX_NETWORK as the
+    # default, so the dataset network must be set in the environment BEFORE the
+    # first import below — otherwise the default (HD189 NCHO) network loads and
+    # sulfur / condensate species (S8, ...) are missing. One network per dataset.
+    # (The subprocess path sidesteps this: each run is a fresh process.) The env
+    # assignment also keeps the import sorter from reordering the two groups.
+    os.environ["VULCAN_JAX_NETWORK"] = str(config["vulcan_runtime"]["chemistry_file"])
+
+    import vulcan_jax.vulcan_cfg as vjcfg
+
+    vjcfg.atom_list = _vulcan_atom_list(config)
+
+    import vulcan_jax.legacy_io as op
+    import vulcan_jax.op_jax as op_jax
+    from vulcan_jax import chem_funs
+    from vulcan_jax.outer_loop import (
+        OuterLoop,
+        stack_atm_statics,
+        stack_integ_states,
+        unstack_integ_states,
+    )
+    from vulcan_jax.state import RunState
+
+    species_list = list(chem_funs.spec_list)
+    # If a prior import already parsed a different network, the species list
+    # won't carry the dataset's output species — fail loudly rather than write
+    # wrong columns into the HDF5.
+    missing = [
+        s for s in config["data_spec"]["output_species"] if s not in species_list
+    ]
+    if missing:
+        raise RuntimeError(
+            "VULCAN-JAX network parsed at import is missing dataset output "
+            f"species {missing}; expected network {vjcfg.network!r}. Ensure no "
+            "other code imported vulcan_jax before GPU-batched generation."
+        )
+    gpu_cfg = dict(config["generation"].get("gpu_batch", {}))
+    batch_size = int(gpu_cfg.get("batch_size", 64))
+    require_converged = bool(gpu_cfg.get("require_converged", True))
+    inputs_dir = ensure_dir(worker_base / "gpu_inproc_inputs")
+
+    successes: list[Path] = []
+    failures: list[str] = []
+
+    buckets: dict[tuple, list[RunSpecification]] = {}
+    for spec in specs:
+        buckets.setdefault(_gpu_bucket_key(spec, config), []).append(spec)
+
+    for bucket_specs in buckets.values():
+        # One OuterLoop per bucket → the runner closure is built once for this
+        # (nz, toggle-combo) and reused across the bucket's batches.
+        integ = OuterLoop(op_jax.Ros2JAX(), op.Output())
+        for start in range(0, len(bucket_specs), batch_size):
+            chunk = bucket_specs[start : start + batch_size]
+            inits: list[Any] = []
+            atms: list[Any] = []
+            kept: list[RunSpecification] = []
+            for spec in chunk:
+                try:
+                    tp_file, spectrum_file = _write_worker_inputs(inputs_dir, spec)
+                    _set_vulcan_jax_cfg_inprocess(
+                        vjcfg, spec, config, tp_file, spectrum_file
+                    )
+                    rs = RunState.with_pre_loop_setup(vjcfg)
+                    init_state, atm_static = integ.prepare_runstate(rs)
+                    inits.append(init_state)
+                    atms.append(atm_static)
+                    kept.append(spec)
+                except Exception:
+                    LOGGER.warning(
+                        "VULCAN-JAX-GPU setup for %s failed, will backfill",
+                        spec.run_id,
+                        exc_info=True,
+                    )
+                    failures.append(spec.run_id)
+            if not inits:
+                continue
+            try:
+                batched = integ.run_batch(
+                    stack_integ_states(inits), stack_atm_statics(atms)
+                )
+                finals = unstack_integ_states(batched, len(inits))
+            except Exception:
+                LOGGER.warning(
+                    "VULCAN-JAX-GPU batch of %d runs failed, will backfill",
+                    len(inits),
+                    exc_info=True,
+                )
+                failures.extend(spec.run_id for spec in kept)
+                continue
+            for spec, final in zip(kept, finals):
+                # termination_reason: 1 converged, 4 stalled-converged (both ok),
+                # 2 runtime, 3 step-count, 5 non-finite.
+                reason = int(final.termination_reason)
+                if reason == 5 or (require_converged and reason not in (1, 4)):
+                    LOGGER.warning(
+                        "VULCAN-JAX-GPU run %s did not converge "
+                        "(termination_reason=%d), will backfill",
+                        spec.run_id,
+                        reason,
+                    )
+                    failures.append(spec.run_id)
+                    continue
+                try:
+                    out_h5 = runs_dir / f"{spec.run_id}.h5"
+                    successes.append(
+                        _write_batched_run_hdf5(
+                            final,
+                            spec=spec,
+                            config=config,
+                            output_h5_path=out_h5,
+                            species_list=species_list,
+                        )
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "VULCAN-JAX-GPU write for %s failed, will backfill",
+                        spec.run_id,
+                        exc_info=True,
+                    )
+                    failures.append(spec.run_id)
+    return successes, failures
 
 
 def _run_single_fastchem_spec(
@@ -2176,8 +2539,10 @@ def _run_single_fastchem_spec(
     timeout_seconds = float(config["generation"].get("fastchem_timeout_seconds", 30.0))
     _run_chemistry_subprocess(
         ["./fastchem", "input/config.input"],
-        cwd=fastchem_root, run_id=spec.run_id,
-        timeout=timeout_seconds, label="FastChem",
+        cwd=fastchem_root,
+        run_id=spec.run_id,
+        timeout=timeout_seconds,
+        label="FastChem",
     )
     _raise_on_fastchem_monitor_failures(
         fastchem_root / "output" / "monitor_output.dat",
@@ -2234,7 +2599,9 @@ def run_vulcan_generation(
     """
     is_sharded = shard_id is not None
     if is_sharded != (num_shards is not None):
-        raise ValueError("shard_id and num_shards must be passed together or not at all.")
+        raise ValueError(
+            "shard_id and num_shards must be passed together or not at all."
+        )
     if is_sharded:
         if not (0 <= shard_id < num_shards):
             raise ValueError(
@@ -2242,16 +2609,23 @@ def run_vulcan_generation(
             )
         LOGGER.info(
             "VULCAN generation starting (shard %d/%d, num_runs=%s, staging_root=%s)",
-            shard_id, num_shards, num_runs or "config default", staging_root,
+            shard_id,
+            num_shards,
+            num_runs or "config default",
+            staging_root,
         )
     else:
-        LOGGER.info("VULCAN generation starting (num_runs=%s)", num_runs or "config default")
-    run_root, raw_root, info_root, runs_dir, chunks_dir, reusable_path = _prepare_generation_directory(
-        config,
-        project_root=project_root,
-        num_runs=num_runs,
-        shard_id=shard_id,
-        staging_root=staging_root,
+        LOGGER.info(
+            "VULCAN generation starting (num_runs=%s)", num_runs or "config default"
+        )
+    run_root, raw_root, info_root, runs_dir, chunks_dir, reusable_path = (
+        _prepare_generation_directory(
+            config,
+            project_root=project_root,
+            num_runs=num_runs,
+            shard_id=shard_id,
+            staging_root=staging_root,
+        )
     )
     if reusable_path is not None:
         run_ids = list_run_ids_from_consolidated(reusable_path)
@@ -2281,7 +2655,9 @@ def run_vulcan_generation(
         # this shard's subtree.
         worker_base = staging_root
     elif "vulcan_runtime" in config:
-        worker_base = resolve_path(config["vulcan_runtime"]["worker_root"], project_root)
+        worker_base = resolve_path(
+            config["vulcan_runtime"]["worker_root"], project_root
+        )
     else:
         worker_base = resolve_path("data/vulcan_workers", project_root)
     if is_sharded:
@@ -2292,10 +2668,28 @@ def run_vulcan_generation(
         run_single = _run_single_vulcan_jax_spec
     else:
         run_single = _run_single_vulcan_spec
+    # GPU-batched VULCAN-JAX path: integrate whole buckets in one vmapped
+    # device call (in-process) instead of one subprocess per profile. Single
+    # process by design — the host-setup loop runs sequentially and the GPU
+    # parallelises the integration. The $VULCAN_GEN_GPU_BATCH env var (set by
+    # the HPC scripts when they detect a usable GPU) overrides the config flag,
+    # so "use the GPU if possible" needs no config edit; it only ever activates
+    # for the vulcan_jax backend.
+    _gpu_batch_cfg = bool(
+        config["generation"].get("gpu_batch", {}).get("enabled", False)
+    )
+    _gpu_batch_env = os.environ.get("VULCAN_GEN_GPU_BATCH", "").strip().lower()
+    if _gpu_batch_env in {"1", "true", "yes", "on"}:
+        _gpu_batch_cfg = True
+    elif _gpu_batch_env in {"0", "false", "no", "off"}:
+        _gpu_batch_cfg = False
+    gpu_batch_enabled = backend == "vulcan_jax" and _gpu_batch_cfg
     backfill = config["generation"]["backfill"]
     target_count = num_runs or int(config["generation"]["num_runs"])
     shard_start = (shard_id * target_count) // num_shards if is_sharded else 0
-    shard_end = ((shard_id + 1) * target_count) // num_shards if is_sharded else target_count
+    shard_end = (
+        ((shard_id + 1) * target_count) // num_shards if is_sharded else target_count
+    )
     shard_count = shard_end - shard_start
     shard_tag = f"_s{shard_id:02d}" if is_sharded else ""
 
@@ -2307,7 +2701,9 @@ def run_vulcan_generation(
         """Closure-bound wrapper around ``_attach_species_metadata`` for this config."""
         return _attach_species_metadata(specs, config, start_index=start_index)
 
-    def _sample_and_prepare(n: int, seed: int, *, start_index: int) -> list[RunSpecification]:
+    def _sample_and_prepare(
+        n: int, seed: int, *, start_index: int
+    ) -> list[RunSpecification]:
         """Sample run specs and attach the current processed species contract.
 
         Parameters
@@ -2338,7 +2734,9 @@ def run_vulcan_generation(
     # threading.get_ident() values, which made _ensure_fastchem_worker_tree
     # do a full source-tree copy for every new thread and dominated wall time
     # on shared filesystems.
-    generation_worker_count = _generation_worker_count(config, target_count)
+    generation_worker_count = (
+        1 if gpu_batch_enabled else _generation_worker_count(config, target_count)
+    )
     generation_executor = (
         concurrent.futures.ThreadPoolExecutor(
             max_workers=generation_worker_count, thread_name_prefix="gen"
@@ -2372,6 +2770,22 @@ def run_vulcan_generation(
         batch_total = len(specs)
         batch_t0 = time.monotonic()
 
+        # GPU-batched path: bypass the per-profile ThreadPool/subprocess fan-out
+        # and integrate buckets in-process on the device. Writes the same
+        # per-run HDF5 files into runs_dir, so the chunk-merge / resume / shard
+        # machinery downstream is unchanged.
+        if gpu_batch_enabled:
+            LOGGER.info(
+                "VULCAN-JAX GPU-batched generation: %d specs in-process", batch_total
+            )
+            return _run_batch_vulcan_jax_gpu(
+                specs,
+                source_root=source_root,
+                worker_base=worker_base,
+                runs_dir=runs_dir,
+                config=config,
+            )
+
         def _log_progress(n: int) -> None:
             if n == 1 or n % 50 == 0 or n == batch_total:
                 elapsed = max(time.monotonic() - batch_t0, 1.0e-9)
@@ -2380,8 +2794,13 @@ def run_vulcan_generation(
                 LOGGER.info(
                     "Batch progress: %d/%d processed (%d ok, %d failed, %s wall, "
                     "%.2f runs/min, eta %s)",
-                    n, batch_total, len(successes), len(failures),
-                    _format_seconds(elapsed), runs_per_min, _format_seconds(eta_seconds),
+                    n,
+                    batch_total,
+                    len(successes),
+                    len(failures),
+                    _format_seconds(elapsed),
+                    runs_per_min,
+                    _format_seconds(eta_seconds),
                 )
 
         pending_specs = specs
@@ -2433,7 +2852,9 @@ def run_vulcan_generation(
                         )
                     )
                 except Exception:
-                    LOGGER.warning("Run %s failed, will backfill", spec.run_id, exc_info=True)
+                    LOGGER.warning(
+                        "Run %s failed, will backfill", spec.run_id, exc_info=True
+                    )
                     failures.append(spec.run_id)
                 _log_progress(i)
         else:
@@ -2454,7 +2875,9 @@ def run_vulcan_generation(
                 try:
                     successes.append(future.result())
                 except Exception:
-                    LOGGER.warning("Run %s failed, will backfill", run_id, exc_info=True)
+                    LOGGER.warning(
+                        "Run %s failed, will backfill", run_id, exc_info=True
+                    )
                     failures.append(run_id)
                 processed += 1
                 _log_progress(processed)
@@ -2470,7 +2893,9 @@ def run_vulcan_generation(
     if chunk_files:
         LOGGER.info(
             "Resuming: found %d existing chunk files covering %d runs in %s",
-            len(chunk_files), len(completed_run_ids), chunks_dir,
+            len(chunk_files),
+            len(completed_run_ids),
+            chunks_dir,
         )
 
     # Lock the runs_dir before touching orphan per-run files so two
@@ -2482,7 +2907,8 @@ def run_vulcan_generation(
     # empty-directory cleanup does not trip over it.
     ensure_dir(runs_dir)
     lock_filename = (
-        ".orphan_promotion.lock" if not is_sharded
+        ".orphan_promotion.lock"
+        if not is_sharded
         else f".orphan_promotion_s{shard_id:02d}.lock"
     )
     _orphan_lock_path = runs_dir.parent / lock_filename
@@ -2504,10 +2930,13 @@ def run_vulcan_generation(
                 suffix = 0
                 while resume_chunk.exists():
                     suffix += 1
-                    resume_chunk = chunks_dir / f"chunk_resume{shard_tag}_{suffix:03d}.h5"
+                    resume_chunk = (
+                        chunks_dir / f"chunk_resume{shard_tag}_{suffix:03d}.h5"
+                    )
                 LOGGER.info(
                     "Resuming: promoting %d orphan per-run files into %s",
-                    len(orphan_run_files), resume_chunk,
+                    len(orphan_run_files),
+                    resume_chunk,
                 )
                 merge_run_files_to_chunk(orphan_run_files, resume_chunk)
                 chunk_files.append(resume_chunk)
@@ -2537,7 +2966,11 @@ def run_vulcan_generation(
         LOGGER.info(
             "Streaming generation: shard %d/%d slice [%d, %d) of target_count=%d, "
             "sample_chunk_size=%d",
-            shard_id, num_shards, shard_start, shard_end, target_count,
+            shard_id,
+            num_shards,
+            shard_start,
+            shard_end,
+            target_count,
             sample_chunk_size,
         )
     else:
@@ -2570,7 +3003,9 @@ def run_vulcan_generation(
     for chunk_start in range(shard_start, shard_end, sample_chunk_size):
         chunk_end = min(chunk_start + sample_chunk_size, shard_end)
         raw_chunk = sample_run_specifications_slice(
-            plan, start=chunk_start, end=chunk_end,
+            plan,
+            start=chunk_start,
+            end=chunk_end,
         )
         chunk_specs = _attach(raw_chunk)
         all_specs.extend(chunk_specs)
@@ -2580,26 +3015,37 @@ def run_vulcan_generation(
         if chunk_skipped:
             LOGGER.info(
                 "Chunk [%d, %d): skipping %d already-completed runs",
-                chunk_start, chunk_end, chunk_skipped,
+                chunk_start,
+                chunk_end,
+                chunk_skipped,
             )
         if not chunk_remaining:
             continue
         chunk_t0 = time.monotonic()
         LOGGER.info(
             "Chunk [%d, %d): starting %d runs (%d workers)",
-            chunk_start, chunk_end, len(chunk_remaining), generation_worker_count,
+            chunk_start,
+            chunk_end,
+            len(chunk_remaining),
+            generation_worker_count,
         )
         new_successes, new_failures = _run_batch(chunk_remaining)
         chunk_elapsed = max(time.monotonic() - chunk_t0, 1.0e-9)
         chunk_rate = 3600.0 * len(new_successes) / chunk_elapsed
         LOGGER.info(
             "Chunk [%d, %d) done: %d ok, %d failed in %s (%.1f successful runs/hour)",
-            chunk_start, chunk_end, len(new_successes), len(new_failures),
-            _format_seconds(chunk_elapsed), chunk_rate,
+            chunk_start,
+            chunk_end,
+            len(new_successes),
+            len(new_failures),
+            _format_seconds(chunk_elapsed),
+            chunk_rate,
         )
         all_failures.extend(new_failures)
         if new_successes:
-            chunk_path = chunks_dir / f"chunk{shard_tag}_{chunk_start:06d}_{chunk_end:06d}.h5"
+            chunk_path = (
+                chunks_dir / f"chunk{shard_tag}_{chunk_start:06d}_{chunk_end:06d}.h5"
+            )
             # Pre-existing file would only appear if a previous crashed
             # run wrote the chunk but failed to delete its per-run files;
             # the promoted resume chunk already covers those. Use a unique
@@ -2624,7 +3070,9 @@ def run_vulcan_generation(
         next_run_index = target_count
         backfill_id_slot_end = _SHARD_RUN_ID_MAX_EXCLUSIVE
     if skipped_total:
-        LOGGER.info("Resumed %d already-completed runs across all chunks", skipped_total)
+        LOGGER.info(
+            "Resumed %d already-completed runs across all chunks", skipped_total
+        )
 
     # Backfill rounds. Note the shard-id stamp on backfill_seed: without it,
     # two shards' first backfill rounds would draw identical specs.
@@ -2649,10 +3097,12 @@ def run_vulcan_generation(
                 )
             LOGGER.info(
                 "Backfill attempt %d/%d: %d runs needed",
-                attempt, max_retries, shortfall,
+                attempt,
+                max_retries,
+                shortfall,
             )
-            backfill_seed = base_seed + 1000 * attempt + (
-                1_000_000 * shard_id if is_sharded else 0
+            backfill_seed = (
+                base_seed + 1000 * attempt + (1_000_000 * shard_id if is_sharded else 0)
             )
             backfill_specs = _sample_and_prepare(
                 shortfall,
@@ -2707,7 +3157,10 @@ def run_vulcan_generation(
     if is_sharded:
         LOGGER.info(
             "VULCAN generation shard %d/%d complete: %d runs across %d chunk files",
-            shard_id, num_shards, len(completed_run_ids), len(chunk_files),
+            shard_id,
+            num_shards,
+            len(completed_run_ids),
+            len(chunk_files),
         )
         # Per-shard fragment, consumed by merge_shards_stage. Lightweight (no
         # full specs — those are recoverable from the seed). Lists which
@@ -2715,10 +3168,15 @@ def run_vulcan_generation(
         # which backfill IDs landed, and the metadata needed to validate
         # cross-shard consistency before merging.
         deterministic_ids = [f"run_{i:06d}" for i in range(shard_start, shard_end)]
-        deterministic_ok = sorted(rid for rid in completed_run_ids if rid in set(deterministic_ids))
-        deterministic_failed = sorted(rid for rid in deterministic_ids if rid not in completed_run_ids)
+        deterministic_ok = sorted(
+            rid for rid in completed_run_ids if rid in set(deterministic_ids)
+        )
+        deterministic_failed = sorted(
+            rid for rid in deterministic_ids if rid not in completed_run_ids
+        )
         backfill_ok = sorted(
-            rid for rid in completed_run_ids
+            rid
+            for rid in completed_run_ids
             if rid.startswith("run_") and int(rid.split("_", 1)[1]) >= target_count
         )
         backfill_ok_set = set(backfill_ok)
@@ -2749,8 +3207,10 @@ def run_vulcan_generation(
             "chunk_files_relpath": chunk_files_relpath,
             "backfill_seed_formula": "base_seed + 1000*attempt + 1_000_000*shard_id",
             "shard_backfill_slot_size": _SHARD_BACKFILL_SLOT_SIZE,
-            "backfill_id_slot_start": target_count + shard_id * _SHARD_BACKFILL_SLOT_SIZE,
-            "backfill_id_slot_end": target_count + (shard_id + 1) * _SHARD_BACKFILL_SLOT_SIZE,
+            "backfill_id_slot_start": target_count
+            + shard_id * _SHARD_BACKFILL_SLOT_SIZE,
+            "backfill_id_slot_end": target_count
+            + (shard_id + 1) * _SHARD_BACKFILL_SLOT_SIZE,
             "completed_at_iso8601": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "host": socket.gethostname(),
             "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
@@ -2758,7 +3218,9 @@ def run_vulcan_generation(
         }
         fragment_path = info_root / "shards" / f"shard_s{shard_id:02d}.json"
         ensure_dir(fragment_path.parent)
-        fragment_path.write_text(json.dumps(fragment, indent=2) + "\n", encoding="utf-8")
+        fragment_path.write_text(
+            json.dumps(fragment, indent=2) + "\n", encoding="utf-8"
+        )
         if runs_dir.exists() and not any(runs_dir.iterdir()):
             runs_dir.rmdir()
         _cleanup_worker_base(worker_base)
@@ -2766,17 +3228,20 @@ def run_vulcan_generation(
             run_root=run_root,
             raw_root=raw_root,
             run_ids=sorted(completed_run_ids),
-            consolidated_path=raw_root / "runs.h5",  # not yet written; merge_shards owns it.
+            consolidated_path=raw_root
+            / "runs.h5",  # not yet written; merge_shards owns it.
             manifest_path=fragment_path,
             coverage_path=None,
         )
 
     LOGGER.info(
         "VULCAN generation complete: %d runs across %d chunk files",
-        len(completed_run_ids), len(chunk_files),
+        len(completed_run_ids),
+        len(chunk_files),
     )
     consolidated_path = merge_chunks_to_runs_h5(
-        chunk_files, raw_root / "runs.h5",
+        chunk_files,
+        raw_root / "runs.h5",
     )
     if chunks_dir.exists() and not any(chunks_dir.iterdir()):
         chunks_dir.rmdir()
@@ -3003,8 +3468,10 @@ def merge_shards_stage(
     consolidated_path = merge_chunks_to_runs_h5(all_chunk_files, raw_root / "runs.h5")
 
     plan = build_sampling_plan(
-        config=config, project_root=project_root,
-        num_runs=target_count, seed=base_seed,
+        config=config,
+        project_root=project_root,
+        num_runs=target_count,
+        seed=base_seed,
     )
     det_specs = sample_run_specifications_slice(plan, start=0, end=target_count)
     det_specs = _attach_species_metadata(det_specs, config)
@@ -3018,14 +3485,19 @@ def merge_shards_stage(
             _run_specification_from_payload(payload)
             for payload in frag.get("successful_backfill_specs", [])
         )
-    successful_specs = [s for s in det_specs if s.run_id not in failed_set] + backfill_specs
+    successful_specs = [
+        s for s in det_specs if s.run_id not in failed_set
+    ] + backfill_specs
 
     if failed_set:
         (info_root / "failed_runs.json").write_text(
-            json.dumps(sorted(failed_set), indent=2) + "\n", encoding="utf-8",
+            json.dumps(sorted(failed_set), indent=2) + "\n",
+            encoding="utf-8",
         )
 
-    all_run_ids = sorted({s.run_id for s in successful_specs} | set(backfill_success_ids))
+    all_run_ids = sorted(
+        {s.run_id for s in successful_specs} | set(backfill_success_ids)
+    )
     if len(all_run_ids) != target_count:
         raise RuntimeError(
             f"Merged shard dataset has {len(all_run_ids)} runs, expected {target_count}. "
@@ -3060,7 +3532,9 @@ def merge_shards_stage(
 
     LOGGER.info(
         "merge_shards complete: %d runs (%d deterministic + %d backfill) into %s",
-        len(all_run_ids), len(successful_specs), len(backfill_success_ids),
+        len(all_run_ids),
+        len(successful_specs),
+        len(backfill_success_ids),
         consolidated_path,
     )
     return GeneratedRawDataset(

@@ -86,18 +86,33 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$(pwd)/src:$(pwd):${PYTHONPATH:-}"
 export MPLBACKEND=Agg
-export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
 export JAX_ENABLE_X64=${JAX_ENABLE_X64:-1}
-export XLA_FLAGS="${XLA_FLAGS:---xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1}"
 
-# One BLAS thread per worker — the parallelism comes from the Python-level
-# ThreadPoolExecutor in the exogibbs/generation backend.
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export BLIS_NUM_THREADS=1
+# generation.gpu_batch.enabled → in-process vmapped GPU path (one H100 per
+# shard task) instead of the CPU subprocess pool.
+GPU_BATCH="$(python - "$CONFIG_PATH" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+print("1" if cfg.get("generation", {}).get("gpu_batch", {}).get("enabled", False) else "0")
+PY
+)"
+if [ "$GPU_BATCH" = "1" ]; then
+  unset JAX_PLATFORMS
+  export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-true}
+  export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}
+  export XLA_FLAGS="${XLA_FLAGS:---xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0}"
+else
+  export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+  export XLA_FLAGS="${XLA_FLAGS:---xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1}"
+  # One BLAS thread per worker — the parallelism comes from the Python-level
+  # ThreadPoolExecutor in the exogibbs/generation backend.
+  export OMP_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+  export OPENBLAS_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
+  export VECLIB_MAXIMUM_THREADS=1
+  export BLIS_NUM_THREADS=1
+fi
 export PYTHONUNBUFFERED=1
 
 SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-48}}}

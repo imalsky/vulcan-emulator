@@ -67,16 +67,31 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$(pwd)/src:$(pwd):${PYTHONPATH:-}"
 export MPLBACKEND=Agg
-export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+# generation.gpu_batch.enabled selects the in-process vmapped GPU path
+# (OuterLoop.run_batch on the H100) over the CPU subprocess pool.
+GPU_BATCH="$(python - "$CONFIG_PATH" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+print("1" if cfg.get("generation", {}).get("gpu_batch", {}).get("enabled", False) else "0")
+PY
+)"
 export JAX_ENABLE_X64=${JAX_ENABLE_X64:-1}
-export XLA_FLAGS="${XLA_FLAGS:---xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1}"
-
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export BLIS_NUM_THREADS=1
+if [ "$GPU_BATCH" = "1" ]; then
+  # GPU-batched: let JAX pick the GPU (do NOT pin cpu) and use the GPU XLA env.
+  unset JAX_PLATFORMS
+  export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-true}
+  export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}
+  export XLA_FLAGS="${XLA_FLAGS:---xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0}"
+else
+  export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+  export XLA_FLAGS="${XLA_FLAGS:---xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1}"
+  export OMP_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+  export OPENBLAS_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
+  export VECLIB_MAXIMUM_THREADS=1
+  export BLIS_NUM_THREADS=1
+fi
 export PYTHONUNBUFFERED=1
 
 SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-48}}}
@@ -93,6 +108,19 @@ echo "[preflight] config_path=$CONFIG_PATH"
 echo "[preflight] job_id=${SLURM_JOB_ID:-local} cpus_per_task=$SRUN_CPUS_PER_TASK nodelist=${SLURM_JOB_NODELIST:-unknown}"
 echo "[preflight] jax_compilation_cache=$JAX_COMPILATION_CACHE_DIR"
 echo "[preflight] xla_flags=$XLA_FLAGS"
+echo "[preflight] generation_mode=$([ "$GPU_BATCH" = "1" ] && echo gpu-batched || echo cpu-subprocess)"
+
+if [ "$GPU_BATCH" = "1" ]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: generation.gpu_batch.enabled but no visible NVIDIA GPU in this job."; exit 1
+  fi
+  python - <<'PY' || { echo "ERROR: JAX is not on the GPU — gpu-batched generation would fall back to CPU."; exit 1; }
+import jax, sys
+be = jax.default_backend()
+print(f"[preflight] jax {jax.__version__}  backend={be}  devices={jax.devices()}")
+sys.exit(0 if be in ("gpu", "cuda", "rocm") else 1)
+PY
+fi
 
 if [ "$SKIP_INSTALL" != "1" ]; then
   python -m pip install -U pip setuptools wheel

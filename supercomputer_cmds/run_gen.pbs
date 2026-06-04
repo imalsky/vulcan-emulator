@@ -7,14 +7,15 @@
 #PBS -j oe
 #
 # =============================================================================
-# Single-node, CPU-parallel VULCAN-JAX generation for the 100k Luhman 16A set.
+# Single-node VULCAN-JAX generation for the 100k Luhman 16A set.
 #
-# 72 worker subprocesses, each a single-threaded vulcan_jax run (the GH200's 72
-# Grace cores). Generation RESUMES from already-consolidated chunks, and this job
+# Uses the GH200's H100 GPU when one is usable: by default it auto-detects the
+# GPU and runs the in-process vmap-across-profiles path (OuterLoop.run_batch),
+# integrating whole (nz, toggle-combo) buckets in one device call. If no GPU is
+# visible it falls back to 72 single-threaded vulcan_jax subprocesses on the
+# Grace cores. Generation RESUMES from already-consolidated chunks, and this job
 # SELF-RESUBMITS (PBS depend=afterany) until all num_runs are present — so 100k
 # completes across as many 10h jobs as it takes, with no manual babysitting.
-# (The GPU on the node is idle during generation; that's unavoidable because the
-#  vulcan_jax/FastChem binaries are aarch64 and only GH200 nodes are aarch64.)
 #
 #   cd /nobackup/$USER/vulcan-emulator
 #   qsub supercomputer_cmds/run_gen.pbs
@@ -23,6 +24,7 @@
 #
 # Env (-v):
 #   CONFIG_PATH        default config/vulcan_luhman16a_100k.json
+#   GEN_GPU_BATCH      auto (default) use GPU if usable; 1 force GPU; 0 force CPU
 #   GEN_AUTORESUBMIT   1 (default) self-chain until complete; 0 = one job only
 #   GEN_MAX_ATTEMPTS   safety cap on the self-chain (default 15)
 #   GEN_ATTEMPT        internal chain counter — do not set by hand
@@ -63,17 +65,69 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV:-pyt2_8_gh}"
 "${SCRIPT_DIR}/ensure_vulcan_jax.sh"
 
+# --- generation mode: use the GPU if one is usable, else the CPU pool --------
+# GEN_GPU_BATCH selects the in-process vmapped GPU path (OuterLoop.run_batch on
+# the GH200 H100) vs the 72-core CPU subprocess pool:
+#   auto (default) — use the GPU when JAX can see one, else fall back to CPU
+#   1              — force the GPU path (hard-fail below if no usable GPU)
+#   0              — force the CPU subprocess pool
+# Only the vulcan_jax backend has a GPU path; generation.py gates on that, so
+# this just exports VULCAN_GEN_GPU_BATCH for the pipeline to honor.
+GEN_GPU_BATCH="${GEN_GPU_BATCH:-auto}"
+
+# A GPU is "usable" iff nvidia-smi works AND JAX actually lands on it. Probed in
+# a subshell with JAX_PLATFORMS unset so JAX auto-selects the device.
+gpu_usable() {
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1 || return 1
+  ( unset JAX_PLATFORMS; python - >/dev/null 2>&1 <<'PY'
+import jax, sys
+sys.exit(0 if jax.default_backend() in ("gpu", "cuda", "rocm") else 1)
+PY
+  )
+}
+
+if [ "${GEN_GPU_BATCH}" = "0" ]; then
+  USE_GPU=0
+elif [ "${GEN_GPU_BATCH}" = "1" ]; then
+  USE_GPU=1
+elif gpu_usable; then
+  USE_GPU=1
+else
+  USE_GPU=0
+fi
+
 # --- generation runtime env --------------------------------------------------
-# Keep every vulcan_jax worker single-threaded so 72 of them don't oversubscribe
-# the 72 cores. generation.py already forces JAX_PLATFORMS=cpu per worker.
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export HDF5_USE_FILE_LOCKING=FALSE
-export JAX_ENABLE_X64=1
-export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false"
-
-echo "config=${CONFIG_PATH}  attempt=${GEN_ATTEMPT}/${GEN_MAX_ATTEMPTS}  node=$(hostname)  arch=$(uname -m)"
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
+if [ "${USE_GPU}" = "1" ]; then
+  # GPU-batched: integrate buckets on the H100. Use the GPU runtime env (NOT
+  # the CPU pin), and allow a few host threads for the NumPy/FastChem setup.
+  export VULCAN_GEN_GPU_BATCH=1
+  unset JAX_PLATFORMS
+  export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
+  export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
+  export XLA_FLAGS="${XLA_FLAGS:---xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0}"
+  echo "config=${CONFIG_PATH}  mode=gpu-batched  attempt=${GEN_ATTEMPT}/${GEN_MAX_ATTEMPTS}  node=$(hostname)  arch=$(uname -m)"
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: GEN_GPU_BATCH=1 but no visible NVIDIA GPU in this job."; exit 1
+  fi
+  python - <<'PY' || { echo "ERROR: JAX is not on the GPU — gpu-batched generation would fall back to CPU."; exit 1; }
+import jax, sys
+be = jax.default_backend()
+print(f"jax {jax.__version__}  backend={be}  devices={jax.devices()}")
+sys.exit(0 if be in ("gpu", "cuda", "rocm") else 1)
+PY
+else
+  # CPU subprocess pool: single-threaded workers so 72 of them don't
+  # oversubscribe the 72 Grace cores. generation.py forces JAX_PLATFORMS=cpu
+  # per worker; the H100 is idle in this mode.
+  export VULCAN_GEN_GPU_BATCH=0
+  export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+  export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false"
+  echo "config=${CONFIG_PATH}  mode=cpu-subprocess  attempt=${GEN_ATTEMPT}/${GEN_MAX_ATTEMPTS}  node=$(hostname)  arch=$(uname -m)"
+fi
 
 # --- completion check (consolidated runs.h5 vs num_runs) ---------------------
 read -r EXPECTED COUNT < <(python - "${CONFIG_PATH}" <<'PY'

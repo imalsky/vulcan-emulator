@@ -127,7 +127,9 @@ class PathsConfig(_StrictModel):
 class DataSpecConfig(_StrictModel):
     """State and output species contract. Derived fields are added post-validation."""
 
-    state_species: list[str] = Field(default_factory=lambda: list(DEFAULT_STATE_SPECIES))
+    state_species: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_STATE_SPECIES)
+    )
     output_species: list[str] | None = None
 
     @model_validator(mode="before")
@@ -458,8 +460,7 @@ class AnalyticSamplerConfig(_StrictModel):
         if self.power_law_p_ref_bar <= 0.0:
             raise ValueError("power_law_p_ref_bar must be > 0")
         if self.power_law_probability > 0.0 and (
-            self.power_law_t0_range_k is None
-            or self.power_law_alpha_range is None
+            self.power_law_t0_range_k is None or self.power_law_alpha_range is None
         ):
             raise ValueError(
                 "power_law_probability > 0 requires both power_law_t0_range_k "
@@ -483,7 +484,9 @@ class TPValidationConfig(_StrictModel):
         return self
 
 
-def _validate_filter_entry(field: str, raw_value: Any) -> float | tuple[float, float] | bool:
+def _validate_filter_entry(
+    field: str, raw_value: Any
+) -> float | tuple[float, float] | bool:
     if field in _ALLOWED_TEMPERATURE_PROFILE_BOOLEAN_FILTER_KEYS:
         if not isinstance(raw_value, bool):
             raise ValueError(f"filters.{field} must be a boolean")
@@ -530,7 +533,9 @@ class _TPBase(_StrictModel):
         result: dict[str, Any] = {}
         for raw_key, raw_val in value.items():
             if not isinstance(raw_key, str) or not raw_key.strip():
-                raise ValueError("temperature_profiles.filters must use non-empty string keys")
+                raise ValueError(
+                    "temperature_profiles.filters must use non-empty string keys"
+                )
             key = raw_key.strip()
             if key not in _ALLOWED_TEMPERATURE_PROFILE_FILTER_KEYS:
                 raise ValueError(
@@ -585,6 +590,22 @@ class BackfillConfig(_StrictModel):
     max_retries: NonNegativeInt = 3
 
 
+class GpuBatchConfig(_StrictModel):
+    """GPU-batched VULCAN-JAX generation (``backend == "vulcan_jax"`` only).
+
+    When ``enabled``, generation runs in-process on the GPU via
+    ``OuterLoop.run_batch`` instead of one subprocess per profile, integrating
+    whole ``(nz, toggle-combo)`` buckets in a single ``jax.vmap``'d device
+    call. ``parallel_workers`` is ignored in this mode (host setup is
+    sequential by design). Non-converged / non-finite runs are sent to
+    backfill (controlled by ``require_converged``).
+    """
+
+    enabled: bool = False
+    batch_size: PositiveInt = 64
+    require_converged: bool = True
+
+
 class GenerationConfig(_StrictModel):
     num_runs: PositiveInt
     seed: int
@@ -595,6 +616,7 @@ class GenerationConfig(_StrictModel):
     fastchem_timeout_seconds: PositiveFloat = 30.0
     vulcan_timeout_seconds: PositiveFloat = 1800.0
     backfill: BackfillConfig = Field(default_factory=BackfillConfig)
+    gpu_batch: GpuBatchConfig = Field(default_factory=GpuBatchConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +866,9 @@ class CondensationConfig(_StrictModel):
     @field_validator("condense_sp", mode="after")
     @classmethod
     def _condense_sp_supported(cls, value: list[str]) -> list[str]:
-        unsupported = [sp for sp in value if sp not in VULCAN_SUPPORTED_CONDENSATE_SPECIES]
+        unsupported = [
+            sp for sp in value if sp not in VULCAN_SUPPORTED_CONDENSATE_SPECIES
+        ]
         if unsupported:
             raise ValueError(
                 f"condense_sp entries {unsupported} are not in "
@@ -878,9 +902,13 @@ class VulcanRuntimeConfig(_StrictModel):
     worker_root: str = Field(
         default=_INTERNAL_VULCAN_RUNTIME_DEFAULTS["worker_root"], min_length=1
     )
-    regenerate_chem_funs: bool = _INTERNAL_VULCAN_RUNTIME_DEFAULTS["regenerate_chem_funs"]
+    regenerate_chem_funs: bool = _INTERNAL_VULCAN_RUNTIME_DEFAULTS[
+        "regenerate_chem_funs"
+    ]
     cfg_assignments: dict[str, Any] = Field(default_factory=dict)
-    use_lowT_limit_rates: bool = _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_lowT_limit_rates"]
+    use_lowT_limit_rates: bool = _INTERNAL_VULCAN_RUNTIME_DEFAULTS[
+        "use_lowT_limit_rates"
+    ]
     use_adaptive_rtol: bool = _INTERNAL_VULCAN_RUNTIME_DEFAULTS["use_adaptive_rtol"]
     rocky: bool = _INTERNAL_VULCAN_RUNTIME_DEFAULTS["rocky"]
     top_bc_flux_file: str | None = _INTERNAL_VULCAN_RUNTIME_DEFAULTS["top_bc_flux_file"]
@@ -976,7 +1004,9 @@ class VulcanSection(_StrictModel):
             ]
         else:
             if not presets:
-                raise ValueError("vulcan.science_presets must be a non-empty list when provided.")
+                raise ValueError(
+                    "vulcan.science_presets must be a non-empty list when provided."
+                )
             seen_names: set[str] = set()
             expanded = []
             for idx, preset in enumerate(presets):
@@ -985,7 +1015,9 @@ class VulcanSection(_StrictModel):
                         f"vulcan.science_presets contains duplicate preset name {preset.name!r}."
                     )
                 seen_names.add(preset.name)
-                atm_base = preset.atm_base if preset.atm_base is not None else default_atm_base
+                atm_base = (
+                    preset.atm_base if preset.atm_base is not None else default_atm_base
+                )
                 merged = dict(default_physics)
                 merged.update(preset.physics_toggles)
                 expanded.append(
@@ -1048,10 +1080,12 @@ class FastChemConfig(_ConfigBase):
         _check_fastchem_normalization_keys(self.normalization, self.data_spec)
         _check_fastchem_temperature_floor(self.sampling, self.temperature_profiles)
         _check_sampling_temperature_range_matches_validation(
-            self.sampling, self.temperature_profiles,
+            self.sampling,
+            self.temperature_profiles,
         )
         _check_corner_coverage_temperature_thresholds(
-            self.sampling, self.temperature_profiles,
+            self.sampling,
+            self.temperature_profiles,
         )
         return self
 
@@ -1074,10 +1108,12 @@ class ExoGibbsConfig(_ConfigBase):
     def _check_normalization_keys(self) -> "ExoGibbsConfig":
         _check_fastchem_normalization_keys(self.normalization, self.data_spec)
         _check_sampling_temperature_range_matches_validation(
-            self.sampling, self.temperature_profiles,
+            self.sampling,
+            self.temperature_profiles,
         )
         _check_corner_coverage_temperature_thresholds(
-            self.sampling, self.temperature_profiles,
+            self.sampling,
+            self.temperature_profiles,
         )
         return self
 
@@ -1100,10 +1136,12 @@ class VulcanConfig(_ConfigBase):
     def _check_normalization_keys(self) -> "VulcanConfig":
         _check_vulcan_normalization_keys(self.normalization, self.data_spec)
         _check_sampling_temperature_range_matches_validation(
-            self.sampling, self.temperature_profiles,
+            self.sampling,
+            self.temperature_profiles,
         )
         _check_corner_coverage_temperature_thresholds(
-            self.sampling, self.temperature_profiles,
+            self.sampling,
+            self.temperature_profiles,
         )
         _check_vulcan_condensation_contract(self.vulcan, self.data_spec)
         return self
@@ -1142,11 +1180,11 @@ def _check_fastchem_temperature_floor(
     temperature_profiles: TemperatureProfilesConfig,
 ) -> None:
     min_sampling_temperature = float(sampling.temperature_range_k[0])
-    min_validation_temperature = float(temperature_profiles.validation.min_temperature_k)
+    min_validation_temperature = float(
+        temperature_profiles.validation.min_temperature_k
+    )
     if min_sampling_temperature < 100.0:
-        raise ValueError(
-            "FastChem sampling.temperature_range_k[0] must be >= 100.0 K."
-        )
+        raise ValueError("FastChem sampling.temperature_range_k[0] must be >= 100.0 K.")
     if min_validation_temperature < 100.0:
         raise ValueError(
             "FastChem temperature_profiles.validation.min_temperature_k must be >= 100.0 K."
@@ -1163,7 +1201,10 @@ def _check_sampling_temperature_range_matches_validation(
     validation_lo = float(validation.min_temperature_k)
     validation_hi = float(validation.max_temperature_k)
     tolerance = 1.0e-9
-    if validation_lo < sampling_lo - tolerance or validation_hi > sampling_hi + tolerance:
+    if (
+        validation_lo < sampling_lo - tolerance
+        or validation_hi > sampling_hi + tolerance
+    ):
         raise ValueError(
             "temperature_profiles.validation min/max_temperature_k must lie within "
             "sampling.temperature_range_k so the configured sampling envelope bounds "
@@ -1193,8 +1234,7 @@ def _check_corner_coverage_temperature_thresholds(
         )
     if float(corner.large_trange_k) > (t_max - t_min):
         raise ValueError(
-            "corner_coverage.large_trange_k must be <= the validation "
-            "temperature span."
+            "corner_coverage.large_trange_k must be <= the validation temperature span."
         )
 
 
