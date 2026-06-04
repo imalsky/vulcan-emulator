@@ -595,15 +595,20 @@ class GpuBatchConfig(_StrictModel):
 
     When ``enabled``, generation runs in-process on the GPU via
     ``OuterLoop.run_batch`` instead of one subprocess per profile, integrating
-    whole ``(nz, toggle-combo)`` buckets in a single ``jax.vmap``'d device
-    call. ``parallel_workers`` is ignored in this mode (host setup is
-    sequential by design). Non-converged / non-finite runs are sent to
-    backfill (controlled by ``require_converged``).
+    whole ``(nz, toggle-combo)`` buckets in a single ``jax.vmap``'d device call.
+    Per-profile host setup (atmosphere + rates + FastChem-EQ abundances) is
+    fanned out across the CPU cores by a persistent spawn ProcessPool — each
+    worker holds its own ``vulcan_jax`` import + private FastChem tree — so the
+    FastChem subprocess no longer serialises the critical path. ``host_setup_workers``
+    sizes that pool (``0`` = auto-detect cores; the ``$VULCAN_GEN_HOST_SETUP_WORKERS``
+    env var overrides it). ``parallel_workers`` is ignored in this mode.
+    Non-converged / non-finite runs are sent to backfill (``require_converged``).
     """
 
     enabled: bool = False
     batch_size: PositiveInt = 64
     require_converged: bool = True
+    host_setup_workers: NonNegativeInt = 0
 
 
 class GenerationConfig(_StrictModel):

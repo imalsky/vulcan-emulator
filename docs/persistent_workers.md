@@ -1,8 +1,24 @@
 # Persistent generation workers (design proposal)
 
-Status: **proposal — not implemented.** This documents the per-profile overhead in
-VULCAN-JAX data generation and the design I'd use to fix it. It deliberately stops
-short of code.
+Status: **proposal — not implemented for CPU nodes.** This documents the per-profile
+overhead in VULCAN-JAX data generation and the design I'd use to fix it. It
+deliberately stops short of code.
+
+> **Update (2026-06): the GPU-batched path realizes most of this.** The "separate
+> proposal" referenced in *Open questions* §4 — a batched-GPU generator — is now
+> implemented (`generation.py::_run_batch_vulcan_jax_gpu`, `gpu_batch.enabled`; see
+> `docs/config_guide.md` and the GPU section of `CLAUDE.md`). On GPU nodes the
+> integration runs as one `jax.vmap`'d device call per `(nz, toggle-combo)` bucket,
+> and **host setup runs on a persistent spawn `ProcessPool`** that adopts several
+> decisions below verbatim: spawn-not-fork (parent has CUDA initialised), a private
+> per-worker FastChem tree (now via the `$VULCAN_JAX_FASTCHEM_DIR` hook in
+> `vulcan-jax >= 0.1.10` rather than full package copies), in-memory `vulcan_cfg`
+> mutation per spec, and writing the per-run HDF5 directly (no `.vul` round-trip).
+> What differs: GPU workers do **host setup only** (the GPU integrates), and they are
+> not recycled per-K or watchdog-killed — a setup failure just routes the spec to
+> backfill. **This CPU-node proposal (persistent workers that also *integrate*
+> in-process) remains unbuilt**; it's the right design for CPU-only nodes where
+> there is no GPU to batch onto.
 
 ## Scope
 

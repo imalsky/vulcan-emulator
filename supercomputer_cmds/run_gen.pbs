@@ -25,6 +25,9 @@
 # Env (-v):
 #   CONFIG_PATH        default config/vulcan_luhman16a_100k.json
 #   GEN_GPU_BATCH      auto (default) use GPU if usable; 1 force GPU; 0 force CPU
+#   GEN_HOST_SETUP_WORKERS  GPU mode only: size of the CPU pool that builds
+#                      profiles (FastChem) to feed the GPU. unset/0 = auto
+#                      (detect the Grace cores).
 #   CONDA_ENV, VULCAN_SCRATCH   as in run_install
 # =============================================================================
 set -uo pipefail
@@ -96,9 +99,14 @@ export PYTHONUNBUFFERED=1
 export HDF5_USE_FILE_LOCKING=FALSE
 export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
 if [ "${USE_GPU}" = "1" ]; then
-  # GPU-batched: integrate buckets on the H100. Use the GPU runtime env (NOT
-  # the CPU pin), and allow a few host threads for the NumPy/FastChem setup.
+  # GPU-batched: integrate buckets on the H100 while a spawn ProcessPool builds
+  # the next profiles (FastChem) across the Grace cores. Use the GPU runtime env
+  # (NOT the CPU pin); the host-setup workers pin THEMSELVES to CPU. Do not cap
+  # host threads here — the pool wants the cores for NumPy/FastChem setup.
   export VULCAN_GEN_GPU_BATCH=1
+  if [ -n "${GEN_HOST_SETUP_WORKERS:-}" ]; then
+    export VULCAN_GEN_HOST_SETUP_WORKERS="${GEN_HOST_SETUP_WORKERS}"
+  fi
   unset JAX_PLATFORMS
   export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
   export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"

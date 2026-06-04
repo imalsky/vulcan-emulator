@@ -34,12 +34,14 @@ these invariants and silently corrupt the dataset — preserve them.
 from __future__ import annotations
 
 import ast
+import atexit
 import concurrent.futures
 import datetime as _dt
 import fcntl
 import importlib
 import importlib.util
 import json
+import multiprocessing
 import os
 import pickle
 import re
@@ -2367,6 +2369,187 @@ def _write_batched_run_hdf5(
     )
 
 
+# ===========================================================================
+# Parallel host setup for the GPU-batched path
+# ===========================================================================
+# Building each profile's RunState (atmosphere + rates + FastChem-EQ initial
+# abundances) is host-side NumPy/subprocess work dominated by the FastChem
+# subprocess (~0.5-5 s/profile). Done sequentially it starves the GPU, so it is
+# fanned out across the Grace cores with a persistent spawn ProcessPool: each
+# worker holds its own `vulcan_jax` import + private FastChem tree, builds the
+# RunState, and pickles it back. The parent buckets the RunStates and integrates
+# them on the H100 (see `_run_batch_vulcan_jax_gpu`).
+#
+# Processes (not threads) because `vulcan_jax.state` reads the GLOBAL
+# `vulcan_cfg` module — each forked-by-spawn worker gets its own copy, so per-
+# spec cfg mutation can't collide. spawn (not fork) because the parent has CUDA
+# initialised (forking after CUDA init is unsafe) and spawn re-imports
+# `vulcan_jax` fresh in each worker so the per-worker $VULCAN_JAX_FASTCHEM_DIR
+# takes effect.
+
+# Per-worker state, set once by the spawn initializer (module globals in the
+# worker process; never read in the parent).
+_HS_VJCFG = None
+_HS_CONFIG: dict[str, Any] | None = None
+_HS_RUNSTATE = None
+_HS_INPUTS_DIR: Path | None = None
+
+# Persistent pool singleton (parent process).
+_HOST_SETUP_POOL: concurrent.futures.ProcessPoolExecutor | None = None
+_HOST_SETUP_POOL_KEY: tuple | None = None
+_HOST_SETUP_ATEXIT_REGISTERED = False
+
+
+def _seed_vulcan_jax_fastchem_tree(package_root: Path, worker_root: Path) -> Path:
+    """Seed a private FastChem working tree for one host-setup worker.
+
+    Copies the installed package's ``fastchem_vulcan/`` (binary + input data +
+    config) into ``worker_root`` so the worker can point
+    ``$VULCAN_JAX_FASTCHEM_DIR`` at it and run FastChem without contending on the
+    package's shared ``fcntl.flock``. Idempotent via a ready marker; ``output/``
+    is always (re)created empty. The binary must already exist in the package
+    tree — the parent builds it before the pool starts.
+    """
+    marker = worker_root / _FASTCHEM_TREE_READY_MARKER
+    fastchem_root = worker_root / "fastchem_vulcan"
+    if marker.exists():
+        ensure_dir(fastchem_root / "output")
+        return fastchem_root
+    if worker_root.exists():
+        shutil.rmtree(worker_root)
+    worker_root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        package_root / "fastchem_vulcan",
+        fastchem_root,
+        ignore=shutil.ignore_patterns(
+            "obj", "output", ".fastchem_lock", "*.pyc", "__pycache__"
+        ),
+    )
+    ensure_dir(fastchem_root / "output")
+    marker.write_text("")
+    return fastchem_root
+
+
+def _host_setup_worker_init(
+    config: dict[str, Any],
+    package_root_str: str,
+    scratch_base_str: str,
+    network: str,
+) -> None:
+    """Initialise one spawn worker: pin JAX to CPU, seed FastChem, import vulcan_jax.
+
+    Runs once per worker process (persistent pool). CPU-only so the workers never
+    touch the H100 the parent integrates on; each gets a private FastChem tree so
+    the cross-process flock is uncontended.
+    """
+    import os as _os
+
+    # Pin to CPU BEFORE vulcan_jax's first device query. `jax` may already be
+    # imported (the spawn bootstrap imports the package __main__ -> cli), but no
+    # backend is initialised until first use, so a late JAX_PLATFORMS still wins.
+    _os.environ["JAX_PLATFORMS"] = "cpu"
+    _os.environ["JAX_ENABLE_X64"] = "1"
+    # Pin the dataset network and a PRIVATE FastChem tree before importing
+    # vulcan_jax — both are read at import (module-level constants).
+    _os.environ["VULCAN_JAX_NETWORK"] = network
+    worker_root = Path(scratch_base_str) / f"hs_pid_{_os.getpid()}"
+    fastchem_root = _seed_vulcan_jax_fastchem_tree(Path(package_root_str), worker_root)
+    _os.environ["VULCAN_JAX_FASTCHEM_DIR"] = str(fastchem_root)
+
+    import vulcan_jax.vulcan_cfg as vjcfg
+
+    vjcfg.atom_list = _vulcan_atom_list(config)
+    from vulcan_jax.state import RunState
+
+    global _HS_VJCFG, _HS_CONFIG, _HS_RUNSTATE, _HS_INPUTS_DIR
+    _HS_VJCFG = vjcfg
+    _HS_CONFIG = config
+    _HS_RUNSTATE = RunState
+    _HS_INPUTS_DIR = ensure_dir(worker_root / "inputs")
+
+
+def _host_setup_worker_task(spec: RunSpecification):
+    """Build one profile's RunState on a host-setup worker (FastChem on CPU).
+
+    Returns ``(run_id, runstate_or_None, error_or_None)``. The RunState is
+    pickled back to the parent, which buckets it and integrates on the GPU. The
+    chem-RHS warmup is skipped — the parent compiles the device runner.
+    """
+    try:
+        tp_file, spectrum_file = _write_worker_inputs(_HS_INPUTS_DIR, spec)
+        _set_vulcan_jax_cfg_inprocess(
+            _HS_VJCFG, spec, _HS_CONFIG, tp_file, spectrum_file
+        )
+        rs = _HS_RUNSTATE.with_pre_loop_setup(_HS_VJCFG, skip_chem_warmup=True)
+        return (spec.run_id, rs, None)
+    except Exception as exc:  # noqa: BLE001 - reported to parent for backfill
+        return (spec.run_id, None, f"{type(exc).__name__}: {exc}")
+
+
+def _host_setup_worker_count(config: dict[str, Any]) -> int:
+    """Resolve the host-setup pool size (env override > config > auto-detect)."""
+    n = 0
+    env = os.environ.get("VULCAN_GEN_HOST_SETUP_WORKERS", "").strip()
+    if env:
+        try:
+            n = int(env)
+        except ValueError:
+            n = 0
+    if n <= 0:
+        n = int(config["generation"].get("gpu_batch", {}).get("host_setup_workers", 0))
+    if n <= 0:
+        n = _detect_available_cpus()
+    return max(1, n)
+
+
+def _get_host_setup_pool(
+    config: dict[str, Any],
+    package_root: Path,
+    scratch_base: Path,
+    network: str,
+    max_workers: int,
+) -> concurrent.futures.ProcessPoolExecutor:
+    """Lazily create (and cache) the persistent spawn pool for host setup.
+
+    Persistent across chunks so each worker imports vulcan_jax + seeds FastChem
+    exactly once.
+    """
+    global _HOST_SETUP_POOL, _HOST_SETUP_POOL_KEY, _HOST_SETUP_ATEXIT_REGISTERED
+    key = (str(package_root), str(scratch_base), network, int(max_workers))
+    if _HOST_SETUP_POOL is not None and _HOST_SETUP_POOL_KEY == key:
+        return _HOST_SETUP_POOL
+    if _HOST_SETUP_POOL is not None:
+        _HOST_SETUP_POOL.shutdown(wait=True)
+        _HOST_SETUP_POOL = None
+    ctx = multiprocessing.get_context("spawn")
+    _HOST_SETUP_POOL = concurrent.futures.ProcessPoolExecutor(
+        max_workers=int(max_workers),
+        mp_context=ctx,
+        initializer=_host_setup_worker_init,
+        initargs=(config, str(package_root), str(scratch_base), network),
+    )
+    _HOST_SETUP_POOL_KEY = key
+    if not _HOST_SETUP_ATEXIT_REGISTERED:
+        atexit.register(_shutdown_host_setup_pool)
+        _HOST_SETUP_ATEXIT_REGISTERED = True
+    LOGGER.info(
+        "Host-setup spawn pool: %d workers (reused across chunks)", int(max_workers)
+    )
+    return _HOST_SETUP_POOL
+
+
+def _shutdown_host_setup_pool() -> None:
+    """Tear down the persistent host-setup pool (atexit / end of generation)."""
+    global _HOST_SETUP_POOL, _HOST_SETUP_POOL_KEY
+    if _HOST_SETUP_POOL is not None:
+        try:
+            _HOST_SETUP_POOL.shutdown(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
+        _HOST_SETUP_POOL = None
+        _HOST_SETUP_POOL_KEY = None
+
+
 def _run_batch_vulcan_jax_gpu(
     specs: list[RunSpecification],
     *,
@@ -2377,18 +2560,21 @@ def _run_batch_vulcan_jax_gpu(
 ) -> tuple[list[Path], list[str]]:
     """In-process GPU-batched VULCAN-JAX generation.
 
-    Integrates a whole bucket of profiles in one ``jax.vmap``'d device call via
-    ``OuterLoop.run_batch``, replacing the per-profile subprocess pool on GPU
-    nodes. Profiles are bucketed by ``(nz, toggle-combo, atm_base)`` so each
-    batch is shape/network-homogeneous. Per-spec ``RunState`` construction is
-    SEQUENTIAL (``vulcan_jax.state`` reads the global ``vulcan_cfg`` module);
-    the bucket then integrates in parallel on device. Returns
-    ``(successes, failures)`` matching the ``_run_batch`` contract.
+    Two phases. (1) HOST SETUP is fanned out across the Grace cores by a
+    persistent spawn ``ProcessPool``: each worker builds one profile's RunState
+    (atmosphere + rates + FastChem-EQ abundances) on CPU and pickles it back.
+    This removes the FastChem subprocess (~0.5-5 s/profile) from the critical
+    path that would otherwise starve the GPU. (2) INTEGRATION groups the
+    RunStates by ``(nz, toggle-combo, atm_base)`` and integrates each bucket in
+    ``batch_size`` chunks in one ``jax.vmap``'d device call via
+    ``OuterLoop.run_batch``. Returns ``(successes, failures)`` matching the
+    ``_run_batch`` contract; setup failures / non-converged / non-finite runs go
+    to backfill.
 
-    NOT YET VALIDATED end-to-end (needs a GPU + the FastChem ``ini_mix='EQ'``
-    runtime). Correct-by-construction over the CPU-validated
-    ``OuterLoop.run_batch`` and the tested ``write_raw_run_hdf5`` contract;
-    validate against the real pipeline before a production run.
+    The parent never runs FastChem; it only re-derives each bucket's cfg
+    (cheap) to build the device runner, then calls ``prepare_runstate`` (which
+    reads bucket-invariant global cfg) on each worker-built RunState. Per-spec
+    data rides in the RunState, so one cfg-set per bucket is correct.
     """
     # Imported lazily so non-GPU generation never pays the JAX import cost.
     # CRITICAL ordering: vulcan_jax parses the chemical network ONCE at the very
@@ -2415,7 +2601,6 @@ def _run_batch_vulcan_jax_gpu(
         stack_integ_states,
         unstack_integ_states,
     )
-    from vulcan_jax.state import RunState
 
     species_list = list(chem_funs.spec_list)
     # If a prior import already parsed a different network, the species list
@@ -2434,41 +2619,100 @@ def _run_batch_vulcan_jax_gpu(
     batch_size = int(gpu_cfg.get("batch_size", 64))
     require_converged = bool(gpu_cfg.get("require_converged", True))
     inputs_dir = ensure_dir(worker_base / "gpu_inproc_inputs")
+    network = str(config["vulcan_runtime"]["chemistry_file"])
 
     successes: list[Path] = []
     failures: list[str] = []
+    if not specs:
+        return successes, failures
 
-    buckets: dict[tuple, list[RunSpecification]] = {}
-    for spec in specs:
-        buckets.setdefault(_gpu_bucket_key(spec, config), []).append(spec)
+    # The host-setup workers seed their private FastChem trees by copying the
+    # installed package's `fastchem_vulcan/`, which must contain a built binary.
+    # Build it once here (in the package tree — the parent has no
+    # $VULCAN_JAX_FASTCHEM_DIR override) so the copy always finds it.
+    import vulcan_jax.ini_abun as _ini_abun
 
-    for bucket_specs in buckets.values():
-        # One OuterLoop per bucket → the runner closure is built once for this
-        # (nz, toggle-combo) and reused across the bucket's batches.
+    _ini_abun._ensure_fastchem_binary()
+    package_root = _discover_installed_vulcan_jax_root()
+
+    # ---- Phase 1: parallel host setup on the Grace cores --------------------
+    n_workers = _host_setup_worker_count(config)
+    scratch_base = ensure_dir(worker_base / "gpu_host_setup")
+    pool = _get_host_setup_pool(
+        config, package_root, scratch_base, network, n_workers
+    )
+    spec_by_id = {spec.run_id: spec for spec in specs}
+    prepared: dict[str, Any] = {}  # run_id -> RunState (host-side, pickled back)
+    setup_t0 = time.monotonic()
+    futures = {
+        pool.submit(_host_setup_worker_task, spec): spec.run_id for spec in specs
+    }
+    for future in concurrent.futures.as_completed(futures):
+        run_id = futures[future]
+        try:
+            rid, rs, err = future.result()
+        except Exception:
+            LOGGER.warning(
+                "VULCAN-JAX-GPU host setup for %s crashed, will backfill",
+                run_id,
+                exc_info=True,
+            )
+            failures.append(run_id)
+            continue
+        if rs is None:
+            LOGGER.warning(
+                "VULCAN-JAX-GPU host setup for %s failed (%s), will backfill",
+                rid,
+                err,
+            )
+            failures.append(rid)
+            continue
+        prepared[rid] = rs
+    LOGGER.info(
+        "VULCAN-JAX-GPU host setup: %d/%d RunStates in %s (%d workers)",
+        len(prepared),
+        len(specs),
+        _format_seconds(time.monotonic() - setup_t0),
+        n_workers,
+    )
+    if not prepared:
+        return successes, failures
+
+    # ---- Phase 2: bucket + integrate each bucket on the device --------------
+    buckets: dict[tuple, list[str]] = {}
+    for run_id in prepared:
+        buckets.setdefault(
+            _gpu_bucket_key(spec_by_id[run_id], config), []
+        ).append(run_id)
+
+    for bucket_ids in buckets.values():
+        # Set the parent cfg to a bucket representative so `prepare_runstate`
+        # builds the device runner for this (nz, toggle-combo). The runner /
+        # statics are bucket-invariant; each profile's data flows through its
+        # own RunState, so one cfg-set per bucket is correct (writing the rep's
+        # input files is cheap and runs no FastChem).
+        rep_spec = spec_by_id[bucket_ids[0]]
+        rep_tp, rep_spectrum = _write_worker_inputs(inputs_dir, rep_spec)
+        _set_vulcan_jax_cfg_inprocess(vjcfg, rep_spec, config, rep_tp, rep_spectrum)
         integ = OuterLoop(op_jax.Ros2JAX(), op.Output())
-        for start in range(0, len(bucket_specs), batch_size):
-            chunk = bucket_specs[start : start + batch_size]
+        for start in range(0, len(bucket_ids), batch_size):
+            chunk_ids = bucket_ids[start : start + batch_size]
             inits: list[Any] = []
             atms: list[Any] = []
-            kept: list[RunSpecification] = []
-            for spec in chunk:
+            kept: list[str] = []
+            for run_id in chunk_ids:
                 try:
-                    tp_file, spectrum_file = _write_worker_inputs(inputs_dir, spec)
-                    _set_vulcan_jax_cfg_inprocess(
-                        vjcfg, spec, config, tp_file, spectrum_file
-                    )
-                    rs = RunState.with_pre_loop_setup(vjcfg)
-                    init_state, atm_static = integ.prepare_runstate(rs)
+                    init_state, atm_static = integ.prepare_runstate(prepared[run_id])
                     inits.append(init_state)
                     atms.append(atm_static)
-                    kept.append(spec)
+                    kept.append(run_id)
                 except Exception:
                     LOGGER.warning(
-                        "VULCAN-JAX-GPU setup for %s failed, will backfill",
-                        spec.run_id,
+                        "VULCAN-JAX-GPU prepare for %s failed, will backfill",
+                        run_id,
                         exc_info=True,
                     )
-                    failures.append(spec.run_id)
+                    failures.append(run_id)
             if not inits:
                 continue
             try:
@@ -2482,9 +2726,9 @@ def _run_batch_vulcan_jax_gpu(
                     len(inits),
                     exc_info=True,
                 )
-                failures.extend(spec.run_id for spec in kept)
+                failures.extend(kept)
                 continue
-            for spec, final in zip(kept, finals):
+            for run_id, final in zip(kept, finals):
                 # termination_reason: 1 converged, 4 stalled-converged (both ok),
                 # 2 runtime, 3 step-count, 5 non-finite.
                 reason = int(final.termination_reason)
@@ -2492,17 +2736,17 @@ def _run_batch_vulcan_jax_gpu(
                     LOGGER.warning(
                         "VULCAN-JAX-GPU run %s did not converge "
                         "(termination_reason=%d), will backfill",
-                        spec.run_id,
+                        run_id,
                         reason,
                     )
-                    failures.append(spec.run_id)
+                    failures.append(run_id)
                     continue
                 try:
-                    out_h5 = runs_dir / f"{spec.run_id}.h5"
+                    out_h5 = runs_dir / f"{run_id}.h5"
                     successes.append(
                         _write_batched_run_hdf5(
                             final,
-                            spec=spec,
+                            spec=spec_by_id[run_id],
                             config=config,
                             output_h5_path=out_h5,
                             species_list=species_list,
@@ -2511,10 +2755,13 @@ def _run_batch_vulcan_jax_gpu(
                 except Exception:
                     LOGGER.warning(
                         "VULCAN-JAX-GPU write for %s failed, will backfill",
-                        spec.run_id,
+                        run_id,
                         exc_info=True,
                     )
-                    failures.append(spec.run_id)
+                    failures.append(run_id)
+        # Drop this bucket's RunStates promptly to bound peak host memory.
+        for run_id in bucket_ids:
+            prepared.pop(run_id, None)
     return successes, failures
 
 

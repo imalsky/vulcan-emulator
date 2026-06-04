@@ -192,6 +192,28 @@ Supported filter keys: `Teq`, `LogMet`, `LogDrag`, `Mstar`, `Rp`, `logG` (numeri
 | `fastchem_timeout_seconds` | FastChem subprocess timeout in seconds (default `30.0`) |
 | `vulcan_timeout_seconds` | VULCAN subprocess timeout in seconds (default `1800.0`). Stalled condensation runs raise `subprocess.TimeoutExpired`, which the worker pool routes through the standard `backfill` path. |
 | `backfill` | `{enabled, max_retries}` for VULCAN failure recovery |
+| `gpu_batch` | GPU-batched VULCAN-JAX generation (see below). `{enabled, batch_size, require_converged, host_setup_workers}` |
+
+#### `generation.gpu_batch` (GPU nodes, `chemistry_type = "vulcan"` only)
+
+On a GPU node, set `gpu_batch.enabled: true` to run generation **in-process on the
+GPU** — profiles are bucketed by `(nz, toggle-combo, atm_base)` and each bucket is
+integrated in one `jax.vmap`'d call via `vulcan_jax.OuterLoop.run_batch`, instead of
+one CPU subprocess per profile. The HPC scripts auto-detect a usable GPU and flip this
+on (`$VULCAN_GEN_GPU_BATCH`), so no config edit is needed on the cluster. Requires
+**`vulcan-jax >= 0.1.10`**. `parallel_workers` is ignored in this mode.
+
+| Key | Description |
+|-----|-------------|
+| `enabled` | Turn on the GPU-batched path (default `false`) |
+| `batch_size` | Profiles per `vmap` device call (default `64`); pad/cap to device memory |
+| `require_converged` | Send non-converged runs to backfill (default `true`); non-finite always backfills |
+| `host_setup_workers` | Size of the CPU pool that builds profiles (atmosphere + rates + FastChem) to feed the GPU (`0` = auto-detect cores). `$VULCAN_GEN_HOST_SETUP_WORKERS` / PBS `GEN_HOST_SETUP_WORKERS` overrides it. |
+
+Per-profile host setup (dominated by the FastChem subprocess) is fanned out across the
+CPU cores by a persistent **spawn `ProcessPool`** so it doesn't starve the GPU; each
+worker holds its own `vulcan_jax` import + a private FastChem tree. Recommend
+`sample_chunk_size` be a comfortable multiple of `batch_size`.
 
 `generation.mode` is a deprecated compatibility field. When present it must
 remain `"vulcan"`, but backend selection now comes from `chemistry_type` and

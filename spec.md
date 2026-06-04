@@ -344,6 +344,18 @@ Worker runtime scratch directories use `tempfile.mkdtemp()` for staging and
 `data/vulcan_workers/` for per-worker VULCAN checkouts. No persistent
 `runtime/` directory is created.
 
+#### GPU-batched generation (optional, GPU nodes)
+
+When `generation.gpu_batch.enabled` (the HPC scripts auto-enable it on a usable
+GPU; requires `vulcan-jax >= 0.1.10`), the `vulcan_jax` backend integrates whole
+`(nz, toggle-combo, atm_base)` buckets of profiles in one `jax.vmap`'d device call
+(`OuterLoop.run_batch`) instead of one CPU subprocess per profile. Per-profile host
+setup (atmosphere + rates + FastChem-EQ abundances) runs on a persistent spawn
+`ProcessPool` across the CPU cores (`data/vulcan_workers/.../gpu_host_setup/`), each
+worker with a private FastChem tree. This is an execution-backend choice only: it
+writes the **identical raw HDF5 contract** below (via the same `write_raw_run_hdf5`),
+so normalization / training / export are unaffected. See `docs/config_guide.md`.
+
 ## Raw Data Contract
 
 ### FastChem raw run
