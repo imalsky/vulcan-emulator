@@ -9,12 +9,12 @@
 # After every shard succeeds, run_merge.sh combines them via
 # `--stage merge_shards`. Submit both via submit_gen_array.sh.
 #
-# Usage:
-#   CONFIG_PATH=config/exogibbs_luhman16a_10k.json bash supercomputer_cmds/submit_gen_array.sh
+# Usage (default config is the 100k condensation set; 4 shards = 4 CPU nodes):
+#   bash supercomputer_cmds/submit_gen_array.sh
 #   CONFIG_PATH=config/vulcan_luhman16a_10k.json bash supercomputer_cmds/submit_gen_array.sh
 #
 # Re-run a failed shard (e.g. shard 2):
-#   CONFIG_PATH=config/vulcan_luhman16a_10k.json sbatch --array=2 supercomputer_cmds/run_gen_array.sh
+#   sbatch --array=2 supercomputer_cmds/run_gen_array.sh
 #
 #SBATCH -J vulcan_gen_array
 #SBATCH -o %x_%A_%a.o
@@ -40,7 +40,7 @@ finish() {
 trap finish EXIT
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-1}
 export CONDA_ENV CONFIG_PATH
 

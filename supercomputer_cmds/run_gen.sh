@@ -1,7 +1,11 @@
 #!/bin/bash
 # Run pipeline stages: generation + (optional) normalization.
 #
-# Default invocation (VULCAN-JAX Luhman 16A 10k):
+# This is the SINGLE-NODE generation path. For the 100k condensation set use the
+# 4-node sharded path instead (much faster):
+#   bash supercomputer_cmds/submit_gen_array.sh
+#
+# Default invocation (VULCAN-JAX Luhman 16A 100k, single node — slow, ~46 h):
 #   sbatch supercomputer_cmds/run_gen.sh
 #
 # ExoGibbs Luhman 16A 10k:
@@ -9,7 +13,7 @@
 #          supercomputer_cmds/run_gen.sh
 #
 # VULCAN-JAX Luhman 16A 10k:
-#   sbatch -t 120:00:00 --job-name=vulcan_gen_luhman16a \
+#   sbatch --job-name=vulcan_gen_luhman16a \
 #          --export=ALL,CONFIG_PATH=config/vulcan_luhman16a_10k.json \
 #          supercomputer_cmds/run_gen.sh
 #SBATCH -J vulcan_gen
@@ -35,7 +39,7 @@ finish() {
 trap finish EXIT
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
 SKIP_NORM=${SKIP_NORM:-0}
 export CONDA_ENV CONFIG_PATH SKIP_NORM

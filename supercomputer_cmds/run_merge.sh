@@ -34,7 +34,7 @@ finish() {
 trap finish EXIT
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}
 SKIP_NORM=${SKIP_NORM:-0}
 export CONDA_ENV CONFIG_PATH SKIP_NORM
 

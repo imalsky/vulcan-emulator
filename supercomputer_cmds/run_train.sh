@@ -1,7 +1,8 @@
 #!/bin/bash
-# Run pipeline stages: training + (optional) export.
+# Run pipeline stages: training + (optional) export. GPU job, 1 node.
+# Epochs / early stopping come from the config (100k: 1000 epochs, patience 20).
 #
-# Default invocation (VULCAN-JAX Luhman 16A 10k):
+# Default invocation (VULCAN-JAX Luhman 16A 100k condensation):
 #   sbatch supercomputer_cmds/run_train.sh
 #
 # ExoGibbs:
@@ -29,7 +30,7 @@
 set -euo pipefail
 
 CONDA_ENV=${CONDA_ENV:-vulcan}
-CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
 SKIP_EXPORT=${SKIP_EXPORT:-0}
 

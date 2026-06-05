@@ -1,6 +1,6 @@
 {
  "_comment_units": "Pressures: bar (or log10(bar) for log10_*_bar keys). Temperatures: K. Times: seconds. Abundances: number ratio rel H (n_X/n_H), solar anchors in src/constants.py:SOLAR_ABUNDANCES. Log10 quantities: dex.",
- "_comment_purpose": "VULCAN disequilibrium vertical-mixing emulator for the Luhman 16A brown-dwarf high-resolution retrieval test case. 100k training runs. Kzz varied over [1e4, 1e10] cm2/s. Condensation ON (H2O + S8). T-P profiles use 30% simple power-law profiles and 70% modified-Guillot profiles; no Roth/PT-library profiles. Single GH200 node, 72-way CPU-parallel vulcan_jax generation (resume-safe).",
+ "_comment_purpose": "VULCAN disequilibrium vertical-mixing emulator for the Luhman 16A brown-dwarf high-resolution retrieval test case. 100k training runs. Kzz varied over [1e4, 1e10] cm2/s. Condensation ON (H2O + S8). T-P profiles use 30% simple power-law profiles and 70% modified-Guillot profiles; no Roth/PT-library profiles. Generation is a 4-node CPU job (SLURM array via submit_gen_array.sh -> run_gen_array.sh), 48-way CPU-parallel vulcan_jax per node, resume-safe. Training is GPU; 1000 epochs with early stopping.",
  "chemistry_type": "vulcan",
  "model_type": "transformer",
  "paths": {
@@ -191,7 +191,7 @@
   }
  },
  "generation": {
-  "_comment": "100k VULCAN-JAX kinetics runs with condensation. Single GH200 node, CPU subprocess pool. parallel_workers=48: each vulcan_jax worker uses ~2 threads (measured 2026-06 on the GH200: 48 workers -> ~88% CPU, mild oversubscribe of the 72 cores), so 72 would 2x-oversubscribe and thrash. ~80 s/profile -> ~46 h for 100k single-node; SHARD across nodes (run_gen_array.sh) for production. Resume-safe.",
+  "_comment": "100k VULCAN-JAX kinetics runs with condensation. 4-node CPU job: SLURM array (submit_gen_array.sh -> run_gen_array.sh) splits the deterministic sampling plan into 4 shards of 25k runs, one node each, parallel_workers=48 per node (CPU subprocess pool). ~80 s/profile -> ~46 h single-node, ~12 h/shard across 4 nodes. Resume-safe; shards merged into raw/runs.h5 by run_merge.sh.",
   "num_runs": 100000,
   "seed": 7,
   "overwrite": false,
@@ -251,7 +251,7 @@
  "training": {
   "seed": 123,
   "batch_size": 256,
-  "epochs": 200,
+  "epochs": 1000,
   "learning_rate": 0.0001,
   "min_lr": 1e-06,
   "warmup_epochs": 20,

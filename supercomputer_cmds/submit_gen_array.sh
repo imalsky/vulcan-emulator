@@ -5,11 +5,13 @@
 # env before any array task starts, preventing pip-install race conditions
 # on NFS.
 #
+# Default config is the 100k condensation set (4 shards = 4 CPU nodes, 25k runs
+# each). On the edge cluster prepare the 'vulcan' conda env once on a login node
+# first (SKIP_INSTALL defaults to 1 here; run_install.sh is NAS/PBS-only).
+#
 # Usage:
 #   bash supercomputer_cmds/submit_gen_array.sh
-#   CONFIG_PATH=config/exogibbs_luhman16a_10k.json bash supercomputer_cmds/submit_gen_array.sh
 #   CONFIG_PATH=config/vulcan_luhman16a_10k.json bash supercomputer_cmds/submit_gen_array.sh
-#   SKIP_INSTALL=1 bash supercomputer_cmds/submit_gen_array.sh   # env already set up
 #
 # Prints all job IDs. The merge job fires automatically once every array
 # task succeeds (--dependency=afterok). If any shard fails, the merge job
@@ -19,8 +21,12 @@
 
 set -euo pipefail
 
-CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}
-SKIP_INSTALL=${SKIP_INSTALL:-0}
+CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}
+# Default SKIP_INSTALL=1 on the edge cluster: run_install.sh is NAS/PBS-only
+# (module load miniconda3/gh2, pyt2_8_gh env, /nobackup) and fails here. Prepare
+# the 'vulcan' conda env once on a login node (pip install vulcan-jax from
+# TestPyPI + this package editable), then submit. Set SKIP_INSTALL=0 only on NAS.
+SKIP_INSTALL=${SKIP_INSTALL:-1}
 NUM_SHARDS=${NUM_SHARDS:-4}
 if [ "$NUM_SHARDS" -lt 1 ]; then
   echo "ERROR: NUM_SHARDS must be >= 1 (got ${NUM_SHARDS})." >&2
