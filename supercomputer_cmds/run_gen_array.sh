@@ -13,8 +13,9 @@
 #   bash supercomputer_cmds/submit_gen_array.sh
 #   CONFIG_PATH=config/vulcan_luhman16a_10k.json bash supercomputer_cmds/submit_gen_array.sh
 #
-# Re-run a failed shard (e.g. shard 2):
-#   sbatch --array=2 supercomputer_cmds/run_gen_array.sh
+# Re-run a failed shard (e.g. shard 2). NUM_SHARDS defaults to 4; pass it
+# explicitly if the original run used a different count:
+#   sbatch --array=2 --export=ALL,NUM_SHARDS=4 supercomputer_cmds/run_gen_array.sh
 #
 #SBATCH -J vulcan_gen_array
 #SBATCH -o %x_%A_%a.o
@@ -44,7 +45,11 @@ CONFIG_PATH=${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}
 SKIP_INSTALL=${SKIP_INSTALL:-1}
 export CONDA_ENV CONFIG_PATH
 
-NUM_SHARDS=${NUM_SHARDS:-${SLURM_ARRAY_TASK_COUNT:-4}}
+# NUM_SHARDS must match the shard count the dataset was planned for. It defaults
+# to 4 (the canonical plan); submit_gen_array.sh always passes it explicitly. Do
+# NOT derive it from the array size — a single-element resume array (--array=K)
+# would otherwise imply NUM_SHARDS=1 and break the shard slicing / seed layout.
+NUM_SHARDS=${NUM_SHARDS:-4}
 if [ "$NUM_SHARDS" -lt 1 ]; then
   echo "ERROR: NUM_SHARDS must be >= 1 (got ${NUM_SHARDS})." >&2
   exit 2
@@ -77,6 +82,11 @@ CONDA_BASE="$(dirname "$(dirname "$CONDA_EXE")")"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
+  if [ "$SKIP_INSTALL" = "1" ]; then
+    echo "ERROR: SKIP_INSTALL=1 but conda env '$CONDA_ENV' does not exist." >&2
+    echo "       Build it once on a login node (vulcan-jax + deps) before submitting." >&2
+    exit 2
+  fi
   echo "[setup] creating conda env '$CONDA_ENV' (python=3.11, conda-forge)"
   conda create -y -n "$CONDA_ENV" -c conda-forge --override-channels python=3.11 pip
 fi

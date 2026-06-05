@@ -51,6 +51,11 @@ CONDA_BASE="$(dirname "$(dirname "$CONDA_EXE")")"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
+  if [ "$SKIP_INSTALL" = "1" ]; then
+    echo "ERROR: SKIP_INSTALL=1 but conda env '$CONDA_ENV' does not exist." >&2
+    echo "       Build it once on a login node (jax[cuda12] + deps) before submitting." >&2
+    exit 2
+  fi
   echo "[setup] creating conda env '$CONDA_ENV' (python=3.11, conda-forge)"
   conda create -y -n "$CONDA_ENV" -c conda-forge --override-channels python=3.11 pip
 fi
@@ -95,16 +100,60 @@ if backend not in {"gpu", "cuda", "rocm", "metal"}:
     raise SystemExit(f"ERROR: JAX backend is '{backend}', expected a GPU backend")
 PY
 
+# Reuse-only contract check: the training stage's ensure_processed silently
+# falls through to REGENERATION (which needs vulcan_jax, absent in this GPU env)
+# if the processed dataset is missing/incompatible. Fail fast here — before the
+# GPU is allocated — instead of detonating mid-run.
 python - <<PY
+import json
+import sys
 from pathlib import Path
-from src.utils.config import load_and_validate_config
+from src.data_generation.data_loader import processed_info_dir
+from src.utils.config import get_chemistry_type, get_model_type, load_and_validate_config
+
 cfg = load_and_validate_config(Path("$CONFIG_PATH").expanduser().resolve())
 processed_root = Path(cfg["paths"]["processed_root"])
+if not processed_root.is_absolute():
+    processed_root = (Path.cwd() / processed_root).resolve()
+
+required = (
+    "metadata.json", "run_ids.json", "sequence_inputs.npy", "target_outputs.npy",
+    "global_inputs.npy", "valid_mask.npy", "position_coord.npy",
+)
+problems = []
 for split in ("train", "val", "test"):
-    if not (processed_root / split).is_dir():
-        raise SystemExit(f"ERROR: processed data missing: {processed_root / split}")
+    split_dir = processed_root / split
+    if not split_dir.is_dir():
+        problems.append(f"missing split dir {split_dir}")
+        continue
+    for filename in required:
+        if not (split_dir / filename).exists():
+            problems.append(f"missing {split_dir / filename}")
+
+contract_path = processed_info_dir(processed_root) / "data_contract.json"
+if not contract_path.exists():
+    problems.append(f"missing {contract_path}")
+else:
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if str(contract.get("chemistry_type", "")).lower() != get_chemistry_type(cfg):
+        problems.append("chemistry_type mismatch vs processed data_contract")
+    if str(contract.get("model_type", "")).lower() != get_model_type(cfg):
+        problems.append("model_type mismatch vs processed data_contract")
+    if list(contract.get("sequence_static_feature_order", [])) != list(cfg["data_spec"]["sequence_static_feature_order"]):
+        problems.append("sequence feature order mismatch vs processed data_contract")
+    if list(contract.get("global_static_feature_order", [])) != list(cfg["data_spec"]["global_static_feature_order"]):
+        problems.append("global feature order mismatch vs processed data_contract")
+
+if problems:
+    print("ERROR: processed dataset missing or incompatible with this config.")
+    print("       The training stage would try to REGENERATE (needs vulcan_jax) and fail on the GPU node.")
+    print("       Run generation+merge+normalization with this config first.")
+    for problem in problems:
+        print(f"       - {problem}")
+    sys.exit(1)
+
 print(f"[preflight] chemistry_type={cfg['chemistry_type']} model_type={cfg['model_type']}")
-print(f"[preflight] processed_root={processed_root}")
+print(f"[preflight] processed_root={processed_root} (contract OK, required tensors present)")
 print(f"[preflight] checkpoints_root={cfg['paths']['checkpoints_root']}")
 PY
 

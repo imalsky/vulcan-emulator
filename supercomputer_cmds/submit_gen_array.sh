@@ -16,8 +16,8 @@
 # Prints all job IDs. The merge job fires automatically once every array
 # task succeeds (--dependency=afterok). If any shard fails, the merge job
 # stays queued in DependencyNeverSatisfied until the failing shard is
-# re-submitted (sbatch --array=K) and merge is re-submitted manually with
-# --dependency=afterok:<new_array_id>.
+# re-submitted (sbatch --array=K --export=ALL,NUM_SHARDS=4) and merge is
+# re-submitted manually with --dependency=afterok:<new_array_id>.
 
 set -euo pipefail
 
