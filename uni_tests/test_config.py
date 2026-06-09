@@ -208,16 +208,22 @@ def test_huber_loss_requires_huber_delta(tmp_path):
 
 
 def test_public_surfaces_default_to_shipped_luhman16a_config():
-    """The shell scripts, CLI, tuning entrypoint, and docs must agree on
-    the default shipped config name. Drift here is a contract bug.
+    """CLI, tuning entrypoint, HPC scripts, and docs must default to a shipped
+    Luhman 16A config. Local entry points (CLI / tuning / docs) default to the
+    10k profile set; the HPC PBS scripts (run on big nodes) default to the 100k
+    set. Drift to a config name that is not shipped is a contract bug.
     """
     cli_text = (ROOT / "src" / "utils" / "cli.py").read_text(encoding="utf-8")
     tuning_text = (ROOT / "src" / "tuning" / "__main__.py").read_text(encoding="utf-8")
-    run_pbs_text = (ROOT / "supercomputer_cmds" / "run.pbs").read_text(encoding="utf-8")
 
     assert 'default="config/vulcan_luhman16a_10k.json"' in cli_text
     assert 'default="config/vulcan_luhman16a_10k.json"' in tuning_text
-    assert 'CONFIG_PATH="${CONFIG_PATH:-config/vulcan_luhman16a_10k.json}"' in run_pbs_text
+
+    for hpc in ("run_train.pbs", "run_gen.pbs"):
+        text = (ROOT / "supercomputer_cmds" / hpc).read_text(encoding="utf-8")
+        assert (
+            'CONFIG_PATH="${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}"' in text
+        )
 
     for path in (ROOT / "docs" / "README.md", ROOT / "docs" / "config_guide.md"):
         text = path.read_text(encoding="utf-8")

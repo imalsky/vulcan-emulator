@@ -1949,11 +1949,24 @@ def convert_fastchem_output_to_hdf5(
     state_species = list(config["data_spec"]["state_species"])
     output_species = list(config["data_spec"]["output_species"])
     requested_species = list(dict.fromkeys([*state_species, *output_species]))
-    missing = [name for name in requested_species if name not in fc.dtype.names]
+
+    def _fc_has(name: str) -> bool:
+        # FastChem renames the pressure column to 'P', so np.genfromtxt exposes
+        # atomic phosphorus as 'P_1' (deduplicated header). A bare 'P' column is
+        # PRESSURE, not a species — requesting species 'P' must read 'P_1'.
+        if name == "P":
+            return "P_1" in fc.dtype.names
+        return name in fc.dtype.names
+
+    def _fc_col(name: str) -> np.ndarray:
+        col = "P_1" if name == "P" and "P_1" in fc.dtype.names else name
+        return np.asarray(fc[col], dtype=np.float64)
+
+    missing = [name for name in requested_species if not _fc_has(name)]
     if missing:
         raise ValueError(f"FastChem output is missing requested species: {missing}")
     reference_ymix_state = np.column_stack(
-        [np.asarray(fc[name], dtype=np.float64) for name in state_species]
+        [_fc_col(name) for name in state_species]
     )
     if reference_ymix_state.shape[0] != spec.pressure_bar.size:
         raise ValueError(
@@ -1961,7 +1974,7 @@ def convert_fastchem_output_to_hdf5(
         )
 
     equilibrium_ymix = np.column_stack(
-        [np.asarray(fc[name], dtype=np.float64) for name in output_species]
+        [_fc_col(name) for name in output_species]
     )
     return write_equilibrium_hdf5(
         output_h5_path,

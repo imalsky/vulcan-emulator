@@ -146,12 +146,18 @@ def test_patch_python_assignments_replaces_multiline_assignment():
 
 
 def test_vulcan_jax_backend_requires_importable_package(monkeypatch):
-    def fake_import_module(name: str):
-        if name == "vulcan_jax":
-            raise ImportError("missing vulcan_jax")
-        raise AssertionError(f"unexpected import: {name}")
+    # _discover_installed_vulcan_jax_root resolves the package with
+    # importlib.util.find_spec (NOT import_module), so "absent" must be simulated
+    # by making find_spec return None — otherwise an installed vulcan_jax is found
+    # regardless of any import_module patch.
+    real_find_spec = generation.importlib.util.find_spec
 
-    monkeypatch.setattr(generation.importlib, "import_module", fake_import_module)
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "vulcan_jax":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(generation.importlib.util, "find_spec", fake_find_spec)
 
     with pytest.raises(RuntimeError, match="requires an importable vulcan_jax"):
         generation._discover_installed_vulcan_jax_root()

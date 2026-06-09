@@ -46,32 +46,33 @@ SOLAR_ABUNDANCES: dict[str, float] = {
     "S_H": 1.32e-5,
 }
 
-# Lodders (2009) solar abundances shipped with the FastChem runtime at
-# ``VULCAN-master/fastchem_vulcan/input/solar_element_abundances.dat``.
-# FastChem reads these at every training run and overrides only He/C/O/N/S
-# from the sampled globals, so any classical reference that claims to mirror
-# the FastChem training contract must use *these* values as the background
-# for refractories (P, Si, Ti, V, Cl, K, Na, Mg, F, Ca, Fe) — not the AAG21
-# background that ExoGibbs defaults to.
-# Values are n_X/n_H, converted from log_eps = log10(n_X/n_H) + 12 entries in
-# the FastChem file.
+# Solar abundances shipped with the FastChem runtime at
+# ``VULCAN-master/fastchem_vulcan/input/solar_element_abundances.dat`` — the file
+# FastChem actually reads each training run (it overrides only He/C/O/N/S from the
+# sampled globals). These MUST track that file; it now uses Lodders 2019 / Wogan &
+# Tsai 2023 values (He=10.9232, S=7.1492; was Lodders-2009 He=10.9864, S=7.12) with
+# refractories (P, Si, Ti, V, Cl, K, Na, Mg, F, Ca, Fe) suppressed to log_eps=-3.0,
+# because the shipped NCHO/SNCHO networks contain no refractory species (full-solar
+# refractories would sequester O into metal-oxide species the network can't read).
+# So any classical reference that mirrors the FastChem contract uses these (not the
+# AAG21 background ExoGibbs defaults to). Values are n_X/n_H = 10^(log_eps - 12).
 FASTCHEM_LODDERS_SOLAR_ABUNDANCES: dict[str, float] = {
-    "He": 10.0 ** (10.9864 - 12.0),
+    "He": 10.0 ** (10.9232 - 12.0),
     "C": 10.0 ** (8.4434 - 12.0),
     "N": 10.0 ** (7.9130 - 12.0),
     "O": 10.0 ** (8.7826 - 12.0),
-    "S": 10.0 ** (7.12 - 12.0),
-    "P": 10.0 ** (5.5058 - 12.0),
-    "Si": 10.0 ** (7.5867 - 12.0),
-    "Ti": 10.0 ** (4.9794 - 12.0),
-    "V": 10.0 ** (4.0437 - 12.0),
-    "Cl": 10.0 ** (5.3002 - 12.0),
-    "K": 10.0 ** (5.1619 - 12.0),
-    "Na": 10.0 ** (6.3479 - 12.0),
-    "Mg": 10.0 ** (7.5995 - 12.0),
-    "F": 10.0 ** (4.49196 - 12.0),
-    "Ca": 10.0 ** (6.3677 - 12.0),
-    "Fe": 10.0 ** (7.5151 - 12.0),
+    "S": 10.0 ** (7.1492 - 12.0),
+    "P": 10.0 ** (-3.0 - 12.0),
+    "Si": 10.0 ** (-3.0 - 12.0),
+    "Ti": 10.0 ** (-3.0 - 12.0),
+    "V": 10.0 ** (-3.0 - 12.0),
+    "Cl": 10.0 ** (-3.0 - 12.0),
+    "K": 10.0 ** (-3.0 - 12.0),
+    "Na": 10.0 ** (-3.0 - 12.0),
+    "Mg": 10.0 ** (-3.0 - 12.0),
+    "F": 10.0 ** (-3.0 - 12.0),
+    "Ca": 10.0 ** (-3.0 - 12.0),
+    "Fe": 10.0 ** (-3.0 - 12.0),
 }
 
 # =========================================================================
