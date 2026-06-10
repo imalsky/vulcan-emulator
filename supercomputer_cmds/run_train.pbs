@@ -17,7 +17,8 @@
 #
 # Env (-v):
 #   CONFIG_PATH   default config/vulcan_luhman16a_100k.json
-#   SKIP_NORM     1 to skip normalization (processed tensors already on disk)
+#   SKIP_NORM     auto (default) skips normalization when compatible processed
+#                 tensors already exist; 1 forces skip, 0 forces normalization
 #   CONDA_ENV, VULCAN_SCRATCH   as in run_install
 # =============================================================================
 set -uo pipefail
@@ -40,7 +41,11 @@ SCRIPT_DIR="${PROJECT_ROOT}/supercomputer_cmds"
 
 CONFIG_PATH="${CONFIG_PATH:-config/vulcan_luhman16a_100k.json}"
 [ -f "${CONFIG_PATH}" ] || { echo "ERROR: config not found: ${CONFIG_PATH}"; exit 1; }
-SKIP_NORM="${SKIP_NORM:-0}"
+SKIP_NORM="${SKIP_NORM:-auto}"
+case "${SKIP_NORM}" in
+  auto|0|1) ;;
+  *) echo "ERROR: SKIP_NORM must be one of auto, 0, or 1; got '${SKIP_NORM}'."; exit 1 ;;
+esac
 
 # --- caches off $HOME, conda, vulcan_jax ready --------------------------------
 # shellcheck source=/dev/null
@@ -97,11 +102,79 @@ if [ "${COUNT}" -lt "${EXPECTED}" ]; then
 fi
 
 # --- normalization (CPU) ------------------------------------------------------
-if [ "${SKIP_NORM}" != "1" ]; then
+RUN_NORM=1
+NORM_REASON=""
+if [ "${SKIP_NORM}" = "1" ]; then
+  RUN_NORM=0
+  NORM_REASON="SKIPPED via SKIP_NORM=1"
+elif [ "${SKIP_NORM}" = "auto" ]; then
+  if NORM_REASON="$(python - "${CONFIG_PATH}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from src.data_generation.data_loader import processed_info_dir
+from src.utils.config import get_chemistry_type, get_model_type, load_and_validate_config
+
+config = load_and_validate_config(Path(sys.argv[1]).expanduser().resolve())
+processed_root = Path(config["paths"]["processed_root"])
+if not processed_root.is_absolute():
+    processed_root = (Path.cwd() / processed_root).resolve()
+info_dir = processed_info_dir(processed_root)
+contract_path = info_dir / "data_contract.json"
+required_split_files = (
+    "metadata.json",
+    "run_ids.json",
+    "sequence_inputs.npy",
+    "target_outputs.npy",
+    "global_inputs.npy",
+    "valid_mask.npy",
+    "position_coord.npy",
+)
+
+reasons = []
+if not contract_path.exists():
+    reasons.append(f"missing {contract_path}")
+else:
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        reasons.append(f"could not read {contract_path}: {type(exc).__name__}: {exc}")
+    else:
+        if str(contract.get("chemistry_type", "")).lower() != get_chemistry_type(config):
+            reasons.append("chemistry_type mismatch")
+        if str(contract.get("model_type", "")).lower() != get_model_type(config):
+            reasons.append("model_type mismatch")
+        expected_sequence = list(config["data_spec"]["sequence_static_feature_order"])
+        expected_globals = list(config["data_spec"]["global_static_feature_order"])
+        if list(contract.get("sequence_static_feature_order", [])) != expected_sequence:
+            reasons.append("sequence feature order mismatch")
+        if list(contract.get("global_static_feature_order", [])) != expected_globals:
+            reasons.append("global feature order mismatch")
+
+for split in ("train", "val", "test"):
+    split_dir = processed_root / split
+    for filename in required_split_files:
+        if not (split_dir / filename).exists():
+            reasons.append(f"missing {split_dir / filename}")
+
+if reasons:
+    print("AUTO: processed dataset not reusable; " + "; ".join(reasons))
+    sys.exit(1)
+
+print(f"SKIPPED: compatible processed dataset exists at {processed_root}")
+PY
+)"; then
+    RUN_NORM=0
+  fi
+fi
+
+if [ "${RUN_NORM}" = "1" ]; then
   echo "========== Stage: normalization =========="
+  [ -n "${NORM_REASON}" ] && echo "${NORM_REASON}"
   python -u -m src.utils --config "${CONFIG_PATH}" --stage normalization
 else
-  echo "========== Stage: normalization (SKIPPED via SKIP_NORM=1) =========="
+  echo "========== Stage: normalization (${NORM_REASON}) =========="
 fi
 
 # --- training (GPU) -----------------------------------------------------------

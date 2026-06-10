@@ -3,7 +3,7 @@
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
-#PBS -l walltime=00:30:00
+#PBS -l walltime=02:00:00
 #PBS -j oe
 #
 # =============================================================================
@@ -22,9 +22,9 @@
 # or just `pip install --user vulcan-jax`).
 #
 # Env (-v):
-#   BATCHES    batch sizes to sweep (default "8 32 128 256")
+#   BATCHES    batch sizes to sweep (default "8 64 256 1024")
 #   NZ         layers per profile (default 100)
-#   COUNT_MAX  Ros2 step cap per profile (default 200)
+#   COUNT_MAX  Ros2 step cap per profile (default 2000 -> lanes converge)
 #   CONDA_ENV  interpreter env (default pyt2_8_gh)
 # =============================================================================
 set -uo pipefail
@@ -55,12 +55,17 @@ module load miniconda3/gh2 2>/dev/null || true
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV:-pyt2_8_gh}"
 
-# vulcan_jax must be importable (the benchmark needs no FastChem, so no rebuild).
-python -c 'import vulcan_jax; print("vulcan_jax", vulcan_jax.__version__)' || {
-  echo "ERROR: 'vulcan_jax' is not importable in env '${CONDA_ENV:-pyt2_8_gh}'."
-  echo "       Install it first:  pip install --user vulcan-jax   (or qsub run_install.pbs)"
-  exit 1
-}
+# vulcan_jax must be importable AND new enough to carry the make_config cfg=
+# wiring that the benchmark's standalone config relies on (added after 0.1.10).
+python - <<'PY' || { echo "       Upgrade with:  qsub -v FORCE=1 supercomputer_cmds/run_install.pbs"; exit 1; }
+import sys, inspect
+import vulcan_jax
+from vulcan_jax import legacy_io
+print("vulcan_jax", vulcan_jax.__version__)
+if "cfg" not in inspect.signature(legacy_io.Output.__init__).parameters:
+    sys.exit(f"ERROR: vulcan_jax {vulcan_jax.__version__} is too old for this benchmark "
+             "(needs the make_config cfg= wiring, >=0.1.13).")
+PY
 
 # --- GPU runtime env (same knobs as run_gen.pbs's GPU branch) -----------------
 export PYTHONUNBUFFERED=1
@@ -83,9 +88,9 @@ sys.exit(0 if be in ("gpu", "cuda", "rocm") else 1)
 PY
 
 # --- run the benchmark --------------------------------------------------------
-BATCHES="${BATCHES:-8 32 128 256}"
+BATCHES="${BATCHES:-8 64 256 1024}"
 NZ="${NZ:-100}"
-COUNT_MAX="${COUNT_MAX:-200}"
+COUNT_MAX="${COUNT_MAX:-2000}"
 echo "========== VULCAN-JAX GPU benchmark (batches=${BATCHES}, nz=${NZ}, count_max=${COUNT_MAX}) =========="
 # shellcheck disable=SC2086
 python "${SCRIPT_DIR}/gpu_benchmark.py" --batches ${BATCHES} --nz "${NZ}" --count-max "${COUNT_MAX}"

@@ -96,6 +96,12 @@ def build_profiles(n: int, cfg, seed: int = 0):
     state, so the batch is a real heterogeneous workload (not n copies of one
     atmosphere). const_mix + isothermal means each build is cheap host-side
     work (no FastChem, no file read).
+
+    `skip_chem_warmup=True` drops the per-profile single-profile chem-RHS JIT
+    warmup: `run_batch` compiles its own *batched* (vmapped) chem RHS, so the
+    single-profile compile this would trigger is never used. Skipping it removes
+    a one-time ~30-40 s compile from the host build (it instead shows up once,
+    correctly, in the first 'cold' run_batch call).
     """
     import copy
 
@@ -115,7 +121,7 @@ def build_profiles(n: int, cfg, seed: int = 0):
     for T in temps:
         c = copy.copy(cfg)
         c.Tiso = float(T)
-        states.append(vulcan_jax.RunState.with_pre_loop_setup(c))
+        states.append(vulcan_jax.RunState.with_pre_loop_setup(c, skip_chem_warmup=True))
     return states
 
 
