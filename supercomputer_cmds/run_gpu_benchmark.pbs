@@ -3,31 +3,49 @@
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
-#PBS -l walltime=02:00:00
+#PBS -l walltime=01:00:00
 #PBS -j oe
 #
 # =============================================================================
 # Standalone VULCAN-JAX GPU throughput benchmark on a GH200 (H100) node.
 #
-# Integrates batches of different atmospheric profiles in one vmapped device
-# call (OuterLoop.run_batch) and reports profiles/sec vs batch size. This is
-# the number for the paper's GPU throughput TODO.
+# Integrates a batch of HD 189-like planets (the vendored HD189 T-P + Kzz
+# atmosphere, each planet's T(P) scaled by a few percent, FastChem-EQ init,
+# photo off) in one vmapped device call (OuterLoop.run_batch). Converges in
+# ~600 steps/planet, so the default 4-planet test finishes in a few minutes.
+# For the paper's throughput-vs-batch-size sweep:
+#   qsub -v BATCHES="8 64 256 512" supercomputer_cmds/run_gpu_benchmark.pbs
 #
 #   cd /nobackup/$USER/vulcan-emulator
 #   qsub supercomputer_cmds/run_gpu_benchmark.pbs
 #
+# LIVE PROGRESS: PBS only delivers the .o file when the job ends, so this
+# script also streams everything to a log file you can watch while it runs:
+#
+#   tail -f /nobackup/$USER/vulcan-emulator/logs/vjax_gpu_bench_<jobid>.log
+#
 # It runs the self-contained script supercomputer_cmds/gpu_benchmark.py, which
-# imports only the installed `vulcan_jax` (no FastChem, no atm files, no sibling
-# repos). vulcan-jax must already be installed in the env (see run_install.pbs
-# or just `pip install --user vulcan-jax`).
+# imports only the installed `vulcan_jax` (the HD189 atm file and the FastChem
+# binary ship inside the package; no sibling repos). vulcan-jax must already be
+# installed in the env (see run_install.pbs
+# or just `pip install --user vulcan-jax`). Host setup (RunState builds) fans
+# out across all 72 Grace cores on a CPU-pinned spawn pool and overlaps with
+# the GPU integration; the GPU integration itself is driven in CHUNK-step
+# device calls so a progress line appears every chunk.
 #
 # Env (-v):
-#   BATCHES    batch sizes to sweep (default "8 64 256 512"; 1024 OOMs the
-#              96 GB H100 — stack_integ_states' eager jnp.stack of the
-#              (conv_step=500, nz, ni) y_time_ring leaf transiently needs
-#              ~90+ GB at that size)
-#   NZ         layers per profile (default 100)
-#   COUNT_MAX  Ros2 step cap per profile (default 2000 -> lanes converge)
+#   BATCHES    batch sizes to sweep (default "4" = the quick test; 1024
+#              OOMs the 96 GB H100 — stack_integ_states' eager jnp.stack of
+#              the (conv_step=500, nz, ni) y_time_ring leaf transiently
+#              needs ~90+ GB at that size)
+#   NZ         layers per planet (default 150 = the real HD189 config)
+#   COUNT_MAX  Ros2 step cap per planet (default 2500; this regime converges
+#              in ~600 steps — the old synthetic const_mix benchmark needed
+#              ~4100, which with its 2000-step cap is why the first run
+#              "converged" 0/512)
+#   CHUNK      accepted steps per device call / progress-log cadence
+#              (default 250)
+#   WORKERS    host-setup CPU processes (default 0 = all visible cores)
 #   CONDA_ENV  interpreter env (default pyt2_8_gh)
 # =============================================================================
 set -uo pipefail
@@ -47,6 +65,15 @@ if [ ! -d "${PROJECT_ROOT}/supercomputer_cmds" ]; then
 fi
 cd -P "${PROJECT_ROOT}"
 SCRIPT_DIR="${PROJECT_ROOT}/supercomputer_cmds"
+
+# --- stream all output to a tail-able log (PBS .o only appears at job end) ----
+LOG_DIR="${PROJECT_ROOT}/logs"
+mkdir -p "${LOG_DIR}"
+_jobid="${PBS_JOBID:-manual_$$}"
+LOG_FILE="${LOG_DIR}/vjax_gpu_bench_${_jobid%%.*}.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "Live log: tail -f ${LOG_FILE}"
+echo "Job ${PBS_JOBID:-?} started $(date)"
 
 # --- caches off $HOME, conda, vulcan_jax + FastChem ready ---------------------
 # shellcheck source=/dev/null
@@ -91,10 +118,14 @@ sys.exit(0 if be in ("gpu", "cuda", "rocm") else 1)
 PY
 
 # --- run the benchmark --------------------------------------------------------
-BATCHES="${BATCHES:-8 64 256 512}"
-NZ="${NZ:-100}"
-COUNT_MAX="${COUNT_MAX:-2000}"
-echo "========== VULCAN-JAX GPU benchmark (batches=${BATCHES}, nz=${NZ}, count_max=${COUNT_MAX}) =========="
+BATCHES="${BATCHES:-4}"
+NZ="${NZ:-150}"
+COUNT_MAX="${COUNT_MAX:-2500}"
+CHUNK="${CHUNK:-250}"
+WORKERS="${WORKERS:-0}"
+echo "========== VULCAN-JAX GPU benchmark (batches=${BATCHES}, nz=${NZ}, count_max=${COUNT_MAX}, chunk=${CHUNK}, workers=${WORKERS}) =========="
 # shellcheck disable=SC2086
-python "${SCRIPT_DIR}/gpu_benchmark.py" --batches ${BATCHES} --nz "${NZ}" --count-max "${COUNT_MAX}"
-echo "benchmark returned."
+python "${SCRIPT_DIR}/gpu_benchmark.py" --batches ${BATCHES} --nz "${NZ}" --count-max "${COUNT_MAX}" --chunk "${CHUNK}" --workers "${WORKERS}"
+rc=$?
+echo "benchmark returned rc=${rc} at $(date)"
+exit "${rc}"
