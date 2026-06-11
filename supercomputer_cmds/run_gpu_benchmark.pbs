@@ -22,7 +22,10 @@
 # or just `pip install --user vulcan-jax`).
 #
 # Env (-v):
-#   BATCHES    batch sizes to sweep (default "8 64 256 1024")
+#   BATCHES    batch sizes to sweep (default "8 64 256 512"; 1024 OOMs the
+#              96 GB H100 — stack_integ_states' eager jnp.stack of the
+#              (conv_step=500, nz, ni) y_time_ring leaf transiently needs
+#              ~90+ GB at that size)
 #   NZ         layers per profile (default 100)
 #   COUNT_MAX  Ros2 step cap per profile (default 2000 -> lanes converge)
 #   CONDA_ENV  interpreter env (default pyt2_8_gh)
@@ -88,7 +91,7 @@ sys.exit(0 if be in ("gpu", "cuda", "rocm") else 1)
 PY
 
 # --- run the benchmark --------------------------------------------------------
-BATCHES="${BATCHES:-8 64 256 1024}"
+BATCHES="${BATCHES:-8 64 256 512}"
 NZ="${NZ:-100}"
 COUNT_MAX="${COUNT_MAX:-2000}"
 echo "========== VULCAN-JAX GPU benchmark (batches=${BATCHES}, nz=${NZ}, count_max=${COUNT_MAX}) =========="
