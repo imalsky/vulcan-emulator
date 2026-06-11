@@ -174,6 +174,7 @@ def _seed_private_fastchem_tree(worker_root) -> None:
 def _worker_init(nz: int, count_max: int) -> None:
     """Pin this worker to CPU before its first vulcan_jax import, seed its
     private FastChem tree, and parse the vendored HD189 atm table once."""
+    import logging
     import tempfile
     from pathlib import Path
 
@@ -181,6 +182,11 @@ def _worker_init(nz: int, count_max: int) -> None:
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["JAX_ENABLE_X64"] = "1"
+    # These workers are CPU-only, but JAX still *discovers* the installed CUDA
+    # plugin and calls cuInit(0), which fails with CUDA_ERROR_NO_DEVICE (no GPU
+    # visible) and is logged at ERROR level. Mute xla_bridge BEFORE the first
+    # vulcan_jax/jax import so that per-worker traceback never reaches the log.
+    logging.getLogger("jax._src.xla_bridge").setLevel(logging.CRITICAL)
     worker_root = Path(tempfile.mkdtemp(prefix=f"vjax_bench_{os.getpid()}_"))
     _seed_private_fastchem_tree(worker_root)
 
