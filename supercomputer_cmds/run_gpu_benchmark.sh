@@ -193,12 +193,14 @@ echo "[phase 1] sweep rc=${sweep_rc}"
 probe_rc=0
 if [ "${PROBE}" = "1" ]; then
   if [ "${PROBE_BATCH}" = "auto" ]; then
-    # The pre-fix batch-512 stack/Jacobian transients needed ~42-61 GiB on top
-    # of ~3 GiB persistent; size the probe so a HEALTHY (chunked) run fits the
-    # card while a chunking regression would still blow past it.
-    if   [ "${GPU_MEM_MIB}" -ge 71680 ]; then PROBE_BATCH=512
-    elif [ "${GPU_MEM_MIB}" -ge 35840 ]; then PROBE_BATCH=256
-    else PROBE_BATCH=128; fi
+    # Measured on the A100 (80 GB): a HEALTHY chunked-Jacobian run costs
+    # ~0.17 GiB/lane (carry + solver workspace), so untiled 256 needs ~45 GiB
+    # and untiled 512 ~88 GiB — 512 does not fit current cards even with the
+    # fix. Size the probe so a healthy run fits with headroom while the
+    # pre-fix scatter transients (~+0.1 GiB/lane) would still blow past it.
+    if   [ "${GPU_MEM_MIB}" -ge 65536 ]; then PROBE_BATCH=256
+    elif [ "${GPU_MEM_MIB}" -ge 32768 ]; then PROBE_BATCH=128
+    else PROBE_BATCH=64; fi
   fi
   echo "========== phase 2: Fix-B probe — UNTILED batch ${PROBE_BATCH} on a ${GPU_MEM_MIB} MiB GPU =========="
   echo "[probe] watch the 'peak GiB' column: chunked-Jacobian-healthy means it"
@@ -209,13 +211,18 @@ if [ "${PROBE}" = "1" ]; then
   probe_rc=$?
   if [ "${probe_rc}" -ne 0 ]; then
     echo "[probe] FINDING: untiled batch ${PROBE_BATCH} FAILED (rc=${probe_rc}, likely OOM)."
-    echo "[probe] If the sweep above succeeded, XLA may have un-done the lax.scan"
-    echo "[probe] chunking in chem.chem_jac_analytical_per_layer — see"
-    echo "[probe] VULCAN-JAX/docs/notes.md (add jax.checkpoint on the chunk body"
-    echo "[probe] or shrink _JAC_CHUNK_REACTIONS). Production runs are unaffected"
-    echo "[probe] as long as --device-batch stays tiled (default 128)."
+    echo "[probe] Diagnose with the sweep's peak-GiB column: a HEALTHY run grows"
+    echo "[probe] ~0.17 GiB/lane (linear). If the probe peak was on that line and"
+    echo "[probe] simply exceeded the card, this is per-lane state, NOT a Fix-B"
+    echo "[probe] failure — rerun with a smaller PROBE_BATCH. Only a peak far"
+    echo "[probe] ABOVE the linear trend means XLA un-did the lax.scan chunking"
+    echo "[probe] in chem.chem_jac_analytical_per_layer (then: jax.checkpoint on"
+    echo "[probe] the chunk body or shrink _JAC_CHUNK_REACTIONS; see"
+    echo "[probe] VULCAN-JAX/docs/notes.md). Tiled production runs are unaffected."
   else
-    echo "[probe] untiled batch ${PROBE_BATCH} completed — Fix B holds on this device."
+    echo "[probe] untiled batch ${PROBE_BATCH} completed — compare its peak GiB to"
+    echo "[probe] the ~0.17 GiB/lane linear trend from the sweep; on-trend = Fix B"
+    echo "[probe] holds on this device."
   fi
 fi
 
