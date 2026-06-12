@@ -4,11 +4,13 @@ This script integrates a batch of HD 189-like planets to steady state in ONE
 vmapped device call (`OuterLoop.run_batch`, the vmap-across-profiles path).
 Each planet is the vendored HD189 atmosphere (T-P + Kzz file) with its
 temperature profile scaled by a few percent, initialised from FastChem
-equilibrium, photochemistry off (`run_batch` does not support it). That
+equilibrium, photochemistry off (the emulator data-generation regime this
+benchmark measures; `run_batch` also supports photo-on batches). That
 workload converges in ~600 accepted Ros2 steps (~50 s single-profile on a
 laptop CPU), so the default job is a few minutes, not an hour.
 
-Design (all four were problems in the first GH200 run):
+Design (items 1-4 were problems in the first GH200 run; item 5 came from
+its batch-512 OOM analysis):
 
 1.  **Profiles actually converge.** The real HD189 EQ-init regime needs only
     ~600 steps; the step cap defaults to 2500 (4x margin). The first GH200
@@ -28,6 +30,13 @@ Design (all four were problems in the first GH200 run):
     250 accepted steps per device call) via the carry's `chunk_target` yield,
     so a timestamped status line (lanes done, step counts, reason breakdown)
     appears every chunk instead of one table after a long silence.
+5.  **Device-batch tiling.** The on-device batch is capped (default 128 via
+    `--device-batch`); larger sweep batches run as sequential sub-tiles
+    sharing one XLA compile. The vmapped Jacobian-assembly transient grows
+    linearly in the on-device batch and OOM'd an untiled batch 512 on a
+    96 GB GH200; per-planet throughput was already near-saturated by 128,
+    so 4x128 tiles recover essentially all of the 512-wide throughput.
+    Per-lane results are unchanged (lanes never interact).
 
 It is standalone: it imports only `vulcan_jax`, the stdlib, NumPy, and JAX —
 no sibling repos, no `../VULCAN-master/`; the atmosphere file and the FastChem
@@ -44,9 +53,12 @@ After `pip install vulcan-jax` (>= 0.1.13, nothing else):
     # Force the GPU backend (errors early if no GPU is visible to JAX):
     JAX_PLATFORM_NAME=gpu python gpu_benchmark.py
 
-On the GH200 / HPC (an H100 GPU), submit supercomputer_cmds/run_gpu_benchmark.pbs,
-which streams this script's output to a tail-able log file. For the paper's
-throughput-vs-batch-size sweep:  qsub -v BATCHES="8 64 256 512" ...
+On the GH200 / NAS (PBS):  qsub supercomputer_cmds/run_gpu_benchmark.pbs
+On the edge A100 (SLURM):  sbatch supercomputer_cmds/run_gpu_benchmark.sh
+Both stream this script's output to a tail-able log file; the .sh variant
+adds an untiled Fix-B memory probe after the tiled sweep. For the paper's
+throughput-vs-batch-size sweep:  qsub -v BATCHES="8 64 256 512" ... /
+sbatch --export=ALL,BATCHES="8 64 256 512" ...
 
 The "profiles/s" at the largest batch size is the number to watch: the GPU
 amortizes a fixed per-call overhead across the whole batch, so throughput
@@ -97,7 +109,7 @@ _HD189_ATM = "atm/atm_HD189_Kzz.txt"  # vendored in the vulcan_jax package
 
 def build_cfg(nz: int, count_max: int):
     """The real HD189 regime minus photochemistry: vendored T-P + Kzz file
-    (cfg defaults), FastChem-EQ init, photo off (run_batch requires this).
+    (cfg defaults), FastChem-EQ init, photo off (the emulator regime).
 
     `count_max` must comfortably exceed the ~600 accepted steps this regime
     needs to converge (measured single-profile).
@@ -109,7 +121,7 @@ def build_cfg(nz: int, count_max: int):
         # atm_type/atm_file/Kzz_prof stay at the package defaults ('file',
         # the vendored HD189 atm, Kzz from the same file); each worker swaps
         # in its own T-scaled copy of that file per planet.
-        use_photo=False,  # run_batch does not support photochemistry
+        use_photo=False,  # photo-off: the emulator data-generation regime
         use_ion=False,
         use_condense=False,
         nz=nz,
@@ -222,8 +234,7 @@ def _worker_build(task):
     header, P, T, Kzz = _WORKER_ATM
     atm_path = _WORKER_DIR / f"atm_HD189_planet{idx}.txt"
     rows = "\n".join(
-        f"{p:.6E}\t{t * float(tscale):.6f}\t {k:.6E}"
-        for p, t, k in zip(P, T, Kzz)
+        f"{p:.6E}\t{t * float(tscale):.6f}\t {k:.6E}" for p, t, k in zip(P, T, Kzz)
     )
     atm_path.write_text("\n".join(header) + "\n" + rows + "\n")
 
@@ -283,6 +294,28 @@ def stack_batch(integ, run_states):
     )
 
 
+def _device_mem_stats():
+    """Peak / current / limit device memory in GiB, or None when the backend
+    has no allocator stats (CPU, some platforms).
+
+    `peak_bytes_in_use` is cumulative for the process — XLA's allocator has no
+    public reset — so within an ascending batch sweep the value after each
+    batch is that batch's peak. This is the number that verifies the chunked
+    Jacobian assembly actually bounds the vmap transient on device.
+    """
+    import jax
+
+    stats = getattr(jax.devices()[0], "memory_stats", lambda: None)()
+    if not stats:
+        return None
+    gib = 2**30
+    return {
+        "peak": stats.get("peak_bytes_in_use", 0) / gib,
+        "in_use": stats.get("bytes_in_use", 0) / gib,
+        "limit": stats.get("bytes_limit", 0) / gib,
+    }
+
+
 def print_backend_banner():
     """Print the JAX backend + devices and a clear CPU-fallback note."""
     import jax
@@ -301,6 +334,9 @@ def print_backend_banner():
     print(f"jax version        : {jax.__version__}")
     print(f"jax backend        : {backend}")
     print(f"jax devices        : {devices}")
+    mem = _device_mem_stats()
+    if mem and mem["limit"] > 0:
+        print(f"device memory      : {mem['limit']:.1f} GiB visible to XLA")
     on_gpu = backend in ("gpu", "cuda", "rocm")
     if not on_gpu:
         print("")
@@ -370,28 +406,63 @@ def integrate_chunked(integ, states_b, atm_b, n, count_max, chunk, label):
     return states_b, time.perf_counter() - t_start, call_times
 
 
-def benchmark_one(integ, run_states, count_max, chunk, label):
-    """Stack one batch and integrate every lane to termination.
+def benchmark_one(integ, run_states, count_max, chunk, label, device_batch):
+    """Integrate every lane of one sweep batch to termination, tiled host-side.
+
+    The on-device batch is capped at `device_batch` lanes: a sweep batch
+    larger than that is split into equal sub-tiles integrated sequentially,
+    each in its own `run_batch` device call. All full tiles share one XLA
+    compile (same (nz, tile) shape); a final partial tile is padded with
+    copies of planet 0 (padded lanes are integrated but excluded from the
+    stats) so it reuses the same compile too. Per-lane results are identical
+    to the untiled call — lanes never interact — so tiling only bounds the
+    device's peak live memory, which is what OOM'd batch 512 on a 96 GB
+    GH200 (the vmapped Jacobian-assembly transient grows linearly in the
+    on-device batch).
 
     Returns a result dict for the summary table.
     """
     n = len(run_states)
-    t0 = time.perf_counter()
-    states_b, atm_b = stack_batch(integ, run_states)
-    stack_s = time.perf_counter() - t0
-    log(f"{label}: stacked {n} planets onto the device in {stack_s:.1f}s")
+    tile = min(n, max(1, device_batch))
+    n_tiles = -(-n // tile)
 
-    states_b, total_s, call_times = integrate_chunked(
-        integ, states_b, atm_b, n, count_max, chunk, label
-    )
+    steps_parts, reasons_parts = [], []
+    call_times: list = []
+    total_s = 0.0
+    finite = True
+    for t in range(n_tiles):
+        lane_states = run_states[t * tile : (t + 1) * tile]
+        n_real = len(lane_states)
+        if n_real < tile:
+            lane_states = lane_states + [run_states[0]] * (tile - n_real)
+        tlabel = label if n_tiles == 1 else f"{label} [tile {t + 1}/{n_tiles}]"
 
-    steps = np.asarray(states_b.accept_count)
-    reasons = np.asarray(states_b.termination_reason)
-    finite = np.isfinite(np.asarray(states_b.ymix)).all()
+        t0 = time.perf_counter()
+        states_b, atm_b = stack_batch(integ, lane_states)
+        stack_s = time.perf_counter() - t0
+        log(
+            f"{tlabel}: stacked {len(lane_states)} planets onto the device in {stack_s:.1f}s"
+        )
+
+        states_b, tile_s, tile_calls = integrate_chunked(
+            integ, states_b, atm_b, len(lane_states), count_max, chunk, tlabel
+        )
+        total_s += tile_s
+        call_times.extend(tile_calls)
+
+        steps_parts.append(np.asarray(states_b.accept_count)[:n_real])
+        reasons_parts.append(np.asarray(states_b.termination_reason)[:n_real])
+        finite = finite and bool(np.isfinite(np.asarray(states_b.ymix)[:n_real]).all())
+        # Free this tile's device arrays before the next tile stacks.
+        del states_b, atm_b
+        gc.collect()
+
+    steps = np.concatenate(steps_parts)
+    reasons = np.concatenate(reasons_parts)
     n_ok = int(np.isin(reasons, _OK_REASONS).sum())
 
     # The first device call carries the one-time XLA compile for this
-    # (nz, batch) shape; estimate it as that call's excess over the median
+    # (nz, tile) shape; estimate it as that call's excess over the median
     # later call and report throughput with and without it.
     first_call_s = call_times[0]
     compile_est = (
@@ -399,6 +470,7 @@ def benchmark_one(integ, run_states, count_max, chunk, label):
         if len(call_times) > 1
         else 0.0
     )
+    mem = _device_mem_stats()
     result = {
         "n": n,
         "total_s": total_s,
@@ -409,10 +481,10 @@ def benchmark_one(integ, run_states, count_max, chunk, label):
         "reasons": _reason_breakdown(reasons),
         "steps_max": int(steps.max()),
         "finite": bool(finite),
+        # Cumulative process peak; in an ascending sweep this is this batch's
+        # peak. None on backends without allocator stats (CPU).
+        "peak_gib": mem["peak"] if mem else None,
     }
-    # Free this batch's device arrays before the next (bigger) batch stacks.
-    del states_b, atm_b
-    gc.collect()
     return result
 
 
@@ -450,6 +522,16 @@ def main() -> int:
         help="Accepted steps per device call (progress-log cadence).",
     )
     parser.add_argument(
+        "--device-batch",
+        type=int,
+        default=128,
+        help="Max planets per device call. Larger sweep batches are tiled "
+        "host-side into sub-batches of this size (one shared XLA compile); "
+        "per-lane results are unchanged. Bounds the vmapped Jacobian "
+        "transient that OOM'd an untiled batch 512 on a 96 GB GH200. "
+        "Set >= the largest batch to measure a single untiled device call.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=0,
@@ -477,7 +559,8 @@ def main() -> int:
     print(
         f"\nConfig: HD189-like planets (vendored {_HD189_ATM}, T(P) scaled "
         f"1±{args.t_spread:g})  ini_mix=EQ  use_photo=False  nz={args.nz}  "
-        f"count_max={args.count_max}  chunk={args.chunk}"
+        f"count_max={args.count_max}  chunk={args.chunk}  "
+        f"device_batch={args.device_batch}"
     )
     print(f"Batch sizes to sweep: {args.batches}\n", flush=True)
 
@@ -532,14 +615,24 @@ def main() -> int:
                     all_states[idx] = rs
             results.append(
                 benchmark_one(
-                    integ, all_states[:bsz], args.count_max, args.chunk, label
+                    integ,
+                    all_states[:bsz],
+                    args.count_max,
+                    args.chunk,
+                    label,
+                    args.device_batch,
                 )
             )
             r = results[-1]
+            peak = (
+                f" | device peak {r['peak_gib']:.1f} GiB"
+                if r["peak_gib"] is not None
+                else ""
+            )
             log(
                 f"{label}: DONE in {r['total_s']:.1f}s "
                 f"(first call {r['first_call_s']:.1f}s incl XLA compile) | "
-                f"finished-ok {r['n_ok']}/{r['n']} | {r['reasons']}"
+                f"finished-ok {r['n_ok']}/{r['n']} | {r['reasons']}{peak}"
                 + ("" if r["finite"] else " | [NON-FINITE ymix!]")
             )
     finally:
@@ -547,15 +640,18 @@ def main() -> int:
 
     header = (
         f"{'batch':>6} | {'total s':>9} | {'1st call s':>10} | "
-        f"{'prof/s':>8} | {'steady prof/s':>13} | {'ok':>9} | reasons"
+        f"{'prof/s':>8} | {'steady prof/s':>13} | {'peak GiB':>8} | "
+        f"{'ok':>9} | reasons"
     )
     print("\n" + header)
     print("-" * (len(header) + 20))
     for r in results:
         flag = "" if r["finite"] else "  [NON-FINITE!]"
+        peak = f"{r['peak_gib']:>8.1f}" if r["peak_gib"] is not None else f"{'--':>8}"
         print(
             f"{r['n']:>6} | {r['total_s']:>9.1f} | {r['first_call_s']:>10.1f} | "
             f"{r['profiles_s']:>8.3f} | {r['steady_profiles_s']:>13.3f} | "
+            f"{peak} | "
             f"{r['n_ok']:>4}/{r['n']:<4} | {r['reasons']}{flag}"
         )
 
@@ -570,7 +666,9 @@ def main() -> int:
         "\nNotes: every lane runs to its own termination (freeze-on-done), so "
         "'total s' is set by the slowest lane. '1st call s' includes the "
         "one-time XLA compile for that (nz, batch) shape; 'steady prof/s' "
-        "excludes it. 'ok' counts converged + stalled-converged lanes "
+        "excludes it. 'peak GiB' is the process-cumulative device-allocator "
+        "peak (per-batch in an ascending sweep; '--' on backends without "
+        "allocator stats). 'ok' counts converged + stalled-converged lanes "
         "(both are steady-state ends); 'step-cap' lanes need a higher "
         "--count-max.",
         flush=True,
