@@ -111,10 +111,6 @@ if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
 fi
 conda activate "$CONDA_ENV"
 
-if command -v module >/dev/null 2>&1; then
-  module load cuda12.6/toolkit 2>/dev/null || module load cuda11.8/toolkit 2>/dev/null || true
-fi
-
 if [ "$SKIP_INSTALL" != "1" ]; then
   echo "[setup] installing GPU jax + vulcan-jax (TestPyPI) into '$CONDA_ENV'"
   python -m pip install -U pip setuptools wheel
@@ -138,6 +134,25 @@ PY
 # FastChem binary must be native to this node (x86_64 on edge; the package may
 # have been installed elsewhere). Rebuilds in place from bundled source if not.
 bash "${SCRIPT_DIR}/ensure_vulcan_jax.sh" || exit 1
+
+# pip's jax[cuda12] ships its own CUDA runtime in the nvidia-* wheels; a
+# cluster CUDA toolkit module (or inherited LD_LIBRARY_PATH) can shadow them
+# with an incompatible version — symptom: "Unable to load cuSPARSE", JAX
+# falls back to CPU. Do NOT module-load cuda here; put the wheel libs FIRST.
+NVLIB="$(python - <<'PY'
+import pathlib
+try:
+    import nvidia
+except ImportError:
+    raise SystemExit
+root = pathlib.Path(nvidia.__path__[0])
+print(":".join(str(d / "lib") for d in sorted(root.iterdir()) if (d / "lib").is_dir()))
+PY
+)"
+if [ -n "${NVLIB:-}" ]; then
+  export LD_LIBRARY_PATH="${NVLIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  echo "[setup] pip CUDA wheel libs prepended to LD_LIBRARY_PATH"
+fi
 
 # --- GPU runtime env (same knobs as run_gen.sh's GPU branch) --------------------
 export PYTHONUNBUFFERED=1
