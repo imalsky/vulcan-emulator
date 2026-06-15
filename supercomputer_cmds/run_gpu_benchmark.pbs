@@ -46,6 +46,15 @@
 #   CHUNK      accepted steps per device call / progress-log cadence
 #              (default 250)
 #   WORKERS    host-setup CPU processes (default 0 = all visible cores)
+#   DEVICE_BATCH  max lanes per device call (default 128; larger sweep batches
+#              run as sequential tiles sharing one XLA compile)
+#   PROBE      1 = after the sweep, run an UNTILED Fix-B memory probe in a
+#              fresh process (default 1). The probe verifies the chunked
+#              Jacobian assembly (vulcan-jax >= 0.1.14) bounds the vmapped
+#              transient on device: watch the per-batch 'peak GiB' column.
+#   PROBE_BATCH  probe size, or "auto" by GPU memory (default auto;
+#              ~0.17 GiB/lane healthy -> 512 needs ~87 GiB, the ceiling probe
+#              on the 96 GB GH200, where an OOM is a non-fatal FINDING)
 #   CONDA_ENV  interpreter env (default pyt2_8_gh)
 # =============================================================================
 set -uo pipefail
@@ -85,16 +94,24 @@ module load miniconda3/gh2 2>/dev/null || true
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV:-pyt2_8_gh}"
 
-# vulcan_jax must be importable AND new enough to carry the make_config cfg=
-# wiring that the benchmark's standalone config relies on (added after 0.1.10).
+# vulcan_jax must be importable AND new enough to carry BOTH the make_config
+# cfg= wiring (>=0.1.13) and the chunked-Jacobian "Fix B" + run_batch host-side
+# tiling "Fix A" that phases 1-2 below exercise (>=0.1.14). On an older build the
+# tiled sweep and the Fix-B probe are meaningless, so gate on the version tuple
+# (mirrors run_gpu_benchmark.sh) and keep the cfg= signature check as a backstop.
 python - <<'PY' || { echo "       Upgrade with:  qsub -v FORCE=1 supercomputer_cmds/run_install.pbs"; exit 1; }
 import sys, inspect
 import vulcan_jax
 from vulcan_jax import legacy_io
+ver = tuple(int(x) for x in vulcan_jax.__version__.split(".")[:3])
 print("vulcan_jax", vulcan_jax.__version__)
+if ver < (0, 1, 14):
+    sys.exit(f"ERROR: vulcan_jax {vulcan_jax.__version__} predates the chunked "
+             "Jacobian (Fix B) + run_batch tiling (Fix A); the tiled sweep and "
+             "Fix-B probe need >= 0.1.14.")
 if "cfg" not in inspect.signature(legacy_io.Output.__init__).parameters:
-    sys.exit(f"ERROR: vulcan_jax {vulcan_jax.__version__} is too old for this benchmark "
-             "(needs the make_config cfg= wiring, >=0.1.13).")
+    sys.exit(f"ERROR: vulcan_jax {vulcan_jax.__version__} lacks the make_config "
+             "cfg= wiring the benchmark's standalone config relies on.")
 PY
 
 # --- GPU runtime env (same knobs as run_gen.pbs's GPU branch) -----------------
@@ -110,6 +127,7 @@ echo "node=$(hostname)  arch=$(uname -m)"
 if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
   echo "ERROR: no visible NVIDIA GPU in this job (are you on a gh200 node?)."; exit 1
 fi
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 python - <<'PY' || { echo "ERROR: JAX is not on the GPU in this env."; exit 1; }
 import jax, sys
 be = jax.default_backend()
@@ -123,9 +141,49 @@ NZ="${NZ:-150}"
 COUNT_MAX="${COUNT_MAX:-2500}"
 CHUNK="${CHUNK:-250}"
 WORKERS="${WORKERS:-0}"
-echo "========== VULCAN-JAX GPU benchmark (batches=${BATCHES}, nz=${NZ}, count_max=${COUNT_MAX}, chunk=${CHUNK}, workers=${WORKERS}) =========="
+DEVICE_BATCH="${DEVICE_BATCH:-128}"
+PROBE="${PROBE:-1}"
+PROBE_BATCH="${PROBE_BATCH:-auto}"
+echo "========== phase 1: tiled sweep (batches=${BATCHES}, device_batch=${DEVICE_BATCH}, nz=${NZ}, count_max=${COUNT_MAX}, chunk=${CHUNK}, workers=${WORKERS}) =========="
 # shellcheck disable=SC2086
-python "${SCRIPT_DIR}/gpu_benchmark.py" --batches ${BATCHES} --nz "${NZ}" --count-max "${COUNT_MAX}" --chunk "${CHUNK}" --workers "${WORKERS}"
+python "${SCRIPT_DIR}/gpu_benchmark.py" --batches ${BATCHES} --device-batch "${DEVICE_BATCH}" --nz "${NZ}" --count-max "${COUNT_MAX}" --chunk "${CHUNK}" --workers "${WORKERS}"
 rc=$?
-echo "benchmark returned rc=${rc} at $(date)"
+echo "[phase 1] sweep rc=${rc} at $(date)"
+
+# --- phase 2: untiled Fix-B probe (fresh process -> clean allocator peak) -----
+probe_rc=0
+if [ "${PROBE}" = "1" ]; then
+  GPU_MEM_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' ')"
+  if [ "${PROBE_BATCH}" = "auto" ]; then
+    # A healthy chunked-Jacobian run costs ~0.17 GiB/lane (measured), so untiled
+    # 512 needs ~87 GiB and 256 ~45 GiB. On the 96 GB GH200 (~86 GiB usable at
+    # MEM_FRACTION=0.90) batch 512 is the *ceiling* probe -- the exact untiled
+    # width that OOM'd before Fix B -- so even a healthy chunked run sits right
+    # at the edge; an OOM there is reported below as a non-fatal FINDING, not a
+    # job failure. Drop the 512 tier to 256 if you want every probe to fit with
+    # headroom. (The pre-fix scatter transient was the ~42-61 GiB figure Fix B
+    # removed -- not the healthy cost.)
+    if   [ "${GPU_MEM_MIB}" -ge 92160 ]; then PROBE_BATCH=512
+    elif [ "${GPU_MEM_MIB}" -ge 65536 ]; then PROBE_BATCH=256
+    elif [ "${GPU_MEM_MIB}" -ge 32768 ]; then PROBE_BATCH=128
+    else PROBE_BATCH=64; fi
+  fi
+  echo "========== phase 2: Fix-B probe — UNTILED batch ${PROBE_BATCH} on a ${GPU_MEM_MIB} MiB GPU =========="
+  python "${SCRIPT_DIR}/gpu_benchmark.py" --batches "${PROBE_BATCH}" --device-batch "${PROBE_BATCH}" --nz "${NZ}" --count-max "${COUNT_MAX}" --chunk "${CHUNK}" --workers "${WORKERS}"
+  probe_rc=$?
+  if [ "${probe_rc}" -ne 0 ]; then
+    echo "[probe] FINDING: untiled batch ${PROBE_BATCH} FAILED (rc=${probe_rc}, likely OOM)."
+    echo "[probe] Diagnose with the sweep's peak-GiB column: a HEALTHY run grows"
+    echo "[probe] ~0.17 GiB/lane (linear). On-trend but over the card = per-lane"
+    echo "[probe] state, NOT a Fix-B failure — rerun with a smaller PROBE_BATCH."
+    echo "[probe] A peak far ABOVE the trend means XLA un-did the lax.scan"
+    echo "[probe] chunking in chem.chem_jac_analytical_per_layer (see"
+    echo "[probe] VULCAN-JAX/docs/notes.md). Tiled production runs are unaffected."
+  else
+    echo "[probe] untiled batch ${PROBE_BATCH} completed — compare its peak GiB to"
+    echo "[probe] the ~0.17 GiB/lane linear trend; on-trend = Fix B holds here."
+  fi
+fi
+
+echo "sweep rc=${rc}, probe rc=${probe_rc} at $(date)"
 exit "${rc}"
